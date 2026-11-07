@@ -153,6 +153,8 @@ python tools/privacy_gate.py --refs all      # 额外扫全部 ref（见下）
 
 - **每张 M 单合并前必跑一次，rc≠0 即 QA P0**，不许以「已知但先合」放过。
 - 默认 `--refs branch` 必须 rc=0；命中会逐条打印 `文件:行: 模式: 内容` 或 `commit 的 author/committer 命中 模式`。
+- **token 形态**（GitHub PAT `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`、`github_pat_`、`sk-`、AWS `AKIA`、PEM 私钥块）走同一套文件扫描，命中即 rc≠0；每类都带长度下限，`sk-learn`、`task-name` 或单独出现的凭据前缀**不会**误报。
+- **origin 的 owner 段只 WARN、不 fail**：仓属于它自己的主人是合法态，所以 owner 段命中私有词时打印一行 `WARN`、退出码仍为 0；但绝不静默——`WARN` 行必须可见。origin 里 owner 之后的**仓库路径**仍然是 fail 通道。
 - `--refs all` 扫描全部 ref。本仓当前**预期为红**：`refs/original/*` 是早期 filter-branch 留下的备份 ref，仍能走到若干条私有身份的 commit。清除它们需要仓库所有者批准 `git gc` / `git reflog expire`，**不属于日常开发流程**；清理完成后 `--refs all` 预期回到 rc=0。
 - 模式串在 `tools/privacy_gate.py` 里是**分片拼装**的，不是整字写出——否则 gate 会命中自己。改这个文件时不要"顺手"把片段合并。
 - 运行态目录（`state/`、`.kimi/`、`auth/`）一旦出现在 `git ls-files` 里，gate 同样判红：说明运行态或报告被误提交了。

@@ -16,6 +16,15 @@ Four surfaces are scanned and a hit on any of them fails the gate:
 * runtime directories (``state/``, ``.kimi/``, ``auth/``) appearing in the
   tracked list, which means run state or reports leaked into the open repo.
 
+Token-shaped values (GitHub PATs, API keys, AWS access key ids and PEM private
+key headers) are matched by the file and origin checks with a length floor on
+each form, so short hyphenated words and bare credential prefixes stay green.
+
+The owner segment of ``origin`` is the one surface that warns instead of
+failing: the account the required remote already points at is the owner of the
+repository, which is a legitimate state. It is still never dropped silently -
+every owner hit prints a ``WARN`` line while the exit code stays 0.
+
 ``--refs all`` is deliberately red on this repository: the filter-branch backup
 refs (``refs/original/*``) still reach commits authored with a private
 identity. Clearing those needs the owner's approval to run ``git gc`` /
@@ -50,6 +59,29 @@ PATTERNS = {
         r"[A-Za-z]:[/\\](?:" + _joined("github[/\\\\]Lai", "ke")
         + r"|" + _joined("Users[/\\\\]ming", "h") + r")", re.IGNORECASE),
     "machine code": re.compile(r"\bM[12]\b"),
+
+    # Token shapes. Every form carries a length floor so ordinary prose and
+    # hyphenated identifiers (library names, ``task-name``, a bare AWS key
+    # prefix) stay green: a real credential is long, a word is not.
+    #
+    # A classic GitHub PAT is the prefix plus 36 alphanumerics; the floor is 30
+    # to absorb historical length changes without matching prose. Cloud
+    # credential prefixes are only meaningful as prefixes, so writing them
+    # bare in a document does not trip the gate.
+    "token: github pat": re.compile(
+        r"(?<![A-Za-z0-9])(?:"
+        + _joined("gh", "p_|gh", "o_|gh", "u_|gh", "s_|gh", "r_")
+        + r")[A-Za-z0-9]{30,}"),
+    "token: github fine-grained pat": re.compile(
+        r"(?<![A-Za-z0-9])" + _joined("gith", "ub_p", "at_")
+        + r"[A-Za-z0-9_]{20,}"),
+    "token: sk api key": re.compile(
+        r"(?<![A-Za-z0-9])" + _joined("s", "k-")
+        + r"[A-Za-z0-9_-]{16,}"),
+    "token: aws access key id": re.compile(
+        r"\b" + _joined("AK", "IA") + r"[0-9A-Z]{16}\b"),
+    "token: private key block": re.compile(
+        _joined("-----BEGIN ", "[A-Z ]*PRIV", "ATE KEY-----")),
 }
 
 
@@ -152,22 +184,31 @@ def scan_history(root: Path = ROOT, refs: str = "branch") -> list[str]:
     return hits
 
 
-def _remote_scan_target(url: str) -> str:
-    """Return the part of a remote URL below the owner/organisation segment.
-
-    The owner segment is the account the required ``origin`` already points at,
-    so scanning it would make the gate permanently red for this repository.
-    The repository path below it is what can leak a private name.
-    """
+def _remote_path_segments(url: str) -> list[str]:
+    """Split the path part of a remote URL into its non-empty segments."""
     rest = url.strip()
     if "://" in rest:
         rest = rest.split("://", 1)[1]
         _, _, rest = rest.partition("/")
     elif ":" in rest:                       # scp-like: git@host:owner/repo.git
         rest = rest.split(":", 1)[1]
-    segments = [s for s in rest.split("/") if s]
+    return [s for s in rest.split("/") if s]
+
+
+def _remote_scan_target(url: str) -> str:
+    """Return the part of a remote URL below the owner/organisation segment.
+
+    The owner segment is the account the required ``origin`` already points at,
+    so failing on it would make the gate permanently red for this repository:
+    the repository belonging to its owner is a legitimate state, and a policy
+    choice keeps it out of the fail path. It is never dropped silently -
+    :func:`scan_remote_warnings` reports every owner hit as a ``WARN`` so the
+    fact stays visible while the exit code stays 0. The repository path below
+    the owner is what can leak a private name, and that still fails.
+    """
+    segments = _remote_path_segments(url)
     if len(segments) <= 1:
-        return rest
+        return "/".join(segments)
     return "/".join(segments[1:])
 
 
@@ -181,6 +222,24 @@ def scan_remote(root: Path = ROOT) -> list[str]:
             for label, pattern in PATTERNS.items() if pattern.search(target)]
 
 
+def scan_remote_warnings(root: Path = ROOT) -> list[str]:
+    """Report (do not fail) private names in the owner segment of ``origin``.
+
+    A hit here is a ``WARN``: the required remote belongs to its owner, so the
+    owner name appearing in it is expected. Silence is the thing this refuses
+    to do - the caller prints these lines and still exits 0 unless a fail-path
+    surface also hits.
+    """
+    out = _git("remote", "get-url", "origin", root=root)
+    if not out or not out.strip():
+        return []
+    url = out.strip().splitlines()[0]
+    segments = _remote_path_segments(url)
+    owner = segments[0] if segments else ""
+    return [f"origin owner 段命中 {label}: {url}"
+            for label, pattern in PATTERNS.items() if pattern.search(owner)]
+
+
 def scan(root: Path = ROOT, refs: str = "branch") -> list[str]:
     return (scan_files(root) + scan_runtime_paths(root)
             + scan_history(root, refs) + scan_remote(root))
@@ -190,8 +249,9 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="privacy_gate",
         description="Fail (exit 1) when private names, host paths, private "
-                    "identities or runtime directories are reachable from the "
-                    "open repository.")
+                    "identities, token-shaped credentials or runtime "
+                    "directories are reachable from the open repository. "
+                    "Private names in origin's owner segment only WARN.")
     parser.add_argument(
         "--refs", choices=("branch", "all"), default="branch",
         help="branch = scan HEAD's history only (default, the pre-merge gate); "
@@ -202,10 +262,13 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv=None) -> int:
+def main(argv=None, root: Path | None = None) -> int:
     args = _parser().parse_args([] if argv is None else argv)
-    files = tracked_files()
-    hits = scan(ROOT, args.refs)
+    root = ROOT if root is None else Path(root)
+    files = tracked_files(root)
+    hits = scan(root, args.refs)
+    for warning in scan_remote_warnings(root):
+        print("WARN " + warning)
     if hits:
         print(f"privacy gate: {len(hits)} hit(s) across {len(files)} files "
               f"(refs={args.refs})")
