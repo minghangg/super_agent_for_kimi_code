@@ -128,3 +128,31 @@ python -m super_agent.cli run --mode observe --interval 60
 而 `tests/test_red_evidence.py` 会把 `dispatch_enabled` 打桩成 `True` 来证明这个数会动。
 
 `status` 只列「需要人处理」的项，没有就输出「无」。**不需要介入时保持安静。**
+
+---
+
+## 永不出仓
+
+本仓是开源仓，只放**通用底座与引擎**。下面这些东西永不进入本仓：
+
+- `state/**` —— 运行态：索引、游标、事件日志、心跳、计数器、工作树
+- `.kimi/report/**` —— 会话报告、周报、走查结论
+- `auth/**` —— 凭据实体，以及任何 token／密钥值
+- 任何**本机绝对路径**（盘符、用户名、私有工作台目录）
+- 任何**私有项目名**、**私有身份**（真实姓名、邮箱、账号、提交者名）
+- 任何私有会话编号、私有 issue 编号与它们的原文摘录
+
+这些不是靠自觉，靠一条可复跑的命令卡住：
+
+```bash
+python tools/privacy_gate.py                 # 默认：tracked 文件 + 当前分支历史 + origin + 运行态目录
+python tools/privacy_gate.py --refs all      # 额外扫全部 ref（见下）
+```
+
+判据是退出码：
+
+- **每张 M 单合并前必跑一次，rc≠0 即 QA P0**，不许以「已知但先合」放过。
+- 默认 `--refs branch` 必须 rc=0；命中会逐条打印 `文件:行: 模式: 内容` 或 `commit 的 author/committer 命中 模式`。
+- `--refs all` 扫描全部 ref。本仓当前**预期为红**：`refs/original/*` 是早期 filter-branch 留下的备份 ref，仍能走到若干条私有身份的 commit。清除它们需要仓库所有者批准 `git gc` / `git reflog expire`，**不属于日常开发流程**；清理完成后 `--refs all` 预期回到 rc=0。
+- 模式串在 `tools/privacy_gate.py` 里是**分片拼装**的，不是整字写出——否则 gate 会命中自己。改这个文件时不要"顺手"把片段合并。
+- 运行态目录（`state/`、`.kimi/`、`auth/`）一旦出现在 `git ls-files` 里，gate 同样判红：说明运行态或报告被误提交了。
