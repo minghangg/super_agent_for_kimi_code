@@ -212,6 +212,7 @@ class Command(RunLoopBase):
             max_rounds = 0
             config = None
             mode = "observe"
+            role = "supervisor"
             state_dir = str(self.state)
             source = "none"
 

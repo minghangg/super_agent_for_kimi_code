@@ -53,12 +53,16 @@ class History(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def commit_as(self, email: str) -> None:
+    def commit_as(self, email: str, *, branch: str | None = None) -> str:
         who = f"{gate._joined('saf', 'kc')}-bot"
+        if branch:
+            subprocess.run(["git", "checkout", "-q", "-b", branch],
+                           cwd=self.root, check=True, capture_output=True)
         subprocess.run(
             ["git", "-c", f"user.name={who}", "-c", f"user.email={email}",
              "commit", "-q", "--allow-empty", "-m", "probe"],
             cwd=self.root, check=True, capture_output=True)
+        return git(self.root, "rev-parse", "HEAD").stdout.strip()
 
     def test_neutral_identity_is_clean(self):
         self.commit_as("test@example.com")
@@ -68,6 +72,47 @@ class History(unittest.TestCase):
         self.commit_as("x@" + PRIVATE_DOMAIN)
         hits = gate.scan_history(self.root)
         self.assertTrue(any("commit " in h and "命中" in h for h in hits), hits)
+
+    def test_default_refs_scans_the_branch_only(self):
+        self.commit_as("test@example.com")
+        sha = self.commit_as("x@" + PRIVATE_DOMAIN, branch="residue")
+        git(self.root, "checkout", "-q", "main")
+        git(self.root, "update-ref", "refs/original/refs/heads/residue", sha)
+        git(self.root, "update-ref", "-d", "refs/heads/residue")
+
+        self.assertEqual(gate.scan_history(self.root), [])
+        hits = gate.scan_history(self.root, "all")
+        self.assertTrue(hits, "refs=all must reach the residue")
+        self.assertTrue(any("refs/original/refs/heads/residue" in h
+                            for h in hits), hits)
+
+    def test_main_defaults_to_branch(self):
+        self.assertEqual(gate._parser().parse_args([]).refs, "branch")
+        self.assertEqual(gate._parser().parse_args(["--refs", "all"]).refs, "all")
+
+
+class RuntimePaths(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        git(self.root, "init", "-q", "-b", "main")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_tracked_runtime_directory_turns_red(self):
+        (self.root / "state").mkdir()
+        (self.root / "state" / "index.json").write_text("{}", encoding="utf-8")
+        git(self.root, "add", "state/index.json")
+        self.assertTrue(gate.scan_runtime_paths(self.root))
+
+    def test_untracked_runtime_directory_is_fine(self):
+        (self.root / "state").mkdir()
+        (self.root / "state" / "index.json").write_text("{}", encoding="utf-8")
+        self.assertEqual(gate.scan_runtime_paths(self.root), [])
+
+    def test_repository_has_no_tracked_runtime_paths(self):
+        self.assertEqual(gate.scan_runtime_paths(ROOT), [])
 
 
 class Remote(unittest.TestCase):

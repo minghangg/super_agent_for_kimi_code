@@ -42,6 +42,8 @@ def _build(args) -> tuple[dict, Store]:
     overrides: dict = {}
     if args.mode:
         overrides["mode"] = args.mode
+    if args.role:
+        overrides["role"] = args.role
     if args.state_dir:
         overrides["state_dir"] = args.state_dir
     if args.source:
@@ -226,7 +228,8 @@ def cmd_status(args) -> int:
     cfg, store = _build(args)
     engine = build_engine(cfg, store, _bus(cfg), source=NullSource())
     report = engine.status()
-    print(f"mode={report['mode']} external_actions={report['external_actions']}")
+    print(f"status  role={engine.role} mode={report['mode']} "
+          f"external_actions={report['external_actions']}")
     if not report["items"]:
         print(NONE_TEXT)
         return 0
@@ -242,7 +245,7 @@ def cmd_doctor(args) -> int:
     report = engine.doctor()
     worst = "ok"
     width = max((len(c["name"]) for c in report["checks"]), default=4)
-    print(f"doctor  mode={report['mode']} "
+    print(f"doctor  role={engine.role} mode={report['mode']} "
           f"external_actions={report['external_actions']}")
     for check in report["checks"]:
         mark = {"ok": "OK  ", "warn": "WARN", "fail": "FAIL"}[check["level"]]
@@ -299,6 +302,13 @@ def _non_negative_int(text: str) -> int:
     return value
 
 
+def _non_empty_text(text: str) -> str:
+    value = str(text).strip()
+    if not value:
+        raise argparse.ArgumentTypeError("must not be empty")
+    return value
+
+
 def _add_common(parser: argparse.ArgumentParser, *, suppress: bool) -> None:
     """Shared options. On subcommands they use SUPPRESS so they do not clobber
     a value given before the subcommand (``--mode`` works on either side)."""
@@ -308,6 +318,9 @@ def _add_common(parser: argparse.ArgumentParser, *, suppress: bool) -> None:
                         help="override the state directory")
     parser.add_argument("--mode", choices=list(config_mod.MODES), default=default,
                         help="observe (default) or assist")
+    parser.add_argument("--role", type=_non_empty_text, default=default,
+                        help="role name for this run (default: config's role, "
+                             "else supervisor)")
     parser.add_argument("--source", choices=list(config_mod.SOURCES), default=default,
                         help="override github.source (none|fixture|live)")
 
@@ -354,7 +367,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _ensure_common_defaults(args) -> None:
-    for name in ("config", "state_dir", "mode", "source"):
+    for name in ("config", "state_dir", "mode", "role", "source"):
         if not hasattr(args, name):
             setattr(args, name, None)
 

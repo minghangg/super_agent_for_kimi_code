@@ -236,6 +236,48 @@ class Gate(Base):
         engine.run_round()
         self.assertEqual(engine.status()["external_actions"], 0)
 
+    def _run(self, argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rc = cli.main(argv)
+        return rc, out.getvalue()
+
+    def test_a10_role_flag_reaches_status_and_doctor(self):
+        for command in ("status", "doctor"):
+            rc, text = self._run(["--state-dir", str(self.state), command,
+                                  "--role", "quartermaster"])
+            self.assertEqual(rc, 0, text)
+            self.assertIn("role=quartermaster", text.splitlines()[0], text)
+
+    def test_a11_role_flag_is_written_before_the_subcommand(self):
+        rc, text = self._run(["--role", "quartermaster", "--state-dir",
+                              str(self.state), "status"])
+        self.assertEqual(rc, 0, text)
+        self.assertIn("role=quartermaster", text)
+
+    def test_a12_role_flag_beats_config(self):
+        cfg_path = self.root / "role.json"
+        cfg_path.write_text(json.dumps({"role": "from_config"}), encoding="utf-8")
+        rc, text = self._run(["--config", str(cfg_path), "status",
+                              "--role", "from_flag"])
+        self.assertEqual(rc, 0, text)
+        self.assertIn("role=from_flag", text)
+        self.assertNotIn("from_config", text)
+
+    def test_a13_default_role_is_supervisor(self):
+        rc, text = self._run(["--state-dir", str(self.state), "status"])
+        self.assertEqual(rc, 0, text)
+        self.assertIn("role=supervisor", text)
+
+    def test_r4_empty_role_flag_is_rejected(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            with self.assertRaises(SystemExit) as caught:
+                cli.main(["--state-dir", str(self.state), "status",
+                          "--role", ""])
+        self.assertEqual(caught.exception.code, 2)
+        self.assertNotIn("role=", out.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
