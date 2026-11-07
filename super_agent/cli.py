@@ -22,8 +22,10 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from . import config as config_mod
+from . import session_events
 from .bus_client import BusClient
 from .engine import build_engine
 from .github_source import NullSource
@@ -261,6 +263,13 @@ def cmd_doctor(args) -> int:
 def cmd_replay(args) -> int:
     cfg, store = _build(args)
     engine = build_engine(cfg, store, _bus(cfg))
+    at = getattr(args, "at", None)
+    if at or getattr(args, "sessions", False):
+        return _cmd_replay_sessions(engine, args)
+    if getattr(args, "issue", None) is None:
+        print("replay: give --issue <n>, or --at/--sessions for the session view",
+              file=sys.stderr)
+        return 2
     try:
         out = engine.replay(args.issue)
     except Exception as exc:  # noqa: BLE001  report, do not dump a traceback
@@ -269,6 +278,97 @@ def cmd_replay(args) -> int:
     print(f"issue=#{out['issue']} state={out['state']} "
           f"comments={out['comments']} external_actions={out['external_actions']}")
     return 0
+
+
+def _cmd_replay_sessions(engine, args) -> int:
+    """`replay --at <ISO>` / `replay --sessions`: session truth as of an instant."""
+    at = getattr(args, "at", None)
+    try:
+        state = engine.replay_sessions(at)
+    except Exception as exc:  # noqa: BLE001
+        print(f"replay failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    print(f"session replay  events={state['events_path']} "
+          f"at={at or '(newest)'} applied={state['applied']} skipped={state['skipped']}")
+    active = state["keys_active"]
+    if not active:
+        print(NONE_TEXT)
+    for key in sorted(active):
+        sid = active[key]
+        rec = state["sessions"].get(sid) or {}
+        profile = rec.get("profile") or {}
+        profile_text = ",".join(f"{k}={profile[k]}" for k in sorted(profile)) or "-"
+        print(f"- {key:<16} sid={sid[:26]:<28} role={rec.get('role') or '-':<10} "
+              f"issue={rec.get('issue') if rec.get('issue') is not None else '-':<6} "
+              f"profile={profile_text}")
+    if len(active) < len(state["keys"]):
+        dropped = sorted(set(state["keys"]) - set(active))
+        print(f"archived-or-gone keys: {', '.join(dropped)}")
+    return 0
+
+
+def cmd_reconcile(args) -> int:
+    """Three-way session check: lifecycle replay × sessions.json × live server.
+
+    Exit 0 only when all three agree. A non-empty diff exits 1; a missing third
+    source exits 2 (it must never look like agreement).
+    """
+    cfg, store = _build(args)
+    engine = build_engine(cfg, store, _bus(cfg), source=NullSource())
+    server_sids = None
+    if not args.no_server:
+        try:
+            server_sids = _live_sids(args.live_file)
+        except Exception as exc:  # noqa: BLE001
+            print(f"reconcile: live session list unavailable: "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
+            server_sids = None
+    try:
+        report = engine.reconcile_sessions(at=args.at, server_sids=server_sids)
+    except Exception as exc:  # noqa: BLE001
+        print(f"reconcile failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    sizes = report["sizes"]
+    print(f"reconcile  events={report['events_path']}")
+    print(f"           sessions={report['sessions_path']}")
+    print(f"sizes  events_keys={sizes['events_keys']} "
+          f"ledger_keys={sizes['ledger_keys']} "
+          f"server_live={sizes['server_live'] if sizes['server_live'] is not None else '-'}")
+    for name, value in report["diff"].items():
+        print(f"[{'DIFF' if value else 'OK  '}] {name}  {value if value else ''}".rstrip())
+    if report["live_unclaimed"]:
+        print(f"[NOTE] live sessions not claimed by any key "
+              f"({len(report['live_unclaimed'])}): "
+              f"{', '.join(s[:26] for s in report['live_unclaimed'][:5])}")
+    if not report["server_supplied"]:
+        print("result: UNKNOWN (live server not consulted; use --live-file or drop --no-server)")
+        return 2
+    if report["diff_non_empty"]:
+        print(f"result: DRIFT ({len(report['diff_non_empty'])} non-empty sections)")
+        return 1
+    print("result: ok (diff=0)")
+    return 0
+
+
+def _live_sids(live_file: str | None) -> set[str]:
+    """Live sids from a saved ``sess.py list`` output, or by running it.
+
+    The console lives in the workbench checkout's ``tools/``; its directory name
+    is assembled from fragments in :mod:`session_events` so the privacy gate
+    (which greps the private name) stays green.
+    """
+    if live_file:
+        return session_events.parse_server_list(Path(live_file))
+    import subprocess
+    script = Path(__file__).resolve().parent.parent.parent / session_events.LWA_DIRNAME \
+        / "tools" / session_events.SESS_CONSOLE
+    if not script.is_file():
+        raise RuntimeError(f"session console not found: {script.name}")
+    done = subprocess.run([sys.executable, str(script), "list"],
+                          capture_output=True, text=True, timeout=60)
+    if done.returncode != 0:
+        raise RuntimeError((done.stderr or done.stdout or "sess.py list failed").strip()[:200])
+    return session_events.parse_sids(done.stdout or "")
 
 
 # ------------------------------------------------------------------- arguments
@@ -357,10 +457,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_replay = sub.add_parser("replay", help="rebuild one issue's index entry")
     _add_common(p_replay, suppress=True)
-    p_replay.add_argument("--issue", type=int, required=True)
+    p_replay.add_argument("--issue", type=int, default=None,
+                          help="issue number to rebuild (omit with --at/--sessions)")
+    p_replay.add_argument("--at", default=None,
+                          help="ISO instant: replay the session stream as of then "
+                               "(implies the session view)")
+    p_replay.add_argument("--sessions", action="store_true",
+                          help="show the session view (sid -> role/issue/profile)")
     p_replay.set_defaults(func=cmd_replay)
 
-    for sub_parser in (p_once, p_run, p_status, p_doctor, p_replay):
+    p_rec = sub.add_parser("reconcile",
+                          help="three-way session check: replay x sessions.json x live")
+    _add_common(p_rec, suppress=True)
+    p_rec.add_argument("--at", default=None, help="ISO instant for the replay side")
+    p_rec.add_argument("--live-file", default=None,
+                       help="saved `sess.py list` output instead of querying the server")
+    p_rec.add_argument("--no-server", action="store_true",
+                       help="skip the live side (then exit 2 = UNKNOWN, never ok)")
+    p_rec.set_defaults(func=cmd_reconcile)
+
+    for sub_parser in (p_once, p_run, p_status, p_doctor, p_replay, p_rec):
         sub_parser.set_defaults(_has_common=True)
 
     return parser

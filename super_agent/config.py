@@ -37,6 +37,7 @@ DEFAULTS: dict = {
         "allowlist": ["issue_comment.created"],
         "cooldown_s": 900,
         "assignments": {},         # reserved; M0 must leave this empty
+        "session_events_path": "",  # workbench lifecycle stream (read-only); "" = resolve
     },
 }
 
@@ -89,6 +90,9 @@ def validate(cfg: dict) -> dict:
     allow = (cfg.get("engine") or {}).get("allowlist")
     if not isinstance(allow, list) or not all(isinstance(x, str) for x in allow):
         raise ConfigError("engine.allowlist must be a list of event type strings")
+    events_path = (cfg.get("engine") or {}).get("session_events_path")
+    if events_path is not None and not isinstance(events_path, str):
+        raise ConfigError("engine.session_events_path must be a path string (or empty)")
     poll = (cfg.get("github") or {}).get("poll_interval_s")
     if not isinstance(poll, (int, float)) or poll <= 0:
         raise ConfigError("github.poll_interval_s must be a positive number")

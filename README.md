@@ -109,8 +109,33 @@ python -m unittest discover -s tests -v                # L1 测试（含 R1–R3
 | `super_agent/bus_client.py` | 连本地事件总线：`healthz()` / `events(since, wait)` / `inject()`，断连不抛栈 |
 | `super_agent/github_source.py` | 轮询 Issue 评论；`fixture` / `live`（**只发 GET**）/ `none` 三种源 |
 | `super_agent/store.py` | `index.json` 原子替换、`events.jsonl`／`outbox.jsonl` 有界轮转、游标、计数器 |
+| `super_agent/session_events.py` | **只读**工作台的会话生命周期流：`replay(events, at)` 重建某时刻的 `sid → (role, issue, assignment, profile)`，`reconcile()` 做三方对账 |
 | `super_agent/engine.py` | 确定性 Fast Path：去重／允许清单／冷却／状态机；**不接 LLM** |
-| `super_agent/cli.py` | `run` / `once` / `status` / `doctor` / `replay` |
+| `super_agent/cli.py` | `run` / `once` / `status` / `doctor` / `replay` / `reconcile` |
+
+### 两条事件流：一条是引擎的，一条是会话的
+
+```
+工作台 state/events.jsonl   ← 只由 sess_events.emit() 写：谁在什么时候持有哪个会话
+        │  （引擎只读，不复制、不双写；配置 engine.session_events_path）
+        ▼
+super_agent/session_events.py ── replay --at / reconcile
+super_agent/store.py:log_event() ─→ state/events.jsonl   引擎自己的运行事件（run.started …）
+```
+
+**顺序是固定的：先落 `store/events.jsonl`，再 inject 到事件总线**（`Store.log_event` /
+`Engine._dispatch`）。inject 失败**不回滚** store——那条记录已经在盘上，由
+`store/outbox.jsonl` 重投（`Engine._dispatch` 里 `log_outbox` 记的是 `ok`/`error`）。
+
+会话真相对账（三方差集非空即 rc=1；第三个源缺失则 rc=2，**绝不当作一致**）：
+
+```bash
+python -m super_agent.cli replay --sessions                 # 当前会话视图
+python -m super_agent.cli replay --at 2026-11-08T03:44:20+08:00 --sessions   # 历史时刻
+python -m super_agent.cli reconcile --live-file live.txt    # 或省略 --live-file 直查 sess.py list
+```
+
+`SESS_EVENTS_STATE_DIR` 决定读哪条流（与写入端同一个变量），所以自测不会碰到生产 `state/`。
 
 **`run` 是 `once` 的常驻形态**：同一轮，反复跑。`--interval` 缺省取 `github.poll_interval_s`（60s）；
 每轮原子替换一次 `state/run_heartbeat.json`（`{ts, round, ok, external_actions}`），供外部看门狗判活。

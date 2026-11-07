@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
-from . import github_source
+from . import github_source, session_events
 from .store import Store
 
 OBSERVE = "observe"
@@ -296,6 +297,34 @@ class Engine:
                 "state": rec["state"],
                 "external_actions": self.store.load_counters()
                 .get("external_actions", 0)}
+
+    # ------------------------------------------------------ session truth (ISS-27)
+    def _session_stream(self) -> tuple[Path, Path]:
+        engine_cfg = self.cfg.get("engine") or {}
+        events = session_events.resolve_events_path(
+            self.cfg, engine_cfg.get("session_events_path") or None)
+        sessions = session_events.resolve_sessions_path(self.cfg)
+        return events, sessions
+
+    def replay_sessions(self, at: str | None = None) -> dict:
+        """Rebuild ``sid -> (role, issue, assignment, profile)`` as of ``at``.
+
+        Reads the workbench lifecycle stream (``tools/sess_events.py:emit`` wrote
+        it). Strictly read-only and it never writes into ``store/``: the engine's
+        own ``events.jsonl`` is a different stream and stays untouched.
+        """
+        events_path, _sessions_path = self._session_stream()
+        events = session_events.load_events(events_path)
+        state = session_events.replay(events, at)
+        state["events_path"] = str(events_path)
+        state["keys_active"] = session_events.active_keys(state)
+        return state
+
+    def reconcile_sessions(self, at: str | None = None,
+                           server_sids: set[str] | None = None) -> dict:
+        """Three-way: replay × ``sessions.json`` × live server. Read-only."""
+        events_path, sessions_path = self._session_stream()
+        return session_events.reconcile(events_path, sessions_path, server_sids, at)
 
 
 def build_engine(cfg: dict, store: Store, bus=None, *, source=None) -> Engine:
