@@ -62,7 +62,10 @@ PATTERNS = {
 
     # Token shapes. Every form carries a length floor so ordinary prose and
     # hyphenated identifiers (library names, ``task-name``, a bare AWS key
-    # prefix) stay green: a real credential is long, a word is not.
+    # prefix) stay green: a real credential is long, a word is not. The API-key
+    # form additionally forbids hyphens inside its bare spelling and starts at
+    # 20 characters, so "sk" + "-" + a hyphenated word never reaches the floor;
+    # project keys keep their own hyphenated spelling.
     #
     # A classic GitHub PAT is the prefix plus 36 alphanumerics; the floor is 30
     # to absorb historical length changes without matching prose. Cloud
@@ -77,7 +80,9 @@ PATTERNS = {
         + r"[A-Za-z0-9_]{20,}"),
     "token: sk api key": re.compile(
         r"(?<![A-Za-z0-9])" + _joined("s", "k-")
-        + r"[A-Za-z0-9_-]{16,}"),
+        + r"(?:[A-Za-z0-9]{20,}(?![A-Za-z0-9_-])"
+        + r"|(?:" + _joined("pro", "j-") + "|" + _joined("an", "t-") + r")"
+        + r"[A-Za-z0-9_-]{20,})"),
     "token: aws access key id": re.compile(
         r"\b" + _joined("AK", "IA") + r"[0-9A-Z]{16}\b"),
     "token: private key block": re.compile(

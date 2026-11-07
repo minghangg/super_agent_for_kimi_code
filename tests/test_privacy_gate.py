@@ -192,6 +192,19 @@ class Tokens(unittest.TestCase):
         self.assert_token_hit("sk.txt", gate._joined("s", "k-") + "d" * 40,
                               "token: sk api key")
 
+    def test_real_shaped_sk_key_turns_red(self):
+        self.assert_token_hit(
+            "sk-mixed.txt",
+            gate._joined("s", "k-") + "Ab3dEf9hIj2kLm4nOp6qRs8tUv0wXy2z",
+            "token: sk api key")
+
+    def test_project_scoped_sk_key_turns_red(self):
+        self.assert_token_hit(
+            "sk-proj.txt",
+            gate._joined("s", "k-") + gate._joined("pro", "j-")
+            + "Ab3dEf9hIj2kLm4nOp6qRs8tUv0wXy2z",
+            "token: sk api key")
+
     def test_aws_access_key_id_turns_red(self):
         self.assert_token_hit("aws.txt", gate._joined("AK", "IA") + "D" * 16,
                               "token: aws access key id")
@@ -200,6 +213,13 @@ class Tokens(unittest.TestCase):
         self.track("prose.txt",
                    "sk-learn and task-name are words, not credentials\n")
         self.assertEqual(gate.scan_files(self.root), [])
+
+    def test_sk_shaped_english_words_stay_green(self):
+        for word in ("sk-learn", "sk-image-classification",
+                     "sk-learn-pipeline-tools", "sk-build-documentation"):
+            with self.subTest(word=word):
+                self.track(f"{word}.txt", word + "\n")
+                self.assertEqual(gate.scan_files(self.root), [])
 
     def test_bare_prefixes_stay_green(self):
         self.track("prefixes.txt",
@@ -267,9 +287,33 @@ class OwnerWarning(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("hit(s)", buf.getvalue())
 
-    def test_repository_origin_warns_about_its_owner(self):
-        warnings = gate.scan_remote_warnings(ROOT)
-        self.assertTrue(warnings, "this repo's origin owner is the private account")
+    def test_fake_origin_owner_warns_only_for_private_names(self):
+        """Owner WARN is a behaviour of the URL, not of wherever this repo lives.
+
+        Both sides run against a throwaway repository with a synthetic origin,
+        so the test stays green no matter which account the real remote points
+        at. Changing the real remote to prove that is never required.
+        """
+        (self.root / "README.md").write_text("hello\n", encoding="utf-8")
+        git(self.root, "add", "README.md")
+
+        self.set_origin("https://example.invalid/neutralacct/repo.git")
+        self.assertEqual(gate.scan_remote_warnings(self.root), [])
+        self.assertEqual(gate.scan_remote(self.root), [])
+        self.assertEqual(gate.main([], root=self.root), 0)
+
+        git(self.root, "remote", "set-url", "origin",
+            "https://example.invalid/" + PRIVATE_PROJECT + "/repo.git")
+        warnings = gate.scan_remote_warnings(self.root)
+        self.assertTrue(warnings, "owner hit must not be silent")
+        self.assertTrue(any("project name" in w for w in warnings), warnings)
+        self.assertEqual(gate.scan_remote(self.root), [],
+                         "the owner segment is warn-only, never a fail hit")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = gate.main([], root=self.root)
+        self.assertEqual(rc, 0)
+        self.assertIn("WARN", buf.getvalue())
 
 
 if __name__ == "__main__":
