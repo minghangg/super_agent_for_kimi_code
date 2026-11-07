@@ -25,14 +25,19 @@ FAULT_HOOK = None
 def atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(text)
-        fh.flush()
-        os.fsync(fh.fileno())
-    hook = FAULT_HOOK
-    if hook is not None:
-        hook(tmp)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        hook = FAULT_HOOK
+        if hook is not None:
+            hook(tmp)
+        os.replace(tmp, path)
+    finally:
+        # After a successful rename the temporary file is already gone, so this
+        # is a no-op there; after a failed write it removes the residue.
+        tmp.unlink(missing_ok=True)
 
 
 def _count_lines(path: Path) -> int:

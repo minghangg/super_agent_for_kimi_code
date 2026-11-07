@@ -142,6 +142,8 @@ class Acceptance(Base):
         finally:
             store_mod.FAULT_HOOK = None
         self.assertEqual((self.state / "index.json").read_bytes(), before)
+        self.assertFalse(list(self.state.glob("*.tmp")),
+                         "a failed write must not leave the temporary file behind")
 
     def test_a8_event_log_rotates(self):
         bounded = Store(self.state, max_event_lines=10)
