@@ -86,3 +86,34 @@
 每一步都不删旧路径，回退只回退本阶段。
 
 **这不是一个要取代人类判断的系统。** 它想做的事更朴素：把那些不需要判断的搬运动作从人的视野里拿走，好让剩下的判断有地方落脚。
+
+---
+
+## 30 秒跑起来
+
+```bash
+git clone <this repo> && cd super_agent_for_kimi_code
+python -m super_agent.cli doctor                       # 体检：总线／数据源／游标／残留 Assignment
+python -m super_agent.cli once --mode observe          # 跑一轮，只算不动
+python -m unittest discover -s tests -v                # L1 测试（含 R1–R3 反例）
+```
+
+三条命令都不需要网络凭据：默认 `--source none`，`doctor` 遇到总线未连上只报错不抛栈。
+要看真实数据，把 `github.source` 设成 `fixture`（本地 JSON）或 `live`（只读 REST，token 走环境变量）。
+
+### 现在有什么
+
+| 模块 | 作用 |
+|---|---|
+| `super_agent/bus_client.py` | 连本地事件总线：`healthz()` / `events(since, wait)` / `inject()`，断连不抛栈 |
+| `super_agent/github_source.py` | 轮询 Issue 评论；`fixture` / `live`（**只发 GET**）/ `none` 三种源 |
+| `super_agent/store.py` | `index.json` 原子替换、`events.jsonl`／`outbox.jsonl` 有界轮转、游标、计数器 |
+| `super_agent/engine.py` | 确定性 Fast Path：去重／允许清单／冷却／状态机；**不接 LLM** |
+| `super_agent/cli.py` | `once` / `status` / `doctor` / `replay` |
+
+**observe 是默认模式，也是本阶段的唯一承诺。** `Engine.dispatch_enabled` 在 observe 下恒为
+`False`，所有对外动作都收敛到 `Engine._dispatch` 一个出口并计入 `external_actions`。
+因此 `status` 里的 `external_actions=0` 不是写死的字面量——它读的是落盘计数器，
+而 `tests/test_red_evidence.py` 会把 `dispatch_enabled` 打桩成 `True` 来证明这个数会动。
+
+`status` 只列「需要人处理」的项，没有就输出「无」。**不需要介入时保持安静。**
