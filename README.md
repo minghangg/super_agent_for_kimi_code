@@ -95,10 +95,11 @@
 git clone <this repo> && cd super_agent_for_kimi_code
 python -m super_agent.cli doctor                       # 体检：总线／数据源／游标／残留 Assignment
 python -m super_agent.cli once --mode observe          # 跑一轮，只算不动
+python -m super_agent.cli run --mode observe --interval 60   # 常驻，Ctrl-C 优雅退出
 python -m unittest discover -s tests -v                # L1 测试（含 R1–R3 反例）
 ```
 
-三条命令都不需要网络凭据：默认 `--source none`，`doctor` 遇到总线未连上只报错不抛栈。
+这几条命令都不需要网络凭据：默认 `--source none`，`doctor` 遇到总线未连上只报错不抛栈。
 要看真实数据，把 `github.source` 设成 `fixture`（本地 JSON）或 `live`（只读 REST，token 走环境变量）。
 
 ### 现在有什么
@@ -109,7 +110,17 @@ python -m unittest discover -s tests -v                # L1 测试（含 R1–R3
 | `super_agent/github_source.py` | 轮询 Issue 评论；`fixture` / `live`（**只发 GET**）/ `none` 三种源 |
 | `super_agent/store.py` | `index.json` 原子替换、`events.jsonl`／`outbox.jsonl` 有界轮转、游标、计数器 |
 | `super_agent/engine.py` | 确定性 Fast Path：去重／允许清单／冷却／状态机；**不接 LLM** |
-| `super_agent/cli.py` | `once` / `status` / `doctor` / `replay` |
+| `super_agent/cli.py` | `run` / `once` / `status` / `doctor` / `replay` |
+
+**`run` 是 `once` 的常驻形态**：同一轮，反复跑。`--interval` 缺省取 `github.poll_interval_s`（60s）；
+每轮原子替换一次 `state/run_heartbeat.json`（`{ts, round, ok, external_actions}`），供外部看门狗判活。
+单轮异常只记日志继续，连续 `--max-failures`（默认 10）次失败才以非 0 退出；
+`SIGINT`/`SIGTERM` 在轮次之间收尾，重写游标与索引后 rc=0。
+常驻路径不改变 observe 的承诺——它调的仍是 `Engine.run_once()`，外部动作照样只经 `_dispatch`。
+
+```bash
+python -m super_agent.cli run --mode observe --interval 60
+```
 
 **observe 是默认模式，也是本阶段的唯一承诺。** `Engine.dispatch_enabled` 在 observe 下恒为
 `False`，所有对外动作都收敛到 `Engine._dispatch` 一个出口并计入 `external_actions`。

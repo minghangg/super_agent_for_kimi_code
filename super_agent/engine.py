@@ -102,6 +102,10 @@ class Engine:
                 "external_actions_total": total}
 
     # ------------------------------------------------------------------- round
+    def run_once(self) -> dict:
+        """One round. ``cli once`` and every iteration of ``cli run`` use this."""
+        return self.run_round()
+
     def run_round(self) -> dict:
         index = self.store.load_index()
         cursor = self.store.load_cursor()

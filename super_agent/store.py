@@ -61,6 +61,7 @@ class Store:
         self.outbox_path = self.root / "outbox.jsonl"
         self.cursor_path = self.root / "cursor.json"
         self.counters_path = self.root / "counters.json"
+        self.heartbeat_path = self.root / "run_heartbeat.json"
         self.root.mkdir(parents=True, exist_ok=True)
         self._lines = {
             self.events_path: _count_lines(self.events_path),
@@ -147,3 +148,21 @@ class Store:
         data["last_external_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         self.save_counters(data)
         return data["external_actions"]
+
+    # -------------------------------------------------------------- heartbeat
+    def save_heartbeat(self, record: dict) -> None:
+        """One line, replaced atomically every round of ``run``.
+
+        An external watchdog reads this file to tell a live loop from a dead
+        one: ``ts`` moves every round, ``round`` grows, and
+        ``external_actions`` is the same persisted counter ``status`` prints.
+        """
+        atomic_write_text(self.heartbeat_path,
+                          json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def load_heartbeat(self) -> dict:
+        try:
+            data = json.loads(self.heartbeat_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
