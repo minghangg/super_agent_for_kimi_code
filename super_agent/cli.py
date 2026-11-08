@@ -29,6 +29,7 @@ from . import session_events
 from .bus_client import BusClient
 from .engine import build_engine
 from .github_source import NullSource
+from .pidlock import LockError, PidLock
 from .store import Store
 
 NONE_TEXT = "无"
@@ -38,6 +39,23 @@ _WAIT_SLICE = 0.2
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _allowlist_path(args) -> str:
+    """Explicit ``--allowlist``, or "" so the config/default path decides."""
+    explicit = getattr(args, "allowlist", None)
+    return str(explicit) if explicit else ""
+
+
+def _repo_allowlist() -> str:
+    """``config/allowlist.json`` in this checkout, when it exists.
+
+    Only used when neither the flag nor the config names a path: a checkout
+    without the file keeps its previous behaviour (no project gate) instead of
+    refusing everything.
+    """
+    candidate = Path(__file__).resolve().parent.parent / "config" / "allowlist.json"
+    return str(candidate) if candidate.is_file() else ""
 
 
 def _build(args) -> tuple[dict, Store]:
@@ -51,11 +69,24 @@ def _build(args) -> tuple[dict, Store]:
     if args.source:
         overrides.setdefault("github", {})["source"] = args.source
     cfg = config_mod.load(args.config, overrides)
+    allow_path = _allowlist_path(args)
+    if not allow_path:
+        allow_path = str((cfg.get("engine") or {}).get("project_allowlist") or "")
+    if not allow_path:
+        allow_path = _repo_allowlist()
+    if allow_path:
+        cfg.setdefault("engine", {})["project_allowlist"] = allow_path
     store_cfg = cfg.get("store") or {}
     store = Store(config_mod.state_root(cfg, args.state_dir),
                   max_event_lines=int(store_cfg.get("max_event_lines") or 10_000),
-                  max_outbox_lines=int(store_cfg.get("max_outbox_lines") or 5_000))
+                  max_outbox_lines=int(store_cfg.get("max_outbox_lines") or 5_000),
+                  outbox_stale_s=float(store_cfg.get("outbox_stale_s") or 300))
     return cfg, store
+
+
+def _engine(cfg: dict, store: Store, bus=None, *, source=None):
+    """``build_engine``: the project allowlist is built from the config path."""
+    return build_engine(cfg, store, bus, source=source)
 
 
 def _bus(cfg: dict) -> BusClient:
@@ -64,10 +95,24 @@ def _bus(cfg: dict) -> BusClient:
                      float(b.get("timeout_s") or 2.0))
 
 
+def _recover(engine) -> None:
+    """Startup recovery when the engine implements it (``Engine`` does)."""
+    recover = getattr(engine, "recover", None)
+    if callable(recover):
+        recover()
+
+
 def cmd_once(args) -> int:
     cfg, store = _build(args)
-    engine = build_engine(cfg, store, _bus(cfg))
-    summary = engine.run_once()
+    engine = _engine(cfg, store, _bus(cfg))
+    try:
+        with PidLock(store.pid_path, argv=["super_agent", "once"]):
+            _recover(engine)
+            summary = engine.run_once()
+            engine.write_health(running=False)
+    except LockError as exc:
+        print(f"engine.pid: {exc}", file=sys.stderr)
+        return 3
     print(f"mode={summary['mode']} issues={summary['issues']} "
           f"new_comments={summary['comments_new']} processed={summary['processed']} "
           f"needs_person={summary['needs_person']} "
@@ -200,6 +245,15 @@ def run_loop(engine, store: Store, *, interval: float = 60.0,
     exit_code = 1 if reason == "max_failures" else 0
     store.log_event({"type": "run.stopped", "at": now(), "reason": reason,
                      "rounds": rounds, "external_actions": external})
+    # A clean stop must not look like a crash: the pid lock is about to go, so
+    # flip the health snapshot to running=false. A killed process never gets
+    # here and leaves running=true, which is exactly what doctor reports.
+    write_health = getattr(engine, "write_health", None)
+    if callable(write_health):
+        try:
+            write_health(running=False)
+        except OSError as exc:
+            print(f"warning: health write failed: {exc}", file=sys.stderr)
     _flush_state(store)
     return {"rounds": rounds, "consecutive_failures": consecutive,
             "external_actions": external, "reason": reason,
@@ -208,17 +262,29 @@ def run_loop(engine, store: Store, *, interval: float = 60.0,
 
 def cmd_run(args) -> int:
     cfg, store = _build(args)
-    engine = build_engine(cfg, store, _bus(cfg))
+    engine = _engine(cfg, store, _bus(cfg))
     interval = args.interval
     if interval is None:
         interval = float((cfg.get("github") or {}).get("poll_interval_s") or 60)
     stop_event = threading.Event()
     previous = _install_stop_handlers(stop_event)
+    lock = PidLock(store.pid_path, argv=["super_agent", "run"])
+    ok, info = lock.try_acquire()
+    if not ok:
+        _restore_handlers(previous)
+        print(f"engine.pid: refused to start - {lock.describe(info)}",
+              file=sys.stderr)
+        return 3
+    if lock.took_over:
+        print(f"engine.pid: took over a stale lock ({lock.describe(info)})",
+              flush=True)
     try:
+        _recover(engine)
         result = run_loop(engine, store, interval=interval,
                           max_failures=args.max_failures,
                           max_rounds=args.max_rounds, stop_event=stop_event)
     finally:
+        lock.release()
         _restore_handlers(previous)
     print(f"run stopped: reason={result['reason']} rounds={result['rounds']} "
           f"consecutive_failures={result['consecutive_failures']} "
@@ -228,7 +294,7 @@ def cmd_run(args) -> int:
 
 def cmd_status(args) -> int:
     cfg, store = _build(args)
-    engine = build_engine(cfg, store, _bus(cfg), source=NullSource())
+    engine = _engine(cfg, store, _bus(cfg), source=NullSource())
     report = engine.status()
     print(f"status  role={engine.role} mode={report['mode']} "
           f"external_actions={report['external_actions']}")
@@ -243,16 +309,19 @@ def cmd_status(args) -> int:
 
 def cmd_doctor(args) -> int:
     cfg, store = _build(args)
-    engine = build_engine(cfg, store, _bus(cfg))
+    engine = _engine(cfg, store, _bus(cfg))
     report = engine.doctor()
     worst = "ok"
     width = max((len(c["name"]) for c in report["checks"]), default=4)
+    label_width = max((len(c.get("label") or "") for c in report["checks"]), default=4)
     print(f"doctor  role={engine.role} mode={report['mode']} "
           f"external_actions={report['external_actions']}")
     for check in report["checks"]:
         mark = {"ok": "OK  ", "warn": "WARN", "fail": "FAIL"}[check["level"]]
-        print(f"[{mark}] {check['name'].ljust(width)}  {check['detail']}")
-        if check["level"] == "fail" and worst == "ok":
+        label = check.get("label") or check["name"]
+        print(f"[{mark}] {label.ljust(label_width)}  {check['name'].ljust(width)}  "
+              f"{check['detail']}")
+        if check["level"] == "fail":
             worst = "fail"
         elif check["level"] == "warn" and worst == "ok":
             worst = "warn"
@@ -314,7 +383,7 @@ def cmd_reconcile(args) -> int:
     source exits 2 (it must never look like agreement).
     """
     cfg, store = _build(args)
-    engine = build_engine(cfg, store, _bus(cfg), source=NullSource())
+    engine = _engine(cfg, store, _bus(cfg), source=NullSource())
     server_sids = None
     if not args.no_server:
         try:
@@ -423,6 +492,10 @@ def _add_common(parser: argparse.ArgumentParser, *, suppress: bool) -> None:
                              "else supervisor)")
     parser.add_argument("--source", choices=list(config_mod.SOURCES), default=default,
                         help="override github.source (none|fixture|live)")
+    parser.add_argument("--allowlist", default=default,
+                        help="project/issue/action allowlist JSON "
+                             "(default: engine.project_allowlist, else "
+                             "config/allowlist.json)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -483,7 +556,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _ensure_common_defaults(args) -> None:
-    for name in ("config", "state_dir", "mode", "role", "source"):
+    for name in ("config", "state_dir", "mode", "role", "source", "allowlist"):
         if not hasattr(args, name):
             setattr(args, name, None)
 

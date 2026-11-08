@@ -93,10 +93,10 @@
 
 ```bash
 git clone <this repo> && cd super_agent_for_kimi_code
-python -m super_agent.cli doctor                       # 体检：总线／数据源／游标／残留 Assignment
+python -m super_agent.cli doctor                       # 体检：进程／总线／数据源／配置／outbox／游标／残留 Assignment
 python -m super_agent.cli once --mode observe          # 跑一轮，只算不动
 python -m super_agent.cli run --mode observe --interval 60   # 常驻，Ctrl-C 优雅退出
-python -m unittest discover -s tests -v                # L1 测试（含 R1–R3 反例）
+python -m unittest discover -s tests -v                # L1 测试（含各条反例）
 ```
 
 这几条命令都不需要网络凭据：默认 `--source none`，`doctor` 遇到总线未连上只报错不抛栈。
@@ -108,10 +108,67 @@ python -m unittest discover -s tests -v                # L1 测试（含 R1–R3
 |---|---|
 | `super_agent/bus_client.py` | 连本地事件总线：`healthz()` / `events(since, wait)` / `inject()`，断连不抛栈 |
 | `super_agent/github_source.py` | 轮询 Issue 评论；`fixture` / `live`（**只发 GET**）/ `none` 三种源 |
-| `super_agent/store.py` | `index.json` 原子替换、`events.jsonl`／`outbox.jsonl` 有界轮转、游标、计数器 |
+| `super_agent/store.py` | `index.json` 原子替换、`events.jsonl`／`outbox.jsonl` 有界轮转、游标、计数器；outbox 状态机（`outbox_state.json` 存未完成项，轮转不丢） |
+| `super_agent/allowlist.py` | 项目／Issue／动作**三级白名单**，mtime 热更新；坏配置保留上一份（跨进程靠 `*.last-good`） |
+| `super_agent/pidlock.py` | `engine.pid` 原子单实例锁（`O_CREAT\|O_EXCL`），stale 才接管 |
+| `super_agent/health.py` | `health.json` 原子快照，供看门狗判活与区分崩溃／正常停止 |
+| `super_agent/dispatch_adapter.py` | 结构化派单接口：返回 dict，只解析 `--json`，不读人类文本 |
 | `super_agent/session_events.py` | **只读**工作台的会话生命周期流：`replay(events, at)` 重建某时刻的 `sid → (role, issue, assignment, profile)`，`reconcile()` 做三方对账 |
 | `super_agent/engine.py` | 确定性 Fast Path：去重／允许清单／冷却／状态机；**不接 LLM** |
 | `super_agent/cli.py` | `run` / `once` / `status` / `doctor` / `replay` / `reconcile` |
+
+### 两个 allowlist 不是一回事
+
+引擎里有两条互不相干的「允许」判据，混用会得出错误结论：
+
+| 维度 | 位置 | 回答的问题 | 默认 |
+|---|---|---|---|
+| **事件类型** | `engine.allowlist`（`config.py`） | 快通道读哪些事件？ | `["issue_comment.created"]` |
+| **项目／Issue／动作** | `config/allowlist.json`（`super_agent/allowlist.py`） | 能不能对某个仓的某张 Issue 做某个动作？ | 未列 repo／Issue／action 一律拒绝 |
+
+能读某类事件，不等于被允许写某个仓库。三级白名单的规则是：未列 repo、未列 Issue、未列 action 全部拒绝；
+新加的 Issue 默认 observe，**不自动继承写权限**；`creation_mode` 只接受 `pm_created`，
+见到 `engine_preapproved` 在加载时就报错拒绝（M0 没有经过批准的代建路径，`create_worker`/`create_qa`
+在 `pm_created` 下返回 `creation_mode_forbidden`，只准备草案）。
+
+热更新走 mtime 轮询（不要求 inotify），但判定用 `(mtime, size, sha256)`：只改 `[28]` → `"28"` 这类
+字节数不变的编辑也不会漏。变化时先完整解析校验，通过才生效；**只影响后续事件，不回溯**。
+坏配置保留上一份并告警，引擎不崩、行为不变。
+
+### outbox 状态机：先落盘再动手
+
+```
+prepared ──► in_flight ──► done
+                 │
+                 └──► uncertain ──► reconcile ──► done | waiting_person
+```
+
+`prepared` 在外部调用**之前**落盘，所以崩在调用前是确定的：这条可以重放。
+一进入 `in_flight` 就表示「可能已经落地」，因此重启**绝不重发**，而是转 `uncertain` 进 reconcile 队列，
+按记录的 `sid` / `prompt_id` / `comment_id` 核对后再标 `done` 或 `waiting_person`。
+`action_id = assignment_id + verb + input_ref`（无 assignment 时取稳定 hash）。
+
+未完成项存在 `outbox_state.json`（原子写），`outbox.jsonl` 只留状态变更历史。
+所以 `max_outbox_lines` 触发的轮转只丢历史，**不会丢未完成动作**。
+
+### 单实例与健康
+
+`engine.pid` 用 `O_CREAT|O_EXCL` 原子创建，内容 `{pid, started_at, cmdline_hash}`。
+pid 活着且命令行匹配 ⇒ 拒绝启动（rc=3）；pid 死了或命令行对不上 ⇒ 视为 stale，接管。
+正常退出删文件；异常退出靠 stale 检测回收。
+
+`health.json` 每个 round 原子替换一次，字段 `pid / mode / last_loop_at /
+last_successful_action_at / active_assignments / degraded / last_error / running`。
+`doctor` 用这些把五种故障区分开，各给一个可读标签：
+
+| 标签 | 含义 |
+|---|---|
+| `process-dead` | pid 锁指向死进程，或 `running=true` 却没有活进程（崩溃） |
+| `bus-down` | 事件总线不可达 |
+| `github-down` | 数据源不可达 |
+| `config-bad` | allowlist 解析失败（会说明「正在用上一份」） |
+| `outbox-stuck` | 有 `in_flight`／`uncertain` 超过 `store.outbox_stale_s`（默认 300s） |
+
 
 ### 两条事件流：一条是引擎的，一条是会话的
 

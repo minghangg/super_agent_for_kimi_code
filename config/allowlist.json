@@ -1,0 +1,8 @@
+{"schema_version": 1,
+ "defaults": {"mode": "observe", "creation_mode": "pm_created"},
+ "projects": {
+  "superagent": {"repo": "safkc-bot/super_agent_for_kimi_code",
+                 "cwd": ".",
+                 "mode": "observe", "creation_mode": "pm_created",
+                 "issues": [28], "actions": ["collect", "reconcile"],
+                 "max_active_writers": 1, "roles": ["worker", "qa"]}}}

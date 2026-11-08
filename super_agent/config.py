@@ -4,6 +4,16 @@ Defaults live in ``DEFAULTS`` below and every field can be overridden by a
 JSON config file (``--config``) or by CLI flags. The role name is
 configuration-only: nothing in the engine compares against a literal role
 string, so renaming the role changes no behaviour.
+
+Two allowlists exist and they are different dimensions, never to be merged:
+
+* ``engine.allowlist`` here lists **event types** the fast path reads.
+* ``engine.project_allowlist`` points at ``config/allowlist.json``, which is the
+  project/issue/action allowlist enforced by :mod:`super_agent.allowlist`.
+  Reading an event type says nothing about being allowed to write a repo.
+
+``engine.creation_mode`` accepts only ``pm_created``; ``engine_preapproved`` is
+rejected at load time because M0 grants no session-creation path.
 """
 from __future__ import annotations
 
@@ -32,12 +42,18 @@ DEFAULTS: dict = {
     "store": {
         "max_event_lines": 10_000,
         "max_outbox_lines": 5_000,
+        "outbox_stale_s": 300,     # in_flight/uncertain older than this is stuck
     },
     "engine": {
+        # Event-type allowlist: which event types the fast path reads.
+        # The project/issue/action allowlist is a different dimension and lives
+        # in config/allowlist.json (see super_agent.allowlist).
         "allowlist": ["issue_comment.created"],
         "cooldown_s": 900,
         "assignments": {},         # reserved; M0 must leave this empty
         "session_events_path": "",  # workbench lifecycle stream (read-only); "" = resolve
+        "project_allowlist": "",   # "" = not configured; the CLI resolves the repo default
+        "creation_mode": "pm_created",  # only pm_created is accepted
     },
 }
 
@@ -87,9 +103,20 @@ def validate(cfg: dict) -> dict:
         val = (cfg.get("store") or {}).get(key)
         if not isinstance(val, int) or val < 10:
             raise ConfigError(f"store.{key} must be an integer >= 10")
+    stale = (cfg.get("store") or {}).get("outbox_stale_s", 300)
+    if not isinstance(stale, (int, float)) or stale <= 0:
+        raise ConfigError("store.outbox_stale_s must be a positive number")
     allow = (cfg.get("engine") or {}).get("allowlist")
     if not isinstance(allow, list) or not all(isinstance(x, str) for x in allow):
         raise ConfigError("engine.allowlist must be a list of event type strings")
+    project_allow = (cfg.get("engine") or {}).get("project_allowlist", "")
+    if project_allow is not None and not isinstance(project_allow, str):
+        raise ConfigError("engine.project_allowlist must be a path string (or empty)")
+    creation = (cfg.get("engine") or {}).get("creation_mode", "pm_created")
+    if creation != "pm_created":
+        raise ConfigError(
+            f"engine.creation_mode {creation!r} is forbidden: only 'pm_created' "
+            "is accepted (session creation needs an approval M0 does not grant)")
     events_path = (cfg.get("engine") or {}).get("session_events_path")
     if events_path is not None and not isinstance(events_path, str):
         raise ConfigError("engine.session_events_path must be a path string (or empty)")
