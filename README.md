@@ -1,3 +1,5 @@
+[English](README.en.md) | [中文](README.md)
+
 # super_agent_for_kimi_code
 
 > 为单人多项目的 Agent 团队补上两件它一直缺的东西：**任务自动化**与**记忆外包**。
