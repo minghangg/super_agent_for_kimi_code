@@ -57,21 +57,52 @@ def process_alive(pid: int) -> bool:
     return True
 
 
-def _pid_cmdline(pid: int) -> str | None:
-    """Command line of ``pid`` when the platform can report it, else None."""
-    if os.name == "nt":
-        import subprocess
-        try:
-            done = subprocess.run(
-                ["wmic", "process", "where", f"ProcessId={int(pid)}",
-                 "get", "CommandLine", "/value"],
-                capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.SubprocessError):
-            return None
-        for line in (done.stdout or "").splitlines():
-            if line.startswith("CommandLine="):
-                return line.split("=", 1)[1].strip()
+def _wmic_cmdline(pid: int) -> str | None:
+    """``wmic`` probe. Absent on recent Windows builds, so this may return None."""
+    import subprocess
+    try:
+        done = subprocess.run(
+            ["wmic", "process", "where", f"ProcessId={int(pid)}",
+             "get", "CommandLine", "/value"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
         return None
+    for line in (done.stdout or "").splitlines():
+        if line.startswith("CommandLine="):
+            return line.split("=", 1)[1].strip() or None
+    return None
+
+
+def _cim_cmdline(pid: int) -> str | None:
+    """``Get-CimInstance`` fallback: the probe that still works without wmic."""
+    import subprocess
+    script = (f"Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}' "
+              "| Select-Object -ExpandProperty CommandLine")
+    try:
+        done = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return " ".join((done.stdout or "").split()) or None
+
+
+def _pid_cmdline(pid: int) -> str | None:
+    """Command line of ``pid`` when the platform can report it, else None.
+
+    Windows tries ``wmic`` first and the CIM/PowerShell probe second: wmic is
+    gone from recent builds, and without a fallback every pid-reuse check would
+    silently pass and only a human could ever clear a stale lock. None is
+    returned only after *both* probes failed, which keeps the caller's
+    conservative "assume it is the incumbent" behaviour instead of guessing.
+    """
+    if os.name == "nt":
+        text = _wmic_cmdline(pid)
+        if text is None:
+            text = _cim_cmdline(pid)
+        return text
     try:
         raw = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
     except OSError:
@@ -159,6 +190,16 @@ class PidLock:
         except FileExistsError:
             pass
         info = self.read()
+        if not info:
+            # A concurrent creator holds the file but has not written it yet:
+            # ``O_EXCL`` makes the creation atomic, the content is written right
+            # after. Re-reading briefly stops a mid-create file from looking
+            # stale, which would let two processes both "take it over".
+            for _ in range(20):
+                time.sleep(0.01)
+                info = self.read()
+                if info:
+                    break
         if self.is_stale(info):
             self.took_over = True
             try:

@@ -248,7 +248,10 @@ class ProjectAllowlist:
         projects = sorted((self.data or {}).get("projects", {}))
         return {"path": str(self.path), "generation": self.generation,
                 "valid": self.data is not None, "error": self.load_error,
-                "using_previous": bool(self.using_previous),
+                # ``poll()`` reports ``used: previous`` for any rejection that
+                # leaves a copy in force, so the summary must agree with it
+                # rather than only tracking the cold-start cache path.
+                "using_previous": bool(self.load_error) or bool(self.using_previous),
                 "cache": str(self.cache_path),
                 "projects": projects}
 

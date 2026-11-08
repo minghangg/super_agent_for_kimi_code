@@ -27,6 +27,12 @@ State machine::
 the call is certain: that action may be replayed. Reaching ``in_flight`` means
 the call may or may not have landed, so a restart never resends it: it is moved
 to ``uncertain`` and queued for reconciliation by its recorded remote ids.
+
+``waiting_person`` is unfinished in the sense that matters here: nobody has
+resolved it yet, so it stays in ``outbox_state.json`` (and therefore survives
+history rotation) until a person acts. It is deliberately not in the reconcile
+queue - only ``uncertain``/``reconcile`` are - and not an ``outbox-stuck``
+alarm - it is already waiting for someone.
 """
 from __future__ import annotations
 
@@ -49,8 +55,11 @@ OUTBOX_RECONCILE = "reconcile"
 OUTBOX_WAITING = "waiting_person"
 
 # Statuses that mean "not finished"; these live in outbox_state.json.
+# ``waiting_person`` is included even though it is a reconcile *outcome*: a
+# person has not decided yet, so the record must stay visible in the state file
+# (and survive history rotation) rather than vanish the moment it is written.
 UNFINISHED = (OUTBOX_PREPARED, OUTBOX_IN_FLIGHT, OUTBOX_UNCERTAIN,
-              OUTBOX_RECONCILE)
+              OUTBOX_RECONCILE, OUTBOX_WAITING)
 
 # Actions whose remote effect is not observable by id alone. A timeout is never
 # retried blind; it must be reconciled against the recorded remote id first.
@@ -63,6 +72,10 @@ def action_id(assignment_id: str | None, verb: str, input_ref: str) -> str:
 
     Without an assignment the triple is hashed so the id stays stable across
     restarts while remaining short and filesystem-safe.
+
+    The id is the *base* identity, not necessarily the key of one attempt: a
+    second attempt of the same action gets a ``#<n>`` suffix from
+    :meth:`Store.begin_action`, so it can never overwrite the first one.
     """
     verb = str(verb or "")
     input_ref = str(input_ref or "")
@@ -176,12 +189,14 @@ class Store:
         try:
             data = json.loads(self.outbox_state_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return {"version": 1, "actions": {}}
+            return {"version": 1, "actions": {}, "attempts": {}}
         if not isinstance(data, dict):
-            return {"version": 1, "actions": {}}
+            return {"version": 1, "actions": {}, "attempts": {}}
         data.setdefault("version", 1)
         actions = data.get("actions")
         data["actions"] = actions if isinstance(actions, dict) else {}
+        attempts = data.get("attempts")
+        data["attempts"] = attempts if isinstance(attempts, dict) else {}
         return data
 
     def save_outbox_state(self, data: dict) -> None:
@@ -203,7 +218,7 @@ class Store:
                    "status": status, "kind": rec.get("kind"),
                    "external_actions_total": self.load_counters().get("external_actions", 0)}
         for key in ("verb", "input_ref", "assignment_id", "sid", "prompt_id",
-                    "comment_id", "error", "reason"):
+                    "comment_id", "error", "reason", "attempt"):
             if fields.get(key) is not None:
                 history[key] = fields[key]
         self.log_outbox(history)
@@ -216,11 +231,44 @@ class Store:
 
     def begin_action(self, aid: str, *, verb: str, kind: str = "",
                      assignment_id: str | None = None,
-                     input_ref: str = "", payload: dict | None = None) -> dict:
-        """Persist ``prepared`` *before* the external call runs."""
-        return self._transition(aid, OUTBOX_PREPARED, verb=verb, kind=kind,
+                     input_ref: str = "", payload: dict | None = None,
+                     issue: int | None = None,
+                     reuse: bool = False) -> dict:
+        """Persist ``prepared`` *before* the external call runs.
+
+        ``aid`` is a *base* identity (:func:`action_id`). A new attempt of an
+        action whose base id is still in ``outbox_state.json`` (``prepared``,
+        ``in_flight``, ``uncertain``, ``reconcile``, ``waiting_person``) gets a
+        ``#<n>`` suffix, so a second dispatch can never overwrite the first
+        record - an ``uncertain`` action stays uncertain until it is
+        reconciled. The counter lives in the state file, so it survives a
+        restart.
+
+        ``reuse=True`` keeps the given key instead: only replay of a
+        ``prepared`` action uses it, because that record is certain not to have
+        run and is the same attempt.
+        """
+        state = self.load_outbox_state()
+        actions, attempts = state["actions"], state["attempts"]
+        base = str(aid)
+        n = int(attempts.get(base) or 0)
+        if reuse and base in actions:
+            n = max(n, 1)
+        elif n < 1:
+            n = 1 if base not in actions else 2
+        else:
+            n += 1
+        key = base if n == 1 else f"{base}#{n}"
+        while key in actions and key != base:
+            n += 1
+            key = f"{base}#{n}"
+        attempts[base] = n
+        # Persist the counter first: ``_transition`` reloads the state file.
+        self.save_outbox_state(state)
+        return self._transition(key, OUTBOX_PREPARED, verb=verb, kind=kind,
                                 assignment_id=assignment_id,
-                                input_ref=input_ref, payload=payload or {})
+                                input_ref=input_ref, payload=payload or {},
+                                issue=issue, attempt=n)
 
     def mark_in_flight(self, aid: str) -> dict:
         return self._transition(aid, OUTBOX_IN_FLIGHT)
@@ -276,6 +324,12 @@ class Store:
         actions = self.load_outbox_state()["actions"]
         return [dict(rec) for _, rec in sorted(actions.items())
                 if rec.get("status") in (OUTBOX_UNCERTAIN, OUTBOX_RECONCILE)]
+
+    def waiting_person(self) -> list[dict]:
+        """Actions a person still has to resolve (doctor reports them apart)."""
+        actions = self.load_outbox_state()["actions"]
+        return [dict(rec) for _, rec in sorted(actions.items())
+                if rec.get("status") == OUTBOX_WAITING]
 
     def stuck_outbox(self, now: float | None = None) -> list[dict]:
         """Unfinished actions older than ``outbox_stale_s`` (doctor's alarm)."""

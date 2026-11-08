@@ -26,6 +26,7 @@ import unittest
 from pathlib import Path
 
 from super_agent import cli, config, dispatch_adapter, health
+from super_agent import pidlock as pidlock_mod
 from super_agent import store as store_mod
 from super_agent.allowlist import AllowlistError, ProjectAllowlist, validate
 from super_agent.engine import Engine
@@ -75,6 +76,12 @@ class Base(unittest.TestCase):
         projects = ProjectAllowlist(self.allow_path) if allowlist else None
         return Engine(cfg, Store(self.state), source or NullSource(), bus,
                       project_allowlist=projects)
+
+    def allow_bus_inject(self) -> None:
+        """Let the demo project dispatch ``bus_inject`` (the engine's only verb)."""
+        data = json.loads(json.dumps(GOOD))
+        data["projects"]["demo"]["actions"] = ["bus_inject", "collect", "reconcile"]
+        self.allow_path.write_text(json.dumps(data), encoding="utf-8")
 
 
 class AllowlistGate(Base):
@@ -214,7 +221,7 @@ class OutboxMachine(Base):
                                     "reconcile", "done"])
         self.assertIsNone(store.outbox_action(aid))
 
-    def test_waiting_person_is_a_terminal_reconcile_outcome(self):
+    def test_waiting_person_stays_visible_and_is_not_a_stuck_alarm(self):
         store = Store(self.state)
         aid = store_mod.action_id("A3", "send", "r")
         store.begin_action(aid, verb="send")
@@ -225,7 +232,18 @@ class OutboxMachine(Base):
         lines = [json.loads(x) for x in
                  (self.state / "outbox.jsonl").read_text("utf-8").splitlines()]
         self.assertEqual(lines[-1]["status"], "waiting_person")
-        self.assertIsNone(store.outbox_action(aid))
+        # waiting_person is unfinished: it must remain in outbox_state.json so
+        # a person can still find it after the history rotates.
+        record = store.outbox_action(aid)
+        self.assertIsNotNone(record)
+        self.assertEqual(record["status"], "waiting_person")
+        self.assertEqual([r["action_id"] for r in store.waiting_person()], [aid])
+        # It is not in the reconcile queue (nothing left to probe) and it is not
+        # an outbox-stuck alarm (a person is already expected to act).
+        store.outbox_stale_s = 0.0
+        time.sleep(0.01)
+        self.assertEqual(store.reconcile_queue(), [])
+        self.assertEqual(store.stuck_outbox(), [])
 
     def test_rotation_keeps_unfinished_actions(self):
         store = Store(self.state, max_outbox_lines=3)
@@ -286,7 +304,9 @@ class OutboxMachine(Base):
         result = engine.reconcile_uncertain(probe=lambda rec: {"found": False,
                                                                "detail": "absent"})
         self.assertEqual(result[0]["outcome"], "waiting_person")
-        self.assertIsNone(engine.store.outbox_action(aid))
+        record = engine.store.outbox_action(aid)
+        self.assertIsNotNone(record, "waiting_person must stay in outbox_state.json")
+        self.assertEqual(record["status"], "waiting_person")
         lines = [json.loads(x) for x in
                  (self.state / "outbox.jsonl").read_text("utf-8").splitlines()]
         self.assertEqual(lines[-1]["status"], "waiting_person")
@@ -548,6 +568,347 @@ class Integration(Base):
                                 "issue": 28, "payload": {}})
         self.assertFalse(out["dispatched"])
         self.assertEqual(engine.store.load_counters()["external_actions"], 0)
+
+
+# --------------------------------------------------------------------- ISS-28 fix
+class StartupRecovery(Base):
+    """P1-1: recovery is a production entry again, and it never re-sends."""
+
+    def crash_then_restart(self, *, probe_found=None, bus=None):
+        """Run a child that dies while in_flight, then recover in this process.
+
+        The child is the real ``cli.main(["once"])`` path against an isolated
+        state dir, so the ``in_flight`` record is produced by production code,
+        not by a hand-written file.
+        """
+        script = (
+            "import os, sys\n"
+            "sys.path.insert(0, r'%s')\n"
+            "from super_agent import config as c\n"
+            "from super_agent.bus_client import BusClient\n"
+            "from super_agent.engine import Engine\n"
+            "from super_agent.github_source import NullSource\n"
+            "from super_agent.store import Store, action_id\n"
+            "cfg = c.load(None, {'github': {'source': 'none'}, 'mode': 'assist'})\n"
+            "store = Store(r'%s')\n"
+            "engine = Engine(cfg, store, NullSource(), None)\n"
+            "engine.dispatch_enabled = True\n"
+            "aid = action_id('A1', 'bus_inject', '28')\n"
+            "store.begin_action(aid, verb='bus_inject', assignment_id='A1',"
+            " input_ref='28')\n"
+            "store.bump_external_actions()\n"
+            "store.mark_in_flight(aid)\n"
+            "print('in_flight', aid)\n"
+            "sys.stdout.flush()\n"
+            "os._exit(9)\n" % (ROOT, self.state))
+        done = subprocess.run([sys.executable, "-c", script],
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 9, done.stderr)
+        self.assertIn("in_flight", done.stdout)
+
+        before = self.state_counter()
+        store = Store(self.state)
+        self.assertEqual([r["status"] for r in store.unfinished_outbox().values()],
+                         ["in_flight"])
+
+        engine = Engine(config.load(None, {"github": {"source": "none"},
+                                           "mode": "assist"}),
+                        Store(self.state), NullSource(), bus)
+        engine.dispatch_enabled = True
+        probe = None
+        if probe_found is not None:
+            probe = lambda rec: {"found": probe_found, "comment_id": 4242,
+                                 "detail": "remote side matched"}
+        out = engine.startup(probe=probe)
+        return engine, out, before
+
+    def state_counter(self) -> int:
+        return int(Store(self.state).load_counters()["external_actions"])
+
+    def test_restart_does_not_resend_and_marks_uncertain(self):
+        engine, out, before = self.crash_then_restart()
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["replayed"], [], "in_flight must never be replayed")
+        # P1-1 counter check: the crash-then-restart adds nothing.
+        self.assertEqual(self.state_counter(), before)
+        # No probe => waiting_person, and it is still on disk afterwards.
+        self.assertEqual([r["outcome"] for r in out["reconciled"]],
+                         ["waiting_person"])
+        waiting = engine.store.waiting_person()
+        self.assertEqual(len(waiting), 1)
+        self.assertEqual(waiting[0]["status"], "waiting_person")
+        self.assertEqual([r["status"] for r in engine.store.reconcile_queue()], [])
+
+    def test_restart_with_a_probe_marks_the_action_done(self):
+        engine, out, before = self.crash_then_restart(probe_found=True)
+        self.assertEqual([r["outcome"] for r in out["reconciled"]], ["done"])
+        self.assertEqual(self.state_counter(), before, "reconciliation resends nothing")
+        self.assertEqual(engine.store.waiting_person(), [])
+        self.assertEqual(engine.store.unfinished_outbox(), {})
+
+    def test_recovery_failure_degrades_health_and_refuses_to_run(self):
+        engine = self.engine()
+        engine.dispatch_enabled = True
+        self.state.mkdir(parents=True, exist_ok=True)
+        engine.store.begin_action("A1:bus_inject:28", verb="bus_inject",
+                                  assignment_id="A1", input_ref="28")
+        engine.store.mark_in_flight("A1:bus_inject:28")
+
+        def boom(*_a, **_kw):
+            raise OSError("disk went away")
+
+        engine.store.recover_outbox = boom
+        out = engine.startup()
+        self.assertFalse(out["ok"])
+        self.assertIn("disk went away", out["error"])
+        snapshot = health.read(self.state / "health.json")
+        self.assertTrue(snapshot["degraded"])
+        self.assertIn("disk went away", snapshot["last_error"])
+
+        # The CLI must not start a round after a failed recovery.
+        out_stream, err_stream = io.StringIO(), io.StringIO()
+        cfg, store = cli._build(type("A", (), {
+            "config": None, "state_dir": str(self.state), "mode": "observe",
+            "role": None, "source": "none", "allowlist": str(self.allow_path)})())
+        broken = Engine(cfg, store, NullSource(), None)
+        broken.store.recover_outbox = boom
+        with contextlib.redirect_stdout(out_stream), \
+                contextlib.redirect_stderr(err_stream):
+            rc = cli._recovery_refusal(cli._recover(broken))
+        self.assertEqual(rc, 1)
+        self.assertIn("recovery failed", err_stream.getvalue())
+
+    def test_replay_prepared_reuses_the_recorded_attempt(self):
+        self.allow_bus_inject()
+        engine = self.engine()
+        engine.dispatch_enabled = False          # prepared stays prepared
+        self.state.mkdir(parents=True, exist_ok=True)
+        store = engine.store
+        store.begin_action("A1:bus_inject:28", verb="bus_inject",
+                           assignment_id="A1", input_ref="28", issue=28)
+        engine.dispatch_enabled = True
+        out = engine.startup()
+        self.assertEqual(len(out["replayed"]), 1)
+        self.assertTrue(out["replayed"][0]["dispatched"])
+        # Replay reused the same key, so no ``#2`` attempt was created; the
+        # failed replay went uncertain, then startup's reconcile (no probe)
+        # left it waiting for a person.
+        record = store.outbox_action("A1:bus_inject:28")
+        self.assertEqual(record["status"], "waiting_person")
+        self.assertEqual(record["attempt"], 1)
+        self.assertEqual([r["outcome"] for r in out["reconciled"]],
+                         ["waiting_person"])
+
+
+class WaitingPersonVisibility(Base):
+    """P1-2: waiting_person is visible in state, in doctor, and after rotation."""
+
+    def make_waiting(self, store=None) -> str:
+        store = store or Store(self.state)
+        aid = store_mod.action_id("W1", "bus_inject", "28")
+        store.begin_action(aid, verb="bus_inject", assignment_id="W1",
+                           input_ref="28")
+        store.mark_in_flight(aid)
+        store.mark_uncertain(aid, "timeout")
+        store.mark_reconciling(aid)
+        store.mark_reconciled(aid, "waiting_person", "no probe configured")
+        return aid
+
+    def test_state_file_and_doctor_both_show_it(self):
+        aid = self.make_waiting()
+        raw = json.loads((self.state / "outbox_state.json").read_text("utf-8"))
+        self.assertIn(aid, raw["actions"])
+        self.assertEqual(raw["actions"][aid]["status"], "waiting_person")
+
+        engine = self.engine(bus=FakeBus())
+        report = engine.doctor()
+        check = next(c for c in report["checks"] if c["name"] == "waiting-person")
+        self.assertEqual(check["level"], "fail")
+        self.assertEqual(check["label"], "waiting-person")
+        self.assertIn(aid, check["detail"])
+        # It must not be mixed into outbox-stuck.
+        outbox = next(c for c in report["checks"] if c["name"] == "outbox")
+        self.assertEqual(outbox["level"], "ok")
+
+    def test_rotation_does_not_drop_it(self):
+        store = Store(self.state, max_outbox_lines=3)
+        aid = self.make_waiting(store)
+        for i in range(12):
+            store.log_outbox({"at": "t", "action_id": f"done-{i}", "status": "done"})
+        self.assertTrue((self.state / "outbox.jsonl.1").is_file())
+        raw = json.loads((self.state / "outbox_state.json").read_text("utf-8"))
+        self.assertIn(aid, raw["actions"], "rotation must not drop waiting_person")
+        engine = self.engine()
+        engine.store.max_outbox_lines = 3
+        check = next(c for c in engine.doctor()["checks"]
+                     if c["name"] == "waiting-person")
+        self.assertIn(aid, check["detail"])
+
+    def test_doctor_cli_prints_the_waiting_person_label(self):
+        aid = self.make_waiting()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rc = cli.main(["--state-dir", str(self.state), "doctor",
+                           "--allowlist", str(self.allow_path),
+                           "--source", "none"])
+        text = out.getvalue()
+        self.assertEqual(rc, 1, text)
+        self.assertIn("waiting-person", text)
+        self.assertIn(aid, text)
+
+
+class ActionIdNoOverwrite(Base):
+    """P1-3: a second attempt gets a new id and never overwrites ``uncertain``."""
+
+    def test_second_begin_creates_a_new_id_and_keeps_the_first(self):
+        store = Store(self.state)
+        base = store_mod.action_id(None, "send", "ref-1")
+        first = store.begin_action(base, verb="send", input_ref="ref-1")
+        store.mark_in_flight(first["action_id"])
+        store.mark_uncertain(first["action_id"], "timeout")
+        self.assertEqual(store.outbox_action(first["action_id"])["status"],
+                         "uncertain")
+
+        second = store.begin_action(base, verb="send", input_ref="ref-1")
+        self.assertNotEqual(second["action_id"], first["action_id"])
+        self.assertEqual(second["action_id"], base + "#2")
+        statuses = {k: v["status"] for k, v in store.unfinished_outbox().items()}
+        self.assertEqual(statuses[first["action_id"]], "uncertain")
+        self.assertEqual(statuses[second["action_id"]], "prepared")
+
+    def test_dispatch_twice_keeps_the_first_uncertain(self):
+        self.allow_bus_inject()
+        engine = self.engine(bus=None)             # no bus => first one is uncertain
+        engine.dispatch_enabled = True
+        action = {"kind": "bus_inject", "event": "event.agent.x", "issue": 28,
+                  "input_ref": "28", "payload": {}}
+        first = engine._dispatch(action)
+        self.assertFalse(first["ok"])
+        first_id = engine.store.outbox_action(
+            store_mod.action_id(None, "bus_inject", "28"))["action_id"]
+        second = engine._dispatch(action)
+        self.assertFalse(second["ok"])
+        records = engine.store.unfinished_outbox()
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[first_id]["status"], "uncertain")
+        self.assertEqual(records[first_id + "#2"]["status"], "uncertain")
+        self.assertEqual(engine.store.load_counters()["external_actions"], 2)
+
+    def test_attempt_counter_survives_a_restart(self):
+        store = Store(self.state)
+        base = store_mod.action_id("A1", "comment", "c")
+        store.begin_action(base, verb="comment")
+        store.mark_done(base)
+        # The base record is gone, but the counter must still move forward.
+        third = Store(self.state).begin_action(base, verb="comment")
+        self.assertEqual(third["action_id"], base + "#2")
+
+
+class PidCmdlineFallback(Base):
+    """Same-block item 1: the CIM fallback makes pid reuse detectable."""
+
+    def test_cim_reports_this_process_command_line(self):
+        text = pidlock_mod._pid_cmdline(os.getpid())
+        self.assertIsInstance(text, str)
+        self.assertTrue(text.strip())
+        self.assertIn("python", text.lower())
+
+    def test_cmdline_matches_is_false_for_a_foreign_identity(self):
+        self.assertFalse(
+            pidlock_mod._cmdline_matches(os.getpid(), "deadbeefdeadbeef"))
+
+    def test_cmdline_matches_is_true_for_the_recorded_identity(self):
+        text = pidlock_mod._pid_cmdline(os.getpid())
+        recorded = pidlock_mod._cmdline_hash(text.split())
+        self.assertTrue(pidlock_mod._cmdline_matches(os.getpid(), recorded))
+
+    def test_reused_pid_is_recognised_as_stale(self):
+        path = self.state / "engine.pid"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"pid": os.getpid(), "started_at": "t",
+                                    "cmdline_hash": "0000000000000000"}),
+                        encoding="utf-8")
+        lock = PidLock(path)
+        self.assertTrue(lock.is_stale())
+        ok, _info = lock.try_acquire()
+        self.assertTrue(ok)
+        self.assertTrue(lock.took_over)
+        lock.release()
+
+    def test_wmic_is_skipped_only_after_the_cim_probe(self):
+        calls = []
+        real_wmic = pidlock_mod._wmic_cmdline
+        real_cim = pidlock_mod._cim_cmdline
+
+        def fake_wmic(pid):
+            calls.append("wmic")
+            return None
+
+        def fake_cim(pid):
+            calls.append("cim")
+            return "python -m super_agent.cli run"
+
+        pidlock_mod._wmic_cmdline = fake_wmic
+        pidlock_mod._cim_cmdline = fake_cim
+        try:
+            self.assertEqual(pidlock_mod._pid_cmdline(1234),
+                             "python -m super_agent.cli run")
+        finally:
+            pidlock_mod._wmic_cmdline = real_wmic
+            pidlock_mod._cim_cmdline = real_cim
+        self.assertEqual(calls, ["wmic", "cim"])
+
+
+class AllowlistSummary(Base):
+    """Same-block item 2: summary agrees with poll()."""
+
+    def test_bad_reload_reports_using_previous_in_both(self):
+        gate = ProjectAllowlist(self.allow_path)
+        self.assertTrue(gate.check("demo", 28, "collect")[0])
+        self.assertFalse(gate.summary()["using_previous"])
+
+        self.allow_path.write_text(json.dumps(
+            {**GOOD, "projects": {"demo": {**GOOD["projects"]["demo"],
+                                           "issues": "28"}}}), encoding="utf-8")
+        result = gate.poll()
+        self.assertEqual(result["used"], "previous")
+        self.assertIn("issues", result["error"])
+        summary = gate.summary()
+        self.assertTrue(summary["using_previous"])
+        self.assertTrue(summary["valid"])
+
+        fixed = json.loads(json.dumps(GOOD))
+        fixed["projects"]["demo"]["issues"] = [28, 29]
+        self.allow_path.write_text(json.dumps(fixed), encoding="utf-8")
+        self.assertEqual(gate.poll()["used"], "new")
+        self.assertFalse(gate.summary()["using_previous"])
+
+
+class ShippedAllowlist(Base):
+    """Same-block item 3: assist can really dispatch one action."""
+
+    def test_shipped_allowlist_permits_bus_inject(self):
+        shipped = json.loads((ROOT / "config" / "allowlist.json").read_text("utf-8"))
+        actions = shipped["projects"]["superagent"]["actions"]
+        self.assertIn("bus_inject", actions)
+        gate = ProjectAllowlist(ROOT / "config" / "allowlist.json")
+        self.assertTrue(gate.check("superagent", 28, "bus_inject")[0])
+
+    def test_assist_mode_dispatches_once_with_a_stub_bus(self):
+        bus = FakeBus()
+        shipped = ProjectAllowlist(ROOT / "config" / "allowlist.json")
+        engine = Engine(config.load(None, {"github": {"source": "none"},
+                                           "mode": "assist"}),
+                        Store(self.state), NullSource(), bus,
+                        project_allowlist=shipped)
+        self.assertTrue(engine.dispatch_enabled, "assist enables dispatch")
+        out = engine._dispatch({"kind": "bus_inject",
+                                "event": "event.agent.needs_person",
+                                "issue": 28, "input_ref": "28", "payload": {}})
+        self.assertTrue(out["dispatched"], out)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(engine.store.load_counters()["external_actions"], 1)
+        self.assertEqual(len(bus.injected), 1)
 
 
 if __name__ == "__main__":

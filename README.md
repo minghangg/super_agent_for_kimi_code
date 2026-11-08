@@ -146,7 +146,16 @@ prepared ──► in_flight ──► done
 `prepared` 在外部调用**之前**落盘，所以崩在调用前是确定的：这条可以重放。
 一进入 `in_flight` 就表示「可能已经落地」，因此重启**绝不重发**，而是转 `uncertain` 进 reconcile 队列，
 按记录的 `sid` / `prompt_id` / `comment_id` 核对后再标 `done` 或 `waiting_person`。
-`action_id = assignment_id + verb + input_ref`（无 assignment 时取稳定 hash）。
+`waiting_person` 是**未完成**状态：它留在 `outbox_state.json` 里（轮转不丢），`doctor` 单列
+`waiting-person` 计数；它不进 reconcile 队列（没有可再核对的），也不算 `outbox-stuck`（已经有人在等）。
+
+启动顺序由 `Engine.startup()` 一次做完，`once` / `run` 都走它：`store.recover_outbox()` →
+`replay_prepared()` → `reconcile_uncertain()`。无 probe 时一律落 `waiting_person`，**不猜、不重发**；
+任一步抛错则 `health.json` 记 `degraded` + `last_error` 并以 rc=1 退出，不带着不确定状态跑外部动作。
+
+`action_id = assignment_id + verb + input_ref`（无 assignment 时取稳定 hash）。这是**基础身份**：
+同一动作二次发起会生成 `...#2`、`...#3`，所以第二次 begin **绝不覆盖**已存在的 `uncertain` 记录；
+尝试计数存在 `outbox_state.json` 的 `attempts` 里，重启后继续递增。
 
 未完成项存在 `outbox_state.json`（原子写），`outbox.jsonl` 只留状态变更历史。
 所以 `max_outbox_lines` 触发的轮转只丢历史，**不会丢未完成动作**。
@@ -157,9 +166,13 @@ prepared ──► in_flight ──► done
 pid 活着且命令行匹配 ⇒ 拒绝启动（rc=3）；pid 死了或命令行对不上 ⇒ 视为 stale，接管。
 正常退出删文件；异常退出靠 stale 检测回收。
 
+命令行取自进程本身：Windows 先试 `wmic`，**不可用时自动回落到** PowerShell
+`Get-CimInstance Win32_Process`（新版 Windows 已无 wmic）。两者都取不到时才按「当活锁」处理，
+不误接管——但 CIM 一定先试过。
+
 `health.json` 每个 round 原子替换一次，字段 `pid / mode / last_loop_at /
 last_successful_action_at / active_assignments / degraded / last_error / running`。
-`doctor` 用这些把五种故障区分开，各给一个可读标签：
+`doctor` 用这些把故障区分开，各给一个可读标签：
 
 | 标签 | 含义 |
 |---|---|
@@ -168,6 +181,7 @@ last_successful_action_at / active_assignments / degraded / last_error / running
 | `github-down` | 数据源不可达 |
 | `config-bad` | allowlist 解析失败（会说明「正在用上一份」） |
 | `outbox-stuck` | 有 `in_flight`／`uncertain` 超过 `store.outbox_stale_s`（默认 300s） |
+| `waiting-person` | 有动作在等**人**裁决（对账无 probe 或远端未确认），单独计数、不混进 `outbox-stuck` |
 
 
 ### 两条事件流：一条是引擎的，一条是会话的

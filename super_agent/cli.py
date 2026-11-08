@@ -95,11 +95,26 @@ def _bus(cfg: dict) -> BusClient:
                      float(b.get("timeout_s") or 2.0))
 
 
-def _recover(engine) -> None:
-    """Startup recovery when the engine implements it (``Engine`` does)."""
+def _recover(engine) -> dict:
+    """Startup recovery: recover -> replay prepared -> reconcile uncertain.
+
+    ``Engine.startup`` is the production entry for the three methods that used
+    to be dead code. It returns ``{"ok": False, ...}`` when recovery failed:
+    the caller must not start a round then, since an unresolved outbox would be
+    carried into a live loop.
+    """
+    startup = getattr(engine, "startup", None)
+    if callable(startup):
+        return startup()
     recover = getattr(engine, "recover", None)
     if callable(recover):
         recover()
+    return {"ok": True, "error": ""}
+
+
+def _recovery_refusal(result: dict) -> int:
+    print(f"recovery failed: {result.get('error') or 'unknown error'}", file=sys.stderr)
+    return 1
 
 
 def cmd_once(args) -> int:
@@ -107,7 +122,9 @@ def cmd_once(args) -> int:
     engine = _engine(cfg, store, _bus(cfg))
     try:
         with PidLock(store.pid_path, argv=["super_agent", "once"]):
-            _recover(engine)
+            recovery = _recover(engine)
+            if not recovery.get("ok", True):
+                return _recovery_refusal(recovery)
             summary = engine.run_once()
             engine.write_health(running=False)
     except LockError as exc:
@@ -279,7 +296,9 @@ def cmd_run(args) -> int:
         print(f"engine.pid: took over a stale lock ({lock.describe(info)})",
               flush=True)
     try:
-        _recover(engine)
+        recovery = _recover(engine)
+        if not recovery.get("ok", True):
+            return _recovery_refusal(recovery)
         result = run_loop(engine, store, interval=interval,
                           max_failures=args.max_failures,
                           max_rounds=args.max_rounds, stop_event=stop_event)

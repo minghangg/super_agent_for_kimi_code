@@ -133,7 +133,7 @@ class Engine:
         return "logged", ""
 
     # --------------------------------------------------------------- dispatch
-    def _dispatch(self, action: dict) -> dict:
+    def _dispatch(self, action: dict, *, reuse_action_id: str | None = None) -> dict:
         """The only exit to the outside world.
 
         Order is load-bearing: the project allowlist is checked first (an
@@ -144,6 +144,9 @@ class Engine:
 
         Counting happens *before* the attempt: an action that was enabled and
         attempted is an external action even if the remote end refuses it.
+
+        ``reuse_action_id`` replays an existing ``prepared`` record (startup
+        recovery) instead of opening a new attempt.
         """
         if not self.dispatch_enabled:
             self.store.log_event({
@@ -163,12 +166,20 @@ class Engine:
             })
             return {"dispatched": False, "reason": reason, "refused": True}
 
-        aid = action_id(action.get("assignment_id"), verb,
-                        str(action.get("input_ref") or issue or ""))
-        self.store.begin_action(aid, verb=verb, kind=verb,
-                                assignment_id=action.get("assignment_id"),
-                                input_ref=str(action.get("input_ref") or issue or ""),
-                                payload=action.get("payload") or {})
+        aid = reuse_action_id or action_id(
+            action.get("assignment_id"), verb,
+            str(action.get("input_ref") or issue or ""))
+        prepared = self.store.begin_action(
+            aid, verb=verb, kind=verb,
+            assignment_id=action.get("assignment_id"),
+            input_ref=str(action.get("input_ref") or issue or ""),
+            payload=action.get("payload") or {},
+            issue=issue,
+            reuse=bool(reuse_action_id))
+        # A second attempt of the same action carries a ``#<n>`` suffix; every
+        # later transition must use that key or it would resurrect the base id
+        # and overwrite the earlier (possibly ``uncertain``) record.
+        aid = str(prepared["action_id"])
         total = self.store.bump_external_actions()
         self.store.mark_in_flight(aid)
         ok, err = False, ""
@@ -224,11 +235,51 @@ class Engine:
                               "moved_to_uncertain": len(result["moved_to_uncertain"])})
         return result
 
+    def startup(self, probe=None) -> dict:
+        """The production startup entry: recover -> replay -> reconcile.
+
+        ``cli`` calls this once before the first round. The three steps are
+        ordered and each is the *only* place that touches its state:
+        ``store.recover_outbox()`` moves ``in_flight`` to ``uncertain``,
+        :meth:`replay_prepared` re-issues only the records that are certain not
+        to have run, and :meth:`reconcile_uncertain` resolves the rest against
+        the remote side - with no probe every one of them lands in
+        ``waiting_person``, never silently dropped and never re-sent.
+
+        A failure here is fatal for the startup: the caller must not start a
+        round with unresolved actions, and the health snapshot records
+        ``degraded`` plus ``last_error`` so a watchdog sees why.
+        """
+        out = {"ok": True, "error": "", "recovered": {}, "replayed": [],
+               "reconciled": []}
+        try:
+            out["recovered"] = self.recover()
+            out["replayed"] = self.replay_prepared()
+            out["reconciled"] = self.reconcile_uncertain(probe)
+        except Exception as exc:  # noqa: BLE001  a failed recovery is a reportable state
+            out["ok"] = False
+            out["error"] = f"{type(exc).__name__}: {exc}"
+            self.store.log_event({"type": "outbox.recovery_failed", "at": _now(),
+                                  "error": out["error"]})
+            self.write_health(error=f"outbox recovery failed: {out['error']}",
+                              degraded=True, running=True)
+            return out
+        self.store.log_event({
+            "type": "outbox.startup", "at": _now(),
+            "replayed": len(out["replayed"]),
+            "reconciled": [r["outcome"] for r in out["reconciled"]],
+            "waiting_person": sum(1 for r in out["reconciled"]
+                                  if r["outcome"] == "waiting_person"),
+        })
+        return out
+
     def replay_prepared(self) -> list[dict]:
         """Replay only actions recorded as ``prepared`` (certain not to have run).
 
         ``in_flight`` and ``uncertain`` records are deliberately excluded: they
         may have landed, so they go through :meth:`reconcile_uncertain` instead.
+        Each replay reuses the exact record key (``reuse_action_id``): the
+        attempt already exists, so it must not fork a second attempt id.
         """
         out = []
         for rec in self.store.recover_outbox()["replayable"]:
@@ -236,12 +287,15 @@ class Engine:
             action = {"kind": rec.get("kind") or rec.get("verb"),
                       "assignment_id": rec.get("assignment_id"),
                       "input_ref": rec.get("input_ref") or rec.get("comment_id"),
-                      "issue": payload.get("issue"),
+                      "issue": rec.get("issue") if rec.get("issue") is not None
+                      else payload.get("issue"),
                       "event": payload.get("event"),
                       "payload": payload.get("payload") if isinstance(
                           payload.get("payload"), dict) else payload}
             action.setdefault("event", payload.get("event"))
-            out.append(self._dispatch(action))
+            result = self._dispatch(action, reuse_action_id=rec.get("action_id"))
+            result["action_id"] = rec.get("action_id")
+            out.append(result)
         return out
 
     def reconcile_uncertain(self, probe=None) -> list[dict]:
@@ -457,6 +511,17 @@ class Engine:
                 label="outbox-stuck")
         else:
             add("outbox", True, "no prepared/in_flight/uncertain action is overdue")
+
+        # Reported separately on purpose: ``outbox-stuck`` means "nobody is
+        # looking", ``waiting-person`` means "a person has to decide". Merging
+        # the two would make a resolved-looking alarm hide a real queue.
+        waiting = self.store.waiting_person()
+        add("waiting-person", not waiting,
+            "none" if not waiting else
+            f"{len(waiting)} action(s) need a person: " + "; ".join(
+                f"{r.get('action_id')} ({r.get('reason') or 'no remote confirmation'})"
+                for r in waiting[:5]),
+            label="waiting-person")
 
         cursor = self.store.load_cursor()
         bad_cursor = [k for k, v in (cursor.get("issues") or {}).items()
