@@ -318,13 +318,15 @@ class ShimFallback(Fixture):
             "sys.meta_path.insert(0, Blocker())\n"
             "sys.path.insert(0, %r)\n"
             "import decide_watch\n"
-            "print('LEGACY', decide_watch.__file__)\n"
+            "print('LEGACY', decide_watch.LEGACY_FALLBACK_PATH)\n"
+            "print('HASH', decide_watch.LEGACY_FALLBACK_HASH[:12])\n"
             "print('SELFTEST', hasattr(decide_watch, 'self_test'))\n"
         ) % str(lwa_tools)
         proc = subprocess.run([sys.executable, "-c", code], cwd=str(lwa_tools.parent),
                               capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("decide_watch_legacy", proc.stdout)
+        self.assertIn("decide_watch_legacy.py", proc.stdout)
+        self.assertIn("HASH ", proc.stdout)
         self.assertIn("SELFTEST True", proc.stdout)
 
 

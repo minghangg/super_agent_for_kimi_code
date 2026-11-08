@@ -138,11 +138,19 @@ BASE = _workspace_root
 STATE_DIR = _state_root
 
 
+def _delivery_log_path() -> Path:
+    return _path("delivery_log_path", "delivery_watch.log")
+
+
+def _delivery_state_path() -> Path:
+    return _path("delivery_state_path", "delivery_watch_state.json")
+
+
 def _delivery_paths() -> dict:
     return {
-        "state": _path("delivery_state_path", "delivery_watch_state.json"),
+        "state": _delivery_state_path(),
         "stats": _path("delivery_stats_path", "delivery_watch_stats.jsonl"),
-        "log": _path("delivery_log_path", "delivery_watch.log"),
+        "log": _delivery_log_path(),
         "undelivered": _path("undelivered_path", "delivery_undelivered.log"),
         "sessions": SESSIONS(),
         "bind": _path("bind_path", "issue_sessions.json"),
@@ -591,7 +599,7 @@ def delivery_log(msg: str) -> None:
     line = f"{datetime.now().strftime('%F %T')} [DELIVERY] {msg}"
     print(line, flush=True)
     try:
-        p = _delivery_paths()["log"]
+        p = _delivery_log_path()
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
@@ -661,7 +669,7 @@ def load_delivery_state() -> dict:
 
 
 def save_delivery_state(st: dict) -> None:
-    p = _delivery_paths()["state"]
+    p = _delivery_state_path()
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(".json.tmp")
@@ -1702,8 +1710,10 @@ def _self_fixture(root: Path) -> dict:
     # 假 sid：绝不指向真会话（自检全程 dry，但宁可多一道）
     db = json.loads((root / "sessions.json").read_text(encoding="utf-8"))
     fake = {}
+    wanted = ("pm-" + _project_of_repo("owner/neutral_project"),
+              _cfg().supervisor_key, "steward")
     for i, (k, v) in enumerate(sorted(db.items()), start=1):
-        if not (k.startswith("pm-") or k in ("supervisor", "steward")):
+        if k not in wanted:
             continue
         rec = dict(v) if isinstance(v, dict) else {"id": v}
         rec["id"] = "session_5e55a000-0000-4000-8000-%012d" % i
@@ -1759,7 +1769,17 @@ def _fresh(root: Path, ledger_lines: list[dict] | None = None,
         with target.open("w", encoding="utf-8") as fh:
             for row in (ledger_lines or []):
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-    configure(state_root=root, ledger_path=target)
+    configure(delivery_state_path=root / "delivery_watch_state.json",
+              delivery_stats_path=root / "delivery_watch_stats.jsonl",
+              delivery_log_path=root / "delivery_watch.log",
+              undelivered_path=root / "delivery_undelivered.log",
+              sessions_path=root / "sessions.json",
+              bind_path=root / "issue_sessions.json",
+              ledger_path=target,
+              health_state_path=root / "supervisor_health_state.json",
+              cursor_path=root / "decide_watch_cursor.json",
+              log_path=root / "decision_watch.log",
+              lock_path=root / "decide_watch.lock")
     os.environ["DELIVERY_NO_INJECT"] = "1"
     if baseline:
         st = _default_state()
