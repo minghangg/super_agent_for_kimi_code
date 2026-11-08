@@ -171,17 +171,24 @@ pid 活着且命令行匹配 ⇒ 拒绝启动（rc=3）；pid 死了或命令行
 不误接管——但 CIM 一定先试过。
 
 `health.json` 每个 round 原子替换一次，字段 `pid / mode / last_loop_at /
-last_successful_action_at / active_assignments / degraded / last_error / running`。
+last_successful_action_at / active_assignments / degraded / last_error / running /
+phase`。`phase` 取 `running`（循环持锁在跑）、`startup-failed`（启动对账失败后退出）
+或 `stopped`（正常退出）；旧快照没有该字段时按 `running` 推导，两者不会互相矛盾。
 `doctor` 用这些把故障区分开，各给一个可读标签：
 
 | 标签 | 含义 |
 |---|---|
 | `process-dead` | pid 锁指向死进程，或 `running=true` 却没有活进程（崩溃） |
+| `startup-failed` | 启动对账失败、进程已退出（`phase=startup-failed`，detail 带 `last_error`），不是崩溃 |
 | `bus-down` | 事件总线不可达 |
 | `github-down` | 数据源不可达 |
 | `config-bad` | allowlist 解析失败（会说明「正在用上一份」） |
 | `outbox-stuck` | 有 `in_flight`／`uncertain` 超过 `store.outbox_stale_s`（默认 300s） |
 | `waiting-person` | 有动作在等**人**裁决（对账无 probe 或远端未确认），单独计数、不混进 `outbox-stuck` |
+
+`engine.pid` 是 stale 但删不掉（Windows 上被别的进程开着句柄，`[WinError 32]`）时，
+引擎**拒绝启动**并按锁错误退出（rc=3），打印 `engine.pid: refused to start - ...`，
+不会带着旧锁继续跑，也不会抛 traceback。
 
 
 ### 两条事件流：一条是引擎的，一条是会话的

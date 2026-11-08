@@ -10,12 +10,15 @@ Fields (all always present, so a watchdog never has to guess):
 ``degraded``                   bool: something is wrong but the loop still runs
 ``last_error``                 the reason it is degraded, or ""
 ``running``                    True while a resident loop owns the state dir
+``phase``                      ``running`` | ``startup-failed`` | ``stopped``
 
 Writes go to a temporary file then ``os.replace``, so a reader either sees the
 previous snapshot or the new one, never a truncated file. ``running`` separates
 a deliberate stop from a crash: otherwise a clean shutdown and a killed process
 both look like "no pid lock but health says it ran", and a watchdog could not
-tell them apart.
+tell them apart. ``phase`` adds the third case: a process that wrote its health
+snapshot, failed during startup and exited before any round ran. It is not a
+crash, and ``running=false`` alone would read as a clean stop.
 """
 from __future__ import annotations
 
@@ -25,13 +28,16 @@ from pathlib import Path
 from .store import atomic_write_text
 
 FIELDS = ("pid", "mode", "last_loop_at", "last_successful_action_at",
-          "active_assignments", "degraded", "last_error", "running")
+          "active_assignments", "degraded", "last_error", "running", "phase")
+
+PHASES = ("running", "startup-failed", "stopped")
 
 
 def blank() -> dict:
     return {"pid": None, "mode": "observe", "last_loop_at": None,
             "last_successful_action_at": None, "active_assignments": 0,
-            "degraded": False, "last_error": "", "running": False}
+            "degraded": False, "last_error": "", "running": False,
+            "phase": "stopped"}
 
 
 def read(path: str | Path) -> dict:
@@ -43,6 +49,10 @@ def read(path: str | Path) -> dict:
         return {}
     out = blank()
     out.update({k: data[k] for k in FIELDS if k in data})
+    if data.get("phase") not in PHASES:
+        # A snapshot written before ``phase`` existed: derive it so the two
+        # fields never disagree.
+        out["phase"] = "running" if out.get("running") else "stopped"
     return out
 
 
@@ -53,6 +63,11 @@ def write(path: str | Path, record: dict) -> dict:
     out["degraded"] = bool(out.get("degraded"))
     out["last_error"] = str(out.get("last_error") or "")
     out["running"] = bool(out.get("running"))
+    # ``phase`` must never contradict ``running``: a caller that only passes
+    # ``running``/``phase`` in one of them still gets a consistent snapshot.
+    phase = record.get("phase")
+    out["phase"] = (phase if phase in PHASES else
+                    ("running" if out["running"] else "stopped"))
     atomic_write_text(Path(path),
                       json.dumps(out, ensure_ascii=False, sort_keys=True) + "\n")
     return out

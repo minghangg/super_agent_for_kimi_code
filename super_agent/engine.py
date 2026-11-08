@@ -87,20 +87,23 @@ class Engine:
 
     # ------------------------------------------------------------------ health
     def health_record(self, *, error: str = "", degraded: bool = False,
-                      running: bool = True) -> dict:
+                      running: bool = True, phase: str = "") -> dict:
         index = self.store.load_index()
-        return {"pid": os.getpid(), "mode": self.mode,
-                "last_loop_at": _now(),
-                "last_successful_action_at": self.last_successful_action_at,
-                "active_assignments": len(index.get("assignments") or {}),
-                "degraded": bool(degraded or error), "last_error": error,
-                "running": bool(running)}
+        record = {"pid": os.getpid(), "mode": self.mode,
+                  "last_loop_at": _now(),
+                  "last_successful_action_at": self.last_successful_action_at,
+                  "active_assignments": len(index.get("assignments") or {}),
+                  "degraded": bool(degraded or error), "last_error": error,
+                  "running": bool(running)}
+        if phase:
+            record["phase"] = phase
+        return record
 
     def write_health(self, *, error: str = "", degraded: bool = False,
-                     running: bool = True) -> dict:
+                     running: bool = True, phase: str = "") -> dict:
         return health.write(self.store.health_path,
                             self.health_record(error=error, degraded=degraded,
-                                               running=running))
+                                               running=running, phase=phase))
 
     # ------------------------------------------------------------------ state
     def _cooldown_ok(self, issue_state: dict, kind: str, now: float) -> bool:
@@ -248,7 +251,9 @@ class Engine:
 
         A failure here is fatal for the startup: the caller must not start a
         round with unresolved actions, and the health snapshot records
-        ``degraded`` plus ``last_error`` so a watchdog sees why.
+        ``degraded``, ``last_error`` and ``phase="startup-failed"`` so a
+        watchdog sees why - and sees that this was not a crash of a running
+        loop.
         """
         out = {"ok": True, "error": "", "recovered": {}, "replayed": [],
                "reconciled": []}
@@ -262,7 +267,8 @@ class Engine:
             self.store.log_event({"type": "outbox.recovery_failed", "at": _now(),
                                   "error": out["error"]})
             self.write_health(error=f"outbox recovery failed: {out['error']}",
-                              degraded=True, running=True)
+                              degraded=True, running=False,
+                              phase="startup-failed")
             return out
         self.store.log_event({
             "type": "outbox.startup", "at": _now(),
@@ -476,11 +482,11 @@ class Engine:
                 "mode": self.mode, "items": items}
 
     def doctor(self) -> dict:
-        """Five distinguishable faults, one readable label each.
+        """Distinguishable faults, one readable label each.
 
-        ``process-dead`` / ``bus-down`` / ``github-down`` / ``config-bad`` /
-        ``outbox-stuck``. A fault is only ever reported once, with the detail
-        that makes it actionable.
+        ``process-dead`` / ``startup-failed`` / ``bus-down`` / ``github-down`` /
+        ``config-bad`` / ``outbox-stuck``. A fault is only ever reported once,
+        with the detail that makes it actionable.
         """
         checks = []
 
@@ -575,6 +581,15 @@ class Engine:
                     f"engine.pid pid={pid} is not alive (stale lock; the next "
                     f"start takes it over)", "fail", "process-dead")
         snap = health.read(self.store.health_path)
+        if snap.get("phase") == "startup-failed" and not snap.get("running"):
+            # The process wrote its snapshot, failed during startup and exited
+            # (rc=1) before any round ran. It did not crash mid-loop, so the
+            # label says so and the detail carries the reason it gave up.
+            return ("process", False,
+                    f"startup-failed: the engine exited while starting up "
+                    f"(last_error={snap.get('last_error') or 'unknown'}, "
+                    f"pid={snap.get('pid')}); no round ran, so this is not a "
+                    f"crash of a running loop", "fail", "startup-failed")
         if snap.get("running"):
             return ("process", False,
                     f"crashed: no pid lock but health.json is still running=true "

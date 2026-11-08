@@ -135,6 +135,9 @@ class PidLock:
         self.info: dict = {}
         self.acquired = False
         self.took_over = False
+        # Why the last ``try_acquire`` refused, when the reason is not simply
+        # "someone else holds a live lock" (a stale lock nobody can delete).
+        self.refusal = ""
 
     def _identity(self) -> str:
         text = _pid_cmdline(os.getpid())
@@ -183,6 +186,7 @@ class PidLock:
 
     def try_acquire(self) -> tuple[bool, dict]:
         """``(acquired, info)``. On refusal ``info`` is the incumbent's record."""
+        self.refusal = ""
         try:
             self.info = self._create()
             self.acquired = True
@@ -201,14 +205,24 @@ class PidLock:
                 if info:
                     break
         if self.is_stale(info):
-            self.took_over = True
             try:
                 self.path.unlink()
             except FileNotFoundError:
                 pass
+            except OSError as exc:
+                # Windows keeps a file locked while a handle is open
+                # (``[WinError 32]``), so a stale lock can sit there and refuse
+                # to be removed. Starting without the lock would break the
+                # single-instance guarantee, so this is a refusal, not a crash:
+                # the caller reports it and exits with the lock error code.
+                self.refusal = (f"stale lock {self.path.name} cannot be removed "
+                                f"({type(exc).__name__}: {exc}); stop the process "
+                                f"holding it open, then retry")
+                return False, info
             try:
                 self.info = self._create()
                 self.acquired = True
+                self.took_over = True
                 return True, dict(self.info)
             except FileExistsError:
                 return False, self.read()
@@ -223,9 +237,17 @@ class PidLock:
                 self.path.unlink()
             except FileNotFoundError:
                 pass
+            except OSError as exc:
+                # A handle held open by somebody else can keep our own lock on
+                # disk on Windows. Releasing must never raise from a ``finally``:
+                # the next start sees a stale lock and reports it by name.
+                self.refusal = (f"lock {self.path.name} could not be removed "
+                                f"({type(exc).__name__}: {exc})")
         self.acquired = False
 
     def describe(self, info: dict | None = None) -> str:
+        if self.refusal:
+            return self.refusal
         info = self.read() if info is None else info
         if not info:
             return "engine.pid absent or empty"
