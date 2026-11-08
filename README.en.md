@@ -257,3 +257,12 @@ The criterion is the exit code:
 - `--refs all` scans every ref. On this repository it is currently **expected to be red**: `refs/original/*` are backup refs left by an early filter-branch and still reach commits authored with a private identity. Clearing them requires the repository owner's approval to run `git gc` / `git reflog expire` and **is not part of the normal development flow**; once cleared, `--refs all` is expected to return to rc=0.
 - The pattern strings in `tools/privacy_gate.py` are **assembled from fragments**, not written out whole — otherwise the gate would match itself. When editing that file, do not "helpfully" merge the fragments back together.
 - Run-state directories (`state/`, `.kimi/`, `auth/`) appearing in `git ls-files` also fail the gate: it means run state or reports were committed by accident.
+
+---
+
+## License
+
+Released under the **MIT** license. See [LICENSE](LICENSE).
+
+In short: use it, modify it and redistribute it freely, including commercially. Keep the copyright and permission notices, and note that the software is provided "as is", without warranty of any kind.
+

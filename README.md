@@ -293,3 +293,12 @@ python tools/privacy_gate.py --refs all      # 额外扫全部 ref（见下）
 - `--refs all` 扫描全部 ref。本仓当前**预期为红**：`refs/original/*` 是早期 filter-branch 留下的备份 ref，仍能走到若干条私有身份的 commit。清除它们需要仓库所有者批准 `git gc` / `git reflog expire`，**不属于日常开发流程**；清理完成后 `--refs all` 预期回到 rc=0。
 - 模式串在 `tools/privacy_gate.py` 里是**分片拼装**的，不是整字写出——否则 gate 会命中自己。改这个文件时不要"顺手"把片段合并。
 - 运行态目录（`state/`、`.kimi/`、`auth/`）一旦出现在 `git ls-files` 里，gate 同样判红：说明运行态或报告被误提交了。
+
+---
+
+## 许可
+
+本项目基于 **MIT** 协议开源，详见 [LICENSE](LICENSE)。
+
+简单说：可以自由使用、修改、分发，包括商用；保留版权声明与许可声明即可，软件按「现状」提供、不附任何担保。
+
