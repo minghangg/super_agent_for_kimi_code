@@ -445,7 +445,15 @@ class Engine:
             cursor.setdefault("issues", {}).setdefault(key, cur)
 
     # ------------------------------------------------------------- status/doctor
-    def status(self) -> dict:
+    def status(self, *, outbox: bool = False) -> dict:
+        """Items that need a person. ``outbox=True`` adds the outbox layer.
+
+        ``index.json`` holds triage results; ``outbox_state.json`` holds actions
+        that are still unfinished. ``waiting_person``/``uncertain`` live in the
+        outbox and were invisible here, so a brief that pointed at ``status`` for
+        them named a command that returned nothing. ``outbox`` defaults to False
+        so the printed shape of plain ``status`` does not change.
+        """
         index = self.store.load_index()
         counters = self.store.load_counters()
         items = []
@@ -453,7 +461,17 @@ class Engine:
                                      key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0):
             for entry in rec.get("needs_person") or []:
                 items.append({"issue": issue_key, "comment_id": entry.get("comment_id"),
-                              "reason": entry.get("reason"), "at": entry.get("at")})
+                              "reason": entry.get("reason"), "at": entry.get("at"),
+                              "source": "index", "action_id": None})
+        if outbox:
+            for aid, rec in sorted(self.store.unfinished_outbox().items()):
+                status = str(rec.get("status") or "")
+                if status not in ("waiting_person", "uncertain"):
+                    continue
+                items.append({"issue": rec.get("issue"), "comment_id": None,
+                              "reason": rec.get("reason"), "at": rec.get("updated_at"),
+                              "source": "outbox", "action_id": aid,
+                              "status": status})
         return {"external_actions": int(counters.get("external_actions") or 0),
                 "mode": self.mode, "items": items}
 

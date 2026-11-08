@@ -24,9 +24,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import brief as brief_mod
 from . import config as config_mod
 from . import session_events
 from .bus_client import BusClient
+from .github_source import FixtureSource, LiveSource
 from .engine import build_engine
 from .github_source import NullSource
 from .pidlock import LockError, PidLock
@@ -314,13 +316,18 @@ def cmd_run(args) -> int:
 def cmd_status(args) -> int:
     cfg, store = _build(args)
     engine = _engine(cfg, store, _bus(cfg), source=NullSource())
-    report = engine.status()
+    # --outbox 只加东西，不改变默认输出；brief 的「取回」命令靠它才真的取得到
+    report = engine.status(outbox=bool(getattr(args, "outbox", False)))
     print(f"status  role={engine.role} mode={report['mode']} "
           f"external_actions={report['external_actions']}")
     if not report["items"]:
         print(NONE_TEXT)
         return 0
     for item in report["items"]:
+        if item.get("action_id"):
+            print(f"- action {item['action_id']} issue #{item['issue']} "
+                  f"({item.get('status') or item['reason']}) at {item['at']}")
+            continue
         print(f"- issue #{item['issue']} comment {item['comment_id']} "
               f"({item['reason']}) at {item['at']}")
     return 0
@@ -438,6 +445,45 @@ def cmd_reconcile(args) -> int:
     return 0
 
 
+def cmd_brief(args) -> int:
+    """Short recovery brief: six fixed sections, capped and truncated loudly."""
+    cfg, store = _build(args)
+    limits = brief_mod.UNLIMITED if args.full else brief_mod.Limits(
+        lines=args.max_lines, bytes=args.max_bytes,
+        comment_preview=args.preview_chars)
+    if args.for_ == "pm" and not args.project:
+        print("brief: --for pm needs --project <name>", file=sys.stderr)
+        return 2
+    brief = brief_mod.build_brief(cfg, store, target=args.for_,
+                                  project=args.project, limits=limits,
+                                  lwa_root=args.lwa)
+    text = brief_mod.render(brief, limits=limits)
+    sys.stdout.write(text)
+    return 0
+
+
+def cmd_context(args) -> int:
+    """One issue card: goal, last decision, acceptance, comment ids."""
+    cfg, _store = _build(args)
+    repo = str((cfg.get("github") or {}).get("repo") or "")
+    try:
+        if args.fixture:
+            source = FixtureSource(args.fixture)
+        else:
+            source = LiveSource(repo) if repo else NullSource()
+            if not repo:
+                print("context: 需要 --fixture 或配置 github.repo", file=sys.stderr)
+                return 2
+        card = brief_mod.build_context(
+            source, args.issue, default_repo=repo,
+            limits=brief_mod.Limits(comment_preview=args.preview_chars))
+    except Exception as exc:  # noqa: BLE001  report, never dump a traceback
+        print(f"context failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    sys.stdout.write(brief_mod.render_context(card))
+    return 0
+
+
 def _live_sids(live_file: str | None) -> set[str]:
     """Live sids from a saved ``sess.py list`` output, or by running it.
 
@@ -541,6 +587,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser("status", help="show only items that need a person")
     _add_common(p_status, suppress=True)
+    p_status.add_argument("--outbox", action="store_true",
+                          help="also list waiting_person/uncertain outbox "
+                               "actions (default: index.json only)")
     p_status.set_defaults(func=cmd_status)
 
     p_doctor = sub.add_parser("doctor", help="check bus, source, cursor, assignments")
@@ -568,7 +617,37 @@ def build_parser() -> argparse.ArgumentParser:
                        help="skip the live side (then exit 2 = UNKNOWN, never ok)")
     p_rec.set_defaults(func=cmd_reconcile)
 
-    for sub_parser in (p_once, p_run, p_status, p_doctor, p_replay, p_rec):
+    p_brief = sub.add_parser("brief", help="short recovery brief (six sections)")
+    _add_common(p_brief, suppress=True)
+    p_brief.add_argument("--for", dest="for_", choices=("supervisor", "pm"),
+                         default="supervisor", help="audience (default supervisor)")
+    p_brief.add_argument("--project", default=None,
+                         help="project name (required with --for pm)")
+    p_brief.add_argument("--max-lines", type=_positive_int, default=60,
+                         help="line cap (default 60)")
+    p_brief.add_argument("--max-bytes", type=_positive_int, default=8 * 1024,
+                         help="byte cap (default 8192)")
+    p_brief.add_argument("--preview-chars", type=_non_negative_int, default=120,
+                         help="per-item text clip (default 120)")
+    p_brief.add_argument("--lwa", default=None,
+                         help="workbench checkout root (default: derived from "
+                              "the session stream's state dir)")
+    p_brief.add_argument("--full", action="store_true",
+                         help="no cap: every item, nothing dropped")
+    p_brief.set_defaults(func=cmd_brief)
+
+    p_ctx = sub.add_parser("context", help="one issue card (no full comment bodies)")
+    _add_common(p_ctx, suppress=True)
+    p_ctx.add_argument("--issue", required=True,
+                       help="owner/name#12, #12, or 12 (with github.repo configured)")
+    p_ctx.add_argument("--fixture", default=None,
+                       help="read the issue from a fixture file instead of GitHub")
+    p_ctx.add_argument("--preview-chars", type=_non_negative_int, default=120,
+                       help="per-comment clip (default 120)")
+    p_ctx.set_defaults(func=cmd_context)
+
+    for sub_parser in (p_once, p_run, p_status, p_doctor, p_replay, p_rec,
+                       p_brief, p_ctx):
         sub_parser.set_defaults(_has_common=True)
 
     return parser
