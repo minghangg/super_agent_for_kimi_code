@@ -336,9 +336,13 @@ class NoLongBodies(BriefBase):
         rec = self.store.begin_action("t-1", verb="send", kind="test",
                                       input_ref="t")
         self.store.mark_reconciled(rec["action_id"], "waiting_person",
-                                   "check ghp_secret sk-abcdefghij")
+                                   "check ghp_secretghij sk-abcdefghij")
         _raw, text = self.brief()
-        self.assertIn("t-1", text)
+        self.assertIn("t-1", text, "id 必须在（否则下面几条是空转）")
+        self.assertNotIn("ghp_secret", text, "GitHub PAT 前缀后的正文没被遮住")
+        self.assertNotIn("sk-abcdefghij", text, "API key 没被遮住")
+        self.assertNotIn("ghp_secretghij", text, "完整 token 漏进了 brief")
+        self.assertIn("ghp_<redacted>", text, "遮罩应保留前缀、盖住正文")
 
 
 class ContextCard(BriefBase):
