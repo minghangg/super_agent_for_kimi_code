@@ -28,6 +28,57 @@ from pathlib import Path
 FORBIDDEN_CREATION = "creation_mode_forbidden"
 ALLOWED_CREATION_MODES = ("pm_created",)
 
+# Built-in default profile (ISS-32): used whenever the model profile table is
+# absent or malformed, so the engine behaves exactly as it did before the table
+# existed.
+DEFAULT_MODEL_PROFILE = {"model": "cb-deepseek-v4.1-flash", "effort": "high",
+                         "thinking": "high"}
+
+
+def _profile_ok(entry) -> bool:
+    return isinstance(entry, dict) and all(
+        isinstance(entry.get(k), str) and entry.get(k) for k in ("model", "effort"))
+
+
+def load_model_profiles(path: str | Path | None) -> dict:
+    """Read the model profile table; ``{}`` means "not usable".
+
+    Validation mirrors the workbench side: ``schema_version`` must be present,
+    ``rotation`` must be a non-empty list, and every profile must carry a string
+    ``model`` and ``effort``. Never raises -- a broken table must not be able to
+    change engine behaviour.
+    """
+    if not path:
+        return {}
+    try:
+        with open(str(path), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as exc:
+        print(f"[WARN] model_profiles: cannot read {path} ({exc}); using default",
+              file=sys.stderr)
+        return {}
+    if not isinstance(data, dict):
+        print(f"[WARN] model_profiles: {path} is not a JSON object; using default",
+              file=sys.stderr)
+        return {}
+    if "schema_version" not in data:
+        print(f"[WARN] model_profiles: {path} has no schema_version; using default",
+              file=sys.stderr)
+        return {}
+    rotation = data.get("rotation")
+    if not isinstance(rotation, list) or not rotation or not all(
+            _profile_ok(c) for c in rotation):
+        print(f"[WARN] model_profiles: {path} rotation must be a non-empty list of "
+              "{model, effort}; using default", file=sys.stderr)
+        return {}
+    profiles = data.get("profiles")
+    if not isinstance(profiles, dict) or not all(_profile_ok(p)
+                                                 for p in profiles.values()):
+        print(f"[WARN] model_profiles: {path} profiles need model+effort each; "
+              "using default", file=sys.stderr)
+        return {}
+    return data
+
 
 def _result(ok: bool, code: str, *, session_id=None, error="", source="local",
             **extra) -> dict:
@@ -47,12 +98,14 @@ class DispatchAdapter:
 
     def __init__(self, *, console: str | Path | None = None,
                  creation_mode: str = "pm_created", mode: str = "observe",
-                 runner=None, timeout_s: float = 60.0):
+                 runner=None, timeout_s: float = 60.0,
+                 model_profiles_path: str | Path | None = None):
         self.console = str(console) if console else ""
         self.creation_mode = str(creation_mode or "pm_created")
         self.mode = str(mode or "observe")
         self.timeout_s = float(timeout_s)
         self.runner = runner or self._subprocess_runner
+        self.model_profiles_path = str(model_profiles_path) if model_profiles_path else ""
 
     # -------------------------------------------------------------- transport
     def _subprocess_runner(self, argv: list[str]) -> tuple[int, str, str]:
@@ -102,7 +155,36 @@ class DispatchAdapter:
                        draft={"kind": kind, "assignment": assignment or {},
                               "status": "draft_only"})
 
-    # -------------------------------------------------------------------- API
+    # ------------------------------------------------------------------ API
+    def choose_profile(self, assignment: dict) -> dict:
+        """Return the model profile an assignment should run with (ISS-32).
+
+        Read-only: it never creates or binds a session and does not consult
+        ``creation_mode``. The role comes from ``assignment["role"]`` (falling
+        back to ``assignment["profile"]``, then ``assignment["kind"]``). The
+        answer is ``{"profile", "model", "effort", "thinking", "source"}`` where
+        ``source`` is ``config`` when the table supplied it and ``fallback``
+        when the built-in default did.
+        """
+        assignment = assignment if isinstance(assignment, dict) else {}
+        role = ""
+        for key in ("role", "profile", "kind"):
+            val = assignment.get(key)
+            if isinstance(val, str) and val.strip():
+                role = val.strip()
+                break
+        table = load_model_profiles(self.model_profiles_path)
+        entry = (table.get("profiles") or {}).get(role) if role else None
+        if _profile_ok(entry):
+            source = "config"
+        else:
+            entry, source = DEFAULT_MODEL_PROFILE, "fallback"
+        return {"profile": role,
+                "model": str(entry["model"]),
+                "effort": str(entry["effort"]),
+                "thinking": str(entry.get("thinking") or entry["effort"]),
+                "source": source}
+
     def resolve_role_session(self, project: str, role: str) -> dict:
         if not project or not role:
             return _result(False, "bad_arguments", error="project and role are required")
@@ -153,4 +235,6 @@ def build(cfg: dict, *, runner=None) -> DispatchAdapter:
                                              or "pm_created"),
                            mode=str(cfg.get("mode") or "observe"),
                            runner=runner,
-                           timeout_s=float(dispatch_cfg.get("timeout_s") or 60.0))
+                           timeout_s=float(dispatch_cfg.get("timeout_s") or 60.0),
+                           model_profiles_path=str(
+                               engine_cfg.get("model_profiles_path") or ""))

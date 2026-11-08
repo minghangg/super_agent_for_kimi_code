@@ -54,6 +54,9 @@ DEFAULTS: dict = {
         "session_events_path": "",  # workbench lifecycle stream (read-only); "" = resolve
         "project_allowlist": "",   # "" = not configured; the CLI resolves the repo default
         "creation_mode": "pm_created",  # only pm_created is accepted
+        # Model profile table (ISS-32). "" = not configured: choose_profile then
+        # falls back to the built-in default pair and no file is read.
+        "model_profiles_path": "",
     },
 }
 
@@ -120,6 +123,9 @@ def validate(cfg: dict) -> dict:
     events_path = (cfg.get("engine") or {}).get("session_events_path")
     if events_path is not None and not isinstance(events_path, str):
         raise ConfigError("engine.session_events_path must be a path string (or empty)")
+    profiles_path = (cfg.get("engine") or {}).get("model_profiles_path", "")
+    if profiles_path is not None and not isinstance(profiles_path, str):
+        raise ConfigError("engine.model_profiles_path must be a path string (or empty)")
     poll = (cfg.get("github") or {}).get("poll_interval_s")
     if not isinstance(poll, (int, float)) or poll <= 0:
         raise ConfigError("github.poll_interval_s must be a positive number")
