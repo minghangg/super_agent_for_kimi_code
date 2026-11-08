@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "super-agent"
+version = "0.1.0"
+description = "Deterministic task automation and memory outsourcing for a single-operator agent team."
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools]
+packages = ["super_agent"]
