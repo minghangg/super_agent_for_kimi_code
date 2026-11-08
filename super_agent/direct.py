@@ -311,7 +311,11 @@ def cached(sid: str, max_age: float = 90.0, cache_file: Path | None = None) -> d
     """
     import time as _time
 
-    path = cache_file or (BASE / "state" / "kimi_ws_cache.json")
+    path = cache_file
+    if path is None:
+        print("direct.cached: 未指定 cache_file，跳过读缓存（缓存位于调用方 state 目录；"
+              "本模块已迁移，不再推断默认路径）", file=sys.stderr)
+        return {}
     try:
         d = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):

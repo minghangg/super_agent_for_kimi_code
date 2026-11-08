@@ -18,8 +18,12 @@ Run: ``python -m pytest tests/test_kimi_ports.py -q``
 """
 from __future__ import annotations
 
+import io
+import json
 import subprocess
 import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -102,6 +106,48 @@ class PortedChain(unittest.TestCase):
         legacy = "Lai" + "ke_work_with_agent"      # 分片：门禁自身扫描要在本文件上保持干净
         for mod in (paths, api):
             self.assertNotIn(legacy, str(Path(mod.__file__).resolve()))
+
+
+class CachePath(unittest.TestCase):
+    """ISS-25 item 4 fix: the default cache path must not be inferred from BASE.
+
+    ``BASE`` follows whoever owns the package, so a default of
+    ``BASE/state/kimi_ws_cache.json`` silently reads an empty file after the
+    move. Omitting ``cache_file`` must therefore return ``{}`` **and** warn.
+    """
+
+    def test_omitted_cache_file_returns_empty_and_warns(self):
+        from super_agent import direct
+
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertEqual(direct.cached("iss25-probe"), {})
+        msg = err.getvalue()
+        self.assertIn("cache_file", msg)
+        self.assertIn("跳过", msg)
+
+    def test_explicit_cache_file_still_reads(self):
+        from super_agent import direct
+
+        tmp = Path(tempfile.mkdtemp(prefix="iss25_cache_")) / "kimi_ws_cache.json"
+        try:
+            now = int(time.time())
+            tmp.write_text(json.dumps({"sessions": {"sid-1": {"ts": now, "status": {"busy": True}}}}),
+                           encoding="utf-8")
+            rec = direct.cached("sid-1", cache_file=tmp)
+            self.assertEqual(rec.get("status"), {"busy": True})
+            self.assertEqual(direct.cached("missing", cache_file=tmp), {})
+        finally:
+            tmp.unlink(missing_ok=True)
+            tmp.parent.rmdir()
+
+    def test_cache_file_constant_no_longer_points_at_base_state(self):
+        from super_agent import direct
+
+        self.assertNotEqual(api.CACHE_FILE, direct.BASE / "state" / "kimi_ws_cache.json")
+        # 空路径（Path("") == Path(".")）用起来会明确失败，不会静默读成空
+        self.assertFalse(api.CACHE_FILE.is_file())
+        with self.assertRaises(OSError):
+            api.CACHE_FILE.read_text(encoding="utf-8")
 
 
 if __name__ == "__main__":

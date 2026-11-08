@@ -36,7 +36,10 @@ WS_PATH = _D.WS_PATH
 DEFAULT_AGENT = _D.AGENT
 TRANSCRIPT_GRADE = _D.TRANSCRIPT_GRADE
 NEW_API_SINCE = _D.NEW_API_SINCE
-CACHE_FILE = BASE / "state" / "kimi_ws_cache.json"
+# ISS-25 第4件 fix：本模块迁到 safkc 后 BASE 变了，此常量不再指向真实缓存
+# （真实缓存在调用方的 state 目录）。保留常量仅为兼容既有 import，
+# 读到它请自行传 cache_file 给 direct.cached()。
+CACHE_FILE = Path("")  # 空路径=未配置；用前必须显式给 cache_file
 TOKEN_FILE = None          # 已废弃：路径解析走 kimi_paths，保留名字避免 ImportError
 
 # ---- 传输
