@@ -173,13 +173,17 @@ pid 活着且命令行匹配 ⇒ 拒绝启动（rc=3）；pid 死了或命令行
 `health.json` 每个 round 原子替换一次，字段 `pid / mode / last_loop_at /
 last_successful_action_at / active_assignments / degraded / last_error / running /
 phase`。`phase` 取 `running`（循环持锁在跑）、`startup-failed`（启动对账失败后退出）
-或 `stopped`（正常退出）；旧快照没有该字段时按 `running` 推导，两者不会互相矛盾。
+或 `stopped`（正常退出）；旧快照没有该字段时按 `running` 推导。
+`health.write()` **保证不变式**：`startup-failed`/`stopped` 只与 `running=false` 一起落盘，
+`running` 只与 `phase=running` 一起落盘；调用方传入矛盾组合时会被纠正（`running=True` +
+`startup-failed`/`stopped` ⇒ 纠成 `running=False`；`running=False` + `phase=running` ⇒
+纠成 `phase=stopped`），并在 stderr 打一行 WARN，快照不会丢。
 `doctor` 用这些把故障区分开，各给一个可读标签：
 
 | 标签 | 含义 |
 |---|---|
 | `process-dead` | pid 锁指向死进程，或 `running=true` 却没有活进程（崩溃） |
-| `startup-failed` | 启动对账失败、进程已退出（`phase=startup-failed`，detail 带 `last_error`），不是崩溃 |
+| `startup-failed` | 启动对账失败、进程已退出（`phase=startup-failed`，detail 带 `last_error`），不是崩溃；**即使残留 stale 锁**也优先报这条，不会被「下次启动会接管」盖掉 |
 | `bus-down` | 事件总线不可达 |
 | `github-down` | 数据源不可达 |
 | `config-bad` | allowlist 解析失败（会说明「正在用上一份」） |

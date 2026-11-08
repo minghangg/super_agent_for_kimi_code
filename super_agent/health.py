@@ -19,10 +19,17 @@ both look like "no pid lock but health says it ran", and a watchdog could not
 tell them apart. ``phase`` adds the third case: a process that wrote its health
 snapshot, failed during startup and exited before any round ran. It is not a
 crash, and ``running=false`` alone would read as a clean stop.
+
+``write()`` guarantees the invariant: ``startup-failed``/``stopped`` are only
+ever stored with ``running=false``, and ``phase="running"`` only with
+``running=true``. A caller passing a contradictory pair gets it corrected and a
+WARN on stderr - the snapshot is never dropped, and a watchdog never sees a
+phase and a ``running`` flag that disagree.
 """
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 from .store import atomic_write_text
@@ -63,11 +70,35 @@ def write(path: str | Path, record: dict) -> dict:
     out["degraded"] = bool(out.get("degraded"))
     out["last_error"] = str(out.get("last_error") or "")
     out["running"] = bool(out.get("running"))
-    # ``phase`` must never contradict ``running``: a caller that only passes
-    # ``running``/``phase`` in one of them still gets a consistent snapshot.
     phase = record.get("phase")
     out["phase"] = (phase if phase in PHASES else
                     ("running" if out["running"] else "stopped"))
+    enforce_invariant(out, where="health.write")
     atomic_write_text(Path(path),
                       json.dumps(out, ensure_ascii=False, sort_keys=True) + "\n")
     return out
+
+
+def enforce_invariant(out: dict, *, where: str = "health") -> dict:
+    """``write()`` guarantees ``phase``/``running`` agree in what it stores.
+
+    The correction is deliberate over a refusal: refusing the write would make
+    the caller lose its snapshot silently, and a missing snapshot reads as "no
+    engine ever ran" - the exact ambiguity ``phase`` exists to remove. The
+    correction keeps the more specific field (``phase`` carries whether this was
+    a startup failure or a clean stop) and forces ``running`` to match it, then
+    says so on stderr so the mistake in the caller does not go unnoticed.
+    """
+    if out["running"] and out["phase"] in ("startup-failed", "stopped"):
+        _warn(f"{where}: phase={out['phase']} 与 running=True 矛盾，"
+              f"已纠正为 running=False")
+        out["running"] = False
+    elif not out["running"] and out["phase"] == "running":
+        _warn(f"{where}: phase=running 与 running=False 矛盾，"
+              f"已纠正为 stopped")
+        out["phase"] = "stopped"
+    return out
+
+
+def _warn(message: str) -> None:
+    sys.stderr.write(message + "\n")

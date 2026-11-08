@@ -567,6 +567,14 @@ class Engine:
     def _check_process(self) -> tuple:
         """Fault 1: a dead pid lock, or a health record with no live engine."""
         from .pidlock import process_alive
+        # Read the snapshot first: the real sequence for a failed startup is
+        # "startup failed -> process exits (rc=1) -> the lock was not cleaned
+        # up", so the stale pid lock and the startup-failed snapshot arrive
+        # together. Judging the lock first would answer "the next start takes
+        # it over" and never mention why the last start gave up.
+        snap = health.read(self.store.health_path)
+        startup_failed = (snap.get("phase") == "startup-failed"
+                          and not snap.get("running"))
         try:
             info = json.loads(self.store.pid_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -577,11 +585,16 @@ class Engine:
                 return ("process", True,
                         f"engine.pid pid={pid} alive since={info.get('started_at')}",
                         "fail", "process-dead")
+            if startup_failed:
+                return ("process", False,
+                        f"startup-failed with a stale engine.pid pid={pid}: "
+                        f"last_error={snap.get('last_error') or 'unknown'}; "
+                        f"the last start failed during startup and left the "
+                        f"lock behind", "fail", "startup-failed")
             return ("process", False,
                     f"engine.pid pid={pid} is not alive (stale lock; the next "
                     f"start takes it over)", "fail", "process-dead")
-        snap = health.read(self.store.health_path)
-        if snap.get("phase") == "startup-failed" and not snap.get("running"):
+        if startup_failed:
             # The process wrote its snapshot, failed during startup and exited
             # (rc=1) before any round ran. It did not crash mid-loop, so the
             # label says so and the detail carries the reason it gave up.

@@ -163,6 +163,120 @@ class StartupFailure(Base):
                          "running")
 
 
+class HealthInvariant(Base):
+    """``write()`` must never store a ``phase``/``running`` contradiction."""
+
+    def write_capturing_stderr(self, record: dict) -> tuple[dict, str]:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            written = health.write(self.state / "health.json", record)
+        return written, err.getvalue()
+
+    def test_running_true_with_startup_failed_is_corrected_and_reported(self):
+        written, warn = self.write_capturing_stderr(
+            {"pid": 1, "running": True, "phase": "startup-failed",
+             "degraded": True, "last_error": "boom"})
+        self.assertFalse(written["running"])
+        self.assertEqual(written["phase"], "startup-failed")
+        self.assertIn("health.write", warn)
+        self.assertIn("running=False", warn)
+
+        raw = json.loads((self.state / "health.json").read_text("utf-8"))
+        self.assertEqual(raw["phase"], "startup-failed")
+        self.assertFalse(raw["running"])
+
+        check = self.process_check(self.engine())
+        self.assertEqual(check["label"], "startup-failed", check)
+        self.assertIn("boom", check["detail"])
+        self.assertNotIn("crashed", check["detail"])
+
+    def test_running_false_with_phase_running_is_corrected_to_stopped(self):
+        written, warn = self.write_capturing_stderr({"running": False,
+                                                     "phase": "running"})
+        self.assertEqual(written["phase"], "stopped")
+        self.assertFalse(written["running"])
+        self.assertIn("已纠正为 stopped", warn)
+        raw = json.loads((self.state / "health.json").read_text("utf-8"))
+        self.assertEqual(raw["phase"], "stopped")
+        self.assertFalse(raw["running"])
+        self.assertEqual(health.read(self.state / "health.json")["phase"],
+                         "stopped")
+
+    def test_running_true_with_phase_stopped_is_corrected(self):
+        written, warn = self.write_capturing_stderr({"running": True,
+                                                     "phase": "stopped"})
+        self.assertEqual(written["phase"], "stopped")
+        self.assertFalse(written["running"])
+        self.assertIn("running=False", warn)
+
+    def test_consistent_pairs_are_stored_untouched_without_a_warning(self):
+        for running, phase in ((True, "running"), (False, "startup-failed"),
+                               (False, "stopped")):
+            written, warn = self.write_capturing_stderr({"running": running,
+                                                         "phase": phase})
+            self.assertEqual((written["running"], written["phase"]),
+                             (running, phase))
+            self.assertEqual(warn, "")
+
+
+class StaleLockOrdering(Base):
+    """A leftover ``engine.pid`` must not bury a startup-failed snapshot."""
+
+    PID = 999997
+
+    def stale_lock(self) -> None:
+        path = self.state / "engine.pid"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"pid": self.PID, "started_at": "t",
+                                    "cmdline_hash": "deadbeef"}), encoding="utf-8")
+
+    def failed_snapshot(self, error: str = "outbox recovery failed: boom") -> None:
+        health.write(self.state / "health.json",
+                     {"pid": self.PID, "running": False,
+                      "phase": "startup-failed", "degraded": True,
+                      "last_error": error})
+
+    def test_stale_lock_keeps_startup_failed_and_its_last_error(self):
+        self.failed_snapshot()
+        self.stale_lock()
+        check = self.process_check(self.engine())
+        self.assertEqual(check["level"], "fail")
+        self.assertEqual(check["label"], "startup-failed", check)
+        self.assertIn("last_error=outbox recovery failed: boom", check["detail"])
+        self.assertIn(str(self.PID), check["detail"])
+        self.assertNotIn("next start takes it over", check["detail"])
+
+    def test_cli_doctor_prints_startup_failed_with_the_stale_lock(self):
+        self.failed_snapshot()
+        self.stale_lock()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(out):
+            rc = cli.main(self.cli_args() + ["doctor"])
+        printed = out.getvalue()
+        self.assertEqual(rc, 1, printed)
+        self.assertIn("[FAIL] startup-failed", printed)
+        self.assertIn("outbox recovery failed: boom", printed)
+        self.assertNotIn("next start takes it over", printed)
+
+    def test_stale_lock_without_startup_failed_stays_process_dead(self):
+        health.write(self.state / "health.json",
+                     {"pid": self.PID, "running": False, "phase": "stopped",
+                      "last_error": ""})
+        self.stale_lock()
+        check = self.process_check(self.engine())
+        self.assertEqual(check["label"], "process-dead", check)
+        self.assertIn("stale lock", check["detail"])
+        self.assertNotIn("startup-failed", check["detail"])
+
+    def test_startup_failed_without_a_lock_is_unchanged(self):
+        self.failed_snapshot("boom")
+        check = self.process_check(self.engine())
+        self.assertEqual(check["label"], "startup-failed", check)
+        self.assertIn("last_error=boom", check["detail"])
+        self.assertIn("not a crash", check["detail"])
+
+
 class LockedStaleLock(Base):
     def stale_lock(self) -> Path:
         path = self.state / "engine.pid"
