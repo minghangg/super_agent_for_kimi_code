@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run test suite
+        run: python -m pytest tests/ -q
+      - name: Privacy gate (tracked files + authors + origin)
+        run: python tools/privacy_gate.py
+      - name: Privacy gate (all reachable refs)
+        run: python tools/privacy_gate.py --refs all
