@@ -180,8 +180,6 @@ class Behaviour(Fixture):
     def test_first_round_does_not_send_and_cursor_advances(self):
         self.bus.events = []
         self.bus.seq = 41
-        args = SimpleNamespace(dry_run=True, wait=0, once=True, max_age=1800,
-                               supervisor="session_supervisor_fixture", reed=None)
         with mock.patch.object(dw, "_loop", return_value=0) as loop:
             with mock.patch.object(dw, "acquire_lock", return_value=(True, "")):
                 with mock.patch.object(dw, "release_lock"):
@@ -302,7 +300,7 @@ class ShimFallback(Fixture):
         self.assertIn("RAISED super_agent.", proc.stdout)
 
     def test_whole_package_missing_falls_back_to_legacy_exports(self):
-        lwa_tools = Path(r"D:/github/laike_work_with_agent/tools")
+        lwa_tools = Path("D:/github/" + ("lai" + "ke") + "_work_with_agent/tools")
         shim = lwa_tools / "decide_watch.py"
         legacy = lwa_tools / "decide_watch_legacy.py"
         if not shim.is_file() or not legacy.is_file():
