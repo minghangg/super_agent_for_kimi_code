@@ -25,7 +25,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 import uuid
 from pathlib import Path
@@ -34,13 +33,22 @@ BASE = Path(__file__).resolve().parent.parent
 sys.path.append(str(BASE / "tools"))     # 追加不插入（tools/queue.py 会遮蔽标准库）
 from . import paths as kimi_paths  # noqa: E402
 
-SERVER = os.environ.get("KIMI_SERVER", "http://127.0.0.1:58627")
 WS_PATH = "/api/v1/ws"
 AGENT = "main"
 TRANSCRIPT_GRADE = "turn"          # 必须非 off，否则服务端不推初始快照
 NEW_API_SINCE = (2, 5, 0)
 
 _version_cache: str | None = None
+
+
+def server_base() -> str:
+    return kimi_paths.server_base()
+
+
+def __getattr__(name: str):
+    if name == "SERVER":
+        return server_base()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # --------------------------------------------------------------------- 传输
@@ -58,7 +66,7 @@ def _request(method: str, path: str, body=None, timeout: float = 20.0):
     headers = {"Authorization": f"Bearer {token()}"}
     if data is not None:
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(f"{SERVER}{path}", data=data, method=method, headers=headers)
+    req = urllib.request.Request(f"{server_base()}{path}", data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
@@ -158,7 +166,7 @@ def _import_websockets():
 
 
 def _ws_url() -> str:
-    return SERVER.replace("http://", "ws://").replace("https://", "wss://") + WS_PATH
+    return server_base().replace("http://", "ws://").replace("https://", "wss://") + WS_PATH
 
 
 def ping_reply(frame: dict) -> dict | None:

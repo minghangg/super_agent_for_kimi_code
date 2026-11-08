@@ -25,17 +25,26 @@
 env 覆盖（保留既有更细粒度的开关，优先级高于本模块）：
   · `KIMI_CODE_TOKEN_FILE`  —— 直接指定 token 文件
   · `KIMI_CODE_CONFIG_FILE` —— 直接指定 config.toml
+  · `KIMI_SERVER_INSTANCES_DIR` —— 实例目录夹具（诊断/测试）
 """
 from __future__ import annotations
 
+import json
+import logging
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ENV_HOME = "KIMI_CODE_HOME"
 ENV_TOKEN_FILE = "KIMI_CODE_TOKEN_FILE"
 ENV_CONFIG_FILE = "KIMI_CODE_CONFIG_FILE"
+ENV_SERVER = "KIMI_SERVER"
+ENV_INSTANCES_DIR = "KIMI_SERVER_INSTANCES_DIR"
+DEFAULT_BASE = "http://127.0.0.1:58627"
 
 DEFAULT_DIRNAME = ".kimi-code"
+
+_WARN = logging.getLogger("super_agent.paths").warning
 
 
 def home() -> Path:
@@ -88,6 +97,108 @@ def describe() -> str:
     src = f"${ENV_HOME}" if os.environ.get(ENV_HOME) else f"~/{DEFAULT_DIRNAME}(默认)"
     return (f"home={home()} [{src}]  token={token_file()}  "
             f"config={config_file()}  sessions={sessions_dir()}")
+
+
+def _valid_url(raw: str) -> bool:
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return False
+    return parts.scheme in ("http", "https") and bool(parts.netloc)
+
+
+def _env_base() -> str | None:
+    raw = (os.environ.get(ENV_SERVER) or "").strip()
+    if not raw or not _valid_url(raw):
+        return None
+    return raw
+
+
+def instances_dir() -> Path:
+    raw = (os.environ.get(ENV_INSTANCES_DIR) or "").strip()
+    if raw:
+        return Path(os.path.expanduser(raw))
+    return home() / "server" / "instances"
+
+
+def _coerce_port(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        port = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        port = int(value.strip())
+    elif isinstance(value, float) and value.is_integer():
+        port = int(value)
+    else:
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
+def _coerce_host(value) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return "127.0.0.1"
+
+
+def _instance_files(root: Path) -> list[Path]:
+    try:
+        return sorted((p for p in root.glob("*.json") if p.is_file()),
+                      key=lambda p: (p.stat().st_mtime, p.name), reverse=True)
+    except OSError as exc:
+        _WARN("instances 解析失败，回落 58627：%s: %s（目录=%s）",
+              type(exc).__name__, exc, root)
+        return []
+
+
+def latest_instance(root: Path | None = None) -> dict | None:
+    """mtime 最新且可解析的实例；返回 server_id/path/port/host/mtime，全坏返回 None。"""
+    directory = root if root is not None else instances_dir()
+    if not directory.is_dir():
+        _WARN("instances 解析失败，回落 58627：FileNotFoundError: %s（目录=%s）",
+              directory, directory)
+        return None
+    errors: list[str] = []
+    for path in _instance_files(directory):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError) as exc:
+            errors.append(f"{type(exc).__name__}: {path.name}")
+            continue
+        if not isinstance(data, dict):
+            errors.append(f"TypeError: {path.name}")
+            continue
+        port = _coerce_port(data.get("port"))
+        if port is None:
+            errors.append(f"ValueError: {path.name}")
+            continue
+        host = _coerce_host(data.get("host"))
+        raw_id = data.get("server_id") or data.get("id") or path.stem
+        return {"server_id": str(raw_id), "path": str(path),
+                "port": port, "host": host,
+                "mtime": path.stat().st_mtime}
+    reason = ", ".join(errors) if errors else "ValueError: no valid instance"
+    _WARN("instances 解析失败，回落 58627：%s（目录=%s）", reason, directory)
+    return None
+
+
+def server_id() -> str:
+    """当前实例的 server_id；env 显式设置或无有效实例时返回空串。"""
+    if _env_base() is not None:
+        return ""
+    rec = latest_instance()
+    return str(rec["server_id"]) if rec else ""
+
+
+def server_base() -> str:
+    """现取服务基址：env > 最新有效 instances > 58627（失败必有 WARN）。"""
+    env = _env_base()
+    if env is not None:
+        return env
+    rec = latest_instance()
+    if rec is None:
+        return DEFAULT_BASE
+    return f"http://{rec['host']}:{rec['port']}"
 
 
 if __name__ == "__main__":
