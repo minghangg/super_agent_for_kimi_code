@@ -88,7 +88,9 @@ class Injection(unittest.TestCase):
 
 class Snapshot(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="iss25_5_", dir="C:/tmp/iss25_5")
+        parent = Path("C:/tmp/iss25_5")
+        parent.mkdir(parents=True, exist_ok=True)  # 靶目录可能被当轮即删清理，setUp 自建保独立
+        self.tmp = tempfile.TemporaryDirectory(prefix="iss25_5_", dir=str(parent))
         self.root = Path(self.tmp.name)
         self.config = make_config(self.root)
         self.mon = monitor.Monitor(self.config)
