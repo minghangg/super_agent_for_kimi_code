@@ -5,3 +5,4 @@ __pycache__/
 state/
 *.tmp
 *.last-good
+*.egg-info/
