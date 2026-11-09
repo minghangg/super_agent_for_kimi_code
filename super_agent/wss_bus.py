@@ -1,4 +1,8 @@
-"""WSS event bus daemon —— the single observation/control plane over Kimi Code.
+"""[RULING B 2026-11-09] 编排层裁定工作台私有：现网 daemon 真相在 lwa tools/wss_bus.py
+（私有对象宿主：PM 键/退役表/单路由/guardian 名单）。本模块是完整移植的候选底座版，
+未作为运行入口启用；规则与 skill 的 safkc 迁移另独立项（用户令）。勿把本文件当运行时真相。
+
+ —— the single observation/control plane over Kimi Code.
 
 Architecture
 ------------
