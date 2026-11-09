@@ -117,6 +117,9 @@ python -m unittest discover -s tests -v                # L1 测试（含各条�
 | `super_agent/dispatch_adapter.py` | 结构化派单接口：返回 dict，只解析 `--json`，不读人类文本 |
 | `super_agent/session_events.py` | **只读**工作台的会话生命周期流：`replay(events, at)` 重建某时刻的 `sid → (role, issue, assignment, profile)`，`reconcile()` 做三方对账 |
 | `super_agent/engine.py` | 确定性 Fast Path：去重／允许清单／冷却／状态机；**不接 LLM** |
+| `super_agent/issuekey.py` | 线程主键 `owner/repo#N`；旧数字键只读兼容（新键优先、迁移幂等） |
+| `super_agent/markers.py` | 只解析**第一条非空行**的 `[WK:<name>]` 交付标记 |
+| `super_agent/assignments.py` | Thread × Assignment 状态机：`queued→working→waiting_review→completed`，交付归属与一次性通知 |
 | `super_agent/cli.py` | `run` / `once` / `status` / `doctor` / `replay` / `reconcile` |
 
 ### 两个 allowlist 不是一回事
@@ -136,6 +139,11 @@ python -m unittest discover -s tests -v                # L1 测试（含各条�
 热更新走 mtime 轮询（不要求 inotify），但判定用 `(mtime, size, sha256)`：只改 `[28]` → `"28"` 这类
 字节数不变的编辑也不会漏。变化时先完整解析校验，通过才生效；**只影响后续事件，不回溯**。
 坏配置保留上一份并告警，引擎不崩、行为不变。
+
+**真实仓名走未跟踪 overlay**：`config/allowlist.json` 只留占位（可入库、过隐私门禁），
+`config/allowlist.local.json`（已 `.gitignore`）可覆盖 `repo`/`issues`/`actions`/`mode`/`roles`/
+`max_active_writers`，其余继承 tracked；合并结果**再校验一次**，坏的 overlay 被拒且 tracked 照用。
+`doctor` 会打印哪一份生效：`allowlist=tracked+local(生效:local: <项目>)`。删掉 overlay 即回单文件语义。
 
 ### outbox 状态机：先落盘再动手
 
