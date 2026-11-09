@@ -539,6 +539,7 @@ DELIVERY_PENDING_CHECK_S = 60.0     # 收据/汇总/升级的检查节流
 EXIT_FIXTURE_INVALID = 6            # 夹具前置校验失败（--send-mode 的 unknown 预留给 8，勿混）
 EXIT_SEND_MODE_UNKNOWN = 8         # --send-mode 无法判定（issue #18 本体，预留位正式启用）
 EXIT_SELFTEST_FAILED = 7            # --self-test 有用例失败
+EXIT_LOCKED = 2                     # 已有实例在跑（与老址 tools/decide_watch_legacy.py 同值）
 DELIVERY_SINK = None                # 自检用：非 None 时只记录不发送（生产恒 None）
 
 # --------------------------------------------------------------------------------------

@@ -218,6 +218,26 @@ class Behaviour(Fixture):
         self.assertIn("拒绝启动", why)
         self.assertIn("避免同一事件双发", why)
 
+    def test_main_returns_two_when_lock_held(self):
+        dw.LOCK().write_text(json.dumps({"pid": os.getpid(),
+                                         "started_at": "x"}),
+                             encoding="utf-8")
+        err = io.StringIO()
+        with mock.patch.object(dw, "_pid_alive", return_value=True):
+            with mock.patch.object(dw, "_cmdline_of",
+                                   return_value="python decide_watch.py"):
+                with mock.patch.object(dw, "_loop",
+                                       side_effect=AssertionError("must not loop")):
+                    with contextlib.redirect_stderr(err):
+                        rc = dw.main(["--once", "--dry-run"])
+        self.assertEqual(rc, 2)
+        self.assertIn("拒绝启动", err.getvalue())
+        self.assertIn("避免同一事件双发", err.getvalue())
+        self.assertEqual(self.injections, [])
+        self.assertEqual(self.sends, [])
+        self.assertEqual(dw.EXIT_LOCKED, 2)
+        self.assertNotEqual(dw.EXIT_LOCKED, dw.EXIT_SEND_MODE_UNKNOWN)
+
     def test_delivery_fixture_gate_default_off_and_sink_only(self):
         for name in ("DELIVERY_FIXTURE", "DELIVERY_SEND_SINK", "DELIVERY_ALLOW_SEND"):
             os.environ.pop(name, None)
