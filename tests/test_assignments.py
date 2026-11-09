@@ -6,6 +6,11 @@ lifecycle stream (``session_events.resolve_events_path`` looks at
 ``SESS_EVENTS_STATE_DIR``/``LWA_STATE_DIR``/cwd), so relying on the directory
 would silently read the live workbench state.
 
+The second half covers the QA verdict side: the transitions that used to be
+missing entirely, the gate in front of ``completed``, the hold states, and the
+blocked exit - including the two shapes QA flagged (the same delivery failing
+twice, and the ``no sid`` branch that never consumed a delivery at all).
+
 Run: ``python -m pytest tests/test_assignments.py -q``
 """
 from __future__ import annotations
@@ -522,6 +527,147 @@ class DoctorAndHealth(Base):
         check = [c for c in engine.doctor()["checks"]
                  if c["name"] == "assignments"][0]
         self.assertTrue(check["ok"])
+
+
+class Verdicts(unittest.TestCase):
+    """The QA verdict side of the machine, on records built in memory."""
+
+    @staticmethod
+    def record(**over):
+        rec = {"id": "asg_1_worker_1", "thread": THREAD, "role": "worker",
+               "sid": "session_w1", "status": "waiting_review",
+               "delivery_comment_id": 9001, "last_review_comment_id": None,
+               "qa_verdict": "", "tombstone": {}}
+        rec.update(over)
+        return rec
+
+    def test_pass_moves_to_waiting_release(self):
+        rec = self.record()
+        out = asg.on_review(rec, {"verdict": "pass"}, review_cid=9100)
+        self.assertTrue(out["changed"])
+        self.assertEqual(rec["status"], "waiting_release")
+        self.assertEqual(rec["qa_verdict"], "pass")
+        self.assertEqual(rec["review_comment_id"], 9100)
+
+    def test_reject_returns_the_same_session_to_working(self):
+        rec = self.record()
+        out = asg.on_review(rec, {"verdict": "reject"}, review_cid=9100)
+        self.assertTrue(out["changed"])
+        self.assertEqual(rec["status"], "working")
+        # The thread context is kept: the worker is resumed, not replaced.
+        self.assertEqual(rec["sid"], "session_w1")
+        self.assertEqual(rec["delivery_comment_id"], 9001)
+
+    def test_unreadable_verdict_asks_a_person_and_never_guesses(self):
+        rec = self.record()
+        out = asg.on_review(rec, {"verdict": ""}, review_cid=9100)
+        self.assertEqual(out["status"], "waiting_person")
+        self.assertEqual(rec["qa_verdict"], "")
+
+    def test_unverified_source_is_a_warning_not_a_refusal(self):
+        rec = self.record()
+        out = asg.on_review(rec, {"verdict": "reject"}, review_cid=9100,
+                            verified=False)
+        self.assertTrue(out["changed"])
+        self.assertEqual(rec["status"], "working")
+        self.assertFalse(rec["review_verified"])
+
+    def test_review_is_idempotent_on_the_comment_id(self):
+        rec = self.record()
+        asg.on_review(rec, {"verdict": "reject"}, review_cid=9100)
+        self.assertFalse(asg.on_review(rec, {"verdict": "reject"},
+                                       review_cid=9100)["changed"])
+
+    def test_gate_refuses_without_a_pass(self):
+        ok, why = asg.qa_gate(self.record(qa_verdict=""))
+        self.assertFalse(ok)
+        self.assertIn("no qa pass", why)
+        ok, why = asg.qa_gate(self.record(qa_verdict="reject"))
+        self.assertFalse(ok)
+        self.assertIn("rejected", why)
+
+    def test_manual_status_flip_cannot_complete(self):
+        # The hole the gate closes: a hand-edited ``waiting_release`` with no
+        # verdict must not reach ``completed``.
+        rec = self.record(status="waiting_release", qa_verdict="")
+        out = asg.complete(rec)
+        self.assertTrue(out["refused"])
+        self.assertEqual(rec["status"], "waiting_release")
+        rec["qa_verdict"] = "pass"
+        self.assertEqual(asg.complete(rec)["status"], "completed")
+
+    def test_late_delivery_in_a_hold_state_is_only_audited(self):
+        for status in ("waiting_release", "close_reconcile"):
+            rec = self.record(status=status, qa_verdict="pass")
+            out = asg.on_delivery(rec, 9999, "wk-probe-1", "marker")
+            self.assertFalse(out["changed"])
+            self.assertEqual(out["reason"], "late delivery after a QA pass")
+            self.assertEqual(rec["status"], status)
+
+    def test_completed_assignment_audits_a_late_event(self):
+        rec = self.record(status="completed", qa_verdict="pass")
+        self.assertTrue(asg.late_event(rec, "delivery", cid=9999)["audit"])
+        self.assertEqual(rec["status"], "completed")
+
+    def test_close_reconcile_refuses_without_a_pass(self):
+        rec = self.record(status="waiting_release", qa_verdict="")
+        out = asg.enter_close_reconcile(rec, "binding still registered")
+        self.assertTrue(out["refused"])
+        self.assertEqual(rec["status"], "waiting_release")
+
+    def test_reopen_needs_all_three(self):
+        rec = self.record(status="close_reconcile", qa_verdict="pass",
+                          review_comment_id=9100, delivery_comment_id=9200)
+        # A newer reject alone is not enough.
+        self.assertFalse(asg.reopen(rec, review_cid=9300, delivery_cid=9400,
+                                    archived=None)["changed"])
+        # Reject and delivery, but the session is archived.
+        self.assertFalse(asg.reopen(rec, review_cid=9300, delivery_cid=9400,
+                                    archived=True)["changed"])
+        out = asg.reopen(rec, review_cid=9300, delivery_cid=9400, archived=False)
+        self.assertTrue(out["changed"])
+        self.assertEqual(rec["status"], "working")
+        self.assertEqual(rec["qa_verdict"], "reject")
+
+
+class BlockedExit(unittest.TestCase):
+    def test_a_blocked_assignment_waits_for_a_newer_delivery(self):
+        rec = Verdicts.record(status="blocked")
+        asg.mark_blocked(rec, "archive not confirmed by read-back", cid=9001)
+        self.assertFalse(asg.on_delivery(rec, 9001, "wk-probe-1",
+                                         "marker")["changed"])
+        self.assertTrue(asg.on_delivery(rec, 9002, "wk-probe-1",
+                                        "marker")["changed"])
+
+    def test_the_same_delivery_failing_twice_bumps_the_attempt(self):
+        # blocked -> unblock -> the same delivery fails again: the cid stays,
+        # the attempt grows. Overwriting the tombstone would make the "newer
+        # than" guard impossible to ever satisfy again.
+        rec = Verdicts.record(status="waiting_review")
+        asg.mark_blocked(rec, "archive not confirmed by read-back", cid=9001)
+        self.assertEqual(rec["tombstone"]["attempt"], 1)
+        self.assertTrue(asg.unblock(rec, "retry after a fix")["changed"])
+        self.assertEqual(rec["status"], "working")
+        asg.mark_blocked(rec, "archive not confirmed by read-back", cid=9001)
+        self.assertEqual(rec["status"], "blocked")
+        self.assertEqual(rec["tombstone"]["attempt"], 2)
+        self.assertEqual(rec["tombstone"]["cid"], 9001)
+        self.assertTrue(rec["unblocked_at"])
+
+    def test_no_sid_block_does_not_consume_the_delivery(self):
+        # A block caused by a missing sid happened before the archive, so
+        # finishing the sid must let the very same delivery out.
+        rec = Verdicts.record(status="working", sid="", delivery_comment_id=None)
+        asg.mark_blocked(rec, asg.NO_SID_REASON, cid=None)
+        rec["sid"] = "session_w1"
+        out = asg.on_delivery(rec, 9001, "wk-probe-1", "marker")
+        self.assertTrue(out["changed"])
+        self.assertEqual(rec["status"], "waiting_review")
+
+    def test_unblock_refuses_a_live_assignment(self):
+        rec = Verdicts.record(status="working")
+        self.assertTrue(asg.unblock(rec, "why")["refused"])
+        self.assertEqual(rec["status"], "working")
 
 
 class Matching(unittest.TestCase):
