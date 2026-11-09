@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import github_source, health, issuekey, markers, session_events
+from . import assignments as asg_mod
 from .allowlist import ProjectAllowlist
 from .store import Store, action_id
 
@@ -65,6 +66,10 @@ class Engine:
                     path, cache_path=self.store.root / "allowlist.last-good")
         self._recovered = False
         self.last_successful_action_at: str | None = None
+        # Set when the session stream cannot be read: no assignment is created
+        # and health reports degraded (fail closed, never an empty loop).
+        self.degraded = False
+        self._assignments_error = ""
 
     # ------------------------------------------------------------ allowlist
     def allowlist_allows(self, issue: int | None, action: str | None) -> tuple[bool, str]:
@@ -100,7 +105,7 @@ class Engine:
         record = {"pid": os.getpid(), "mode": self.mode,
                   "last_loop_at": _now(),
                   "last_successful_action_at": self.last_successful_action_at,
-                  "active_assignments": len(index.get("assignments") or {}),
+                  "active_assignments": len(asg_mod.active_assignments(index)),
                   "degraded": bool(degraded or error), "last_error": error,
                   "running": bool(running)}
         if phase:
@@ -233,6 +238,136 @@ class Engine:
         })
         return {"dispatched": True, "ok": ok, "error": err,
                 "external_actions_total": total}
+
+    # ------------------------------------------------------- assignments (ISS-20)
+    def _issue_sessions_path(self) -> Path:
+        """``issue_sessions.json`` beside ``sessions.json`` (cross-check only)."""
+        _events, sessions = self._session_stream()
+        return sessions.parent / "issue_sessions.json"
+
+    def _load_issue_sessions(self) -> dict:
+        try:
+            data = json.loads(self._issue_sessions_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _sync_assignments(self, index: dict, thread: str, issue: int) -> dict:
+        """Create/refresh assignments for ``thread`` from the session stream.
+
+        The stream is the source of truth; ``issue_sessions.json`` only
+        cross-checks it. When the stream cannot be read this refuses to create
+        anything and marks the engine degraded - an empty loop that looks
+        healthy is the one outcome this must never produce.
+        """
+        try:
+            events_path, _sessions = self._session_stream()
+            events = session_events.load_events(events_path)
+            state = session_events.replay(events)
+        except Exception as exc:  # noqa: BLE001  fail closed, report why
+            self.degraded = True
+            self._assignments_error = f"{type(exc).__name__}: {exc}"
+            self.store.log_event({"type": "assignment.stream_unreadable", "at": _now(),
+                                  "thread": thread, "error": self._assignments_error})
+            return {"created": [], "updated": [], "conflict": [],
+                    "unreadable": self._assignments_error}
+        live = asg_mod.live_bindings(state, thread)
+        crosscheck = set()
+        ledger = self._load_issue_sessions().get(thread) or {}
+        if isinstance(ledger, dict):
+            for entry in ledger.values():
+                sid = str((entry or {}).get("session") or "")
+                if sid:
+                    crosscheck.add(sid)
+        out = asg_mod.sync(index, thread, issue, live, crosscheck=crosscheck)
+        if out["conflict"]:
+            self.store.log_event({"type": "assignment.source_conflict", "at": _now(),
+                                  "thread": thread, "conflict": out["conflict"]})
+        return out
+
+    def _notify_waiting_review(self, assignment: dict) -> dict:
+        """Send ``event.agent.waiting_review`` at most once per delivery."""
+        delivery = assignment.get("delivery_comment_id")
+        if delivery is None:
+            return {"dispatched": False, "reason": "no delivery recorded"}
+        base = action_id(assignment["id"], "bus_inject", str(delivery))
+        if self.store.action_attempted(base) > 0:
+            assignment["notification_action_id"] = base
+            return {"dispatched": False, "reason": "already attempted",
+                    "action_id": base}
+        assignment["notification_action_id"] = base
+        assignment["attempts"] = int(assignment.get("attempts") or 0) + 1
+        result = self._dispatch({
+            "kind": "bus_inject",
+            "event": "event.agent.waiting_review",
+            "assignment_id": assignment["id"],
+            "input_ref": str(delivery),
+            "issue": assignment.get("issue"),
+            "payload": {"thread": assignment.get("thread"),
+                        "assignment": assignment["id"],
+                        "sid": assignment.get("sid"),
+                        "delivery_comment_id": delivery},
+        })
+        if result.get("dispatched"):
+            assignment["notified_at"] = _now()
+            self.store.log_event({
+                "type": "assignment.waiting_review", "at": _now(),
+                "assignment": assignment["id"],
+                "delivery_comment_id": delivery,
+                "action_id": result.get("action_id") or base,
+                "ok": bool(result.get("ok")),
+            })
+        return result
+
+    def _retry_waiting_review(self, index: dict) -> int:
+        """Re-attempt notifications a refused/suppressed dispatch never sent.
+
+        The delivery comment is already behind the cursor by then, so this is
+        the only path that can retry: the attempt counter is what keeps it
+        at-most-once (a real attempt - success or ``uncertain`` - is never
+        repeated).
+        """
+        sent = 0
+        for rec in (index.get("assignments") or {}).values():
+            if str(rec.get("status") or "") != "waiting_review":
+                continue
+            if rec.get("delivery_comment_id") is None:
+                continue
+            base = action_id(rec["id"], "bus_inject",
+                             str(rec["delivery_comment_id"]))
+            if self.store.action_attempted(base) > 0:
+                continue
+            result = self._notify_waiting_review(rec)
+            if result.get("dispatched"):
+                sent += 1
+        return sent
+
+    def _on_delivery(self, index: dict, thread: str, issue: int, comment: dict,
+                     delivery: dict, summary: dict) -> str:
+        """Match a delivery marker to an assignment and notify once.
+
+        Returns the resulting triage state so the caller can count it: a
+        delivery that cannot be matched becomes ``needs_person`` (never silently
+        dropped), which is the one place this differs from the other outcomes.
+        """
+        cid = int(comment["id"])
+        assignment, matched_by = asg_mod.match_delivery(index, thread,
+                                                        delivery["name"])
+        if assignment is None:
+            self.store.log_event({"type": "assignment.unmatched", "at": _now(),
+                                  "thread": thread, "comment_id": cid,
+                                  "marker": delivery["name"],
+                                  "reason": matched_by})
+            return "needs_person", f"unmatched delivery {delivery['name']!r}"
+        moved = asg_mod.on_delivery(assignment, cid, delivery["name"], matched_by)
+        if moved["changed"]:
+            self.store.log_event({"type": "assignment.delivery", "at": _now(),
+                                  "assignment": assignment["id"], "thread": thread,
+                                  "comment_id": cid, "matched_by": matched_by})
+        # Retried on a later round when the previous attempt was refused or
+        # suppressed: those paths write no attempt counter on purpose.
+        self._notify_waiting_review(assignment)
+        return "delivery", ""
 
     # ------------------------------------------------------------------- round
     def run_once(self) -> dict:
@@ -386,7 +521,8 @@ class Engine:
 
         summary = {"mode": self.mode, "dispatch_enabled": self.dispatch_enabled,
                    "issues": 0, "comments_new": 0, "processed": 0,
-                   "needs_person": 0, "errors": []}
+                   "needs_person": 0, "deliveries": 0, "assignments": 0,
+                   "errors": []}
         if allowlist_reload:
             summary["allowlist_reload"] = allowlist_reload
         self.store.log_event({"type": "run.started", "at": _now(), "mode": self.mode})
@@ -407,6 +543,8 @@ class Engine:
                                       "issue": int(issue),
                                       "error": f"{type(exc).__name__}: {exc}"})
 
+        summary["notifications_retried"] = self._retry_waiting_review(index)
+
         # Index is written once per round, atomically: a crash leaves the old one.
         index["meta"].update({
             "updated_at": _now(), "mode": self.mode, "role": self.role,
@@ -424,7 +562,7 @@ class Engine:
         health_errors = list(summary["errors"])
         if allowlist_reload:
             health_errors.append(f"allowlist kept previous copy: {allowlist_reload}")
-        self.write_health(error="; ".join(health_errors))
+        self.write_health(error="; ".join(health_errors), degraded=self.degraded)
         return summary
 
     def _round_issue(self, issue: int, index: dict, cursor: dict,
@@ -438,6 +576,11 @@ class Engine:
         rec = issues.setdefault(key, {"state": "idle", "comments_seen": 0,
                                       "needs_person": []})
         rec["title"] = rec.get("title") or self.source.title(issue)
+        # Assignments come from the session stream, once per issue per round,
+        # before any comment is triaged: a delivery needs its assignment to
+        # exist already.
+        synced = self._sync_assignments(index, key, issue)
+        summary["assignments"] += len(synced.get("created") or [])
         # Qualified key first, legacy second: a mixed file converges instead of
         # re-reading comments already consumed under the old form.
         cur = int(issuekey.read_both(cursor.get("issues") or {}, key, legacy) or 0)
@@ -459,6 +602,7 @@ class Engine:
                 continue
             seen_this_round.add(cid)
             state, reason = self._triage(comment)
+            delivery = markers.parse_delivery(str(comment.get("body") or ""))
             summary["processed"] += 1
             rec["comments_seen"] = int(rec.get("comments_seen") or 0) + 1
             rec["last_comment_id"] = cid
@@ -466,6 +610,15 @@ class Engine:
             self.store.log_event({"type": "comment.processed", "at": _now(),
                                   "issue": issue, "comment_id": cid, "state": state,
                                   "reason": reason})
+            if state == "delivery":
+                state, reason = self._on_delivery(index, key, issue, comment,
+                                                  delivery, summary)
+                summary["deliveries"] += 1
+                if state != "needs_person":
+                    summary["processed"] += 0
+                    if rec.get("state") == "idle":
+                        rec["state"] = "tracked"
+                    continue
             if state == "needs_person":
                 rec["state"] = "needs_person"
                 rec.setdefault("needs_person", []).append({
@@ -482,10 +635,6 @@ class Engine:
                                                 "reason": reason}})
             elif rec.get("state") == "idle":
                 rec["state"] = "tracked"
-
-        # ``delivery`` is classified here and acted on by the assignment layer
-        # (C6). Index state is deliberately untouched: a delivery is not a
-        # "needs a person" item and must not flip the issue state.
 
         if fresh:
             cursor.setdefault("issues", {})[key] = max(int(c["id"]) for c in fresh)
@@ -597,9 +746,10 @@ class Engine:
             "cursor ok" if not bad_cursor else f"invalid cursors: {bad_cursor}")
 
         index = self.store.load_index()
-        residual = index.get("assignments") or {}
+        residual = asg_mod.active_assignments(index)
         add("assignments", not residual,
-            "none" if not residual else f"residual: {sorted(residual)}", level="warn")
+            "none" if not residual else f"non-terminal: {sorted(residual)}",
+            level="warn")
 
         counters = self.store.load_counters()
         return {"checks": checks, "external_actions":
