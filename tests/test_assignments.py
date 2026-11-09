@@ -468,6 +468,34 @@ class Notification(Base):
 
 
 class DoctorAndHealth(Base):
+    def test_disabled_crosscheck_leaves_one_visible_trace(self):
+        self.bind("session_w1")
+        engine = self.engine()
+        engine.archived_crosscheck = False
+        engine.run_once()
+        rows = [json.loads(x) for x in
+                (self.state / "events.jsonl").read_text("utf-8").splitlines()]
+        off = [r for r in rows if r["type"] == "engine.crosscheck_disabled"]
+        self.assertEqual(len(off), 1, rows)
+        self.assertEqual(off[0]["sid"], "session_w1")
+
+        # Once per engine, not once per sid or per round: a second round keeps
+        # the single trace instead of flooding the stream.
+        engine.run_once()
+        rows = [json.loads(x) for x in
+                (self.state / "events.jsonl").read_text("utf-8").splitlines()]
+        self.assertEqual(len([r for r in rows
+                              if r["type"] == "engine.crosscheck_disabled"]), 1)
+
+        # The default stays on, and an engine with it on writes no such event.
+        on = self.engine()
+        self.assertTrue(on.archived_crosscheck)
+        on.run_once()
+        rows = [json.loads(x) for x in
+                (self.state / "events.jsonl").read_text("utf-8").splitlines()]
+        self.assertEqual(len([r for r in rows
+                              if r["type"] == "engine.crosscheck_disabled"]), 1)
+
     def test_active_assignments_counts_only_live_ones(self):
         self.bind("session_w1")
         engine = self.engine()

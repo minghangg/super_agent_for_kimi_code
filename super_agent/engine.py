@@ -85,6 +85,9 @@ class Engine:
         # sid -> archived, asked from the server once per round (see
         # ``_live_archived``); reset at the start of every round.
         self._live_check: dict[str, bool] = {}
+        # Set the first time the cross-check being off changes an answer (see
+        # ``_live_archived``): "off" is otherwise invisible in the event stream.
+        self._crosscheck_off_logged = False
 
     # ------------------------------------------------------------ allowlist
     def allowlist_allows(self, issue: int | None, action: str | None) -> tuple[bool, str]:
@@ -473,7 +476,17 @@ class Engine:
         """
         if not self.archived_crosscheck:
             # Stream-only mode: no server call, so ``False`` means "the stream
-            # has no archive event", not "the session is live".
+            # has no archive event", not "the session is live". That answer is
+            # silently optimistic, so leave one trace the first time it is
+            # given: otherwise a production config that turned the check off
+            # looks exactly like a healthy stream.
+            if not self._crosscheck_off_logged:
+                self._crosscheck_off_logged = True
+                self.store.log_event({
+                    "type": "engine.crosscheck_disabled", "at": _now(), "sid": sid,
+                    "detail": "engine.archived_crosscheck is off: an archived sid "
+                              "that wrote no session.archived row is treated as live",
+                })
             return False
         cache = self._live_check
         if sid in cache:
