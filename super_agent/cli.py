@@ -27,6 +27,7 @@ from pathlib import Path
 from . import brief as brief_mod
 from . import config as config_mod
 from . import session_events
+from . import assignments as asg_mod
 from .bus_client import BusClient
 from .github_source import FixtureSource, LiveSource
 from .engine import build_engine
@@ -36,6 +37,7 @@ from .store import Store
 
 NONE_TEXT = "无"
 DEFAULT_MAX_FAILURES = 10
+SESSION_APIS = ("real", "none")
 _WAIT_SLICE = 0.2
 
 
@@ -86,9 +88,37 @@ def _build(args) -> tuple[dict, Store]:
     return cfg, store
 
 
-def _engine(cfg: dict, store: Store, bus=None, *, source=None):
+def _engine(cfg: dict, store: Store, bus=None, *, source=None,
+            session_api=None):
     """``build_engine``: the project allowlist is built from the config path."""
-    return build_engine(cfg, store, bus, source=source)
+    engine = build_engine(cfg, store, bus, source=source)
+    if session_api is not None:
+        engine.session_api = session_api
+    return engine
+
+
+def _session_api(choice: str | None):
+    """``--session-api``: ``real`` (the default) or ``none``.
+
+    Production is always ``real``: the archive read-back and the archived-sid
+    guard both need the server, and ``none`` would make every sid look live
+    (``archived_crosscheck`` would fail closed instead). The switch exists for
+    isolated replays and tests that must not touch the workbench.
+    """
+    if str(choice or "real").lower() in ("none", "off", "no"):
+        return _NoSessionApi()
+    from . import api
+    return api
+
+
+class _NoSessionApi:
+    """Every call fails loudly; a caller that needs an answer gets "unknown"."""
+
+    def archive_session(self, sid):
+        raise RuntimeError("--session-api none: no session console in this run")
+
+    def session_info(self, sid):
+        raise RuntimeError("--session-api none: no session console in this run")
 
 
 def _bus(cfg: dict) -> BusClient:
@@ -121,7 +151,8 @@ def _recovery_refusal(result: dict) -> int:
 
 def cmd_once(args) -> int:
     cfg, store = _build(args)
-    engine = _engine(cfg, store, _bus(cfg))
+    engine = _engine(cfg, store, _bus(cfg),
+                      session_api=_session_api(getattr(args, "session_api", None)))
     try:
         with PidLock(store.pid_path, argv=["super_agent", "once"]):
             recovery = _recover(engine)
@@ -281,7 +312,8 @@ def run_loop(engine, store: Store, *, interval: float = 60.0,
 
 def cmd_run(args) -> int:
     cfg, store = _build(args)
-    engine = _engine(cfg, store, _bus(cfg))
+    engine = _engine(cfg, store, _bus(cfg),
+                      session_api=_session_api(getattr(args, "session_api", None)))
     interval = args.interval
     if interval is None:
         interval = float((cfg.get("github") or {}).get("poll_interval_s") or 60)
@@ -315,7 +347,8 @@ def cmd_run(args) -> int:
 
 def cmd_status(args) -> int:
     cfg, store = _build(args)
-    engine = _engine(cfg, store, _bus(cfg), source=NullSource())
+    engine = _engine(cfg, store, _bus(cfg), source=NullSource(),
+                      session_api=_session_api(getattr(args, "session_api", None)))
     # --outbox 只加东西，不改变默认输出；brief 的「取回」命令靠它才真的取得到
     report = engine.status(outbox=bool(getattr(args, "outbox", False)))
     print(f"status  role={engine.role} mode={report['mode']} "
@@ -335,7 +368,8 @@ def cmd_status(args) -> int:
 
 def cmd_doctor(args) -> int:
     cfg, store = _build(args)
-    engine = _engine(cfg, store, _bus(cfg))
+    engine = _engine(cfg, store, _bus(cfg),
+                      session_api=_session_api(getattr(args, "session_api", None)))
     report = engine.doctor()
     worst = "ok"
     width = max((len(c["name"]) for c in report["checks"]), default=4)
@@ -355,9 +389,37 @@ def cmd_doctor(args) -> int:
     return 0 if worst != "fail" else 1
 
 
+def cmd_unblock(args) -> int:
+    """``blocked -> working`` for one assignment, with the reason recorded.
+
+    The engine has no path out of ``blocked`` other than a newer delivery, so a
+    person needs an explicit command: it writes ``unblocked_at`` and keeps the
+    tombstone (the next failure needs it to bump the attempt counter).
+    """
+    cfg, store = _build(args)
+    index = store.load_index()
+    rec = (index.get("assignments") or {}).get(args.id)
+    if not isinstance(rec, dict):
+        print(f"unblock: no assignment {args.id}", file=sys.stderr)
+        return 1
+    moved = asg_mod.unblock(rec, args.reason or "")
+    if not moved.get("changed"):
+        print(f"unblock: {args.id} is {rec.get('status')} ({moved.get('reason')})",
+              file=sys.stderr)
+        return 1
+    store.save_index(index)
+    store.log_event({"type": "assignment.unblocked", "at": _now(),
+                     "assignment": args.id, "thread": rec.get("thread"),
+                     "reason": args.reason or ""})
+    print(f"unblocked {args.id} ({rec.get('thread')}) -> working; "
+          f"tombstone attempt={int((rec.get('tombstone') or {}).get('attempt') or 0)}")
+    return 0
+
+
 def cmd_replay(args) -> int:
     cfg, store = _build(args)
-    engine = build_engine(cfg, store, _bus(cfg))
+    engine = _engine(cfg, store, _bus(cfg),
+                     session_api=_session_api(getattr(args, "session_api", None)))
     at = getattr(args, "at", None)
     if at or getattr(args, "sessions", False):
         return _cmd_replay_sessions(engine, args)
@@ -409,7 +471,8 @@ def cmd_reconcile(args) -> int:
     source exits 2 (it must never look like agreement).
     """
     cfg, store = _build(args)
-    engine = _engine(cfg, store, _bus(cfg), source=NullSource())
+    engine = _engine(cfg, store, _bus(cfg), source=NullSource(),
+                      session_api=_session_api(getattr(args, "session_api", None)))
     server_sids = None
     if not args.no_server:
         try:
@@ -566,6 +629,9 @@ def _add_common(parser: argparse.ArgumentParser, *, suppress: bool) -> None:
                         help="project/issue/action allowlist JSON "
                              "(default: engine.project_allowlist, else "
                              "config/allowlist.json)")
+    parser.add_argument("--session-api", choices=list(SESSION_APIS), default=default,
+                        help="session console: real (default, production) or "
+                             "none (isolated runs; every call raises)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -600,6 +666,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_doctor = sub.add_parser("doctor", help="check bus, source, cursor, assignments")
     _add_common(p_doctor, suppress=True)
     p_doctor.set_defaults(func=cmd_doctor)
+
+    p_unblock = sub.add_parser("unblock", help="move one blocked assignment back to working")
+    _add_common(p_unblock, suppress=True)
+    p_unblock.add_argument("--id", required=True,
+                           help="assignment id (asg_<issue>_<role>_<n>)")
+    p_unblock.add_argument("--reason", default="",
+                           help="why the block is over (recorded in the event)")
+    p_unblock.set_defaults(func=cmd_unblock)
 
     p_replay = sub.add_parser("replay", help="rebuild one issue's index entry")
     _add_common(p_replay, suppress=True)
@@ -651,15 +725,16 @@ def build_parser() -> argparse.ArgumentParser:
                        help="per-comment clip (default 120)")
     p_ctx.set_defaults(func=cmd_context)
 
-    for sub_parser in (p_once, p_run, p_status, p_doctor, p_replay, p_rec,
-                       p_brief, p_ctx):
+    for sub_parser in (p_once, p_run, p_status, p_doctor, p_unblock, p_replay,
+                       p_rec, p_brief, p_ctx):
         sub_parser.set_defaults(_has_common=True)
 
     return parser
 
 
 def _ensure_common_defaults(args) -> None:
-    for name in ("config", "state_dir", "mode", "role", "source", "allowlist"):
+    for name in ("config", "state_dir", "mode", "role", "source", "allowlist",
+                 "session_api"):
         if not hasattr(args, name):
             setattr(args, name, None)
 

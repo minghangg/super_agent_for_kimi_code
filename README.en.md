@@ -66,7 +66,7 @@ Four steps, each reversible:
 
 1. **Fix the role boundaries and the memory baseline first.** The supervisor is not a PM; a PM does not share the supervisor's global authority; the engine holds no production privilege. At the same time, freeze the "minimum memory pack" output contract: fixed sections, a byte ceiling, and when over budget, keep pending-arbitration and pending-user items first — and **always report how many items were omitted**. This is a lossy but traceable summary; it does not pretend to be lossless.
 2. **Close the loop on one project.** One Issue, from event to dispatch to delivery to archive, fully reconstructible. If any step is interrupted, a restart completes only the unfinished step and repeats no external action.
-3. **Wire in QA and close-out.** QA returns to the original worker; a pass moves to waiting-release; after close-out, verify archive consistency — and if it does not match, stop at "pending reconciliation" rather than pretend success.
+3. **Wire in QA and close-out.** QA returns to the original worker; a pass moves to waiting-release; after close-out, verify archive consistency — and if it does not match, stop at "pending reconciliation" rather than pretend success. **The engine never closes an Issue:** whether an Issue is closed is the supervisor's decision on GitHub, and the engine only reads `issue_state()` to check it. `completed` is written only when four conditions hold in two consecutive rounds.
 4. **Only then talk about automation.** Observe by default. Internal actions such as automatic recycling and automatic wake-up open only after proven stable. Real session creation (auto-creating a worker session) must be a **narrow authorization: explicitly pre-approved, fixed profile, switchable off** — and it never includes release, close-out, production writes or privilege expansion.
 
 One rule throughout: **for any external action you are unsure about, verify first; never blindly replay.**
@@ -81,7 +81,7 @@ One rule throughout: **for any external action you are unsure about, verify firs
 |---|---|
 | **First stage** | Role boundaries, memory baseline, read-only skeleton. Event collection watches without acting; briefs can be generated, the index rebuilt, **external actions stay at exactly 0** |
 | **Second stage** | Single-project loop plus memory recovery. Thread/Assignment model, deterministic fast path, thin dispatch adapter; pending-item recovery after simulated rotation is 100% |
-| **Third stage** | QA loop and close-out reconciliation. Return to the original worker, pass to waiting-release, verify consistency after close-out |
+| **Third stage** | QA loop and close-out reconciliation. Return to the original worker, pass to waiting-release, verify consistency after close-out; the engine checks the close-out but never performs it |
 | **Fourth stage** | Multi-project expansion and watchdog replacement. One project at a time, observe by default; disable the old mechanism only when duplicate actions, session leaks and false alarms are all 0 |
 | **Fifth stage** | Limited autonomous work. Opened step by step: observe → assist → a small amount of pre-approved auto, with a one-switch return to observe |
 
@@ -117,7 +117,7 @@ To see real data, set `github.source` to `fixture` (local JSON) or `live` (read-
 | `super_agent/dispatch_adapter.py` | Structured dispatch interface: returns dicts, parses only `--json`, never reads human text |
 | `super_agent/session_events.py` | **Read-only** view of the workbench's session lifecycle: `replay(events, at)` reconstructs `sid → (role, issue, assignment, profile)` at a moment, `reconcile()` does the three-way check |
 | `super_agent/engine.py` | Deterministic Fast Path: dedupe / allowlist / cooling / state machine; **no LLM** |
-| `super_agent/cli.py` | `run` / `once` / `status` / `doctor` / `replay` / `reconcile` |
+| `super_agent/cli.py` | `run` / `once` / `status` / `doctor` / `unblock` / `replay` / `reconcile` |
 
 ### Two allowlists, two different questions
 
@@ -191,6 +191,14 @@ super_agent/store.py:log_event() ─→ state/events.jsonl   the engine's own ru
 **Archiving is the one thing this stream cannot be trusted for.** `POST /api/v2/sessions:archive` runs server-side and writes **no** `session.archived` row — that event is written only by the workbench's own `tools/sess_events.py:emit`. So `archived=false` in the stream means "nobody emitted an archive", not "the session is live". A stream-only view keeps an archived worker as a live binding, and the next round forks `asg_<issue>_<role>_2` on the same sid, so the thread never reaches a terminal state.
 
 `_sync_assignments` therefore asks `session_info(sid)["archived"]` again for the **candidate** sids (not archived in the stream, role worker/qa, issue matches), drops the confirmed ones and logs `assignment.archived_offstream`. Two cost limits apply: candidates only, and at most one server question per sid per round (`_live_check`, cleared at the start of `run_round`). An unreachable server counts as archived (**fail closed**, no dispatch) and logs `assignment.archived_unreachable`. `engine.archived_crosscheck` (default `true`) turns the server question off and falls back to stream-only semantics — used by tests that inject no `session_api` and must stay offline.
+
+**`--session-api real|none`** (default `real`; **production is always `real`**): with `none` the engine gets no session console, every call raises, and both the archive read-back and the archived-sid guard fail closed. It exists for isolated replays and tests — do not set it on a resident production process.
+
+**`engine.max_closed_thread_checks`** (default 10, positive integer): how many held threads one round checks. The key is registered in both `DEFAULTS` and `validate` in `config.py` — an unknown key written only into JSON is silently ignored.
+
+**Close reconciliation, and "the engine never closes an Issue":** every round checks four conditions for threads in `waiting_release`/`close_reconcile` — the Issue is `closed`, the binding is cleared, every sid is archived, no task is running. `completed` is written only when all four hold in **two consecutive rounds**, and the second must be a later `run_round`; any failure demotes a release to `close_reconcile` and resets the streak, never to `completed`. The engine only reads `issue_state()` and **never PATCHes `state=closed`**.
+
+A `blocked` assignment without an automatic exit is released by a person: `python -m super_agent.cli unblock --id asg_1_worker_1 --reason "..."`.
 
 Session truth reconciliation (a non-empty three-way difference is rc=1; a missing third source is rc=2, **never treated as agreement**):
 

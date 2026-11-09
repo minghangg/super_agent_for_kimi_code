@@ -66,7 +66,7 @@
 
 1. **先把角色边界和记忆基线定下来。** supervisor 不做 PM，PM 不共享 supervisor 的全局授权，引擎不持有任何生产权限。同时把"最小记忆包"的输出契约定死：固定小节、有字节上限、超限时优先保留待裁决与待用户的事项，且**必须报告被省略了多少项**——这是有损但可回溯的摘要，不假装无损。
 2. **单项目跑通闭环。** 一张 Issue 从事件到派单到交付到归档，全程可复原。中间任意一步被打断，重启后只补没做完的那一步，不重复外部动作。
-3. **把 QA 与关单接进来。** QA 退回原 worker、通过则进入待发布；关单后核对归档状态一致，不一致就停在"待对账"而不是假装成功。
+3. **把 QA 与关单接进来。** QA 退回原 worker、通过则进入待发布；关单后核对归档状态一致，不一致就停在"待对账"而不是假装成功。**引擎永不关单**：Issue 是否 closed 由人（supervisor）在 GitHub 上决定，引擎只读 `issue_state()` 核对；四条件连续两轮成立才写 `completed`。
 4. **再谈自动化。** 默认只观察；确认稳定后才开放"自动回收、自动唤醒"这类内部动作；真正的代建（自动创建 worker 会话）必须是**经过显式预批、限定画像、可一键关闭**的窄授权，且永远不包括发布、关单、生产写、扩大权限。
 
 贯穿始终的一条：**没有把握的外部动作，先查证再执行，不重放。**
@@ -81,7 +81,7 @@
 |---|---|
 | **第一阶段** | 角色边界、记忆基线、只读骨架。事件采集只看不动，能生成 brief、能重建索引，**外部动作数恒为 0** |
 | **第二阶段** | 单项目闭环 + 记忆恢复。Thread/Assignment 模型、确定性快速通道、薄派单适配层；模拟换血后未决事项恢复率 100% |
-| **第三阶段** | QA 闭环与关单对账。退回原 worker、通过进待发布、关单后核对一致 |
+| **第三阶段** | QA 闭环与关单对账。退回原 worker、通过进待发布（`waiting_release`）、关单后核对一致；引擎只核对、不关单 |
 | **第四阶段** | 多项目扩展与看门狗替换。一次只加一个项目，默认观察；重复动作、会话泄漏、误报均为 0 才停用旧机制 |
 | **第五阶段** | 有限主动工作。按"观察 → 辅助 → 预批后的少量自动"逐级开放，一键可退回观察态 |
 
@@ -119,8 +119,8 @@ python -m unittest discover -s tests -v                # L1 测试（含各条�
 | `super_agent/engine.py` | 确定性 Fast Path：去重／允许清单／冷却／状态机；**不接 LLM** |
 | `super_agent/issuekey.py` | 线程主键 `owner/repo#N`；旧数字键只读兼容（新键优先、迁移幂等） |
 | `super_agent/markers.py` | 只解析**第一条非空行**的 `[WK:<name>]` 交付标记 |
-| `super_agent/assignments.py` | Thread × Assignment 状态机：`queued→working→waiting_review→completed`，交付归属与一次性通知 |
-| `super_agent/cli.py` | `run` / `once` / `status` / `doctor` / `replay` / `reconcile` |
+| `super_agent/assignments.py` | Thread × Assignment 状态机：`queued→working→waiting_review→waiting_release→completed`（另有 `close_reconcile`／`blocked`／`waiting_person`），交付归属与一次性通知 |
+| `super_agent/cli.py` | `run` / `once` / `status` / `doctor` / `unblock` / `replay` / `reconcile` |
 
 ### 两个 allowlist 不是一回事
 
@@ -231,6 +231,20 @@ super_agent/store.py:log_event() ─→ state/events.jsonl   引擎自己的运�
 服务端不可达时按 **fail-closed** 当作已归档、不派单，并写 `assignment.archived_unreachable`。
 `engine.archived_crosscheck`（默认 `true`）可关掉这次服务端查询，退回纯流语义——测试里
 没注入 `session_api` 又不想联网时用它。
+
+**`--session-api real|none`**（默认 `real`，**生产恒为 real**）：`none` 时引擎拿不到会话控制台，
+每次调用都抛错，归档回读与已归档 sid 守卫都会按 fail-closed 处理。它只用于隔离复现与测试，
+不要在生产常驻进程上设 `none`。
+
+**`engine.max_closed_thread_checks`**（默认 10，正整数）：一轮最多核对多少个「待关单」线程。
+该键同时登记在 `config.py` 的 `DEFAULTS` 与 `validate` 里——只写 JSON 不校验的未知键会静默无效。
+
+**关单对账与「引擎永不关单」**：`waiting_release`／`close_reconcile` 的线程每轮被核对四条件
+（Issue 已 `closed`、绑定已清、sid 已归档、无运行中任务），**连续两轮**成立才写 `completed`；
+第二轮必须是下一次 `run_round`。任何一条不成立就把 `waiting_release` 降为 `close_reconcile`
+并清零连续计数，绝不写 `completed`。引擎只读 `issue_state()`，**从不 PATCH `state=closed`**。
+
+`blocked` 没有自动出口时用人：`python -m super_agent.cli unblock --id asg_1_worker_1 --reason "..."`。
 
 会话真相对账（三方差集非空即 rc=1；第三个源缺失则 rc=2，**绝不当作一致**）：
 
