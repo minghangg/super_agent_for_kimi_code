@@ -6,6 +6,28 @@ stream, so the path is always passed through ``engine.session_events_path``.
 No network, no session service, no change to the live workbench state.
 
     python tools/verify_counterexamples.py
+
+Semantics this file asserts (read this before trusting a green run)
+--------------------------------------------------------------------
+``verify-semantics: 2``  -  the assignment lifecycle of milestone 2.
+``follows: milestone 2`` -  ``70a2a48`` (archive stops at ``waiting_release``)
+                             and ``b80e991`` (a thread-level ``completed``
+                             follows the result).
+``synced-at: d4a573f``  -  the commit that re-read the semantics: example 5
+                             moved from ``completed`` to ``waiting_release``.
+``collected-by: tests/test_verify_scripts.py``.
+
+The one assertion that moved: example 5 used to require ``completed`` after a
+successful archive. Since milestone 2 C4 that is wrong - an archive proves the
+worker is done, not that the Issue is closed, so the record stops at
+``waiting_release`` and only the close reconciliation (four conditions, two
+rounds) writes ``completed``. Example 5 now pins ``waiting_release``,
+``archived_at`` and the archive read-back.
+
+**A milestone change must update the assertions in this file.** When a
+milestone moves a transition, a green ``pytest`` that never runs this script is
+not evidence: adjust the assertion, bump ``verify-semantics``, and move
+``follows`` and ``synced-at`` with it.
 """
 
 from __future__ import annotations
@@ -243,7 +265,8 @@ def example_5():
     src = Comments([
         {"id": 9005, "issue": 1, "body": "[WK:wk-probe-1] done",
          "author": "worker", "created_at": ""},
-        # The archive pass sits behind ``assignments.qa_gate`` since M2 C4: a
+        # The archive pass sits behind ``assignments.qa_gate`` since milestone 2
+        # C4: a
         # delivery without a ``pass`` verdict is refused and archived never
         # happens. The example is about the archive, so it feeds the verdict.
         {"id": 9100, "issue": 1, "body": "[QA] **通过**",
@@ -262,7 +285,7 @@ def example_5():
     info = sessions.session_info("session_w1")
     # This half proves the *bookkeeping*: the archive was called once, the
     # read-back was consulted, and the record claims ``waiting_release`` because
-    # the read-back said archived. Since M2 C4 (70a2a48) a successful archive
+    # the read-back said archived. Since milestone 2 C4 (70a2a48) an archive
     # stops at ``waiting_release`` - ``completed`` is written only by the close
     # reconciliation two rounds later, never here. What this half cannot prove is
     # that the real server agrees - the injected fake answers by construction.
