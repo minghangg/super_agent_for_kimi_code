@@ -5,6 +5,26 @@ triage with fixed rules -> update the local index -> *maybe* dispatch one
 action. Dispatch is the single guarded exit: everything it can do is counted
 in ``external_actions``, and while ``dispatch_enabled`` is False it does
 nothing at all.
+
+Routing a ``[QA]`` verdict::
+
+    comment c on thread T
+    | first line [WK:name]  -> delivery (matches the worker's assignment)
+    | first line [QA]       -> ALWAYS event.agent.project_pm, never a worker
+    | first line [PM]/[supervisor] -> audit only
+    + ordinary comment
+       | waiting_review and a qa session is known -> send to qa
+       | waiting_release / close_reconcile       -> audit only
+       | the thread belongs to a project         -> project_pm (slow path)
+       + cross-project or unlisted               -> needs_person
+
+``_dispatch`` refuses ``origin_role=qa`` with ``target_role=worker`` outright.
+That gate covers **route decisions the engine makes itself**. It does not cover
+a process that calls the session API on its own (``sess.py``, ``direct.send``),
+a workbench script writing a comment, or ``_archive_one``, which runs after the
+decision was made. Guarding the engine's decisions is not the same as
+guarding authority - the boundary is stated here so nobody reads the gate as
+more than it is.
 """
 from __future__ import annotations
 
@@ -161,24 +181,246 @@ class Engine:
         1. a delivery marker on the first line wins over everything - a worker
            whose role is configured would otherwise have its own delivery
            ignored as role-authored noise;
-        2. role-authored noise is ignored;
-        3. escalation markers ask for a person;
-        4. everything else is logged (the historical behaviour, unchanged).
+        2. a ``[QA]`` review is the second marker: its verdict is a transition,
+           not discussion, and it must be read before role noise too;
+        3. role-authored noise is ignored;
+        4. escalation markers ask for a person;
+        5. everything else is logged (the historical behaviour, unchanged).
 
-        ``parse_delivery`` only reads the first non-empty line, so a comment
-        that quotes a delivery in its body stays ordinary discussion.
+        ``parse_delivery`` and ``parse_review`` only read the first non-empty
+        line, so a comment that quotes a delivery or a verdict in its body stays
+        ordinary discussion.
         """
-        delivery = markers.parse_delivery(str(comment.get("body") or ""))
+        body = str(comment.get("body") or "")
+        delivery = markers.parse_delivery(body)
         if delivery:
             return "delivery", f"marker {delivery['name']!r}"
+        review = markers.parse_review(body)
+        if review:
+            return "review", f"qa verdict {review['verdict'] or 'unreadable'!r}"
         author = str(comment.get("author") or "").strip().lower()
         if self.role and author == self.role.lower():
             return "ignored", "authored by configured role"
-        body = str(comment.get("body") or "").lower()
+        lowered = body.lower()
         for marker in self.markers:
-            if marker and marker in body:
+            if marker and marker in lowered:
                 return "needs_person", f"marker {marker!r}"
         return "logged", ""
+
+    # ------------------------------------------------------------ qa routing
+    def _qa_session_keys(self, thread: str) -> set[str]:
+        """Session keys that count as *this thread's* QA.
+
+        Two sources, unioned so a rotation does not lose the check:
+
+        * the ``qa`` entry of ``issue_sessions.json[thread]`` (``name`` and
+          ``session``);
+        * every ``qa-*`` key in ``sessions.json`` - the one-shot naming rule.
+
+        The verdict's author login cannot be used: every role shares one token,
+        so the login is the same for a rejection and for a forgery. This is a
+        weak check and it is treated as one: a miss downgrades the verdict, it
+        never blocks it.
+        """
+        keys: set[str] = set()
+        ledger = self._load_issue_sessions().get(thread) or {}
+        if isinstance(ledger, dict):
+            for role, entry in ledger.items():
+                if str(role).lower() != "qa" or not isinstance(entry, dict):
+                    continue
+                for field in ("name", "session"):
+                    value = str(entry.get(field) or "")
+                    if value:
+                        keys.add(value)
+        try:
+            path = self._session_stream()[1]
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        if isinstance(data, dict):
+            keys.update(str(k) for k in data if str(k).startswith("qa"))
+        return keys
+
+    def _review_verified(self, thread: str, comment: dict) -> bool:
+        """Does this comment come from a QA key of this thread?
+
+        A comment that names its session (``session_key``) is checked against
+        the whitelist exactly. Without that field the answer is "the thread has
+        a QA registered at all", which is the strongest statement the shared
+        login allows - and it is logged as unverified when it is false.
+        """
+        keys = self._qa_session_keys(thread)
+        claimed = str(comment.get("session_key") or "")
+        if claimed:
+            return claimed in keys
+        return bool(keys)
+
+    def _pm_target(self, thread: str, issue: int) -> dict:
+        """Where a verdict goes: the project's PM, never a worker."""
+        ledger = self._load_issue_sessions().get(thread) or {}
+        pm_sid = ""
+        if isinstance(ledger, dict):
+            entry = ledger.get("pm")
+            if isinstance(entry, dict):
+                pm_sid = str(entry.get("session") or "")
+        project = self._project_for(issue) or ""
+        return {"project": project, "pm_sid": pm_sid, "target_role": "pm"}
+
+    def _review_target(self, index: dict, thread: str) -> dict | None:
+        """The worker assignment a verdict on ``thread`` applies to.
+
+        A verdict judges a **delivery**, so an assignment that never recorded
+        one is not a candidate: without a delivery there is nothing to accept or
+        send back, and moving it would invent state out of a stray comment. The
+        newest delivery wins - an older assignment on the same thread is stale.
+        """
+        candidates = [rec for rec in (index.get("assignments") or {}).values()
+                      if str(rec.get("thread") or "") == thread
+                      and str(rec.get("role") or "") == "worker"
+                      and rec.get("delivery_comment_id") is not None
+                      and str(rec.get("status") or "") in
+                      ("working", "waiting_review", "blocked")]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda r: int(r.get("delivery_comment_id") or 0))
+
+    def _route_action(self, thread: str, issue: int, cid, payload: dict,
+                      event: str, *, target_role: str, origin_role: str,
+                      assignment_id: str) -> dict:
+        """A dispatch record whose id is the route key, not a hash.
+
+        ``_dispatch`` derives the action id from ``assignment + verb +
+        input_ref``; naming the route as the "assignment" keeps the route's
+        attempt counter findable from ``index["routes"]``.
+        """
+        return {"kind": "bus_inject", "event": event, "issue": issue,
+                "thread": thread, "input_ref": str(cid),
+                "assignment_id": assignment_id,
+                "origin_role": origin_role, "target_role": target_role,
+                "payload": payload}
+
+    def _route_review(self, index: dict, thread: str, issue: int, comment: dict,
+                      review: dict, *, log_unverified: bool = True) -> dict:
+        """Send one verdict to the project PM and record the attempt.
+
+        The route record lives in ``index["routes"]`` keyed by thread and
+        comment, so a refused or suppressed dispatch can be retried next round
+        under the **same** action id - at-most-once is the attempt counter, not
+        the record's presence.
+        """
+        cid = int(comment["id"])
+        key = f"route:{thread}:{cid}"
+        target = self._pm_target(thread, issue)
+        verified = self._review_verified(thread, comment)
+        if not verified and log_unverified:
+            # Doctor is the only consumer on purpose: a key miss is a warning
+            # to look at, not a reason to wake the PM twice for one verdict.
+            self.store.log_event({
+                "type": "review.unverified", "at": _now(), "thread": thread,
+                "comment_id": cid, "level": "warn", "consumers": ["doctor"],
+                "detail": "the verdict did not name a qa session key of this thread",
+            })
+        payload = {"thread": thread, "issue": int(issue),
+                   "review_comment_id": cid,
+                   "verdict": str(review.get("verdict") or ""),
+                   "project": target["project"], "pm_sid": target["pm_sid"],
+                   "unverified": not verified}
+        base = action_id(key, "bus_inject", str(cid))
+        routes = index.setdefault("routes", {})
+        if routes is None or not isinstance(routes, dict):
+            routes = index["routes"] = {}
+        if key not in routes:
+            routes[key] = {"thread": thread, "comment_id": cid, "at": _now(),
+                           "verdict": payload["verdict"], "ok": None,
+                           "action_id": base}
+        route = routes[key]
+        if self.store.action_attempted(base) > 0:
+            return {"dispatched": False, "reason": "already attempted",
+                    "action_id": base}
+        result = self._dispatch(self._route_action(
+            thread, issue, cid, payload, "event.agent.project_pm",
+            target_role=target["target_role"], origin_role=markers.QA.lower(),
+            assignment_id=key))
+        route["ok"] = bool(result.get("ok")) if result.get("dispatched") else False
+        route["refused"] = bool(result.get("refused"))
+        route["action_id"] = result.get("action_id") or base
+        self.store.log_event({
+            "type": "route.decided", "at": _now(), "thread": thread,
+            "comment_id": cid, "to": "project_pm", "project": target["project"],
+            "verdict": payload["verdict"],
+            "dispatched": bool(result.get("dispatched")),
+            "refused": bool(result.get("refused")),
+            "reason": result.get("reason") or "",
+        })
+        if not result.get("dispatched"):
+            numbers = index.setdefault("issues", {}).setdefault(
+                thread, {"state": "idle", "comments_seen": 0, "needs_person": []})
+            numbers.setdefault("needs_person", []).append({
+                "comment_id": cid, "reason": "route.undeliverable", "at": _now()})
+            self.store.log_event({
+                "type": "route.undeliverable", "at": _now(), "thread": thread,
+                "comment_id": cid, "reason": result.get("reason") or "",
+            })
+        return result
+
+    def _on_review(self, index: dict, thread: str, issue: int, comment: dict,
+                   review: dict, summary: dict) -> str:
+        """Apply a verdict, then route it. Returns the triage state."""
+        cid = int(comment["id"])
+        assignment = self._review_target(index, thread)
+        if assignment is None:
+            self.store.log_event({"type": "review.unmatched", "at": _now(),
+                                  "thread": thread, "comment_id": cid,
+                                  "reason": "no active worker assignment"})
+            return "needs_person", "review without an active assignment"
+        verified = self._review_verified(thread, comment)
+        moved = asg_mod.on_review(assignment, review, review_cid=cid,
+                                  verified=verified)
+        if moved["changed"]:
+            self.store.log_event({
+                "type": "assignment.qa_review", "at": _now(),
+                "assignment": assignment["id"], "thread": thread,
+                "comment_id": cid, "status": moved.get("status"),
+                "verdict": str(review.get("verdict") or ""),
+                "verified": verified,
+            })
+        elif moved.get("reason") == "review.stale":
+            self.store.log_event({"type": "review.stale", "at": _now(),
+                                  "assignment": assignment["id"],
+                                  "thread": thread, "comment_id": cid})
+        self._route_review(index, thread, issue, comment, review)
+        return "review", ""
+
+    def _retry_routes(self, index: dict) -> int:
+        """Re-send verdicts a refused/suppressed dispatch never delivered.
+
+        Same rule as the notification retry: an attempt that exists (success or
+        ``uncertain``) is never repeated, a refusal writes no attempt so the
+        next round may try again.
+        """
+        sent = 0
+        for key, route in sorted((index.get("routes") or {}).items()):
+            if route.get("ok"):
+                continue
+            base = str(route.get("action_id") or "")
+            if base and self.store.action_attempted(base) > 0:
+                continue
+            cid = route.get("comment_id")
+            thread = str(route.get("thread") or "")
+            issue = None
+            for rec in (index.get("assignments") or {}).values():
+                if str(rec.get("thread") or "") == thread:
+                    issue = rec.get("issue")
+                    break
+            if issue is None:
+                continue
+            review = {"verdict": str(route.get("verdict") or "")}
+            result = self._route_review(index, thread, int(issue),
+                                        {"id": cid, "body": "", "author": ""},
+                                        review, log_unverified=False)
+            if result.get("dispatched"):
+                sent += 1
+        return sent
 
     # --------------------------------------------------------------- dispatch
     def _dispatch(self, action: dict, *, reuse_action_id: str | None = None) -> dict:
@@ -196,6 +438,21 @@ class Engine:
         ``reuse_action_id`` replays an existing ``prepared`` record (startup
         recovery) instead of opening a new attempt.
         """
+        # A verdict never goes to the worker it judges. This covers only the
+        # engine's own routing path (``_dispatch``); a process that talks to the
+        # session API directly is outside this gate - see the module docstring
+        # and the ``_archive_one`` note below.
+        origin = str(action.get("origin_role") or "")
+        target = str(action.get("target_role") or "")
+        if origin == markers.QA.lower() and target == "worker":
+            self.store.log_event({
+                "type": "route.refused", "at": _now(), "action": action.get("kind"),
+                "issue": action.get("issue"), "thread": action.get("thread"),
+                "origin_role": origin, "target_role": target,
+                "reason": "a qa verdict is never dispatched to a worker",
+            })
+            return {"dispatched": False, "refused": True,
+                    "reason": "qa verdict routed to a worker"}
         if not self.dispatch_enabled:
             self.store.log_event({
                 "type": "dispatch.suppressed", "at": _now(),
@@ -851,6 +1108,7 @@ class Engine:
                                       "error": f"{type(exc).__name__}: {exc}"})
 
         summary["notifications_retried"] = self._retry_waiting_review(index)
+        self._retry_routes(index)
         # Archive last: a review that arrived this round is archived this
         # round, and the archived-sid guard applies from the next dispatch on.
         self._archived_cache = None
@@ -920,6 +1178,7 @@ class Engine:
             seen_this_round.add(cid)
             state, reason = self._triage(comment)
             delivery = markers.parse_delivery(str(comment.get("body") or ""))
+            review = markers.parse_review(str(comment.get("body") or ""))
             summary["processed"] += 1
             rec["comments_seen"] = int(rec.get("comments_seen") or 0) + 1
             rec["last_comment_id"] = cid
@@ -933,6 +1192,14 @@ class Engine:
                 summary["deliveries"] += 1
                 if state != "needs_person":
                     summary["processed"] += 0
+                    if rec.get("state") == "idle":
+                        rec["state"] = "tracked"
+                    continue
+            if state == "review":
+                state, reason = self._on_review(index, key, issue, comment,
+                                                review, summary)
+                summary["reviews"] = int(summary.get("reviews") or 0) + 1
+                if state != "needs_person":
                     if rec.get("state") == "idle":
                         rec["state"] = "tracked"
                     continue
