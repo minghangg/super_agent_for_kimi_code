@@ -240,21 +240,39 @@ def example_4():
 def example_5():
     tmp, events, allow = scenario()
     bind(events)
-    src = Comments([{"id": 9005, "issue": 1, "body": "[WK:wk-probe-1] done",
-                     "author": "worker", "created_at": ""}])
+    src = Comments([
+        {"id": 9005, "issue": 1, "body": "[WK:wk-probe-1] done",
+         "author": "worker", "created_at": ""},
+        # The archive pass sits behind ``assignments.qa_gate`` since M2 C4: a
+        # delivery without a ``pass`` verdict is refused and archived never
+        # happens. The example is about the archive, so it feeds the verdict.
+        {"id": 9100, "issue": 1, "body": "[QA] **通过**",
+         "author": "qa", "created_at": ""},
+    ])
     sessions = FakeSessions()
     eng = engine(tmp, events, allow, src, FakeBus(), sessions)
+    # The round must end where the archive ends, at ``waiting_release``: the
+    # close reconciliation needs a provable Issue state, which this fake source
+    # does not have, so a real reconciler would (correctly) demote the thread to
+    # ``close_reconcile`` in the very same round. Completion is the subject of
+    # ``tests/test_close_reconcile.py``, not of this example.
+    eng._round_closed_threads = lambda index: []
     eng.run_once()
     rec = eng.store.load_index()["assignments"]["asg_1_worker_1"]
     info = sessions.session_info("session_w1")
     # This half proves the *bookkeeping*: the archive was called once, the
-    # read-back was consulted, and the record only claims completed because the
-    # read-back said archived. What it cannot prove is that the real server
-    # agrees - the injected fake answers by construction.
-    accounting = (rec["status"] == "completed" and info.get("archived") is True
+    # read-back was consulted, and the record claims ``waiting_release`` because
+    # the read-back said archived. Since M2 C4 (70a2a48) a successful archive
+    # stops at ``waiting_release`` - ``completed`` is written only by the close
+    # reconciliation two rounds later, never here. What this half cannot prove is
+    # that the real server agrees - the injected fake answers by construction.
+    accounting = (rec["status"] == "waiting_release"
+                  and bool(rec.get("archived_at"))
+                  and info.get("archived") is True
                   and sessions.calls == ["session_w1"])
-    detail = (f"accounting status={rec['status']} archived={info.get('archived')} "
-              f"archive_calls={sessions.calls}")
+    detail = (f"accounting status={rec['status']} "
+              f"archived_at={rec.get('archived_at')} "
+              f"archived={info.get('archived')} archive_calls={sessions.calls}")
 
     sid = (os.environ.get("SAFKC_VERIFY_REAL_SID") or "").strip()
     if not sid:
