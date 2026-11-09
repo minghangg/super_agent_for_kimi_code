@@ -188,6 +188,10 @@ super_agent/store.py:log_event() ─→ state/events.jsonl   the engine's own ru
 
 **The order is fixed: write `store/events.jsonl` first, then inject into the event bus** (`Store.log_event` / `Engine._dispatch`). A failed inject **does not roll back** the store — the record is already on disk and is redelivered from `store/outbox.jsonl` (`Engine._dispatch` logs `ok`/`error` into `log_outbox`).
 
+**Archiving is the one thing this stream cannot be trusted for.** `POST /api/v2/sessions:archive` runs server-side and writes **no** `session.archived` row — that event is written only by the workbench's own `tools/sess_events.py:emit`. So `archived=false` in the stream means "nobody emitted an archive", not "the session is live". A stream-only view keeps an archived worker as a live binding, and the next round forks `asg_<issue>_<role>_2` on the same sid, so the thread never reaches a terminal state.
+
+`_sync_assignments` therefore asks `session_info(sid)["archived"]` again for the **candidate** sids (not archived in the stream, role worker/qa, issue matches), drops the confirmed ones and logs `assignment.archived_offstream`. Two cost limits apply: candidates only, and at most one server question per sid per round (`_live_check`, cleared at the start of `run_round`). An unreachable server counts as archived (**fail closed**, no dispatch) and logs `assignment.archived_unreachable`. `engine.archived_crosscheck` (default `true`) turns the server question off and falls back to stream-only semantics — used by tests that inject no `session_api` and must stay offline.
+
 Session truth reconciliation (a non-empty three-way difference is rc=1; a missing third source is rc=2, **never treated as agreement**):
 
 ```bash

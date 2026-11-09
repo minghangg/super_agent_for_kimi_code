@@ -219,6 +219,19 @@ super_agent/store.py:log_event() ─→ state/events.jsonl   引擎自己的运�
 `Engine._dispatch`）。inject 失败**不回滚** store——那条记录已经在盘上，由
 `store/outbox.jsonl` 重投（`Engine._dispatch` 里 `log_outbox` 记的是 `ok`/`error`）。
 
+**归档是这条流唯一不可信的地方**：`POST /api/v2/sessions:archive` 走服务端，**不写**
+`session.archived`——那个事件只由工作台自己的 `tools/sess_events.py:emit` 写。于是流里的
+`archived=false` 只意味着「没人发过归档事件」，不意味着「会话还活着」。只看流的话，
+已归档 worker 会一直算活绑定，下一轮就会在同一 sid 上再建一条 `asg_<issue>_<role>_2`，
+线程永远到不了终态。
+
+所以 `_sync_assignments` 对**候选 sid**（流里未归档、角色是 worker/qa、issue 匹配）再问一次
+`session_info(sid)["archived"]`，确认归档的从 live 里剔除并写 `assignment.archived_offstream`。
+成本受两条约束：只问候选，且每个 sid 每轮最多一次（`_live_check`，`run_round` 开头清空）。
+服务端不可达时按 **fail-closed** 当作已归档、不派单，并写 `assignment.archived_unreachable`。
+`engine.archived_crosscheck`（默认 `true`）可关掉这次服务端查询，退回纯流语义——测试里
+没注入 `session_api` 又不想联网时用它。
+
 会话真相对账（三方差集非空即 rc=1；第三个源缺失则 rc=2，**绝不当作一致**）：
 
 ```bash
