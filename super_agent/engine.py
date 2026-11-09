@@ -1042,6 +1042,10 @@ class Engine:
         is only ever advanced by a call from a new round, so a loop inside one
         round cannot confirm itself. Any failed observation resets the streak
         to zero and moves a release into ``close_reconcile``.
+
+        The record says ``completed`` only when the gate let every held
+        assignment through; a refusal keeps it ``pending`` with the refusing
+        id in ``blocked_reason``, so the next round checks the thread again.
         """
         records = index.setdefault("close_reconcile", {})
         if not isinstance(records, dict):
@@ -1085,7 +1089,7 @@ class Engine:
             return {"thread": thread, "status": "pending", "completed": [],
                     "reason": record["blocked_reason"], "conditions":
                     snap["conditions"], "consecutive_ok": streak}
-        completed = []
+        completed, refused = [], []
         if streak >= 2:
             for assignment in (index.get("assignments") or {}).values():
                 if str(assignment.get("thread") or "") != thread:
@@ -1094,28 +1098,42 @@ class Engine:
                         "waiting_release", "close_reconcile"):
                     continue
                 moved = asg_mod.complete(assignment)
-                if moved.get("changed"):
-                    completed.append(assignment["id"])
-                else:
+                if not moved.get("changed"):
+                    refused.append(str(assignment.get("id") or ""))
                     self.store.log_event({
                         "type": "assignment.qa_gate_refused", "at": _now(),
                         "thread": thread, "assignment": assignment.get("id"),
                         "reason": moved.get("reason") or "",
                         "level": "info", "consumers": ["doctor"]})
+                    continue
+                completed.append(assignment["id"])
                 # A late event after this finds a terminal assignment, so it is
                 # audited by on_delivery/late_event and never restarts work.
                 self.store.log_event({
                     "type": "assignment.completed", "at": _now(),
                     "thread": thread, "assignment": assignment.get("id"),
                     "reason": moved.get("reason") or ""})
-            record["status"] = "completed"
-            records[thread] = record
-            if completed:
+            # The thread record may only claim ``completed`` when every held
+            # assignment actually moved: a gate refusal leaves the assignments
+            # held, and a ``completed`` record would drop the thread out of
+            # ``_round_closed_threads`` - no later round would ever look again.
+            if completed and not refused:
+                record["status"] = "completed"
+                records[thread] = record
                 self.store.log_event({"type": "thread.completed", "at": _now(),
                                       "thread": thread, "assignments": completed,
                                       "conditions": snap["conditions"]})
-            return {"thread": thread, "status": "completed",
-                    "completed": completed, "reason": "",
+                return {"thread": thread, "status": "completed",
+                        "completed": completed, "reason": "",
+                        "conditions": snap["conditions"], "consecutive_ok": streak}
+            record["status"] = "pending"
+            record["blocked_reason"] = (
+                "qa_gate_refused: " + ", ".join(sorted(refused)) if refused
+                else "no held assignment to complete")
+            records[thread] = record
+            return {"thread": thread, "status": "pending",
+                    "completed": completed,
+                    "reason": record["blocked_reason"],
                     "conditions": snap["conditions"], "consecutive_ok": streak}
         self.store.log_event({"type": "close_reconcile.passed", "at": _now(),
                               "thread": thread, "streak": streak,

@@ -9,6 +9,8 @@ The properties pinned here:
   streak; it never completes;
 * an already-archived worker is not archived again and produces no error;
 * a late event on a completed assignment is audited, not restarted;
+* a gate refusal keeps the thread record ``pending`` (never ``completed``), so
+  the next round still selects it;
 * the scan only visits ``waiting_release``/``close_reconcile`` and honours
   ``engine.max_closed_thread_checks``.
 
@@ -305,6 +307,53 @@ class Counterfact5(Base):
                          "a late delivery never replaces the recorded one")
         kinds = [r["type"] for r in self.rows()]
         self.assertNotIn("assignment.waiting_review", kinds[-3:])
+
+
+class Counterfact6(Base):
+    """a gate refusal never writes a thread-level completed."""
+
+    def test_a_gate_refusal_keeps_the_thread_in_the_scan(self):
+        engine = self.engine()
+        self.sessions.archived.add("session_w1")
+        index = self.index(engine)
+        index["assignments"]["asg_1_worker_1"] = {
+            "id": "asg_1_worker_1", "thread": THREAD, "issue": 1,
+            "role": "worker", "status": "waiting_release",
+            "sid": "session_w1", "qa_verdict": "",
+            "delivery_comment_id": 9001,
+        }
+        engine.store.save_index(index)
+        engine.run_once()
+        engine.run_once()
+        # A third round: if the record had said ``completed`` this round would
+        # no longer select the thread at all, so the second refusal is proof
+        # that it is still watched.
+        engine.run_once()
+
+        rec = self.index(engine)["assignments"]["asg_1_worker_1"]
+        state = self.index(engine)["close_reconcile"][THREAD]
+        self.assertEqual(rec["status"], "waiting_release",
+                         "the gate refusal must not move the assignment")
+        self.assertNotEqual(state["status"], "completed",
+                            "a refused thread is not done")
+        self.assertEqual(state["status"], "pending")
+        self.assertIn("qa_gate_refused", state["blocked_reason"])
+        self.assertIn("asg_1_worker_1", state["blocked_reason"])
+        kinds = [r["type"] for r in self.rows()]
+        self.assertNotIn("thread.completed", kinds)
+        self.assertNotIn("assignment.completed", kinds)
+        self.assertGreaterEqual(kinds.count("assignment.qa_gate_refused"), 2)
+
+        # Still a candidate for the next round: the thread stays visible to
+        # ``_round_closed_threads`` (and therefore to the doctor).
+        live = self.index(engine)
+        eligible = {str(r.get("thread") or "")
+                    for r in (live.get("assignments") or {}).values()
+                    if str(r.get("status") or "") in
+                    ("waiting_release", "close_reconcile")}
+        self.assertIn(THREAD, eligible)
+        out = engine._round_closed_threads(live)
+        self.assertIn(THREAD, [r["thread"] for r in out])
 
 
 class ScanBounds(Base):
