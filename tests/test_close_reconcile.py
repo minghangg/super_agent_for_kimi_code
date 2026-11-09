@@ -222,7 +222,7 @@ class Counterfact2(Base):
         self.assertEqual(state["consecutive_ok"], 0)
         self.assertIn("binding", state["blocked_reason"])
 
-        # Reed clears the binding; the next two rounds close the thread.
+        # The supervisor clears the binding; the next two rounds close it.
         self.ledger_write({})
         engine.run_once()
         self.assertEqual(self.index(engine)["assignments"]["asg_1_worker_1"]
