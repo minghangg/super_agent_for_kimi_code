@@ -87,6 +87,71 @@ class TriageOrder(unittest.TestCase):
         self.assertEqual(state, "ignored")
 
 
+class ReviewParsing(unittest.TestCase):
+    """``[QA]`` verdicts, read by position rather than by table order.
+
+    The first seven cases are the **shape** of real review first lines: the
+    project's own name is replaced by ``X`` and the evidence dropped, so only
+    the structure that the parser has to survive is committed. Every one of
+    them was a false pass under the old "check ``通过`` before ``不通过``"
+    table, because ``"通过" in "不通过"`` is true.
+    """
+
+    def assertVerdict(self, body, want):
+        out = markers.parse_review(body)
+        self.assertIsNotNone(out, body)
+        self.assertEqual(out["verdict"], want, body)
+
+    def test_double_qa_prefix_reject_with_counts(self):
+        self.assertVerdict(
+            "[QA] [QA] X-32 独立复核：**不通过**（P0=0，P1=1，P2=4）。…", "reject")
+
+    def test_double_qa_prefix_reject_with_slashes(self):
+        self.assertVerdict(
+            "[QA] [QA] X-29 独立复核：**不通过**（P0=0 / P1=2 / P2=5）。…", "reject")
+
+    def test_second_round_reject(self):
+        self.assertVerdict(
+            "[QA] [QA] #27 第二轮复核（顺修后）：**不通过**（P0=0 / P1=1 / P2=5）",
+            "reject")
+
+    def test_reject_with_a_bracketed_reason(self):
+        self.assertVerdict("[QA] **不通过（退回改）** — 方案主干可落地，但…",
+                           "reject")
+
+    def test_bare_return_word_is_a_reject(self):
+        self.assertVerdict("[QA] **退回改** —— 门禁全绿、P1-1…四条修得对，但…",
+                           "reject")
+
+    def test_conclusion_clause_is_judged_not_the_rest_of_the_line(self):
+        self.assertVerdict(
+            "[QA] 结论：不通过——步 2 检查点不算过（P0：2 / P1：2 / P2：2）。…",
+            "reject")
+
+    def test_reject_after_a_parenthesised_scope(self):
+        self.assertVerdict(
+            "[QA] 方案复核（X-21 出方案轮 · 零代码改动 · 只读）：**不通过（退回补写）**",
+            "reject")
+
+    def test_pass_with_counts(self):
+        self.assertVerdict("[QA] #24 独立复核：**通过**（P0=0 / P1=3 / P2=2）",
+                           "pass")
+
+    def test_quoted_rule_after_the_conclusion_does_not_flip_it(self):
+        # The first line concludes "通过" and then quotes the stop-loss rule; a
+        # word-table reader would see ``退回`` in the quote and reject.
+        self.assertVerdict(
+            "[QA] **按停损规则，仅 P0 可退 —— 本轮结论：通过**（…）", "pass")
+
+    def test_a_word_followed_by_a_tail_is_not_a_verdict(self):
+        self.assertVerdict("[QA] 通过项先说：…", "")
+
+    def test_full_width_prefix_unpassed_variant_and_non_qa_lines(self):
+        self.assertVerdict("［QA］［QA］ #8 复核：未通过", "reject")
+        self.assertIsNone(markers.parse_review("[WK:wk-1] done"))
+        self.assertIsNone(markers.parse_review("plain remark"))
+
+
 class _NullStore:
     root = None
 
