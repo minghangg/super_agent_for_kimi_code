@@ -67,15 +67,22 @@ class Base(unittest.TestCase):
         self.state = self.root / "state"
         self.allow_path = self.root / "allowlist.json"
         self.allow_path.write_text(json.dumps(GOOD), encoding="utf-8")
+        # ``--state-dir`` does not isolate the lifecycle stream, so pin it to an
+        # empty file inside the temp dir (see tests/test_assignments.py).
+        self.events = self.root / "sessions" / "events.jsonl"
+        self.events.parent.mkdir(parents=True, exist_ok=True)
+        self.events.write_text("", encoding="utf-8")
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def engine(self, *, allowlist=True, source=None, bus=None) -> Engine:
-        # ``--state-dir`` does not isolate the lifecycle stream, so a round here
-        # can see real bindings. No session API is injected: stay offline.
+        # ``--state-dir`` does not isolate the lifecycle stream, so an unset path
+        # would read this machine's live bindings. Pin it to the temp dir; no
+        # session API is injected, so the archived cross-check stays off.
         cfg = config.load(None, {"github": {"source": "none"},
-                                 "engine": {"archived_crosscheck": False}})
+                                 "engine": {"archived_crosscheck": False,
+                                            "session_events_path": str(self.events)}})
         projects = ProjectAllowlist(self.allow_path) if allowlist else None
         return Engine(cfg, Store(self.state), source or NullSource(), bus,
                       project_allowlist=projects)

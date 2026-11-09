@@ -71,19 +71,27 @@ class Base(unittest.TestCase):
         self.allow = self.root / "allowlist.json"
         self.allow.write_text("{}", encoding="utf-8")
         self.allow.write_text(__import__("json").dumps(GOOD), encoding="utf-8")
+        # ``--state-dir`` does not isolate the lifecycle stream, so pin it to an
+        # empty file inside the temp dir: otherwise the engine reads the live
+        # workbench stream and its assignments depend on this machine's state.
+        self.events = self.root / "sessions" / "events.jsonl"
+        self.events.parent.mkdir(parents=True, exist_ok=True)
+        self.events.write_text("", encoding="utf-8")
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def engine(self, source) -> Engine:
-        # No session API is injected here, and ``--state-dir`` does not isolate
-        # the lifecycle stream, so the archived cross-check is turned off: these
-        # tests exercise paging/cursor behaviour and must not touch a server.
+        # No session API is injected here, so the archived cross-check stays off
+        # (it would otherwise ask a server). The lifecycle stream is still
+        # pinned to the temp dir: an unset path resolves to the live workbench
+        # stream, which would leak this machine's bindings into the round.
         cfg = config.load(None, {"mode": "assist",
                                  "github": {"source": "none", "repo": "owner/demo",
                                             "max_comments_per_issue": 2,
                                             "max_comment_pages": 5},
-                                 "engine": {"archived_crosscheck": False}})
+                                 "engine": {"archived_crosscheck": False,
+                                            "session_events_path": str(self.events)}})
         return Engine(cfg, Store(self.state), source, None,
                       project_allowlist=ProjectAllowlist(self.allow))
 
