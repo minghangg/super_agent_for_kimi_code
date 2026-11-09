@@ -124,9 +124,16 @@ class Base(unittest.TestCase):
             "engine": {"session_events_path": str(self.events),
                        "allowlist": ["issue_comment.created"]},
         })
-        return Engine(cfg, Store(self.state), self.source, bus or self.bus,
-                      project_allowlist=ProjectAllowlist(self.allow),
-                      session_api=self.sessions)
+        engine = Engine(cfg, Store(self.state), self.source, bus or self.bus,
+                        project_allowlist=ProjectAllowlist(self.allow),
+                        session_api=self.sessions)
+        # Close reconciliation is exercised in tests/test_close_reconcile.py.
+        # Here the round must end where the lifecycle does, at waiting_release:
+        # these fakes have no provable issue state, so the real reconciler would
+        # (correctly) demote the thread to close_reconcile.
+        engine._round_closed_threads = lambda index: []
+        return engine
+
 
     def index(self, engine):
         return engine.store.load_index()

@@ -950,6 +950,208 @@ class Engine:
             return "unknown"
         return str(state or "unknown")
 
+    # ------------------------------------------------- close reconciliation
+    def _binding_roles(self, thread: str) -> list[str]:
+        """Roles still registered for ``thread`` in ``issue_sessions.json``."""
+        ledger = self._load_issue_sessions().get(thread)
+        if not isinstance(ledger, dict):
+            return []
+        return sorted(str(role) for role, entry in ledger.items()
+                      if isinstance(entry, dict) and entry)
+
+    def _running_tasks(self, sid: str):
+        """``(running, skipped)`` for one sid.
+
+        An archived session returns ``[]`` from ``tasks()``, which is neither
+        "idle" nor evidence: the concurrency question is answered by the
+        un-cached archive read-back, so a skipped table is reported as skipped
+        and the condition does not depend on it.
+        """
+        if not sid:
+            return [], "no sid"
+        try:
+            from . import direct
+            rows = direct.tasks(sid)
+        except Exception as exc:  # noqa: BLE001  an unreadable table is not "idle"
+            return [], f"unreadable: {type(exc).__name__}"
+        running = [str(t.get("id") or "") for t in (rows or [])
+                   if str(t.get("status") or "") == "running"]
+        return running, ""
+
+    def close_conditions(self, thread: str, index: dict) -> dict:
+        """The four conditions that make a closed thread provable.
+
+        Every answer is a live read: ``_read_back_archived`` asks the server
+        and is **not** cached, so two rounds that both say "archived" are two
+        independent observations rather than one repeated from memory.
+        """
+        recs = [rec for rec in (index.get("assignments") or {}).values()
+                if str(rec.get("thread") or "") == thread]
+        issue = None
+        for rec in recs:
+            if rec.get("issue") is not None:
+                issue = int(rec.get("issue"))
+                break
+        issue_state = self._issue_state(issue) if issue is not None else "unknown"
+        binding_roles = self._binding_roles(thread)
+        unarchived, running, skipped = [], [], []
+        for rec in recs:
+            sid = str(rec.get("sid") or "")
+            if not sid:
+                continue
+            if not self._read_back_archived(sid):
+                unarchived.append(sid)
+                continue
+            tasks_running, why = self._running_tasks(sid)
+            if why:
+                skipped.append(f"{sid}:{why}")
+            running.extend(tasks_running)
+        return {
+            "conditions": {
+                "issue_closed": issue_state == "closed",
+                "binding_cleared": not binding_roles,
+                "sid_archived": not unarchived,
+                # Archived sids cannot be judged; the archive read-back is what
+                # carries concurrency, so an unjudgeable table is not a "false".
+                "no_running_task": not running,
+            },
+            "detail": {"issue_state": issue_state,
+                       "binding_roles": binding_roles,
+                       "unarchived_sids": sorted(unarchived),
+                       "running_tasks": sorted(running),
+                       "tasks_skipped": "; ".join(skipped)},
+        }
+
+    def _close_blocked_reason(self, snapshot: dict) -> str:
+        cond, detail = snapshot["conditions"], snapshot["detail"]
+        if not cond["issue_closed"]:
+            return f"issue_state={detail['issue_state']}"
+        if not cond["binding_cleared"]:
+            return f"binding still registered: {detail['binding_roles']}"
+        if not cond["sid_archived"]:
+            return f"unarchived sids: {detail['unarchived_sids']}"
+        if not cond["no_running_task"]:
+            return f"running tasks: {detail['running_tasks']}"
+        return ""
+
+    def _reconcile_thread(self, index: dict, thread: str) -> dict:
+        """One observation of one held thread; the record lives in the index.
+
+        ``completed`` needs the **same** four conditions in two consecutive
+        rounds, and the second round must be a later ``run_round`` - the counter
+        is only ever advanced by a call from a new round, so a loop inside one
+        round cannot confirm itself. Any failed observation resets the streak
+        to zero and moves a release into ``close_reconcile``.
+        """
+        records = index.setdefault("close_reconcile", {})
+        if not isinstance(records, dict):
+            records = index["close_reconcile"] = {}
+        snap = self.close_conditions(thread, index)
+        rec = records.get(thread) if isinstance(records.get(thread), dict) else {}
+        previous_ok = int(rec.get("consecutive_ok") or 0)
+        ok_now = all(snap["conditions"].values())
+        round_no = int((index.get("meta") or {}).get("run_count") or 0)
+        last_round = rec.get("last_checked_round")
+        streak = previous_ok + 1 if ok_now and (
+            previous_ok == 0 or last_round != round_no) else (1 if ok_now else 0)
+        record = {
+            "status": "pending", "attempts": int(rec.get("attempts") or 0) + 1,
+            "consecutive_ok": streak,
+            "first_checked_at": rec.get("first_checked_at") or _now(),
+            "checked_at": _now(), "last_checked_round": round_no,
+            "conditions": snap["conditions"], "detail": snap["detail"],
+            "blocked_reason": self._close_blocked_reason(snap),
+        }
+        records[thread] = record
+        if not ok_now:
+            for assignment in (index.get("assignments") or {}).values():
+                if str(assignment.get("thread") or "") != thread:
+                    continue
+                if str(assignment.get("status") or "") != "waiting_release":
+                    continue
+                moved = asg_mod.enter_close_reconcile(
+                    assignment, record["blocked_reason"])
+                self.store.log_event({
+                    "type": ("assignment.reopened" if moved.get("changed")
+                             else "close_reconcile.refused"),
+                    "at": _now(), "thread": thread,
+                    "assignment": assignment.get("id"),
+                    "reason": moved.get("reason") or "",
+                })
+            self.store.log_event({"type": "close_reconcile.blocked", "at": _now(),
+                                  "thread": thread,
+                                  "reason": record["blocked_reason"],
+                                  "streak": streak})
+            return {"thread": thread, "status": "pending", "completed": [],
+                    "reason": record["blocked_reason"], "conditions":
+                    snap["conditions"], "consecutive_ok": streak}
+        completed = []
+        if streak >= 2:
+            for assignment in (index.get("assignments") or {}).values():
+                if str(assignment.get("thread") or "") != thread:
+                    continue
+                if str(assignment.get("status") or "") not in (
+                        "waiting_release", "close_reconcile"):
+                    continue
+                moved = asg_mod.complete(assignment)
+                if moved.get("changed"):
+                    completed.append(assignment["id"])
+                else:
+                    self.store.log_event({
+                        "type": "assignment.qa_gate_refused", "at": _now(),
+                        "thread": thread, "assignment": assignment.get("id"),
+                        "reason": moved.get("reason") or "",
+                        "level": "info", "consumers": ["doctor"]})
+                # A late event after this finds a terminal assignment, so it is
+                # audited by on_delivery/late_event and never restarts work.
+                self.store.log_event({
+                    "type": "assignment.completed", "at": _now(),
+                    "thread": thread, "assignment": assignment.get("id"),
+                    "reason": moved.get("reason") or ""})
+            record["status"] = "completed"
+            records[thread] = record
+            if completed:
+                self.store.log_event({"type": "thread.completed", "at": _now(),
+                                      "thread": thread, "assignments": completed,
+                                      "conditions": snap["conditions"]})
+            return {"thread": thread, "status": "completed",
+                    "completed": completed, "reason": "",
+                    "conditions": snap["conditions"], "consecutive_ok": streak}
+        self.store.log_event({"type": "close_reconcile.passed", "at": _now(),
+                              "thread": thread, "streak": streak,
+                              "conditions": snap["conditions"]})
+        return {"thread": thread, "status": "pending", "completed": [],
+                "reason": "waiting for a second round", "conditions":
+                snap["conditions"], "consecutive_ok": streak}
+
+    def _round_closed_threads(self, index: dict) -> list[dict]:
+        """Check the held threads of this round, up to the configured cap.
+
+        Only ``waiting_release`` and ``close_reconcile`` qualify: every other
+        active assignment is still being worked on, and a terminal one has
+        nothing left to prove.
+        """
+        engine_cfg = self.cfg.get("engine") or {}
+        try:
+            limit = max(1, int(engine_cfg.get("max_closed_thread_checks") or 10))
+        except (TypeError, ValueError):
+            limit = 10
+        threads = sorted({str(rec.get("thread") or "")
+                          for rec in (index.get("assignments") or {}).values()
+                          if str(rec.get("status") or "") in
+                          ("waiting_release", "close_reconcile")})
+        out = []
+        for thread in [t for t in threads if t][:limit]:
+            try:
+                out.append(self._reconcile_thread(index, thread))
+            except Exception as exc:  # noqa: BLE001  one bad thread is isolated
+                self.store.log_event({"type": "close_reconcile.blocked",
+                                      "at": _now(), "thread": thread,
+                                      "reason": f"{type(exc).__name__}: {exc}"})
+                out.append({"thread": thread, "status": "pending",
+                            "completed": [], "reason": str(exc)})
+        return out
+
     def reconcile_close(self, thread: str, index: dict | None = None) -> dict:
         """Close a thread: every assignment completed, then reconcile the stream."""
         index = index if index is not None else self.store.load_index()
@@ -1179,6 +1381,11 @@ class Engine:
         })
         self.store.save_index(index)
         self.store.save_cursor(cursor)
+        # Close reconciliation last: the round's own archives are visible to it,
+        # and ``run_count`` is already incremented, so the two-round streak can
+        # only be advanced by a genuine next round.
+        self._round_closed_threads(index)
+        self.store.save_index(index)
         self.store.log_event({"type": "run.completed", "at": _now(),
                               "processed": summary["processed"],
                               "needs_person": summary["needs_person"],

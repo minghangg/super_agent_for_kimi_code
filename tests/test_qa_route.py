@@ -145,9 +145,14 @@ class Base(unittest.TestCase):
             "engine": {"session_events_path": str(self.events),
                        "allowlist": ["issue_comment.created"]},
         })
-        return Engine(cfg, Store(self.state), self.source, self.bus,
-                      project_allowlist=ProjectAllowlist(self.allow),
-                      session_api=self.sessions)
+        engine = Engine(cfg, Store(self.state), self.source, self.bus,
+                        project_allowlist=ProjectAllowlist(self.allow),
+                        session_api=self.sessions)
+        # Close reconciliation is exercised in tests/test_close_reconcile.py.
+        # These fakes have no provable issue state, so the real reconciler would
+        # (correctly) demote the thread; here the round ends at the lifecycle.
+        engine._round_closed_threads = lambda index: []
+        return engine
 
     def rows(self):
         path = self.state / "events.jsonl"

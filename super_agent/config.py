@@ -62,6 +62,10 @@ DEFAULTS: dict = {
         # Model profile table (ISS-32). "" = not configured: choose_profile then
         # falls back to the built-in default pair and no file is read.
         "model_profiles_path": "",
+        # How many held threads one round asks the close reconciliation about.
+        # ``waiting_release`` and ``close_reconcile`` are the only states that
+        # need it, so the cap bounds a poll loop rather than all assignments.
+        "max_closed_thread_checks": 10,
     },
 }
 
@@ -134,6 +138,10 @@ def validate(cfg: dict) -> dict:
     crosscheck = (cfg.get("engine") or {}).get("archived_crosscheck", True)
     if not isinstance(crosscheck, bool):
         raise ConfigError("engine.archived_crosscheck must be a boolean")
+    max_checks = (cfg.get("engine") or {}).get("max_closed_thread_checks", 10)
+    if not isinstance(max_checks, int) or isinstance(max_checks, bool) \
+            or max_checks < 1:
+        raise ConfigError("engine.max_closed_thread_checks must be an integer >= 1")
     poll = (cfg.get("github") or {}).get("poll_interval_s")
     if not isinstance(poll, (int, float)) or poll <= 0:
         raise ConfigError("github.poll_interval_s must be a positive number")
