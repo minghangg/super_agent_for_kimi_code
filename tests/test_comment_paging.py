@@ -76,10 +76,14 @@ class Base(unittest.TestCase):
         self.tmp.cleanup()
 
     def engine(self, source) -> Engine:
+        # No session API is injected here, and ``--state-dir`` does not isolate
+        # the lifecycle stream, so the archived cross-check is turned off: these
+        # tests exercise paging/cursor behaviour and must not touch a server.
         cfg = config.load(None, {"mode": "assist",
                                  "github": {"source": "none", "repo": "owner/demo",
                                             "max_comments_per_issue": 2,
-                                            "max_comment_pages": 5}})
+                                            "max_comment_pages": 5},
+                                 "engine": {"archived_crosscheck": False}})
         return Engine(cfg, Store(self.state), source, None,
                       project_allowlist=ProjectAllowlist(self.allow))
 
