@@ -60,6 +60,12 @@ class Engine:
         self.markers = [s.lower() for s in
                         (engine_cfg.get("escalation_markers") or ["[decision]", "[blocked]"])]
         self.creation_mode = str(engine_cfg.get("creation_mode") or "pm_created")
+        # Ask the server whether a candidate sid is archived. On by default:
+        # an API-side archive writes no ``session.archived`` row, so the stream
+        # alone cannot tell that a session is closed. Tests that do not inject a
+        # session API turn this off to stay off the network; off means
+        # stream-only (the historical behaviour).
+        self.archived_crosscheck = engine_cfg.get("archived_crosscheck") is not False
         self.projects = project_allowlist
         if self.projects is None:
             path = str(engine_cfg.get("project_allowlist") or "").strip()
@@ -76,6 +82,9 @@ class Engine:
         self._assignments_error = ""
         self._archived_cache: dict | None = None
         self._archived_unreadable = False
+        # sid -> archived, asked from the server once per round (see
+        # ``_live_archived``); reset at the start of every round.
+        self._live_check: dict[str, bool] = {}
 
     # ------------------------------------------------------------ allowlist
     def allowlist_allows(self, issue: int | None, action: str | None) -> tuple[bool, str]:
@@ -290,6 +299,20 @@ class Engine:
             return {"created": [], "updated": [], "conflict": [],
                     "unreadable": self._assignments_error}
         live = asg_mod.live_bindings(state, thread, issue)
+        # The lifecycle stream is the source of truth *except* for archiving:
+        # an archive done through the session API writes no ``session.archived``
+        # row, so a stream-only view keeps treating a closed session as a live
+        # binding and the next round forks ``asg_<issue>_<role>_2`` on the same
+        # sid. Ask the server about the *candidates only* (one cached answer per
+        # sid per round) and drop the confirmed-archived ones.
+        offstream = sorted({b["sid"] for b in live if self._sid_archived(b["sid"])})
+        if offstream:
+            self.store.log_event({"type": "assignment.archived_offstream",
+                                  "at": _now(), "thread": thread,
+                                  "issue": int(issue), "sids": offstream,
+                                  "source": "session_info"})
+            live = asg_mod.live_bindings(state, thread, issue,
+                                         archived=set(offstream))
         crosscheck = set()
         ledger = self._load_issue_sessions().get(thread) or {}
         if isinstance(ledger, dict):
@@ -327,7 +350,15 @@ class Engine:
                         "delivery_comment_id": delivery},
         })
         if result.get("dispatched"):
-            assignment["notified_at"] = _now()
+            # ``ok`` is the only confirmation: ``mark_done`` runs only when the
+            # bus accepted the event. A dispatch that was attempted and failed
+            # (`uncertain`) is recorded in the outbox but is *not* a delivery,
+            # and recording ``notified_at`` for it is how the archive pass used
+            # to mark a never-sent notification as sent.
+            if result.get("ok"):
+                assignment["notified_at"] = _now()
+            else:
+                assignment["notified_at"] = ""
             self.store.log_event({
                 "type": "assignment.waiting_review", "at": _now(),
                 "assignment": assignment["id"],
@@ -404,6 +435,16 @@ class Engine:
     def _sid_archived(self, sid: str) -> bool:
         """Is this sid archived? Unreadable state counts as archived (closed).
 
+        Two sources, in this order, and the answer is cached for the round:
+
+        1. the lifecycle stream (``rec["archived"]``) - cheap, but incomplete,
+           because an archive made through ``POST /api/v2/sessions:archive``
+           writes no ``session.archived`` row (only the workbench's own
+           ``tools/sess_events.py:emit`` writes that event);
+        2. the server's ``session_info(sid)["archived"]``, asked **once per sid
+           per round** and only for a sid the stream still calls live - see
+           :meth:`_live_archived`.
+
         Fail **closed** on purpose: if the session service cannot be asked, a
         dispatch to that sid might hit a closed session, and the safe answer is
         "assume closed, refuse the send". The reverse choice would keep pushing
@@ -411,16 +452,57 @@ class Engine:
         """
         if not sid:
             return False
-        cached = getattr(self, "_archived_cache", None)
-        if cached is not None and sid in cached:
-            return cached[sid]
-        snapshot = self._refresh_archived_cache()
+        snapshot = self._archived_cache
+        if snapshot is None:
+            snapshot = self._refresh_archived_cache()
         if self._archived_unreadable:
             return True
-        return bool(snapshot.get(sid))
+        if snapshot.get(sid):
+            # The stream is authoritative when it *did* record the archive.
+            return True
+        # ``False`` only means "no archive event was written", which is the
+        # normal state after an API-side archive. Ask the server.
+        return self._live_archived(sid)
+
+    def _live_archived(self, sid: str) -> bool:
+        """Ask the server about one sid; cached for the round, fail-closed.
+
+        The cache holds a per-round answer *per sid*, so a round with ten
+        candidates makes at most ten ``session_info`` calls and a dispatch
+        check on the same sid later in that round makes none.
+        """
+        if not self.archived_crosscheck:
+            # Stream-only mode: no server call, so ``False`` means "the stream
+            # has no archive event", not "the session is live".
+            return False
+        cache = self._live_check
+        if sid in cache:
+            return cache[sid]
+        try:
+            info = self._session_api().session_info(sid)
+        except Exception as exc:  # noqa: BLE001  unreachable means "closed"
+            cache[sid] = True
+            self.store.log_event({"type": "assignment.archived_unreachable",
+                                  "at": _now(), "sid": sid,
+                                  "error": f"{type(exc).__name__}: {exc}"})
+            return True
+        if not isinstance(info, dict) or info.get("_err"):
+            cache[sid] = True
+            self.store.log_event({"type": "assignment.archived_unreachable",
+                                  "at": _now(), "sid": sid,
+                                  "error": str((info or {}).get("_err")
+                                               or "no session info")})
+            return True
+        cache[sid] = bool(info.get("archived"))
+        return cache[sid]
 
     def _refresh_archived_cache(self) -> dict:
-        """One refresh per round of ``sid -> archived`` from the session stream."""
+        """One refresh per round of ``sid -> archived`` from the session stream.
+
+        Every sid the stream mentions is cached, archived **and** live. A sid
+        that is absent from the cache is unknown to the stream and therefore
+        needs the server check in :meth:`_live_archived`.
+        """
         try:
             events_path, _sessions = self._session_stream()
             events = session_events.load_events(events_path)
@@ -430,7 +512,7 @@ class Engine:
         except Exception:  # noqa: BLE001  unreadable means "assume archived"
             self._archived_cache = {}
             self._archived_unreadable = True
-            return {"*": True}
+            return {}
         sessions = state.get("sessions") or {}
         self._archived_cache = {sid: bool(rec.get("archived"))
                                 for sid, rec in sessions.items()}
@@ -446,6 +528,11 @@ class Engine:
         the read-back says ``archived is True``. When the read-back fails the
         assignment becomes ``blocked`` and says so - it never pretends to be
         done.
+
+        The notification gate is ``notified_at``, not the attempt counter alone:
+        an attempt that came back ``uncertain`` never reached the bus, so the
+        tombstone records ``notified: false`` rather than claiming a delivery
+        that did not happen.
         """
         out = {"archived": [], "skipped": [], "blocked": [], "errors": []}
         save = index is None
@@ -466,10 +553,24 @@ class Engine:
                 # to tell the supervisor, so it waits for the retry pass.
                 out["skipped"].append(aid)
                 continue
+            # An *attempt* is not a delivery: ``uncertain`` means the bus call
+            # raised, so the supervisor was never told. Archiving on the
+            # counter alone recorded those as "notified + archived" while the
+            # event never left the process. The archive still proceeds (a
+            # worker that delivered is done, and leaving it open keeps the
+            # thread permanently non-terminal), but the tombstone records
+            # ``notified: false`` and the loss is logged - the unsettled
+            # outbox entry is what makes it visible to a person.
+            notified = bool(str(rec.get("notified_at") or ""))
             base = action_id(aid, "archive", str(delivery))
             if self.store.action_attempted(base) > 0:
                 out["skipped"].append(aid)
                 continue
+            if not notified:
+                self.store.log_event({"type": "assignment.notify_unconfirmed",
+                                      "at": _now(), "assignment": aid,
+                                      "delivery_comment_id": delivery,
+                                      "action_id": notify_base})
             sid = str(rec.get("sid") or "")
             if not sid:
                 self._mark_blocked(rec, "no sid recorded")
@@ -486,7 +587,7 @@ class Engine:
                 rec["status"] = "completed"
                 rec["archived_at"] = _now()
                 rec["tombstone"] = {"archived": True, "read_back": True,
-                                    "at": _now()}
+                                    "notified": notified, "at": _now()}
                 # Only the archive counter is prunable here: the notification
                 # counter must survive so a late retry cannot re-send it.
                 self.store.prune_attempts(base)
@@ -685,6 +786,11 @@ class Engine:
     def run_round(self) -> dict:
         index = self.store.load_index()
         cursor = self.store.load_cursor()
+        # Both caches are round-scoped: the stream snapshot is re-read lazily
+        # and each candidate sid is asked of the server at most once per round.
+        self._archived_cache = None
+        self._archived_unreadable = False
+        self._live_check = {}
         gh_cfg = self.cfg.get("github") or {}
         max_issues = int(gh_cfg.get("max_issues") or 20)
         max_comments = int(gh_cfg.get("max_comments_per_issue") or 50)

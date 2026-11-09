@@ -18,6 +18,15 @@ Rules this module enforces (each one is a test):
   with an issue and a non-archived session. If the stream cannot be read, no
   assignment is created and the engine is marked ``degraded`` - fail closed,
   never an empty loop that looks healthy.
+* **Archiving is the one thing the stream cannot be trusted for.** An archive
+  made through ``POST /api/v2/sessions:archive`` writes no ``session.archived``
+  row; only the workbench's own ``tools/sess_events.py:emit`` writes that
+  event. So the stream's ``archived=False`` means "nobody emitted an archive",
+  not "the session is live". The engine asks the server about the *candidate*
+  sids (one cached answer per sid per round) and passes the confirmed ones as
+  ``archived=`` to :func:`live_bindings`. Without that, a closed worker stays
+  a live binding and the next round forks ``asg_<issue>_<role>_2`` on the same
+  sid. An unreachable server counts as archived (fail closed) and is logged.
 * ``issue_sessions.json`` is only a **cross-check**: it confirms a thread has a
   binding, it never creates one (it covers a subset of live bindings).
 * A delivery is matched to an assignment by marker name first, then by "the
@@ -28,6 +37,10 @@ Rules this module enforces (each one is a test):
   before the external call, so a crash either replays the same record or waits
   for reconciliation. A refused/disabled dispatch writes no counter, which is
   what makes "refused -> retry next round" safe.
+* **An attempt is not a delivery.** ``uncertain`` means the call raised, so the
+  supervisor was never told; it must never be recorded as ``notified_at``. The
+  archive pass may still close the assignment (a worker that delivered is
+  done), but its tombstone says ``notified: false`` and the loss is logged.
 """
 from __future__ import annotations
 
@@ -64,12 +77,20 @@ def is_active(rec: dict | None) -> bool:
     return bool(rec) and str((rec or {}).get("status") or "") in ACTIVE_STATES
 
 
-def live_bindings(state: dict, thread: str, issue: int | None = None) -> list[dict]:
+def live_bindings(state: dict, thread: str, issue: int | None = None,
+                  archived: set[str] | None = None) -> list[dict]:
     """Sessions currently bound to ``thread`` as a worker/qa participant.
 
     ``state`` is a ``session_events.replay()`` result. The filter is the one QA
     asked for: a session with no role or no issue takes no part in the thread
     view (its ``key`` is just its name).
+
+    ``archived`` is an extra exclusion set supplied by the caller. The stream
+    only knows about archives written by the workbench's own tooling; an
+    archive performed through the session API leaves no ``session.archived``
+    row, so ``rec["archived"]`` alone keeps a closed session looking live. The
+    engine asks the server (one cached answer per sid per round) and passes the
+    confirmed sids here. This function stays pure: it never calls out.
 
     Matching uses the **issue number**, not the event's ``key``: ``bind`` puts
     the worker's *name* (``wk-probe-1``) in ``key`` and the issue number in
@@ -78,9 +99,10 @@ def live_bindings(state: dict, thread: str, issue: int | None = None) -> list[di
     sessions = state.get("sessions") or {}
     keys = session_events_active(state)
     by_key = {sid: key for key, sid in keys.items()}
+    known_archived = set(archived or ())
     out = []
     for sid, rec in sessions.items():
-        if rec.get("archived"):
+        if rec.get("archived") or sid in known_archived:
             continue
         role = str(rec.get("role") or "")
         if role not in PARTICIPANT_ROLES:

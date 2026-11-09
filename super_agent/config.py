@@ -54,6 +54,11 @@ DEFAULTS: dict = {
         "session_events_path": "",  # workbench lifecycle stream (read-only); "" = resolve
         "project_allowlist": "",   # "" = not configured; the CLI resolves the repo default
         "creation_mode": "pm_created",  # only pm_created is accepted
+        # Ask the session service whether a candidate sid is archived. The
+        # lifecycle stream has no archive row for an API-side archive, so this
+        # is what stops a closed session from being treated as a live binding.
+        # False = stream-only (no server call; used by tests that stay offline).
+        "archived_crosscheck": True,
         # Model profile table (ISS-32). "" = not configured: choose_profile then
         # falls back to the built-in default pair and no file is read.
         "model_profiles_path": "",
@@ -126,6 +131,9 @@ def validate(cfg: dict) -> dict:
     profiles_path = (cfg.get("engine") or {}).get("model_profiles_path", "")
     if profiles_path is not None and not isinstance(profiles_path, str):
         raise ConfigError("engine.model_profiles_path must be a path string (or empty)")
+    crosscheck = (cfg.get("engine") or {}).get("archived_crosscheck", True)
+    if not isinstance(crosscheck, bool):
+        raise ConfigError("engine.archived_crosscheck must be a boolean")
     poll = (cfg.get("github") or {}).get("poll_interval_s")
     if not isinstance(poll, (int, float)) or poll <= 0:
         raise ConfigError("github.poll_interval_s must be a positive number")
