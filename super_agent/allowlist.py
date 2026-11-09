@@ -23,6 +23,15 @@ validated in full before it replaces the live copy. If it is malformed the
 previous copy stays in force, the error is recorded, and the engine keeps
 behaving as before. A reload only affects later events, never the round that
 is already in flight.
+
+**Local overlay.** A tracked allowlist must stay publishable, so the real
+repository name cannot live in it. ``<name>.local.json`` next to the tracked
+file (i.e. ``config/allowlist.local.json``) is read *by the same loader* and
+deep-merged over it. Only ``repo``/``issues``/``actions``/``mode``/``roles``/
+``max_active_writers`` may be overridden; everything else is inherited. The
+merged result is validated again, so a broken overlay is refused and the
+tracked copy stays in force - the gate never widens because a local file is
+malformed. Deleting the overlay restores single-file behaviour exactly.
 """
 from __future__ import annotations
 
@@ -43,6 +52,44 @@ ACTIONS = frozenset({
 })
 CREATION_ACTIONS = frozenset({"create_worker", "create_qa"})
 DEFAULT_ACTIONS = ("collect", "reconcile")
+
+# Fields a local overlay may override. Everything else is inherited from the
+# tracked file: the overlay adds a deployment fact (the real repository name),
+# it is not a second place to define project policy.
+OVERLAY_FIELDS = ("repo", "issues", "actions", "mode", "roles",
+                  "max_active_writers")
+OVERLAY_SUFFIX = ".local.json"
+
+
+def overlay_path(path: str | Path) -> Path:
+    """``config/allowlist.json`` -> ``config/allowlist.local.json``."""
+    tracked = Path(path)
+    stem = tracked.name[:-len(".json")] if tracked.name.endswith(".json") else tracked.name
+    return tracked.with_name(stem + OVERLAY_SUFFIX)
+
+
+def merge_overlay(tracked: dict, overlay: dict) -> dict:
+    """Deep-merge the overlay over the tracked data; returns a new dict.
+
+    Only the projects named in the overlay are touched, and only through
+    :data:`OVERLAY_FIELDS`. An overlay project that the tracked file does not
+    define is ignored rather than added: the overlay may narrow the shipped
+    policy for a deployment, never introduce a new project behind its back.
+    """
+    out = copy.deepcopy(tracked)
+    projects = out.setdefault("projects", {})
+    for name, raw in ((overlay or {}).get("projects") or {}).items():
+        if name not in projects or not isinstance(raw, dict):
+            continue
+        entry = dict(projects[name])
+        for field in OVERLAY_FIELDS:
+            if field in raw:
+                entry[field] = copy.deepcopy(raw[field])
+        projects[name] = entry
+    defaults = (overlay or {}).get("defaults")
+    if isinstance(defaults, dict) and "mode" in defaults:
+        out.setdefault("defaults", {})["mode"] = defaults["mode"]
+    return out
 
 
 class AllowlistError(ValueError):
@@ -156,10 +203,13 @@ class ProjectAllowlist:
         # previous copy is in force" instead of having no copy at all.
         self.cache_path = Path(cache_path) if cache_path else \
             self.path.with_name(self.path.name + ".last-good")
+        self.overlay_path = overlay_path(self.path)
         self.data: dict | None = None
         self.load_error = ""
         self.generation = 0
         self.using_previous = False
+        self.source_files: list[str] = [str(self.path)]
+        self.effective_from: dict[str, str] = {}
         self._stamp: tuple | None = None
         self.reload()
 
@@ -169,15 +219,20 @@ class ProjectAllowlist:
 
         mtime alone misses two writes inside one filesystem tick, and a change
         like ``[28]`` -> ``"28"`` keeps the byte count identical, so the hash is
-        what actually decides whether the content changed.
+        what actually decides whether the content changed. The overlay is part
+        of the stamp: editing only the local file must trigger a reload too.
         """
-        try:
-            stat = self.path.stat()
-            raw = self.path.read_bytes()
-        except OSError:
-            return None
-        return (stat.st_mtime_ns, stat.st_size,
-                hashlib.sha256(raw).hexdigest())
+        stamp = []
+        for path in (self.path, self.overlay_path):
+            try:
+                stat = path.stat()
+                raw = path.read_bytes()
+            except OSError:
+                stamp.append(None)
+                continue
+            stamp.append((stat.st_mtime_ns, stat.st_size,
+                          hashlib.sha256(raw).hexdigest()))
+        return tuple(stamp)
 
     def _save_cache(self, data: dict) -> None:
         try:
@@ -196,15 +251,24 @@ class ProjectAllowlist:
             return None
 
     def reload(self) -> dict:
-        """Read + validate once. Never raises: failures are recorded."""
+        """Read + validate once. Never raises: failures are recorded.
+
+        The local overlay is part of the same load: it is merged before
+        validation, so the effective data is always the validated pair. A
+        broken *overlay* is reported and ignored (the tracked copy stays in
+        force, exactly like a broken tracked file); only a broken tracked file
+        falls back to the last-good cache.
+        """
         stamp = self._stamp_now()
-        if stamp is None:
+        if stamp[0] is None:
             self.load_error = f"cannot read allowlist {self.path.name}"
+            self._note_sources(None)
             return {"changed": False, "used": "previous" if self.data else "none",
                     "error": self.load_error}
+        overlay_error = ""
         try:
-            data = validate(json.loads(self.path.read_text(encoding="utf-8")))
-        except (OSError, ValueError, AllowlistError) as exc:
+            tracked = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
             self._stamp = stamp
             self.load_error = f"allowlist {self.path.name}: {exc}"
             if self.data is None:
@@ -216,13 +280,80 @@ class ProjectAllowlist:
                             "error": self.load_error}
             return {"changed": False, "used": "previous" if self.data else "none",
                     "error": self.load_error}
+
+        merged, overlaid = tracked, {}
+        local_data, overlay_error = self._read_overlay()
+        merged = merge_overlay(tracked, local_data)
+        overlaid = dict(local_data.get("projects") or {})
+
+        try:
+            data = validate(merged)
+        except (ValueError, AllowlistError) as exc:
+            self._stamp = stamp
+            self.load_error = f"allowlist {self.path.name}: {exc}"
+            if self.overlay_path.is_file():
+                # The merged pair is bad, but the tracked half may be fine: fall
+                # back to it so one bad value in an untracked file cannot stop
+                # the engine. The reason still reaches doctor via the summary.
+                try:
+                    data = validate(tracked)
+                except (ValueError, AllowlistError):
+                    data = None
+                if data is not None:
+                    self.data = data
+                    self.load_error = (f"{self.overlay_path.name}: "
+                                       f"{overlay_error or exc}")
+                    self.using_previous = True
+                    self.generation += 1
+                    self._stamp = stamp
+                    self._note_sources({})
+                    self._save_cache(data)
+                    return {"changed": True, "used": "tracked",
+                            "error": self.load_error}
+            if self.data is None:
+                cached = self._load_cache()
+                if cached is not None:
+                    self.data = cached
+                    self.using_previous = True
+                    return {"changed": False, "used": "previous",
+                            "error": self.load_error}
+            return {"changed": False, "used": "previous" if self.data else "none",
+                    "error": self.load_error}
         self.data = data
-        self.load_error = ""
-        self.using_previous = False
+        self.load_error = overlay_error
+        self.using_previous = bool(overlay_error)
         self.generation += 1
         self._stamp = stamp
+        self._note_sources({name: "local" for name in overlaid})
         self._save_cache(data)
         return {"changed": True, "used": "new", "error": ""}
+
+    def _note_sources(self, overlaid: dict | None) -> None:
+        """Record which files produced ``data`` and per-project provenance."""
+        files = [str(self.path)]
+        self.effective_from = {}
+        if overlaid is not None and self.overlay_path.is_file():
+            files.append(str(self.overlay_path))
+        if overlaid is not None:
+            for name in sorted((self.data or {}).get("projects", {})):
+                self.effective_from[name] = (
+                    "local" if name in (overlaid or {}) else "tracked")
+        self.source_files = files
+
+    def _read_overlay(self) -> tuple[dict, str]:
+        """``(data, error)`` for the overlay; ``({}, "")`` when it is absent."""
+        if not self.overlay_path.is_file():
+            return {}, ""
+        try:
+            raw = json.loads(self.overlay_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return {}, f"overlay unreadable: {exc}"
+        if not isinstance(raw, dict):
+            return {}, "overlay root must be a JSON object"
+        projects = raw.get("projects", {})
+        if not isinstance(projects, dict):
+            return {}, "overlay projects must be an object"
+        return raw, ""
 
     def poll(self) -> dict:
         """Hot reload when the file content changes; a bad file keeps the last copy.
@@ -253,7 +384,22 @@ class ProjectAllowlist:
                 # rather than only tracking the cold-start cache path.
                 "using_previous": bool(self.load_error) or bool(self.using_previous),
                 "cache": str(self.cache_path),
+                "source_files": list(self.source_files),
+                "overlay": str(self.overlay_path),
+                "overlay_present": self.overlay_path.is_file(),
+                "effective_from": dict(self.effective_from),
                 "projects": projects}
+
+    def source_label(self) -> str:
+        """``tracked``, ``tracked+local`` or ``tracked+local(生效:local)``."""
+        if not self.overlay_path.is_file():
+            return "tracked"
+        if not self.effective_from:
+            return "tracked+local"
+        local = sorted(k for k, v in self.effective_from.items() if v == "local")
+        if not local:
+            return "tracked+local(生效:tracked)"
+        return f"tracked+local(生效:local: {','.join(local)})"
 
     def check(self, project: str | None, issue: int | None = None,
               action: str | None = None) -> tuple[bool, str]:

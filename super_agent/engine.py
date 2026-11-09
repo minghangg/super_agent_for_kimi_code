@@ -626,6 +626,7 @@ class Engine:
         if snap["valid"] and not snap["error"]:
             return ("config", True,
                     f"allowlist ok projects={snap['projects']} "
+                    f"allowlist={self.projects.source_label()} "
                     f"generation={snap['generation']}", "fail", "config-bad")
         if snap["valid"]:
             return ("config", False,

@@ -885,18 +885,62 @@ class AllowlistSummary(Base):
 
 
 class ShippedAllowlist(Base):
-    """Same-block item 3: assist can really dispatch one action."""
+    """Same-block item 3: assist can really dispatch one action.
+
+    The shipped file names a **test issue** rather than a fixed one (the probe
+    target is ``#1``), and the real repository name lives in an untracked
+    overlay. The assertions therefore read the shipped issue number instead of
+    hard-coding it, and never assume the overlay exists.
+    """
+
+    def shipped(self) -> ProjectAllowlist:
+        return ProjectAllowlist(ROOT / "config" / "allowlist.json")
+
+    def shipped_issue(self) -> int:
+        gate = self.shipped()
+        return int(gate.data["projects"]["superagent"]["issues"][0])
 
     def test_shipped_allowlist_permits_bus_inject(self):
         shipped = json.loads((ROOT / "config" / "allowlist.json").read_text("utf-8"))
         actions = shipped["projects"]["superagent"]["actions"]
         self.assertIn("bus_inject", actions)
-        gate = ProjectAllowlist(ROOT / "config" / "allowlist.json")
-        self.assertTrue(gate.check("superagent", 28, "bus_inject")[0])
+        gate = self.shipped()
+        self.assertTrue(gate.check("superagent", self.shipped_issue(), "bus_inject")[0])
+
+    def test_overlay_is_ignored_when_absent_and_wins_when_present(self):
+        """The overlay may override ``repo`` only; the tracked policy stands."""
+        allow = self.root / "tracked.json"
+        allow.write_text(json.dumps(GOOD), encoding="utf-8")
+        self.assertEqual(ProjectAllowlist(allow).data["projects"]["demo"]["repo"],
+                         "owner/demo")
+
+        overlay = self.root / "tracked.local.json"
+        overlay.write_text(json.dumps({"projects": {"demo": {
+            "repo": "someone/else", "creation_mode": "engine_preapproved"}}}),
+            encoding="utf-8")
+        gate = ProjectAllowlist(allow)
+        entry = gate.data["projects"]["demo"]
+        self.assertEqual(entry["repo"], "someone/else")
+        # Not in OVERLAY_FIELDS: inherited, so the shipped gate is unchanged.
+        self.assertEqual(entry["creation_mode"], "pm_created")
+        self.assertEqual(entry["issues"], [28])
+        self.assertEqual(gate.summary()["effective_from"]["demo"], "local")
+        self.assertIn("local", gate.source_label())
+
+    def test_broken_overlay_is_refused_and_tracked_copy_stays(self):
+        allow = self.root / "tracked.json"
+        allow.write_text(json.dumps(GOOD), encoding="utf-8")
+        (self.root / "tracked.local.json").write_text(
+            json.dumps({"projects": {"demo": {"issues": ["28"]}}}), encoding="utf-8")
+        gate = ProjectAllowlist(allow)
+        self.assertTrue(gate.data is not None)
+        self.assertEqual(gate.data["projects"]["demo"]["issues"], [28])
+        self.assertIn("issues", gate.summary()["error"])
 
     def test_assist_mode_dispatches_once_with_a_stub_bus(self):
         bus = FakeBus()
-        shipped = ProjectAllowlist(ROOT / "config" / "allowlist.json")
+        shipped = self.shipped()
+        issue = self.shipped_issue()
         engine = Engine(config.load(None, {"github": {"source": "none"},
                                            "mode": "assist"}),
                         Store(self.state), NullSource(), bus,
@@ -904,7 +948,8 @@ class ShippedAllowlist(Base):
         self.assertTrue(engine.dispatch_enabled, "assist enables dispatch")
         out = engine._dispatch({"kind": "bus_inject",
                                 "event": "event.agent.needs_person",
-                                "issue": 28, "input_ref": "28", "payload": {}})
+                                "issue": issue, "input_ref": str(issue),
+                                "payload": {}})
         self.assertTrue(out["dispatched"], out)
         self.assertTrue(out["ok"], out)
         self.assertEqual(engine.store.load_counters()["external_actions"], 1)

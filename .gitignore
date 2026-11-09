@@ -6,3 +6,4 @@ state/
 *.tmp
 *.last-good
 *.egg-info/
+config/allowlist.local.json
