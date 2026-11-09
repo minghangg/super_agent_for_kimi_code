@@ -58,7 +58,8 @@ class Base(unittest.TestCase):
         self.tmp.cleanup()
 
     def engine(self) -> Engine:
-        cfg = config.load(None, {"github": {"source": "none"}})
+        cfg = config.load(None, {"github": {"source": "none"},
+                                 "engine": {"archived_crosscheck": False}})
         return Engine(cfg, Store(self.state), NullSource())
 
     def cli_args(self) -> list[str]:

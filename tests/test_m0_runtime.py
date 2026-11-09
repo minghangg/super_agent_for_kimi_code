@@ -72,7 +72,10 @@ class Base(unittest.TestCase):
         self.tmp.cleanup()
 
     def engine(self, *, allowlist=True, source=None, bus=None) -> Engine:
-        cfg = config.load(None, {"github": {"source": "none"}})
+        # ``--state-dir`` does not isolate the lifecycle stream, so a round here
+        # can see real bindings. No session API is injected: stay offline.
+        cfg = config.load(None, {"github": {"source": "none"},
+                                 "engine": {"archived_crosscheck": False}})
         projects = ProjectAllowlist(self.allow_path) if allowlist else None
         return Engine(cfg, Store(self.state), source or NullSource(), bus,
                       project_allowlist=projects)
