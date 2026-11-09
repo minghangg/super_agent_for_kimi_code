@@ -218,15 +218,14 @@ class Delivery(Base):
                          "sole")
 
     def test_unmatched_delivery_escalates_and_is_not_dropped(self):
-        self.bind("session_w1", role="qa")
-        self.bind("session_w2", role="worker", name="wk-probe-2")
-        # qa + worker: two candidates, neither named by the marker.
+        # Two workers on the same issue, neither named by the marker: the
+        # sole-worker fallback cannot apply, so the delivery must escalate.
         rows = [
             {"seq": 1, "at": "2026-11-09T10:00:00+00:00",
              "type": session_events.CREATED, "sid": "session_w1", "key": "wk-probe-1"},
             {"seq": 2, "at": "2026-11-09T10:00:01+00:00",
              "type": session_events.BOUND, "sid": "session_w1", "key": THREAD,
-             "role": "qa", "issue": 1},
+             "role": "worker", "issue": 1},
             {"seq": 3, "at": "2026-11-09T10:00:02+00:00",
              "type": session_events.CREATED, "sid": "session_w2", "key": "wk-probe-2"},
             {"seq": 4, "at": "2026-11-09T10:00:03+00:00",

@@ -64,30 +64,35 @@ def is_active(rec: dict | None) -> bool:
     return bool(rec) and str((rec or {}).get("status") or "") in ACTIVE_STATES
 
 
-def live_bindings(state: dict, thread: str) -> list[dict]:
+def live_bindings(state: dict, thread: str, issue: int | None = None) -> list[dict]:
     """Sessions currently bound to ``thread`` as a worker/qa participant.
 
     ``state`` is a ``session_events.replay()`` result. The filter is the one QA
     asked for: a session with no role or no issue takes no part in the thread
     view (its ``key`` is just its name).
+
+    Matching uses the **issue number**, not the event's ``key``: ``bind`` puts
+    the worker's *name* (``wk-probe-1``) in ``key`` and the issue number in
+    ``issue``, so comparing keys would never match a real binding.
     """
     sessions = state.get("sessions") or {}
     keys = session_events_active(state)
+    by_key = {sid: key for key, sid in keys.items()}
     out = []
-    for key, sid in sorted(keys.items()):
-        if key != thread:
-            continue
-        rec = sessions.get(sid) or {}
+    for sid, rec in sessions.items():
         if rec.get("archived"):
             continue
         role = str(rec.get("role") or "")
         if role not in PARTICIPANT_ROLES:
             continue
-        if rec.get("issue") is None:
+        bound_issue = rec.get("issue")
+        if bound_issue is None:
             continue
-        out.append({"key": key, "sid": sid, "role": role,
-                    "issue": rec.get("issue"),
-                    "name": str(rec.get("name") or "")})
+        if issue is not None and int(bound_issue) != int(issue):
+            continue
+        name = str(rec.get("name") or by_key.get(sid) or rec.get("key") or "")
+        out.append({"key": by_key.get(sid) or thread, "sid": sid, "role": role,
+                    "issue": bound_issue, "name": name})
     return out
 
 
@@ -118,20 +123,31 @@ def sync(index: dict, thread: str, issue, live: list[dict], *,
 
     for bind in live:
         role = bind["role"]
+        key = bind.get("name") or bind["key"]
         existing = sorted(by_role.get(role) or [])
-        if existing:
-            aid = existing[0]
+        # A role may be held by more than one session at a time, so the match
+        # key is the *session* (sid or session name), not the role alone.
+        # Matching on the role merged a second worker into the first record and
+        # lost it.
+        match = None
+        for aid in existing:
             rec = assignments[aid]
+            if rec.get("sid") == bind["sid"] or (
+                    rec.get("session_key") and rec.get("session_key") == key):
+                match = aid
+                break
+        if match is not None:
+            rec = assignments[match]
             if rec.get("sid") != bind["sid"]:
                 rec["sid"] = bind["sid"]
-                rec["session_key"] = bind.get("name") or bind["key"]
+                rec["session_key"] = key
                 rec["updated_at"] = now()
-                out["updated"].append(aid)
+                out["updated"].append(match)
             continue
         aid = next_id(assignments, issue, role)
         assignments[aid] = {
             "id": aid, "thread": thread, "issue": int(issue), "role": role,
-            "sid": bind["sid"], "session_key": bind.get("name") or bind["key"],
+            "sid": bind["sid"], "session_key": key,
             "input_comment_id": None, "status": "working",
             "attempts": 0, "notification_action_id": "", "notified_at": "",
             "delivery_comment_id": None, "delivery_marker": "",

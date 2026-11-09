@@ -289,7 +289,7 @@ class Engine:
                                   "thread": thread, "error": self._assignments_error})
             return {"created": [], "updated": [], "conflict": [],
                     "unreadable": self._assignments_error}
-        live = asg_mod.live_bindings(state, thread)
+        live = asg_mod.live_bindings(state, thread, issue)
         crosscheck = set()
         ledger = self._load_issue_sessions().get(thread) or {}
         if isinstance(ledger, dict):
