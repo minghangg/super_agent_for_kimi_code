@@ -30,7 +30,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import health, session_events
+from . import health, issuekey, session_events
 
 PRIORITY_SKELETON = -1
 PRIORITY_USER = 0
@@ -250,7 +250,7 @@ def _outbox_items(store, *, markers=None) -> list[Item]:
 def _index_items(index: dict | None, *, markers=None) -> list[Item]:
     items: list[Item] = []
     issues = (index or {}).get("issues") or {}
-    for key in sorted(issues, key=lambda k: int(k) if str(k).isdigit() else 0):
+    for key in sorted(issues, key=lambda k: issuekey.issue_number(k) or 0):
         rec = issues.get(key) or {}
         if not isinstance(rec, dict):
             continue
@@ -280,7 +280,9 @@ def _recent_decisions(index: dict | None, *, project_issues: set[int] | None,
         try:
             number = int(key)
         except (TypeError, ValueError):
-            continue
+            number = issuekey.issue_number(key)
+            if number is None:
+                continue
         if project_issues is not None and number not in project_issues:
             continue
         stamp = str(rec.get("last_event_ts") or rec.get("rebuilt_at") or "")

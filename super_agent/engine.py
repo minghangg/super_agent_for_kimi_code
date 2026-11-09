@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import github_source, health, session_events
+from . import github_source, health, issuekey, session_events
 from .allowlist import ProjectAllowlist
 from .store import Store, action_id
 
@@ -71,6 +71,14 @@ class Engine:
         if self.projects is None:
             return True, "no project allowlist configured"
         return self.projects.check(self._project_for(issue), issue, action)
+
+    def _thread_key(self, issue) -> str:
+        """Qualified thread key for ``issue`` (falls back to the bare number)."""
+        repo = str((self.cfg.get("github") or {}).get("repo") or "")
+        if not issuekey.is_repo(repo):
+            entry = self.projects.project(self._project_for(issue)) if self.projects else None
+            repo = str((entry or {}).get("repo") or "")
+        return issuekey.thread_key(repo, issue)
 
     def _project_for(self, issue) -> str | None:
         """Project name that lists ``issue``; None when nothing claims it."""
@@ -344,6 +352,12 @@ class Engine:
         max_issues = int(gh_cfg.get("max_issues") or 20)
         max_comments = int(gh_cfg.get("max_comments_per_issue") or 50)
 
+        # Legacy numeric keys are copied forward once, before anything reads
+        # them: from here on every write uses the qualified form.
+        repo = str(gh_cfg.get("repo") or "")
+        if issuekey.is_repo(repo):
+            issuekey.migrate(index, cursor, repo, log_event=self.store.log_event)
+
         # Hot reload before reading anything: a valid new file applies to this
         # round onwards, a broken one leaves the previous copy in force.
         allowlist_reload = ""
@@ -400,13 +414,16 @@ class Engine:
     def _round_issue(self, issue: int, index: dict, cursor: dict,
                      max_comments: int, summary: dict) -> None:
         issue = int(issue)
-        key = str(issue)
+        key = self._thread_key(issue)
+        legacy = str(issue)
         summary["issues"] += 1
         issues = index.setdefault("issues", {})
         rec = issues.setdefault(key, {"state": "idle", "comments_seen": 0,
                                       "needs_person": []})
         rec["title"] = rec.get("title") or self.source.title(issue)
-        cur = int((cursor.get("issues") or {}).get(key) or 0)
+        # Qualified key first, legacy second: a mixed file converges instead of
+        # re-reading comments already consumed under the old form.
+        cur = int(issuekey.read_both(cursor.get("issues") or {}, key, legacy) or 0)
         comments = self.source.comments(issue)[-max_comments:]
         fresh = [c for c in comments if int(c["id"]) > cur]
         summary["comments_new"] += len(fresh)
@@ -464,7 +481,7 @@ class Engine:
         counters = self.store.load_counters()
         items = []
         for issue_key, rec in sorted((index.get("issues") or {}).items(),
-                                     key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0):
+                                     key=lambda kv: issuekey.issue_number(kv[0]) or 0):
             for entry in rec.get("needs_person") or []:
                 items.append({"issue": issue_key, "comment_id": entry.get("comment_id"),
                               "reason": entry.get("reason"), "at": entry.get("at"),
@@ -549,7 +566,8 @@ class Engine:
 
         cursor = self.store.load_cursor()
         bad_cursor = [k for k, v in (cursor.get("issues") or {}).items()
-                      if not isinstance(v, int) or v < 0]
+                      if not isinstance(v, int) or v < 0
+                      or issuekey.issue_number(k) is None]
         add("cursor", not bad_cursor,
             "cursor ok" if not bad_cursor else f"invalid cursors: {bad_cursor}")
 
@@ -657,11 +675,12 @@ class Engine:
             elif rec["state"] == "idle":
                 rec["state"] = "tracked"
         rec["last_comment_id"] = max((int(c["id"]) for c in comments), default=0)
-        index.setdefault("issues", {})[str(issue)] = rec
+        key = self._thread_key(issue)
+        index.setdefault("issues", {})[key] = rec
         index.setdefault("meta", {})["updated_at"] = _now()
         index["meta"]["rebuilt_issue"] = issue
         self.store.save_index(index)
-        cursor.setdefault("issues", {})[str(issue)] = rec["last_comment_id"]
+        cursor.setdefault("issues", {})[key] = rec["last_comment_id"]
         self.store.save_cursor(cursor)
         self.store.log_event({"type": "replay.rebuilt", "at": _now(), "issue": issue,
                               "comments": rec["comments_seen"],

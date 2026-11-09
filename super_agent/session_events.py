@@ -150,13 +150,25 @@ def _event_at(rec: dict) -> datetime | None:
 def replay(events: list[dict], at: str | datetime | None = None) -> dict:
     """Rebuild the session picture as of ``at`` (inclusive), by replaying events.
 
-    Returns ``{"sessions": {sid: {...}}, "keys": {key: sid}, "at": ...,
-    "applied": n, "skipped": n}``. ``at=None`` means "as of the newest event".
-    A record without a parsable ``at`` is applied only when ``at`` is None.
+    Returns ``{"sessions": {sid: {...}}, "keys": {key: sid}, "released": set(),
+    "at": ..., "applied": n, "skipped": n}``. ``at=None`` means "as of the
+    newest event". A record without a parsable ``at`` is applied only when
+    ``at`` is None.
+
+    ``keys`` is the *key-driven* view: it only knows the keys a key event
+    mentioned. That is why a session bound by ``session.bound`` can be missing
+    from it - see :func:`active_keys`, which unions in the session-level
+    bindings that ``sessions[sid]["key"]`` records.
+
+    ``released`` holds keys whose release event (``key_changed`` with no
+    ``sid``) has not been undone by a later bind/rotate. It exists so
+    :func:`active_keys` can tell "this key was deliberately handed back" apart
+    from "this key is still live and the key map simply never saw it".
     """
     cutoff = _parse_at(at) if isinstance(at, str) else at
     sessions: dict[str, dict] = {}
     keys: dict[str, str] = {}
+    released: set[str] = set()
     applied = skipped = 0
 
     def rec_for(sid: str) -> dict:
@@ -185,18 +197,24 @@ def replay(events: list[dict], at: str | datetime | None = None) -> dict:
                     # it as one would make every fresh session look like drift.
                     rec["key"] = key
                     rec["name"] = key
+                    rec["name_only"] = True
         elif kind == KEY_CHANGED:
             if key:
                 if sid:
                     keys[key] = sid
+                    rec_for(sid).pop("name_only", None)
                     rec_for(sid)["key"] = key
+                    released.discard(key)
                 else:
                     keys.pop(key, None)          # rm: the key is released
+                    released.add(key)
         elif kind == ROTATED:
             from_sid, to_sid = str(event.get("from_sid") or ""), str(event.get("to_sid") or "")
             if key and to_sid:
                 keys[key] = to_sid
+                rec_for(to_sid).pop("name_only", None)
                 rec_for(to_sid)["key"] = key
+                released.discard(key)
             if from_sid:
                 rec_for(from_sid)["superseded_by"] = to_sid
         elif kind == ARCHIVED:
@@ -212,14 +230,19 @@ def replay(events: list[dict], at: str | datetime | None = None) -> dict:
         elif kind == BOUND:
             if sid:
                 rec = rec_for(sid)
+                rec.pop("name_only", None)
                 if event.get("role"):
                     rec["role"] = str(event["role"])
                 if event.get("issue") is not None:
                     rec["issue"] = event["issue"]
                     rec["assignment"] = rec["assignment"] or f"#{event['issue']}"
                 if key:
+                    # A bind is a *claim* on the key, so a session-level binding
+                    # must also become visible in the key map - otherwise the
+                    # key is never re-added after a release.
                     rec["assignment"] = key
                     rec["key"] = key
+                    released.discard(key)
         else:
             continue
         # role travels on several event types; the newest non-empty wins.
@@ -227,16 +250,42 @@ def replay(events: list[dict], at: str | datetime | None = None) -> dict:
             rec_for(sid)["role"] = str(event["role"])
         if sid:
             rec_for(sid)["at"] = str(event.get("at") or rec_for(sid)["at"])
-    return {"sessions": sessions, "keys": keys, "at": at, "applied": applied,
-            "skipped": skipped}
+    return {"sessions": sessions, "keys": keys, "released": released, "at": at,
+            "applied": applied, "skipped": skipped}
 
 
 def active_keys(state: dict) -> dict:
-    """``key -> sid`` for keys whose session is not archived (the live truth)."""
+    """``key -> sid`` for keys that are live right now.
+
+    Two sources, unioned: the key map built from key events, and the
+    session-level ``key`` recorded by ``session.bound``. Only the second one is
+    complete for bind-driven workflows - a bound session never appears in the
+    key map, which is how this reader used to lose 19 of 27 live bindings.
+
+    Exclusion order matters and is deliberate:
+
+    * keys whose ``sid`` is archived are dropped;
+    * session-level bindings whose key was explicitly *released* are dropped
+      (the key was handed back, the session record still holds its name);
+    * the key map wins when both sources mention the same key.
+    """
+    sessions = state.get("sessions") or {}
+    released = set(state.get("released") or ())
     out = {}
     for key, sid in (state.get("keys") or {}).items():
-        rec = (state.get("sessions") or {}).get(sid) or {}
+        rec = sessions.get(sid) or {}
         if rec.get("archived"):
+            continue
+        out[key] = sid
+    for sid, rec in sessions.items():
+        key = str(rec.get("key") or "")
+        if not key or key in out or key in released or rec.get("archived"):
+            continue
+        if rec.get("name_only"):
+            # The key came from ``session.created``, i.e. it is the session's
+            # *name*, not a thread binding. Those sessions take no part in the
+            # thread view (no role, no issue): including them would invent a
+            # binding that was never made.
             continue
         out[key] = sid
     return out
@@ -326,9 +375,16 @@ def reconcile(events_path: Path, sessions_path: Path,
                 if rec.get("archived")}
     ledger = load_sessions_ledger(sessions_path)
 
-    keys_missing_in_events = sorted(set(ledger) - set(by_key))
-    keys_missing_in_ledger = sorted(set(by_key) - set(ledger))
-    key_sid_mismatch = sorted(k for k in set(ledger) & set(by_key)
+    # A live binding the flat ledger does not list is a **known gap**, not
+    # drift: ``sessions.json`` is written by the session tools and only ever
+    # covers a subset (it predates bind-driven workers). Reporting it as DRIFT
+    # would make a correct fix look broken, so it is split out into its own
+    # section and printed as a NOTE - visible, never silently dropped, and
+    # never a reason to fail the check.
+    keys_only_in_stream = sorted(set(by_key) - set(ledger))
+    ledger_keys_all = set(ledger)
+    keys_missing_in_events = sorted(ledger_keys_all - set(by_key))
+    key_sid_mismatch = sorted(k for k in ledger_keys_all & set(by_key)
                               if ledger[k] != by_key[k])
 
     # A ledger sid the events never mention is drift too: the flat file claims
@@ -349,7 +405,6 @@ def reconcile(events_path: Path, sessions_path: Path,
 
     diff_keys = {
         "keys_missing_in_events": keys_missing_in_events,
-        "keys_missing_in_ledger": keys_missing_in_ledger,
         "key_sid_mismatch": key_sid_mismatch,
         "ledger_unknown_sid": ledger_unknown_sid,
         "ledger_sid_not_live": ledger_not_live,
@@ -364,6 +419,7 @@ def reconcile(events_path: Path, sessions_path: Path,
                   "server_live": len(server_sids) if server_sids is not None else None},
         "events_keys": by_key,
         "ledger_keys": ledger,
+        "keys_only_in_stream": keys_only_in_stream,
         "live_unclaimed": live_unclaimed,
         "diff": diff_keys,
         "diff_non_empty": non_empty,

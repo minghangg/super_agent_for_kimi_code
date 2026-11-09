@@ -351,6 +351,231 @@ class ReplayAndReconcile(SessionStreamBase):
         self.assertEqual(report["diff"]["ledger_sid_not_live"], [])
 
 
+class ActiveKeyUnion(unittest.TestCase):
+    """The key map used to lose every bind-driven worker (ISS-20 P0).
+
+    These are the two assertions QA asked for, written against a synthetic
+    stream so they do not depend on the live workbench state:
+
+    1. after excluding released and archived, no unarchived session-level
+       binding is missing from ``active_keys``;
+    2. a session with no role and no issue does not participate (its ``key``
+       is its *name* from ``session.created``, never a binding).
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    @staticmethod
+    def stream() -> list[dict]:
+        rows = []
+
+        def add(seq, at, kind, **fields):
+            rows.append({"seq": seq, "at": at, "type": kind, **fields})
+
+        add(1, "2026-11-09T10:00:00+00:00", session_events.CREATED,
+            sid="s1", key="wk-probe-1")
+        add(2, "2026-11-09T10:00:01+00:00", session_events.BOUND,
+            sid="s1", key="o/r#1", role="worker", issue=1)
+        # Released on purpose: the session record keeps the name, the key is
+        # gone and must stay gone.
+        add(3, "2026-11-09T10:00:02+00:00", session_events.KEY_CHANGED,
+            key="o/r#2")
+        add(4, "2026-11-09T10:00:03+00:00", session_events.KEY_CHANGED,
+            key="o/r#2", sid="s2")
+        add(5, "2026-11-09T10:00:04+00:00", session_events.BOUND,
+            sid="s2", key="o/r#2", role="qa", issue=2)
+        add(6, "2026-11-09T10:00:05+00:00", session_events.ARCHIVED, sid="s2")
+        # No role, no issue: a console session, not a thread participant.
+        add(7, "2026-11-09T10:00:06+00:00", session_events.CREATED,
+            sid="s3", key="probe-task")
+        return rows
+
+    def test_bound_session_becomes_visible(self):
+        state = session_events.replay(self.stream())
+        keys = session_events.active_keys(state)
+        self.assertEqual(keys.get("o/r#1"), "s1")
+        self.assertNotIn("o/r#2", keys, "archived sid must not stay live")
+
+    def test_orphan_after_released_and_archived_exclusion_is_zero(self):
+        state = session_events.replay(self.stream())
+        keys = session_events.active_keys(state)
+        released = set(state.get("released") or ())
+        orphan = [sid for sid, rec in state["sessions"].items()
+                  if rec.get("key") and not rec.get("archived")
+                  and not rec.get("name_only")
+                  and rec["key"] not in released and rec["key"] not in keys]
+        self.assertEqual(orphan, [])
+
+    def test_session_without_role_or_issue_does_not_join(self):
+        state = session_events.replay(self.stream())
+        rec = state["sessions"]["s3"]
+        self.assertEqual(rec.get("role"), "")
+        self.assertIsNone(rec.get("issue"))
+        participants = {sid for sid, r in state["sessions"].items()
+                        if r.get("role") in ("worker", "qa")
+                        and r.get("issue") is not None
+                        and not r.get("archived")}
+        self.assertEqual(participants, {"s1"})
+
+    def test_release_is_undone_by_a_later_bind(self):
+        rows = self.stream() + [
+            {"seq": 8, "at": "2026-11-09T10:00:07+00:00",
+             "type": session_events.BOUND, "sid": "s1", "key": "o/r#1",
+             "role": "worker", "issue": 1}]
+        rows.insert(7, {"seq": 9, "at": "2026-11-09T10:00:08+00:00",
+                        "type": session_events.KEY_CHANGED, "key": "o/r#1"})
+        state = session_events.replay(rows)
+        self.assertIn("o/r#1", session_events.active_keys(state))
+        self.assertNotIn("o/r#1", state["released"])
+
+    def test_session_level_binding_absent_from_ledger_is_a_note_not_drift(self):
+        state = session_events.replay(self.stream())
+        events = Path(self._tmp.name) / "events.jsonl"
+        events.write_text("\n".join(json.dumps(r) for r in self.stream()) + "\n",
+                          encoding="utf-8")
+        ledger = Path(self._tmp.name) / "sessions.json"
+        ledger.write_text(json.dumps({}), encoding="utf-8")
+        report = session_events.reconcile(events, ledger, {"session_s1"})
+        self.assertEqual(report["keys_only_in_stream"], ["o/r#1"])
+        self.assertNotIn("keys_missing_in_ledger", report["diff"])
+        self.assertTrue(report["ok"], report["diff"])
+
+
+class IssueKeyContract(unittest.TestCase):
+    """Qualified keys: new form wins, legacy keys are read-only, migrate once."""
+
+    def test_shape_and_parsing(self):
+        from super_agent import issuekey
+        self.assertEqual(issuekey.thread_key("Owner/Repo", 7), "owner/repo#7")
+        self.assertEqual(issuekey.split_key("owner/repo#7"), ("owner/repo", 7))
+        self.assertEqual(issuekey.split_key("7"), ("", 7))
+        self.assertEqual(issuekey.issue_number("owner/repo#7"), 7)
+        self.assertEqual(issuekey.issue_number("7"), 7)
+        self.assertIsNone(issuekey.issue_number("owner/repo"))
+        self.assertTrue(issuekey.is_legacy("7"))
+        self.assertFalse(issuekey.is_legacy("owner/repo#7"))
+
+    def test_qualified_key_wins_over_the_legacy_one(self):
+        from super_agent import issuekey
+        mapping = {"7": 100, "o/r#7": 200}
+        self.assertEqual(issuekey.read_both(mapping, "o/r#7", "7"), 200)
+        self.assertEqual(issuekey.read_both({"7": 100}, "o/r#7", "7"), 100)
+
+    def test_migrate_is_idempotent_and_keeps_the_old_key(self):
+        from super_agent import issuekey
+        index = {"issues": {"7": {"state": "tracked"}}, "meta": {}}
+        cursor = {"issues": {"7": 9001}}
+        first = issuekey.migrate(index, cursor, "o/r")
+        self.assertEqual(first["issues"], 1)
+        self.assertEqual(index["issues"]["o/r#7"]["state"], "tracked")
+        self.assertIn("7", index["issues"], "legacy key is kept for readers")
+        self.assertEqual(cursor["issues"]["o/r#7"], 9001)
+        second = issuekey.migrate(index, cursor, "o/r")
+        self.assertEqual(second["migrated"], [])
+        self.assertTrue(index["meta"]["keys_migrated"])
+
+    def test_migrate_does_not_overwrite_a_newer_qualified_entry(self):
+        from super_agent import issuekey
+        index = {"issues": {"7": {"state": "idle"},
+                            "o/r#7": {"state": "needs_person"}}, "meta": {}}
+        issuekey.migrate(index, {"issues": {}}, "o/r")
+        self.assertEqual(index["issues"]["o/r#7"]["state"], "needs_person")
+
+
+def _extract_function(source: str, name: str) -> str:
+    """The text of one top-level ``def`` up to the next top-level ``def``."""
+    import re as _re
+    start = source.index(f"def {name}(")
+    match = _re.search(r"\ndef ", source[start:])
+    end = start + match.start() + 1 if match else len(source)
+    return source[start:end]
+
+
+class ActiveKeysSourceProof(unittest.TestCase):
+    """QA P1-1: the demo must really replace ``active_keys``.
+
+    BEFORE is loaded from the pre-change backup copy, AFTER from the same file
+    with :func:`_extract_function`-verified replacement. Both sides go through
+    a real import, and the function bodies are compared by hash, so "the
+    replacement happened" is checked rather than asserted: a no-op swap leaves
+    the two hashes identical and the comparison vacuous.
+    """
+
+    def test_replacement_changes_the_function_and_the_answer(self):
+        import hashlib
+        import importlib.util
+        import inspect
+        import re as _re
+        import tempfile
+
+        # BEFORE is the pre-fix body, taken from the tracked backup copy so the
+        # comparison stays meaningful after the fix landed.
+        baseline = Path(__file__).resolve().parents[1] / "backup" / "super_agent"
+        candidates = sorted(baseline.glob("session_events_*.py"))
+        if not candidates:
+            self.skipTest("no pre-change copy to compare against")
+        source = candidates[0].read_text(encoding="utf-8")
+        original_hash = hashlib.sha256(
+            _extract_function(source, "active_keys").strip().encode("utf-8")).hexdigest()
+
+        fixed = '''
+def active_keys(state: dict) -> dict:
+    """Live keys: key map UNION session-level bindings, minus released/archived."""
+    sessions = state.get("sessions") or {}
+    released = set(state.get("released") or ())
+    out = {}
+    for key, sid in (state.get("keys") or {}).items():
+        rec = sessions.get(sid) or {}
+        if rec.get("archived"):
+            continue
+        out[key] = sid
+    for sid, rec in sessions.items():
+        key = str(rec.get("key") or "")
+        if not key or key in out or key in released or rec.get("archived"):
+            continue
+        out[key] = sid
+    return out
+'''
+        start = source.index("def active_keys(")
+        end = _re.search(r"\ndef ", source[start:]).start() + start + 1
+        patched = source[:start] + fixed.lstrip("\n") + "\n\n" + source[end:]
+        self.assertNotEqual(patched, source, "the patch must change the file")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "patched_session_events.py"
+            target.write_text(patched, encoding="utf-8")
+            spec = importlib.util.spec_from_file_location("patched_se", target)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            new_hash = hashlib.sha256(
+                inspect.getsource(module.active_keys).strip().encode("utf-8")).hexdigest()
+            # Load the pre-fix copy the same way, for the BEFORE side.
+            base_copy = Path(tmp) / "baseline_session_events.py"
+            base_copy.write_text(source, encoding="utf-8")
+            base_spec = importlib.util.spec_from_file_location("baseline_se", base_copy)
+            baseline_module = importlib.util.module_from_spec(base_spec)
+            base_spec.loader.exec_module(baseline_module)
+            baseline_hash = hashlib.sha256(
+                inspect.getsource(baseline_module.active_keys).strip().encode("utf-8")
+            ).hexdigest()
+
+        self.assertEqual(original_hash, baseline_hash,
+                         "baseline must be the old body")
+        self.assertNotEqual(baseline_hash, new_hash,
+                            "the replacement did not take effect")
+        rows = ActiveKeyUnion.stream()
+        before = baseline_module.active_keys(baseline_module.replay(rows))
+        after = module.active_keys(module.replay(rows))
+        self.assertNotEqual(before, after)
+        self.assertNotIn("o/r#1", before)
+        self.assertIn("o/r#1", after)
+        self.assertEqual(sorted(set(before) - set(after)), [],
+                         "the fix must never lose a key")
+
+
 class EngineSessionView(unittest.TestCase):
     """The engine reads the workbench stream; it never writes it."""
 

@@ -431,6 +431,11 @@ def cmd_reconcile(args) -> int:
           f"server_live={sizes['server_live'] if sizes['server_live'] is not None else '-'}")
     for name, value in report["diff"].items():
         print(f"[{'DIFF' if value else 'OK  '}] {name}  {value if value else ''}".rstrip())
+    if report.get("keys_only_in_stream"):
+        print(f"[NOTE] live bindings not in sessions.json "
+              f"({len(report['keys_only_in_stream'])}): "
+              f"{', '.join(report['keys_only_in_stream'][:5])}"
+              f"{' …' if len(report['keys_only_in_stream']) > 5 else ''}")
     if report["live_unclaimed"]:
         print(f"[NOTE] live sessions not claimed by any key "
               f"({len(report['live_unclaimed'])}): "
