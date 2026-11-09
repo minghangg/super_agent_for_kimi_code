@@ -96,6 +96,18 @@ class FixtureSource:
         rec = (self.data.get("issues") or {}).get(str(issue)) or {}
         return str(rec.get("title") or "")
 
+    def issue_state(self, issue: int) -> str:
+        """``state`` from the fixture row; ``"open"`` when the row omits it.
+
+        Read-only like everything else here. An issue missing from the fixture
+        is ``"unknown"`` rather than ``"open"``: the close reconciliation must
+        not read absence as proof of anything.
+        """
+        rec = (self.data.get("issues") or {}).get(str(issue))
+        if not isinstance(rec, dict):
+            return "unknown"
+        return str(rec.get("state") or "open")
+
 
 class LiveSource:
     """Public GitHub REST, GET-only."""
@@ -207,6 +219,17 @@ class LiveSource:
         row = self._get(f"/repos/{self.repo}/issues/{int(issue)}")
         return str(row.get("title") or "") if isinstance(row, dict) else ""
 
+    def issue_state(self, issue: int) -> str:
+        """``GET /issues/{n}`` and read ``state``. Still a GET and nothing else.
+
+        This is the only way to learn that the supervisor closed the Issue: the
+        list endpoint only ever returns open ones.
+        """
+        row = self._get(f"/repos/{self.repo}/issues/{int(issue)}")
+        if not isinstance(row, dict):
+            raise SourceError("unexpected issue payload")
+        return str(row.get("state") or "unknown")
+
 
 class NullSource:
     """``github.source=none``: no issues, no network."""
@@ -223,6 +246,10 @@ class NullSource:
 
     def title(self, issue: int) -> str:
         return ""
+
+    def issue_state(self, issue: int) -> str:
+        """No backend, no opinion: ``"unknown"`` is never read as closed."""
+        return "unknown"
 
 
 class BrokenSource:
@@ -247,6 +274,9 @@ class BrokenSource:
         raise SourceError(self.error)
 
     def title(self, issue: int) -> str:
+        raise SourceError(self.error)
+
+    def issue_state(self, issue: int) -> str:
         raise SourceError(self.error)
 
 

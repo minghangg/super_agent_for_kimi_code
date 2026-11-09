@@ -935,6 +935,21 @@ class Engine:
         """
         asg_mod.mark_blocked(rec, reason, cid=cid, at=_now())
 
+    def _issue_state(self, issue) -> str:
+        """``source.issue_state(issue)`` with every failure folded to unknown.
+
+        Fail closed for the caller: an unreadable probe must never look like a
+        closed Issue, or a broken network would complete threads by itself.
+        """
+        try:
+            state = self.source.issue_state(int(issue))
+        except Exception as exc:  # noqa: BLE001  reported as unknown, never closed
+            self.store.log_event({"type": "issue.state_unreadable", "at": _now(),
+                                  "issue": int(issue),
+                                  "error": f"{type(exc).__name__}: {exc}"})
+            return "unknown"
+        return str(state or "unknown")
+
     def reconcile_close(self, thread: str, index: dict | None = None) -> dict:
         """Close a thread: every assignment completed, then reconcile the stream."""
         index = index if index is not None else self.store.load_index()

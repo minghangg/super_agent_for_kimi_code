@@ -19,7 +19,7 @@ from unittest import mock
 from super_agent import cli, config, store as store_mod
 from super_agent.bus_client import BusClient
 from super_agent.engine import Engine, build_engine
-from super_agent.github_source import FixtureSource
+from super_agent.github_source import FixtureSource, NullSource, BrokenSource, SourceError
 from super_agent.store import Store
 
 FIXTURE = {
@@ -277,6 +277,39 @@ class Gate(Base):
                           "--role", ""])
         self.assertEqual(caught.exception.code, 2)
         self.assertNotIn("role=", out.getvalue())
+
+
+class IssueState(Base):
+    """The read-only state probe the close reconciliation depends on."""
+
+    def test_every_backend_answers_without_writing(self):
+        fixture = json.loads(json.dumps(FIXTURE))
+        fixture["issues"]["42"]["state"] = "closed"
+        self.fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+        source = FixtureSource(self.fixture_path)
+        self.assertEqual(source.issue_state(42), "closed")
+        # A row without ``state`` is an open issue, not an unknown one: the
+        # fixture shape predates this field.
+        del fixture["issues"]["42"]["state"]
+        self.fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+        self.assertEqual(FixtureSource(self.fixture_path).issue_state(42), "open")
+        # Missing issue: unknown, never a guess.
+        self.assertEqual(source.issue_state(99), "unknown")
+        self.assertEqual(NullSource().issue_state(42), "unknown")
+        with self.assertRaises(SourceError):
+            BrokenSource("no source").issue_state(42)
+        # Read-only: nothing was archived, no API call was made.
+        self.assertEqual(self.engine.status()["external_actions"], 0)
+
+    def test_unreadable_state_fails_closed_in_the_engine(self):
+        # A source that raises must become "unknown" - fail closed, so the
+        # close reconciliation cannot read a broken probe as "container closed".
+        class Dead(FixtureSource):
+            def issue_state(self, issue):
+                raise SourceError("boom")
+
+        self.engine.source = Dead(self.fixture_path)
+        self.assertEqual(self.engine._issue_state(42), "unknown")
 
 
 if __name__ == "__main__":
