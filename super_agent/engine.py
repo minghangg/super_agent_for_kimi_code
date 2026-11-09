@@ -37,10 +37,14 @@ def _default_allowlist_path() -> Path:
 
 class Engine:
     def __init__(self, cfg: dict, store: Store, source, bus=None, *, clock=_now_ts,
-                 project_allowlist: ProjectAllowlist | None = None):
+                 project_allowlist: ProjectAllowlist | None = None,
+                 adapter=None, session_api=None):
         self.cfg = cfg
         self.store = store
         self.source = source
+        # Injected in tests; ``None`` means "use the direct console".
+        self.adapter = adapter
+        self.session_api = session_api
         self.bus = bus
         self.clock = clock
         self.mode = str(cfg.get("mode") or OBSERVE)
@@ -70,6 +74,8 @@ class Engine:
         # and health reports degraded (fail closed, never an empty loop).
         self.degraded = False
         self._assignments_error = ""
+        self._archived_cache: dict | None = None
+        self._archived_unreadable = False
 
     # ------------------------------------------------------------ allowlist
     def allowlist_allows(self, issue: int | None, action: str | None) -> tuple[bool, str]:
@@ -185,6 +191,18 @@ class Engine:
                 "issue": action.get("issue"),
             })
             return {"dispatched": False, "reason": "dispatch disabled"}
+
+        # Never deliver into a session that is already closed. Checked before
+        # the allowlist and before any counter moves, so a refusal here is not
+        # an external action and leaves no attempt behind.
+        payload_sid = str((action.get("payload") or {}).get("sid") or "")
+        if payload_sid and self._sid_archived(payload_sid):
+            self.store.log_event({"type": "dispatch.archived_sid", "at": _now(),
+                                  "sid": payload_sid,
+                                  "action": action.get("kind"),
+                                  "assignment": action.get("assignment_id")})
+            return {"dispatched": False, "refused": True,
+                    "reason": "target session is archived"}
 
         verb = str(action.get("kind") or "")
         issue = action.get("issue")
@@ -369,6 +387,176 @@ class Engine:
         self._notify_waiting_review(assignment)
         return "delivery", ""
 
+    # ------------------------------------------------------------- archive (C7)
+    def _archiver(self):
+        """Archive callable: the configured adapter, else the direct console.
+
+        Kept behind one method so tests inject a fake and the production path
+        goes through the same code. Archive is *not* guessed: the returned
+        session info is read back and ``archived is True`` is the only success
+        signal (the workbench's own archive path does exactly this read-back).
+        """
+        adapter = getattr(self, "adapter", None)
+        if adapter is not None:
+            return adapter
+        return None
+
+    def _sid_archived(self, sid: str) -> bool:
+        """Is this sid archived? Unreadable state counts as archived (closed).
+
+        Fail **closed** on purpose: if the session service cannot be asked, a
+        dispatch to that sid might hit a closed session, and the safe answer is
+        "assume closed, refuse the send". The reverse choice would keep pushing
+        events into a session that no longer exists.
+        """
+        if not sid:
+            return False
+        cached = getattr(self, "_archived_cache", None)
+        if cached is not None and sid in cached:
+            return cached[sid]
+        snapshot = self._refresh_archived_cache()
+        if self._archived_unreadable:
+            return True
+        return bool(snapshot.get(sid))
+
+    def _refresh_archived_cache(self) -> dict:
+        """One refresh per round of ``sid -> archived`` from the session stream."""
+        try:
+            events_path, _sessions = self._session_stream()
+            events = session_events.load_events(events_path)
+            if not events_path.is_file() or not events:
+                raise RuntimeError(f"session stream unavailable: {events_path.name}")
+            state = session_events.replay(events)
+        except Exception:  # noqa: BLE001  unreadable means "assume archived"
+            self._archived_cache = {}
+            self._archived_unreadable = True
+            return {"*": True}
+        sessions = state.get("sessions") or {}
+        self._archived_cache = {sid: bool(rec.get("archived"))
+                                for sid, rec in sessions.items()}
+        self._archived_unreadable = False
+        return self._archived_cache
+
+    def archive_thread(self, thread: str, index: dict | None = None) -> dict:
+        """Archive every completed-review worker of ``thread``, idempotently.
+
+        A ``waiting_review`` assignment with a delivery is archived exactly
+        once: the outbox attempt counter (``asg:archive:<delivery>``) makes a
+        second call a no-op, and the status only moves to ``completed`` after
+        the read-back says ``archived is True``. When the read-back fails the
+        assignment becomes ``blocked`` and says so - it never pretends to be
+        done.
+        """
+        out = {"archived": [], "skipped": [], "blocked": [], "errors": []}
+        save = index is None
+        index = self.store.load_index() if index is None else index
+        for aid, rec in sorted((index.get("assignments") or {}).items()):
+            if str(rec.get("thread") or "") != thread:
+                continue
+            if str(rec.get("status") or "") != "waiting_review":
+                continue
+            delivery = rec.get("delivery_comment_id")
+            if delivery is None:
+                out["skipped"].append(aid)
+                continue
+            notify_base = action_id(aid, "bus_inject", str(delivery))
+            if self.store.action_attempted(notify_base) < 1:
+                # The review notification has not been sent (refused, or
+                # dispatch disabled). Archiving now would drop the only chance
+                # to tell the supervisor, so it waits for the retry pass.
+                out["skipped"].append(aid)
+                continue
+            base = action_id(aid, "archive", str(delivery))
+            if self.store.action_attempted(base) > 0:
+                out["skipped"].append(aid)
+                continue
+            sid = str(rec.get("sid") or "")
+            if not sid:
+                self._mark_blocked(rec, "no sid recorded")
+                out["blocked"].append(aid)
+                continue
+            self.store.begin_action(base, verb="archive", kind="archive",
+                                    assignment_id=aid, input_ref=str(delivery),
+                                    payload={"sid": sid},
+                                    issue=rec.get("issue"))
+            ok, error = self._archive_one(sid)
+            archived = self._read_back_archived(sid)
+            if ok and archived:
+                self.store.mark_done(base, sid=sid)
+                rec["status"] = "completed"
+                rec["archived_at"] = _now()
+                rec["tombstone"] = {"archived": True, "read_back": True,
+                                    "at": _now()}
+                # Only the archive counter is prunable here: the notification
+                # counter must survive so a late retry cannot re-send it.
+                self.store.prune_attempts(base)
+                out["archived"].append(aid)
+            else:
+                self._mark_blocked(rec, error or "archive not confirmed by read-back")
+                self.store.mark_uncertain(base, error or "archive unconfirmed")
+                out["blocked"].append(aid)
+        if save:
+            self.store.save_index(index)
+        return out
+
+    def _session_api(self):
+        if self.session_api is not None:
+            return self.session_api
+        from . import api
+        return api
+
+    def _archive_one(self, sid: str) -> tuple[bool, str]:
+        adapter = self._archiver()
+        try:
+            if adapter is not None and hasattr(adapter, "archive"):
+                result = adapter.archive({"id": "", "sid": sid}, "thread completed")
+                return bool(result.get("ok")), str(result.get("error") or "")
+            ok, _payload = self._session_api().archive_session(sid)
+            return bool(ok), ""
+        except Exception as exc:  # noqa: BLE001  reported as a blocked archive
+            return False, f"{type(exc).__name__}: {exc}"
+
+    def _read_back_archived(self, sid: str) -> bool:
+        """``archived is True`` for ``sid``; False on any doubt."""
+        try:
+            info = self._session_api().session_info(sid)
+        except Exception:  # noqa: BLE001
+            return False
+        return bool((info or {}).get("archived"))
+
+    def _mark_blocked(self, rec: dict, reason: str) -> None:
+        rec["status"] = "blocked"
+        rec["updated_at"] = _now()
+        rec["tombstone"] = {"archived": False, "reason": reason, "at": _now()}
+
+    def reconcile_close(self, thread: str, index: dict | None = None) -> dict:
+        """Close a thread: every assignment completed, then reconcile the stream."""
+        index = index if index is not None else self.store.load_index()
+        recs = [rec for rec in (index.get("assignments") or {}).values()
+                if str(rec.get("thread") or "") == thread]
+        unfinished = [rec["id"] for rec in recs
+                      if str(rec.get("status") or "") != "completed"]
+        if unfinished:
+            return {"ok": False, "reason": "assignments not completed",
+                    "unfinished": sorted(unfinished)}
+        try:
+            events_path, sessions_path = self._session_stream()
+            report = session_events.reconcile(events_path, sessions_path, None)
+            server_supplied = bool(report.get("server_supplied"))
+            self.store.log_event({"type": "thread.reconciled", "at": _now(),
+                                  "thread": thread, "ok": bool(report.get("ok")),
+                                  "server_supplied": server_supplied,
+                                  "diff": report.get("diff_non_empty") or []})
+            return {"ok": bool(report.get("ok")),
+                    "server_supplied": server_supplied,
+                    "diff": report.get("diff_non_empty") or []}
+        except Exception as exc:  # noqa: BLE001  a failed reconcile is reported
+            self.store.log_event({"type": "thread.reconciled", "at": _now(),
+                                  "thread": thread, "ok": False,
+                                  "error": f"{type(exc).__name__}: {exc}"})
+            return {"ok": False, "server_supplied": False,
+                    "error": f"{type(exc).__name__}: {exc}"}
+
     # ------------------------------------------------------------------- round
     def run_once(self) -> dict:
         """One round. ``cli once`` and every iteration of ``cli run`` use this."""
@@ -544,6 +732,16 @@ class Engine:
                                       "error": f"{type(exc).__name__}: {exc}"})
 
         summary["notifications_retried"] = self._retry_waiting_review(index)
+        # Archive last: a review that arrived this round is archived this
+        # round, and the archived-sid guard applies from the next dispatch on.
+        self._archived_cache = None
+        for thread in sorted({str(rec.get("thread") or "")
+                              for rec in (index.get("assignments") or {}).values()
+                              if str(rec.get("status") or "") == "waiting_review"}):
+            if thread:
+                result = self.archive_thread(thread, index)
+                summary.setdefault("archived", []).extend(result["archived"])
+                summary.setdefault("archive_blocked", []).extend(result["blocked"])
 
         # Index is written once per round, atomically: a crash leaves the old one.
         index["meta"].update({

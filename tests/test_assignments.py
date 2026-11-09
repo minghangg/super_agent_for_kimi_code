@@ -71,6 +71,20 @@ class Comments:
         return self.comments(issue)
 
 
+class FakeSessions:
+    """Archive + read-back without touching the session service."""
+
+    def __init__(self):
+        self.archived = set()
+
+    def archive_session(self, sid):
+        self.archived.add(sid)
+        return True, {"ids": [sid]}
+
+    def session_info(self, sid):
+        return {"archived": sid in self.archived}
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -82,6 +96,7 @@ class Base(unittest.TestCase):
         self.allow.write_text(json.dumps(GOOD), encoding="utf-8")
         self.source = Comments([])
         self.bus = FakeBus()
+        self.sessions = FakeSessions()
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -105,7 +120,8 @@ class Base(unittest.TestCase):
                        "allowlist": ["issue_comment.created"]},
         })
         return Engine(cfg, Store(self.state), self.source, bus or self.bus,
-                      project_allowlist=ProjectAllowlist(self.allow))
+                      project_allowlist=ProjectAllowlist(self.allow),
+                      session_api=self.sessions)
 
     def index(self, engine):
         return engine.store.load_index()
@@ -179,7 +195,9 @@ class Delivery(Base):
         engine = self.engine()
         engine.run_once()
         rec = self.index(engine)["assignments"]["asg_1_worker_1"]
-        self.assertEqual(rec["status"], "waiting_review")
+        # The delivery is archived in the same round that noticed it, so the
+        # observable result of "matched" is the completed record.
+        self.assertEqual(rec["status"], "completed")
         self.assertEqual(rec["delivery_comment_id"], 9001)
         self.assertEqual(rec["matched_by"], "marker")
 
@@ -257,7 +275,8 @@ class Notification(Base):
         self.assertEqual(engine.store.action_attempted(
             action_id("asg_1_worker_1", "bus_inject", "9001")), 0)
         self.allow.write_text(json.dumps(GOOD), encoding="utf-8")
-        engine.projects.poll()
+        self.assertEqual(engine.projects.poll()["used"], "new",
+                         "a valid edit must be picked up before the next round")
         engine.run_once()
         self.assertEqual(len(self.bus.injected), 1)
 
@@ -273,8 +292,11 @@ class Notification(Base):
         self.assertEqual(state["actions"][base]["status"], "uncertain")
 
         engine.run_once()
-        self.assertEqual(engine.store.action_attempted(base), 1,
-                         "an uncertain action is never re-sent blindly")
+        # The uncertain notification is never re-sent; the archive pass may add
+        # its own (separate) attempt, so only the notification counter matters.
+        self.assertEqual(engine.store.action_attempted(
+            action_id("asg_1_worker_1", "bus_inject", "9001")), 1,
+            "an uncertain action is never re-sent blindly")
 
     def test_disabled_dispatch_writes_no_attempt(self):
         self.bind("session_w1")

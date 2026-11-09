@@ -312,15 +312,18 @@ class Store:
     def prune_attempts(self, prefix: str) -> list[str]:
         """Drop the ``attempts`` counters under ``prefix`` and return their keys.
 
-        Only appropriate once every action under that prefix reached a terminal
-        state and its tombstone is persisted: a terminal action is never
-        re-read by ``_on_delivery``, so dropping the counter cannot resurrect a
-        send. Other prefixes are untouched - the file is shared by every action
-        the engine has ever attempted.
+        Only appropriate once the action under that prefix reached a terminal
+        state and its tombstone is persisted: such an action is never re-read,
+        so dropping the counter cannot resurrect a send. ``prefix`` may be a
+        full base id (one action) or a longer fragment; a fragment is matched
+        literally, so pruning ``asg_1_worker_1:archive:9001`` cannot touch
+        ``asg_1_worker_1:bus_inject:9001``.
         """
         state = self.load_outbox_state()
         attempts = state.get("attempts") or {}
-        victims = sorted(k for k in attempts if str(k).startswith(str(prefix)))
+        prefix = str(prefix)
+        victims = sorted(k for k in attempts
+                         if str(k) == prefix or str(k).startswith(prefix))
         if not victims:
             return []
         for key in victims:
