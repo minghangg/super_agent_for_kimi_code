@@ -76,7 +76,7 @@ class Hermetic(unittest.TestCase):
         self.assertNotIn("status=completed", result["detail"])
 
     def test_header_states_the_semantics_it_follows(self):
-        # The rule Reed made binding: a milestone that moves a transition has to
+        # The binding project rule: a milestone that moves a transition has to
         # move this file's assertions with it, so the header must say which
         # milestone the assertions follow.
         head = SCRIPT.read_text(encoding="utf-8").split('"""')[1]
