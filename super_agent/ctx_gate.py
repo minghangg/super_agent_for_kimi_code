@@ -1,10 +1,14 @@
 """Injectable context gate: decide whether a session may be dispatched to.
 
-    ctx < 60%          allow
-    60% <= ctx < 75%   refuse (long-lived: hand over first / one-shot: except)
+    ctx < 35%          allow (one-shot: allow)
+    35% <= ctx < 60%   allow (long-lived) / refuse-35 (one-shot: 不派新活，另起新会话)
+    60% <= ctx < 75%   refuse (long-lived: hand over first / one-shot: 已被 35% 拦)
     ctx >= 75%         refuse (forced hand over)
     ctx >= 90%         refuse even with --force (hard cap)
     ctx unknown        allow + explicit warning
+
+    One-shot refuse-35 is absolute: no --force bypass (a fresh session is
+    cheap; there is no reason to force more work onto a spent short worker).
 
 Session kind comes from the **key names** of the injected sessions table, never
 from a title or a display name. Keys matching the fixed set are long-lived;
@@ -23,6 +27,7 @@ Usage:
 
 Exit codes (for dispatch callers):
     0 allow    4 refuse-60   5 refuse-75   6 hard cap   7 parameter error
+    8 refuse-35 (one-shot spent: spawn a fresh session instead)
 
 Each decision appends one line to the injected ledger and prints the same
 content to stderr, so the dispatcher sees it immediately.
@@ -63,12 +68,14 @@ FIXED_KEYS = {"steward", "qa", "scout", "auditor", "planner", "reviewer",
               _joined("re", "ed")}
 FIXED_PREFIXES = ("pm-", _joined("qa-l", "wa-"), _joined("re", "ed"))
 
+THRESHOLD_ONESHOT_REFUSE = 0.35
 THRESHOLD_REFUSE = 0.60
 THRESHOLD_HANDOFF = 0.75
 THRESHOLD_FORCE_HARD = 0.90
 
 EXIT_OK = 0
 EXIT_PARAM = 7
+EXIT_REFUSE_35 = 8
 EXIT_REFUSE_60 = 4
 EXIT_REFUSE_75 = 5
 EXIT_HARD_CAP = 6
@@ -175,6 +182,12 @@ def verdict(usage: float | None, kind: str, force: bool = False) -> tuple[str, i
             f"ctx ≈{pct:.1f}% ≥ 75%：强制交接（长命助手必须先写交接档换会话）"
             if not force else
             f"ctx ≈{pct:.1f}% ≥ 75%（已 --force 放行；长命助手仍应尽快交接）")
+    if kind == "one-shot" and usage >= THRESHOLD_ONESHOT_REFUSE:
+        # 用户 2026-11-10 规矩：短工/QA 超 35% 不派新活，另起新会话。
+        # 绝对拦截、无 --force  bypass——新会话成本低，没有强派理由。
+        return "refuse-35", EXIT_REFUSE_35, (
+            f"ctx ≈{pct:.1f}% ≥ {THRESHOLD_ONESHOT_REFUSE * 100:.0f}%："
+            f"一次性 worker/QA 不再派新活，请另起新会话")
     if usage >= THRESHOLD_REFUSE:
         if kind == "one-shot":
             return "allow", EXIT_OK, (
@@ -255,7 +268,7 @@ def gate(sid: str, *, force: bool = False, operator: str = "",
 
 
 def self_test() -> int:
-    """Offline assertions: the same 22 checks as the original gate."""
+    """Offline assertions: 25 checks (22 original + 3 one-shot 35% rule)."""
     fails: list[str] = []
     total = 0
 
@@ -269,8 +282,15 @@ def self_test() -> int:
           str(verdict(0.63, "long-lived")))
     check("长命 78% 拒派-75", verdict(0.78, "long-lived")[:2] == ("refuse-75", EXIT_REFUSE_75))
     check("长命 59% 放行", verdict(0.59, "long-lived")[:2] == ("allow", EXIT_OK))
-    check("一次性 63% 放行（不因 60% 被拦）",
-          verdict(0.63, "one-shot")[:2] == ("allow", EXIT_OK), str(verdict(0.63, "one-shot")))
+    check("一次性 63% 拒派-35（用户 2026-11-10 规矩）",
+          verdict(0.63, "one-shot")[:2] == ("refuse-35", EXIT_REFUSE_35),
+          str(verdict(0.63, "one-shot")))
+    check("一次性 34% 放行",
+          verdict(0.34, "one-shot")[:2] == ("allow", EXIT_OK))
+    check("一次性 35% 边界拒派-35",
+          verdict(0.35, "one-shot")[:2] == ("refuse-35", EXIT_REFUSE_35))
+    check("一次性 35% --force 不绕过",
+          verdict(0.35, "one-shot", True)[:2] == ("refuse-35", EXIT_REFUSE_35))
     check("一次性 78% 拦截（按例外上报）",
           verdict(0.78, "one-shot")[:2] == ("refuse-75", EXIT_REFUSE_75))
     check("ctx 未知放行", verdict(None, "long-lived")[:2] == ("allow-unknown", EXIT_OK))

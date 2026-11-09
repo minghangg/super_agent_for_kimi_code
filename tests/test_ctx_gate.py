@@ -73,7 +73,7 @@ class DecisionMatrix(Fixture):
         with contextlib.redirect_stdout(out):
             rc = ctx_gate.self_test()
         self.assertEqual(rc, 0, out.getvalue())
-        self.assertIn("--self-test: 22/22 通过", out.getvalue())
+        self.assertIn("--self-test: 25/25 通过", out.getvalue())
 
     def test_thresholds_and_force(self):
         cases = [
@@ -84,7 +84,10 @@ class DecisionMatrix(Fixture):
             (0.78, "long-lived", False, "refuse-75", 5),
             (0.90, "long-lived", False, "hard-cap", 6),
             (0.95, "one-shot", False, "hard-cap", 6),
-            (0.63, "one-shot", False, "allow", 0),
+            (0.34, "one-shot", False, "allow", 0),
+            (0.35, "one-shot", False, "refuse-35", 8),
+            (0.63, "one-shot", False, "refuse-35", 8),
+            (0.35, "one-shot", True, "refuse-35", 8),
             (0.63, "long-lived", True, "refuse-60", 0),
             (0.78, "long-lived", True, "refuse-75", 0),
             (0.90, "long-lived", True, "hard-cap", 6),
@@ -96,6 +99,7 @@ class DecisionMatrix(Fixture):
                 v, code, msg = ctx_gate.verdict(usage, kind, force)
                 self.assertEqual((v, code), (expect_v, expect_code))
                 self.assertTrue(msg)
+        self.assertEqual(ctx_gate.THRESHOLD_ONESHOT_REFUSE, 0.35)
         self.assertEqual(ctx_gate.THRESHOLD_REFUSE, 0.60)
         self.assertEqual(ctx_gate.THRESHOLD_HANDOFF, 0.75)
         self.assertEqual(ctx_gate.THRESHOLD_FORCE_HARD, 0.90)
@@ -124,13 +128,16 @@ class DecisionMatrix(Fixture):
         self.assertEqual(ctx_gate._is_fixed_key("qa-lwa-any"), True)
         self.assertEqual(ctx_gate._is_fixed_key("wk-any"), False)
 
-    def test_key_name_drives_60_percent_decision_end_to_end(self):
+    def test_key_name_drives_kind_decision_end_to_end(self):
         (v_long, code_long, _), _, _ = self.run_gate(
             sid="sid-long", value={"context_usage": 0.63})
         (v_one, code_one, _), _, _ = self.run_gate(
+            sid="sid-one", value={"context_usage": 0.34})
+        (v_one_spent, code_one_spent, _), _, _ = self.run_gate(
             sid="sid-one", value={"context_usage": 0.63})
         self.assertEqual((v_long, code_long), ("refuse-60", 4))
         self.assertEqual((v_one, code_one), ("allow", 0))
+        self.assertEqual((v_one_spent, code_one_spent), ("refuse-35", 8))
 
 
 class Injection(Fixture):
@@ -217,7 +224,7 @@ class SessionsTable(Fixture):
         self.assertEqual(ctx_gate.session_kind("sid-long", self.sessions),
                          ("one-shot", ""))
         (v, code, _), _, _ = self.run_gate(value={"context_usage": 0.63})
-        self.assertEqual((v, code), ("allow", 0))
+        self.assertEqual((v, code), ("refuse-35", 8))
 
     def test_non_object_top_level_is_one_shot(self):
         self.write_raw('["sid-long"]')
@@ -295,7 +302,7 @@ class CliMapping(Fixture):
             [sys.executable, "-m", "super_agent.ctx_gate", "--self-test"],
             cwd=str(ROOT), capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("--self-test: 22/22 通过", proc.stdout)
+        self.assertIn("--self-test: 25/25 通过", proc.stdout)
 
 
 class Neutrality(unittest.TestCase):
