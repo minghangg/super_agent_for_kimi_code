@@ -11,6 +11,7 @@ No network, no session service, no change to the live workbench state.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -186,21 +187,33 @@ def example_2():
            f"attempts={after}")
 
 
-# --- 3: after archive, dispatch to the old sid is refused and not counted ---
+# --- 3: a dispatch to an archived sid is refused, counted nowhere, queued nowhere ---
 def example_3():
     tmp, events, allow = scenario()
     bind(events, archive=True)
     eng = engine(tmp, events, allow, Comments(), FakeBus(), FakeSessions())
-    before = counters(tmp)
+    before = eng.store.load_counters()
     out = eng._dispatch({"kind": "bus_inject", "event": "event.agent.waiting_review",
                          "issue": 1, "input_ref": "1", "payload": {"sid": "session_w1"}})
-    refusals = len([e for e in events_of(tmp)
-                    if e["type"] == "dispatch.archived_sid"])
+    after = eng.store.load_counters()
+    kinds = [e["type"] for e in events_of(tmp)]
+    # The guard returns before ``bump_external_actions``, so a 0->0 counter would
+    # be true even if the guard were removed (the dispatch would fail later and
+    # still not bump). The real assertions are the ones that can distinguish:
+    # no refusal event would exist, and the aborted action would have left a
+    # record in ``outbox_state.json``.
+    base = action_id(None, "bus_inject", "1")
+    queued = eng.store.load_outbox_state()["actions"]
+    touched = [k for k in queued if k == base or k.startswith(base + "#")]
     record("3 archived-sid-refused",
-           out.get("refused") and not out.get("dispatched") and refusals >= 1
-           and counters(tmp) == before,
-           f"refused={out.get('refused')} archived_sid_events={refusals} "
-           f"external_actions={before}->{counters(tmp)}")
+           out.get("refused") is True and not out.get("dispatched")
+           and "dispatch.archived_sid" in kinds
+           and "dispatch.refused" not in kinds
+           and before == after and touched == [],
+           f"refused={out.get('refused')} archived_sid_events="
+           f"{kinds.count('dispatch.archived_sid')} "
+           f"counters={before.get('external_actions')}->"
+           f"{after.get('external_actions')} outbox_records={touched}")
 
 
 # --- 4: a second trigger inside the per-issue cooldown adds no external action ---
@@ -223,7 +236,7 @@ def example_4():
            f"(model cooling is out of scope)")
 
 
-# --- 5: every probe session ends archived; final check via issue_sessions/session_info ---
+# --- 5: the probe session is archived; accounting here, server-side opt-in ---
 def example_5():
     tmp, events, allow = scenario()
     bind(events)
@@ -234,11 +247,36 @@ def example_5():
     eng.run_once()
     rec = eng.store.load_index()["assignments"]["asg_1_worker_1"]
     info = sessions.session_info("session_w1")
+    # This half proves the *bookkeeping*: the archive was called once, the
+    # read-back was consulted, and the record only claims completed because the
+    # read-back said archived. What it cannot prove is that the real server
+    # agrees - the injected fake answers by construction.
+    accounting = (rec["status"] == "completed" and info.get("archived") is True
+                  and sessions.calls == ["session_w1"])
+    detail = (f"accounting status={rec['status']} archived={info.get('archived')} "
+              f"archive_calls={sessions.calls}")
+
+    sid = (os.environ.get("SAFKC_VERIFY_REAL_SID") or "").strip()
+    if not sid:
+        record("5 probe-session-archived", accounting,
+               detail + " | server side NOT checked here (accounting only; "
+               "QA verifies the real server independently). "
+               "Set SAFKC_VERIFY_REAL_SID=<sid> to include it.")
+        return
+    # Opt-in, read-only check against the real session service. It never
+    # archives anything: it asks whether the server already says archived.
+    try:
+        from super_agent import api
+        real = api.session_info(sid)
+    except Exception as exc:  # noqa: BLE001  a failed check is a failed check
+        record("5 probe-session-archived", False,
+               detail + f" | real session_info({sid}) raised "
+               f"{type(exc).__name__}: {exc}")
+        return
     record("5 probe-session-archived",
-           rec["status"] == "completed" and info.get("archived") is True
-           and sessions.calls == ["session_w1"],
-           f"status={rec['status']} archived={info.get('archived')} "
-           f"archive_calls={sessions.calls}")
+           accounting and bool(real.get("archived")) and not real.get("_err"),
+           detail + f" | real archived={real.get('archived')} "
+           f"archived_at={real.get('archived_at')} sid={sid}")
 
 
 def main() -> int:
