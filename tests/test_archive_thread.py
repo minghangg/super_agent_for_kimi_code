@@ -19,6 +19,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from super_agent import assignments as asg
 from super_agent import config, session_events
 from super_agent.allowlist import ProjectAllowlist
 from super_agent.engine import Engine
@@ -133,9 +134,16 @@ class Base(unittest.TestCase):
                       project_allowlist=ProjectAllowlist(self.allow),
                       session_api=self.sessions)
 
-    def review(self, engine, cid=9001):
+    def review(self, engine, cid=9001, *, pass_cid=9100, verdict="[QA] **通过**"):
+        """Worker delivers, QA judges. Both happen in one round on purpose.
+
+        The archive pass runs after the comments, so a delivery plus a pass in
+        the same round reaches ``waiting_release`` with the worker archived.
+        """
         self.bind()
         self.source.add(cid, "[WK:wk-probe-1] done")
+        if pass_cid is not None:
+            self.source.add(pass_cid, verdict, author="qa")
         engine.run_once()
 
     def events_rows(self):
@@ -146,14 +154,34 @@ class Base(unittest.TestCase):
 
 
 class Archive(Base):
-    def test_archive_moves_to_completed_after_read_back(self):
+    def test_archive_moves_to_waiting_release_after_read_back(self):
         engine = self.engine()
         self.review(engine)
         rec = engine.store.load_index()["assignments"]["asg_1_worker_1"]
-        self.assertEqual(rec["status"], "completed")
+        # Archiving proves the worker is done, not that the Issue is closed:
+        # ``completed`` belongs to the close reconciliation.
+        self.assertEqual(rec["status"], "waiting_release")
         self.assertEqual(rec["tombstone"]["archived"], True)
         self.assertEqual(rec["tombstone"]["read_back"], True)
         self.assertEqual(self.sessions.archive_calls, ["session_w1"])
+
+    def test_no_qa_pass_blocks_archive(self):
+        # Semantics deliberately reversed for ISS-21: the old test asserted
+        # that a delivery alone got archived, which is the earlier hole - a
+        # worker could be retired with no review at all. Now the gate refuses
+        # before ``begin_action``, the assignment stays ``waiting_review``, and
+        # the refusal is visible as ``assignment.qa_gate_refused``.
+        engine = self.engine()
+        self.review(engine, pass_cid=None)
+        rec = engine.store.load_index()["assignments"]["asg_1_worker_1"]
+        self.assertEqual(rec["status"], "waiting_review")
+        self.assertEqual(rec.get("qa_verdict") or "", "")
+        self.assertEqual(self.sessions.archive_calls, [])
+        kinds = [r["type"] for r in self.events_rows()]
+        self.assertEqual(kinds.count("assignment.qa_gate_refused"), 1)
+        base = action_id("asg_1_worker_1", "archive", "9001")
+        self.assertEqual(engine.store.action_attempted(base), 0,
+                         "a refusal is not an attempt and leaves no side effect")
 
     def test_archive_is_idempotent(self):
         engine = self.engine()
@@ -169,6 +197,7 @@ class Archive(Base):
         rec = engine.store.load_index()["assignments"]["asg_1_worker_1"]
         self.assertEqual(rec["status"], "blocked")
         self.assertIn("read-back", rec["tombstone"]["reason"])
+        self.assertEqual(rec["tombstone"]["cid"], 9001)
         base = action_id("asg_1_worker_1", "archive", "9001")
         self.assertEqual(engine.store.load_outbox_state()["actions"][base]["status"],
                          "uncertain")
@@ -225,9 +254,24 @@ class ArchivedSidGuard(Base):
 
 
 class ReconcileClose(Base):
-    def test_close_writes_thread_reconciled(self):
+    def test_close_refuses_while_the_release_is_still_held(self):
+        # Archiving the worker is not the end of the thread: the Issue is not
+        # proved closed, so ``reconcile_close`` must refuse and say which
+        # assignment is unfinished.
         engine = self.engine()
         self.review(engine)
+        out = engine.reconcile_close(THREAD)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["unfinished"], ["asg_1_worker_1"])
+
+    def test_close_writes_thread_reconciled_once_everything_is_completed(self):
+        engine = self.engine()
+        self.review(engine)
+        index = engine.store.load_index()
+        rec = index["assignments"]["asg_1_worker_1"]
+        self.assertEqual(rec["status"], "waiting_release")
+        self.assertTrue(asg.complete(rec)["changed"])
+        engine.store.save_index(index)
         out = engine.reconcile_close(THREAD)
         self.assertFalse(out["server_supplied"], "no live side was consulted")
         self.assertFalse(out["ok"], "UNKNOWN is never OK")

@@ -196,18 +196,25 @@ class Sync(Base):
                          ["asg_1_worker_1"])
 
     def test_completed_then_archived_does_not_fork_a_second_assignment(self):
-        # QA's exact chain: round 1 binds and completes _1 (delivery + archive),
+        # QA's exact chain: round 1 binds, delivers, passes and archives _1;
         # round 2 still sees the same sid in the stream (the API-side archive
         # wrote no event). Before the cross-check that forked ``_2`` on the very
-        # same sid and the thread never reached a terminal state.
+        # same sid and the thread never reached a terminal state. Archiving now
+        # stops at ``waiting_release``: the Issue is not proved closed yet, so
+        # the terminal write is simulated here.
         self.bind("session_w1")
         self.source.add(9001, "[WK:wk-probe-1] done")
+        self.source.add(9100, "[QA] **通过**", author="qa")
         engine = self.engine()
         engine.run_once()
         first = self.index(engine)["assignments"]
         self.assertEqual(sorted(first), ["asg_1_worker_1"])
-        self.assertEqual(first["asg_1_worker_1"]["status"], "completed")
+        self.assertEqual(first["asg_1_worker_1"]["status"], "waiting_release")
         self.assertIn("session_w1", self.sessions.archived)
+
+        index = self.index(engine)
+        asg.complete(index["assignments"]["asg_1_worker_1"])
+        engine.store.save_index(index)
 
         engine.run_once()
         engine.run_once()
@@ -272,11 +279,12 @@ class Delivery(Base):
         engine = self.engine()
         engine.run_once()
         rec = self.index(engine)["assignments"]["asg_1_worker_1"]
-        # The delivery is archived in the same round that noticed it, so the
-        # observable result of "matched" is the completed record.
-        self.assertEqual(rec["status"], "completed")
+        # No review yet, so the gate holds the record where the delivery put it:
+        # waiting_review, not archived and not completed.
+        self.assertEqual(rec["status"], "waiting_review")
         self.assertEqual(rec["delivery_comment_id"], 9001)
         self.assertEqual(rec["matched_by"], "marker")
+        self.assertEqual(self.sessions.archived, set())
 
     def test_named_worker_marker_matches_its_own_session(self):
         self.bind("session_w1")
@@ -375,7 +383,7 @@ class Delivery(Base):
         engine.run_once()
         assignments = self.index(engine)["assignments"]
         by_key = {rec["session_key"]: rec for rec in assignments.values()}
-        self.assertEqual(by_key["wk-probe-2"]["status"], "completed")
+        self.assertEqual(by_key["wk-probe-2"]["status"], "waiting_review")
         self.assertEqual(by_key["wk-probe-2"]["matched_by"], "marker")
         self.assertEqual(by_key["wk-probe-1"]["status"], "working",
                          "the other worker's assignment must stay untouched")
@@ -438,15 +446,15 @@ class Notification(Base):
     def test_uncertain_notification_is_never_recorded_as_notified(self):
         # QA's real-probe shape: the bus raised, so the event never left the
         # process, yet the archive pass used the *attempt* counter as proof of
-        # delivery and wrote ``notified_at`` + ``completed``. Archiving may
-        # still happen (the worker did deliver), but it must not claim the
-        # supervisor was told.
+        # delivery and wrote ``notified_at``. A pass still archives the worker
+        # (it did deliver), but it must not claim the supervisor was told.
         self.bind("session_w1")
         self.source.add(9001, "[WK:owner/demo#1] done")
+        self.source.add(9100, "[QA] **通过**", author="qa")
         engine = self.engine(bus=FakeBus(fail=True))
         engine.run_once()
         rec = self.index(engine)["assignments"]["asg_1_worker_1"]
-        self.assertEqual(rec["status"], "completed")
+        self.assertEqual(rec["status"], "waiting_release")
         self.assertEqual(rec["notified_at"], "",
                          "a failed send is not a notification")
         self.assertFalse(rec["tombstone"]["notified"])
@@ -457,6 +465,7 @@ class Notification(Base):
     def test_successful_notification_is_recorded_as_notified(self):
         self.bind("session_w1")
         self.source.add(9001, "[WK:owner/demo#1] done")
+        self.source.add(9100, "[QA] **通过**", author="qa")
         engine = self.engine()
         engine.run_once()
         rec = self.index(engine)["assignments"]["asg_1_worker_1"]

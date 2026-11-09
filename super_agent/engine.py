@@ -790,14 +790,21 @@ class Engine:
         return self._archived_cache
 
     def archive_thread(self, thread: str, index: dict | None = None) -> dict:
-        """Archive every completed-review worker of ``thread``, idempotently.
+        """Archive a worker whose review passed, idempotently.
 
-        A ``waiting_review`` assignment with a delivery is archived exactly
-        once: the outbox attempt counter (``asg:archive:<delivery>``) makes a
-        second call a no-op, and the status only moves to ``completed`` after
-        the read-back says ``archived is True``. When the read-back fails the
-        assignment becomes ``blocked`` and says so - it never pretends to be
-        done.
+        The archive is gated by :func:`assignments.qa_gate` and the gate sits
+        **between the idempotency check and ``begin_action``**: ``begin_action``
+        is the first side effect of the pass (it persists a ``prepared`` record
+        and moves the try counter), so a refusal placed after it would already
+        have written state. Refused assignments are skipped with
+        ``assignment.qa_gate_refused`` and stay ``waiting_review`` - a thread
+        that is still waiting for QA is not a fault, and inventing a ``blocked``
+        state for it would make every in-flight delivery look broken.
+
+        Success moves the assignment to ``waiting_release``, **not**
+        ``completed``: the work is done and archived, but the Issue is not
+        proved closed yet. ``completed`` is written by the close reconciliation
+        (four conditions, two rounds), never here.
 
         The notification gate is ``notified_at``, not the attempt counter alone:
         an attempt that came back ``uncertain`` never reached the bus, so the
@@ -810,7 +817,14 @@ class Engine:
         for aid, rec in sorted((index.get("assignments") or {}).items()):
             if str(rec.get("thread") or "") != thread:
                 continue
-            if str(rec.get("status") or "") != "waiting_review":
+            if str(rec.get("status") or "") == "waiting_release" and \
+                    (rec.get("tombstone") or {}).get("archived"):
+                # Already archived (possibly in this same round): nothing left
+                # to do for this record here.
+                out["skipped"].append(aid)
+                continue
+            if str(rec.get("status") or "") not in ("waiting_review",
+                                                    "waiting_release"):
                 continue
             delivery = rec.get("delivery_comment_id")
             if delivery is None:
@@ -841,9 +855,23 @@ class Engine:
                                       "at": _now(), "assignment": aid,
                                       "delivery_comment_id": delivery,
                                       "action_id": notify_base})
+            # The gate, and its position: after the idempotency checks above,
+            # before ``begin_action`` below - which is the first side effect
+            # (a persisted ``prepared`` record and a bumped try counter). A gate
+            # placed after it would have written state it then refuses.
+            gate_ok, gate_why = asg_mod.qa_gate(rec)
+            if not gate_ok:
+                self.store.log_event({
+                    "type": "assignment.qa_gate_refused", "at": _now(),
+                    "assignment": aid, "thread": thread,
+                    "delivery_comment_id": delivery, "reason": gate_why,
+                    "level": "info", "consumers": ["doctor"],
+                })
+                out["skipped"].append(aid)
+                continue
             sid = str(rec.get("sid") or "")
             if not sid:
-                self._mark_blocked(rec, "no sid recorded")
+                self._mark_blocked(rec, asg_mod.NO_SID_REASON)
                 out["blocked"].append(aid)
                 continue
             self.store.begin_action(base, verb="archive", kind="archive",
@@ -854,16 +882,18 @@ class Engine:
             archived = self._read_back_archived(sid)
             if ok and archived:
                 self.store.mark_done(base, sid=sid)
-                rec["status"] = "completed"
+                rec["status"] = "waiting_release"
                 rec["archived_at"] = _now()
                 rec["tombstone"] = {"archived": True, "read_back": True,
-                                    "notified": notified, "at": _now()}
+                                    "notified": notified, "at": _now(),
+                                    "cid": delivery, "attempt": 1}
                 # Only the archive counter is prunable here: the notification
                 # counter must survive so a late retry cannot re-send it.
                 self.store.prune_attempts(base)
                 out["archived"].append(aid)
             else:
-                self._mark_blocked(rec, error or "archive not confirmed by read-back")
+                self._mark_blocked(rec, error or "archive not confirmed by read-back",
+                                   cid=delivery)
                 self.store.mark_uncertain(base, error or "archive unconfirmed")
                 out["blocked"].append(aid)
         if save:
@@ -895,10 +925,15 @@ class Engine:
             return False
         return bool((info or {}).get("archived"))
 
-    def _mark_blocked(self, rec: dict, reason: str) -> None:
-        rec["status"] = "blocked"
-        rec["updated_at"] = _now()
-        rec["tombstone"] = {"archived": False, "reason": reason, "at": _now()}
+    def _mark_blocked(self, rec: dict, reason: str, *, cid=None) -> None:
+        """Block one assignment through the shared tombstone writer.
+
+        ``cid`` follows the rule the state machine documents: ``None`` for a
+        failure that happened before a delivery was acted on (no sid), the
+        delivery id once the archive started. The attempt counter is monotonic,
+        so the same delivery failing twice is attempt 2 rather than a reset key.
+        """
+        asg_mod.mark_blocked(rec, reason, cid=cid, at=_now())
 
     def reconcile_close(self, thread: str, index: dict | None = None) -> dict:
         """Close a thread: every assignment completed, then reconcile the stream."""
@@ -1114,7 +1149,8 @@ class Engine:
         self._archived_cache = None
         for thread in sorted({str(rec.get("thread") or "")
                               for rec in (index.get("assignments") or {}).values()
-                              if str(rec.get("status") or "") == "waiting_review"}):
+                              if str(rec.get("status") or "") in
+                              ("waiting_review", "waiting_release")}):
             if thread:
                 result = self.archive_thread(thread, index)
                 summary.setdefault("archived", []).extend(result["archived"])
