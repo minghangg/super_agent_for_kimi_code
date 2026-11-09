@@ -294,6 +294,40 @@ class Store:
     def outbox_action(self, aid: str) -> dict | None:
         return (self.load_outbox_state()["actions"]).get(aid)
 
+    def action_attempted(self, aid: str) -> int:
+        """How many times this **base** action id has been attempted.
+
+        Read-only. The counter is incremented in :meth:`begin_action` *before*
+        the external call, and it outlives the action's own record, so a caller
+        reads this to enforce at-most-once: ``0`` means "never attempted, safe
+        to dispatch", anything else means "an attempt exists, do not send a
+        second copy blindly".
+        """
+        state = self.load_outbox_state()
+        try:
+            return int((state.get("attempts") or {}).get(str(aid)) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def prune_attempts(self, prefix: str) -> list[str]:
+        """Drop the ``attempts`` counters under ``prefix`` and return their keys.
+
+        Only appropriate once every action under that prefix reached a terminal
+        state and its tombstone is persisted: a terminal action is never
+        re-read by ``_on_delivery``, so dropping the counter cannot resurrect a
+        send. Other prefixes are untouched - the file is shared by every action
+        the engine has ever attempted.
+        """
+        state = self.load_outbox_state()
+        attempts = state.get("attempts") or {}
+        victims = sorted(k for k in attempts if str(k).startswith(str(prefix)))
+        if not victims:
+            return []
+        for key in victims:
+            attempts.pop(key, None)
+        self.save_outbox_state(state)
+        return victims
+
     def unfinished_outbox(self) -> dict:
         return dict(self.load_outbox_state()["actions"])
 

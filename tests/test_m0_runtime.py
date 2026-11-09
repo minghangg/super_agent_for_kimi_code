@@ -859,6 +859,41 @@ class PidCmdlineFallback(Base):
         self.assertEqual(calls, ["wmic", "cim"])
 
 
+class AttemptCounters(Base):
+    """Per-attempt counters: readable before a send, prunable after a terminal."""
+
+    def test_attempted_is_zero_until_an_attempt_exists(self):
+        store = Store(self.state)
+        base = store_mod.action_id("asg_1_worker_1", "bus_inject", "9001")
+        self.assertEqual(store.action_attempted(base), 0)
+        store.begin_action(base, verb="bus_inject", kind="bus_inject",
+                           assignment_id="asg_1_worker_1", input_ref="9001")
+        self.assertEqual(store.action_attempted(base), 1)
+        store.begin_action(base, verb="bus_inject", kind="bus_inject",
+                           assignment_id="asg_1_worker_1", input_ref="9001")
+        self.assertEqual(store.action_attempted(base), 2)
+
+    def test_counter_survives_done_and_is_read_only(self):
+        store = Store(self.state)
+        base = store_mod.action_id("asg_1_worker_2", "bus_inject", "9002")
+        rec = store.begin_action(base, verb="bus_inject", input_ref="9002")
+        store.mark_done(rec["action_id"])
+        self.assertIsNone(store.outbox_action(rec["action_id"]))
+        self.assertEqual(store.action_attempted(base), 1)
+
+    def test_prune_attempts_only_touches_its_own_prefix(self):
+        store = Store(self.state)
+        keep = store_mod.action_id("asg_1_worker_3", "bus_inject", "9003")
+        drop = store_mod.action_id("asg_1_worker_4", "bus_inject", "9004")
+        for base in (keep, drop):
+            store.begin_action(base, verb="bus_inject", input_ref="1")
+        pruned = store.prune_attempts("asg_1_worker_4:")
+        self.assertEqual(pruned, [drop])
+        self.assertEqual(store.action_attempted(drop), 0)
+        self.assertEqual(store.action_attempted(keep), 1)
+        self.assertEqual(store.prune_attempts("asg_1_worker_4:"), [])
+
+
 class AllowlistSummary(Base):
     """Same-block item 2: summary agrees with poll()."""
 
