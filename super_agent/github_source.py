@@ -26,6 +26,7 @@ import urllib.request
 from pathlib import Path
 
 API = "https://api.github.com"
+PER_PAGE = 100
 
 
 class SourceError(RuntimeError):
@@ -81,6 +82,15 @@ class FixtureSource:
                 "created_at": str(row.get("created_at") or ""),
             })
         return sorted(out, key=lambda c: c["id"])
+
+    def paged(self, issue: int, *, since_id: int = 0, max_pages: int = 10) -> list[dict]:
+        """Fixture backend of the paged reader: all rows, one synthetic page.
+
+        The fixture is small and local, so "paging" is a no-op that still has to
+        honour the same contract: rows are ordered by id and ``since_id`` is a
+        hint, not a filter (the caller applies the cursor).
+        """
+        return self.comments(issue)
 
     def title(self, issue: int) -> str:
         rec = (self.data.get("issues") or {}).get(str(issue)) or {}
@@ -149,6 +159,50 @@ class LiveSource:
             })
         return sorted(out, key=lambda c: c["id"])
 
+    def paged(self, issue: int, *, since_id: int = 0,
+              max_pages: int = 10) -> list[dict]:
+        """Comments from the oldest page forward, stopping at ``since_id``.
+
+        Pages are requested in ascending order (``per_page=100&page=n``) and the
+        walk stops as soon as a page contains an id ``<= since_id``: everything
+        after that page is newer than the cursor, so there is nothing left to
+        collect. Any non-200 / network / JSON failure raises :class:`SourceError`
+        **instead of returning what was gathered so far** - a partial list would
+        be silently mistaken for "no new comments" and the cursor would advance
+        past comments that were never read.
+        """
+        since_id = int(since_id or 0)
+        max_pages = max(1, int(max_pages or 1))
+        collected: list[dict] = []
+        for page in range(1, max_pages + 1):
+            rows = self._get(f"/repos/{self.repo}/issues/{int(issue)}/comments",
+                             {"per_page": PER_PAGE, "page": page,
+                              "sort": "created", "direction": "asc"})
+            if not isinstance(rows, list):
+                raise SourceError("unexpected comments payload")
+            if not rows:
+                break
+            page_rows = self._normalise(rows, issue)
+            collected.extend(page_rows)
+            if since_id and page_rows and min(c["id"] for c in page_rows) <= since_id:
+                break
+        return sorted(collected, key=lambda c: c["id"])
+
+    @staticmethod
+    def _normalise(rows: list, issue: int) -> list[dict]:
+        out = []
+        for row in rows:
+            if not isinstance(row, dict) or row.get("id") is None:
+                continue
+            out.append({
+                "id": int(row["id"]),
+                "issue": int(issue),
+                "body": str(row.get("body") or ""),
+                "author": str((row.get("user") or {}).get("login") or ""),
+                "created_at": str(row.get("created_at") or ""),
+            })
+        return sorted(out, key=lambda c: c["id"])
+
     def title(self, issue: int) -> str:
         row = self._get(f"/repos/{self.repo}/issues/{int(issue)}")
         return str(row.get("title") or "") if isinstance(row, dict) else ""
@@ -161,6 +215,10 @@ class NullSource:
         return []
 
     def comments(self, issue: int) -> list[dict]:
+        return []
+
+    def paged(self, issue: int, *, since_id: int = 0,
+              max_pages: int = 10) -> list[dict]:
         return []
 
     def title(self, issue: int) -> str:
@@ -184,8 +242,27 @@ class BrokenSource:
     def comments(self, issue: int) -> list[dict]:
         raise SourceError(self.error)
 
+    def paged(self, issue: int, *, since_id: int = 0,
+              max_pages: int = 10) -> list[dict]:
+        raise SourceError(self.error)
+
     def title(self, issue: int) -> str:
         raise SourceError(self.error)
+
+
+def comments_from(source, issue: int, *, since_id: int = 0,
+                  max_pages: int = 10) -> list[dict]:
+    """``source.paged()`` when the backend has it, else the whole list.
+
+    Keeping this behind one helper means the engine never needs to know which
+    backend it was given, and a test double that only implements ``comments()``
+    keeps working unchanged.
+    """
+    paged = getattr(source, "paged", None)
+    if callable(paged):
+        return paged(issue, since_id=since_id, max_pages=max_pages)
+    rows = source.comments(issue)
+    return [c for c in rows if int(c["id"]) >= int(since_id or 0)]
 
 
 def build(cfg: dict):

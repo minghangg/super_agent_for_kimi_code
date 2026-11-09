@@ -351,6 +351,7 @@ class Engine:
         gh_cfg = self.cfg.get("github") or {}
         max_issues = int(gh_cfg.get("max_issues") or 20)
         max_comments = int(gh_cfg.get("max_comments_per_issue") or 50)
+        max_pages = int(gh_cfg.get("max_comment_pages") or 10)
 
         # Legacy numeric keys are copied forward once, before anything reads
         # them: from here on every write uses the qualified form.
@@ -384,7 +385,8 @@ class Engine:
 
         for issue in issue_numbers:
             try:
-                self._round_issue(issue, index, cursor, max_comments, summary)
+                self._round_issue(issue, index, cursor, max_comments, summary,
+                                  max_pages)
             except Exception as exc:  # noqa: BLE001  isolate one bad issue
                 summary["errors"].append(f"issue {issue}: {type(exc).__name__}: {exc}")
                 self.store.log_event({"type": "issue.error", "at": _now(),
@@ -412,7 +414,8 @@ class Engine:
         return summary
 
     def _round_issue(self, issue: int, index: dict, cursor: dict,
-                     max_comments: int, summary: dict) -> None:
+                     max_comments: int, summary: dict,
+                     max_pages: int = 10) -> None:
         issue = int(issue)
         key = self._thread_key(issue)
         legacy = str(issue)
@@ -424,8 +427,12 @@ class Engine:
         # Qualified key first, legacy second: a mixed file converges instead of
         # re-reading comments already consumed under the old form.
         cur = int(issuekey.read_both(cursor.get("issues") or {}, key, legacy) or 0)
-        comments = self.source.comments(issue)[-max_comments:]
-        fresh = [c for c in comments if int(c["id"]) > cur]
+        # Paged read from the cursor, then take the **oldest** N new comments:
+        # taking the newest N (the old slice) silently skipped the middle when
+        # an issue had more new comments than the cap.
+        comments = github_source.comments_from(self.source, issue, since_id=cur,
+                                               max_pages=max_pages)
+        fresh = [c for c in comments if int(c["id"]) > cur][:max_comments]
         summary["comments_new"] += len(fresh)
 
         seen_this_round: set[int] = set()
