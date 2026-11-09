@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import github_source, health, issuekey, session_events
+from . import github_source, health, issuekey, markers, session_events
 from .allowlist import ProjectAllowlist
 from .store import Store, action_id
 
@@ -133,7 +133,21 @@ class Engine:
         return str(explicit) if explicit else str(action.get("kind") or "")
 
     def _triage(self, comment: dict) -> tuple[str, str]:
-        """Fixed rules only: role-authored noise is ignored, markers escalate."""
+        """Fixed rules, in this order:
+
+        1. a delivery marker on the first line wins over everything - a worker
+           whose role is configured would otherwise have its own delivery
+           ignored as role-authored noise;
+        2. role-authored noise is ignored;
+        3. escalation markers ask for a person;
+        4. everything else is logged (the historical behaviour, unchanged).
+
+        ``parse_delivery`` only reads the first non-empty line, so a comment
+        that quotes a delivery in its body stays ordinary discussion.
+        """
+        delivery = markers.parse_delivery(str(comment.get("body") or ""))
+        if delivery:
+            return "delivery", f"marker {delivery['name']!r}"
         author = str(comment.get("author") or "").strip().lower()
         if self.role and author == self.role.lower():
             return "ignored", "authored by configured role"
@@ -468,6 +482,10 @@ class Engine:
                                                 "reason": reason}})
             elif rec.get("state") == "idle":
                 rec["state"] = "tracked"
+
+        # ``delivery`` is classified here and acted on by the assignment layer
+        # (C6). Index state is deliberately untouched: a delivery is not a
+        # "needs a person" item and must not flip the issue state.
 
         if fresh:
             cursor.setdefault("issues", {})[key] = max(int(c["id"]) for c in fresh)
