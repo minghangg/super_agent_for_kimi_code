@@ -191,6 +191,19 @@ class MustFixParsing(unittest.TestCase):
         ("## ISS-53 方案轮复核（零代码改动轮）", "", False),
         ("通过；P2 未修好但不阻塞", "pass", False),
         ("方案复核：有条件通过——P1 必须修", "pass", True),
+        # A partial fix is still a fix. Every line here writes a requirement
+        # and a completion word in the same clause; reading the completion
+        # word as "nothing left" sends a false "ready to close", which is the
+        # one direction this bit must never take.
+        ("有条件通过（2 条必须修，已修 1 条）", "pass", True),
+        ("必须修的 P0-1 已修，P0-2 未修", "", True),
+        ("通过；必须修；尚未全部修完", "pass", True),
+        ("必须修 2 条，已修 1 条", "", True),
+        ("必须修，其中 1 条已修", "", True),
+        ("必须修 3 条（已修 0 条）", "", True),
+        ("必须修（未修完）", "", True),
+        ("必须修 2 条，其中 1 条已修", "", True),
+        ("通过；2 条必须修，0 条已修", "pass", True),
     ]
 
     def review(self, text):
@@ -225,6 +238,24 @@ class MustFixParsing(unittest.TestCase):
         # The word table deliberately holds no state words (``未修复``/``待修``):
         # "P3 is unfixed" is not "the release must wait".
         self.assertShape("未修复项为 P3", "", False)
+
+    def test_hard_6_partial_fix_is_still_a_fix(self):
+        # The completion guard used to read "a completion word within 12
+        # characters" as "nothing left". A review that states its own
+        # arithmetic - "2 required, 1 fixed" - then produced a false
+        # "ready to close". Completion is a count relation, not a distance.
+        for text in ("有条件通过（2 条必须修，已修 1 条）",
+                     "必须修的 P0-1 已修，P0-2 未修",
+                     "通过；必须修；尚未全部修完",
+                     "必须修 2 条，已修 1 条",
+                     "必须修，其中 1 条已修",
+                     "必须修 3 条（已修 0 条）",
+                     "必须修（未修完）",
+                     "必须修 2 条，其中 1 条已修"):
+            with self.subTest(text=text):
+                out = self.review(text)
+                self.assertTrue(out["fix_needed"], text)
+                self.assertEqual(out["fix_matched"], "必须修", text)
 
     def test_state_words_are_not_requirements(self):
         for text in ("尚未修复的 P2 可随下轮", "P2 待修可随下轮", "未修复项为 P3"):

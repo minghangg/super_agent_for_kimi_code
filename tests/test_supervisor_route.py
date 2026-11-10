@@ -115,6 +115,11 @@ class Base(unittest.TestCase):
         self.bind_both()
         self.write_sessions({"supervisor": {"id": "session_sup"}})
 
+    def fresh(self):
+        """Restart from a clean state directory, inside one test method."""
+        self.tmp.cleanup()
+        self.setUp()
+
     def tearDown(self):
         self.tmp.cleanup()
 
@@ -301,6 +306,38 @@ class DecidedBeforeThePmEarlyReturn(Base):
         self.assertEqual(engine._retry_supervisor_routes(index), 0)
 
 
+class PartialFixNeverReachesTheSupervisor(Base):
+    """The end-to-end shape of P0-1: a partial fix must not send "ready to close".
+
+    ``markers`` answers the parsing question and ``test_markers`` pins it. This
+    class pins the consequence: with a partial-fix verdict the supervisor gets
+    **no** event, because the message it would receive says "P0=0, no must-fix
+    items" and there is nothing in it the reader could use to notice the lie.
+    """
+
+    PARTIAL = (
+        "有条件通过（2 条必须修，已修 1 条）",
+        "必须修 2 条，已修 1 条",
+        "必须修 3 条（已修 0 条）",
+        "必须修（未修完）",
+        "通过；必须修；尚未全部修完",
+    )
+
+    def test_a_partial_fix_sends_nothing_to_the_supervisor(self):
+        for body in self.PARTIAL:
+            with self.subTest(body=body):
+                self.fresh()
+                engine = self.engine()
+                self.deliver_and_pass(engine, body="[QA] " + body)
+                self.assertEqual(
+                    self.bus.payloads("event.agent.supervisor"), [], body)
+                self.assertEqual(
+                    len(self.bus.payloads("event.agent.project_pm")), 1, body)
+                index = self.index(engine)
+                self.assertFalse(
+                    (index.get("supervisor_routes") or {}), body)
+
+
 class ReleaseTimeout(Base):
     """The held state is ``close_reconcile``; nothing here is hand-assembled."""
 
@@ -379,6 +416,49 @@ class ReleaseTimeout(Base):
         self.assertNotIn("waiting_release", statuses)
         self.assertIn("close_reconcile", statuses)
 
+    def test_a_second_release_cycle_does_not_inherit_the_first_start(self):
+        # ``close_reconcile[thread]`` outlives a completed thread, so a start
+        # carried forward would date the second release to the first one and
+        # fire "held for 313 days" on its very first round. The cycle start is
+        # reset when the previous status was not ``pending``.
+        engine = self.engine()
+        self.deliver_and_pass(engine)
+        index = self.index(engine)
+        old = "2026-01-01T00:00:00+00:00"
+        index["close_reconcile"][THREAD]["status"] = "completed"
+        index["close_reconcile"][THREAD]["first_checked_at"] = old
+        # A new assignment on the same thread enters the hold again.
+        index["assignments"]["asg_1_worker_2"] = {
+            "id": "asg_1_worker_2", "thread": THREAD, "issue": 1,
+            "role": "worker", "status": "waiting_release", "sid": "session_w1",
+            "delivery_comment_id": 9002, "qa_verdict": "pass"}
+        engine.store.save_index(index)
+        engine.run_once()
+        fresh = self.index(engine)["close_reconcile"][THREAD]["first_checked_at"]
+        self.assertNotEqual(fresh, old, "the second cycle keeps its own start")
+        timeout = [p for p in self.bus.payloads("event.agent.supervisor")
+                   if p.get("kind") == "release_timeout"]
+        self.assertEqual(timeout, [], "a fresh cycle is not overdue")
+
+    def test_a_missing_start_is_logged_once_and_queued(self):
+        # The scan runs every round; an unconditional event per round buries
+        # the queue it is writing to.
+        engine = self.engine()
+        self.deliver_and_pass(engine)
+        index = self.index(engine)
+        index["close_reconcile"] = {}
+        for rec in (index.get("assignments") or {}).values():
+            rec.pop("tombstone", None)
+            rec.pop("archived_at", None)
+        for _ in range(3):
+            engine._remind_release_timeouts(index)
+        skipped = [r for r in self.rows() if r["type"] == "release_timeout.skipped"]
+        self.assertEqual(len(skipped), 1, "one line, not one per round")
+        rows = [e for e in (index["issues"][THREAD]["needs_person"] or [])
+                if str(e.get("reason") or "") ==
+                "route.supervisor_undeliverable[user]"]
+        self.assertEqual(len(rows), 1, "one row, not one per round")
+
 
 class UndeliverableSupervisor(Base):
     def test_undeliverable_supervisor_lands_in_the_user_bucket(self):
@@ -412,6 +492,54 @@ class UndeliverableSupervisor(Base):
         self.assertEqual(engine._supervisor_sid(), "session_b")
         engine = self.engine(engine_cfg={"supervisor_keys": ["missing"]})
         self.assertEqual(engine._supervisor_sid(), "")
+
+    def test_a_retry_that_cannot_resolve_the_issue_is_not_silent(self):
+        # Dropping the record quietly leaves ``ok=False`` forever with nothing
+        # to look at - the same silence this bit exists to remove.
+        engine = self.engine()
+        index = self.index(engine)
+        sup_key = f"sup:{THREAD}:9100"
+        index["assignments"] = {}
+        index["supervisor_routes"] = {sup_key: {
+            "thread": THREAD, "comment_id": 9100, "at": "2026-11-10T10:00:00Z",
+            "verdict": "pass", "fix_needed": False, "sup_eligible": True,
+            "action_id": action_id(sup_key, "bus_inject", "9100")}}
+        self.assertEqual(engine._retry_supervisor_routes(index), 0)
+        logged = [r for r in self.rows()
+                  if r["type"] == "route.supervisor_undeliverable"]
+        self.assertEqual(len(logged), 1)
+        self.assertIn("resolve the issue", logged[0]["detail"])
+        rows = [e for e in (index["issues"][THREAD]["needs_person"] or [])
+                if str(e.get("reason") or "") ==
+                "route.supervisor_undeliverable[user]"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(brief._classify(rows[0]["reason"]),
+                         brief.PRIORITY_USER)
+
+    def test_two_different_failures_on_one_comment_keep_two_rows(self):
+        # A ``None`` delivery id is not an identity: two assignments sharing it
+        # must not collapse into one row, and two different reasons for the
+        # same comment are two problems, not one.
+        engine = self.engine()
+        index = self.index(engine)
+        engine._note_undeliverable(index, THREAD, None, "no supervisor sid",
+                                   assignment="asg_1_worker_1")
+        engine._note_undeliverable(index, THREAD, None, "no supervisor sid",
+                                   assignment="asg_1_worker_2")
+        self.assertEqual(len(index["issues"][THREAD]["needs_person"]), 2)
+        engine._note_undeliverable(index, THREAD, None, "dispatch refused",
+                                   assignment="asg_1_worker_1")
+        self.assertEqual(len(index["issues"][THREAD]["needs_person"]), 3)
+
+        # ... and the same failure across rounds still writes one row.
+        for _ in range(3):
+            engine._note_undeliverable(index, THREAD, None,
+                                       "dispatch refused",
+                                       assignment="asg_1_worker_1")
+        self.assertEqual(len(index["issues"][THREAD]["needs_person"]), 3)
+        logged = [r for r in self.rows()
+                  if r["type"] == "route.supervisor_undeliverable"]
+        self.assertEqual(len(logged), 3, "one line per distinct failure")
 
 
 class ConfigSurface(unittest.TestCase):

@@ -83,8 +83,28 @@ MODIFIER_TAIL = "的"
 
 # ``必须修的 P1 已在本轮修完`` / ``必须修项为0``: the requirement was met (or
 # counts zero), so it must not withhold the notification.
-DONE_WORDS = ("已修", "修完", "已改", "已补", "已完成", "已处理")
-ZERO_WORDS = ("为0", "为 0", "=0", "= 0")
+#
+# Completion is a **count relation**, never a character distance. A real review
+# says ``有条件通过（2 条必须修，已修 1 条）``: both words sit in the same line
+# and the work is *not* done. Reading "a completion word appears nearby" as
+# "nothing left" turns that into a false "ready to close", which is the one
+# failure this whole bit exists to prevent - a missed notice has a
+# ``needs_person`` row behind it, a false one has nothing.
+DONE_WORDS = ("已修完", "已修", "修完", "已补", "已改", "已完成", "已处理")
+# Any of these in the same neighbourhood withdraws the completion claim.
+INCOMPLETE_WORDS = ("未修完", "尚未修完", "未全部修完", "未修", "尚未修",
+                    "未修复", "尚未修复", "待修", "未完成", "未处理")
+# The zero must belong to the requirement (``必须修项为0``), not to an unrelated
+# counter that happens to sit on the same line (``P0=0 / P1=1 必须修``).
+ZERO_TAIL_RE = re.compile(r"^(?:项|条)?\s*(?:为|=)\s*0")
+# How far around a requirement word its completion claim is read. A clause is
+# short; a whole line is not, and a distant "P2 已修完" must not speak for it.
+COMPLETION_WINDOW = 30
+FIXED_COUNT_RE = re.compile(r"已修\s*(\d+)\s*条|(\d+)\s*条\s*已修")
+_REQ_WORDS_RE = "|".join(re.escape(w) for w in
+                         sorted(MUST_FIX_WORDS, key=len, reverse=True))
+REQUIRED_COUNT_RE = re.compile(
+    rf"(?:{_REQ_WORDS_RE})\s*(\d+)\s*条|(\d+)\s*条\s*(?:{_REQ_WORDS_RE})")
 
 
 def first_line(body: str) -> str:
@@ -179,23 +199,26 @@ def _must_fix(text: str) -> str:
     A substring test is as wrong here as it is for the verdict: ``无需修改``
     contains ``需修``, so the naive reader turns the most common pass into a
     demand for work and the supervisor never hears about the release. The
-    guards below are the answer, and they must stay together:
+    guards run in this order, and the order is the design:
 
-    1. **long word first, and a rejected hit propagates.** Negation words are
-       scanned longest first (``无需`` before any bare character) and every hit
-       interval is remembered; a candidate whose interval intersects one is
-       void. A rejected *requirement* hit is remembered too, so the shorter word
-       inside it (``须修`` inside ``必须修``) is not read as a second, clean hit.
-    2. **a glued single-character negation** - ``非必须修`` - is void even though
-       no negation word spans the candidate; consecutive characters are eaten.
-    3. **interval intersection** is the form rule 1 uses, spelled out because it
-       is the only one that stops ``无需修改``: the ``需`` is shared.
+    1. **whole-word negation first.** ``无需``/``无须``/``不必`` are matched as
+       whole words from :data:`NEGATION_WORDS`; that alone settles ``无需修改``
+       and ``无需修复``, and it is what the ordinary pass relies on. Every
+       negation span is remembered, and a rejected *requirement* hit is
+       remembered too, so the shorter word inside it (``须修`` inside
+       ``必须修``) is not read as a second, clean hit.
+    2. **a local overlap the whole-word table cannot cover.** ``非必须修`` has
+       no negation word spanning it - the ``非`` is a single character glued to
+       the front - so a glued ``无不免勿非`` (and any interval that still
+       intersects a negation span) voids the candidate. This guard covers
+       *partial* overlaps; it is not what stops ``无需修改``, which the whole
+       word already did.
+    3. **the completion claim is a count relation, not a distance.**
+       ``2 条必须修，已修 1 条`` states its own arithmetic; reading the nearby
+       ``已修`` as "nothing left" is how a partial round turns into a false
+       "ready to close". See :func:`_settled`.
     4. **the pick** is ``(position, -length)``, the same comparison
        :func:`_first_hit` uses - one rule, not two.
-    5. **a modifier plus an absence** - ``没有必须修的项`` - states that nothing is
-       required.
-    6. **a completed or zero-count requirement** - ``必须修项为0``,
-       ``必须修的 P1 已在本轮修完`` - is not pending work.
 
     ``fix_matched`` is for the event log only; callers decide on
     ``fix_needed``.
@@ -230,9 +253,54 @@ def _spans_negate(text: str, start: int, end: int, rejected) -> bool:
     if text[end:end + 1] == MODIFIER_TAIL and any(
             absent in text[max(0, start - 6):start] for absent in ABSENT_WORDS):
         return True
-    tail = text[end:end + 12]
-    return any(done in tail for done in DONE_WORDS) or any(
-        zero in tail for zero in ZERO_WORDS)
+    return _settled(text, start, end)
+
+
+def _settled(text: str, start: int, end: int) -> bool:
+    """Is the requirement at ``[start, end)`` a *finished* one?
+
+    Completion is decided by the **counts the sentence states about itself**,
+    never by how close a completion word happens to sit. The order is:
+
+    1. **a contradiction wins.** ``未修完``/``尚未修完``/``待修``/``未修`` near
+       the requirement keeps it pending, whatever else the clause claims;
+    2. **an explicit zero is settled** - ``必须修项为0`` needs no other proof;
+    3. **the arithmetic decides.** ``2 条必须修，已修 1 条`` says exactly how much
+       is left. A partial count (``已修 N 条`` with no total) means "some were
+       fixed", which is not "all were fixed";
+    4. **only with no counts at all** does a completion word speak for the
+       requirement itself - and there it must be a completion of that
+       requirement, which is why ``必须修的 P1 已在本轮修完`` is settled while a
+       bare ``已修`` next to an unknown number is not.
+
+    The default is "still needed". A false "ready to close" misleads the reader
+    with no way to notice; a withheld one at least leaves a ``needs_person``
+    row behind.
+    """
+    near = text[max(0, start - COMPLETION_WINDOW):end + COMPLETION_WINDOW]
+    if any(word in near for word in INCOMPLETE_WORDS):
+        return False
+    if ZERO_TAIL_RE.match(text[end:]) or ZERO_TAIL_RE.match(near):
+        return True
+    required = _first_count(REQUIRED_COUNT_RE, near)
+    fixed = _first_count(FIXED_COUNT_RE, near)
+    if required is not None and fixed is not None:
+        return fixed >= required
+    if fixed is not None:
+        # Some were fixed and the total is not stated: not provably all.
+        return False
+    return any(done in near for done in DONE_WORDS)
+
+
+def _first_count(pattern, text: str) -> int | None:
+    """The first integer ``pattern`` captures, whichever group held it."""
+    match = pattern.search(text)
+    if not match:
+        return None
+    for group in match.groups():
+        if group is not None:
+            return int(group)
+    return None
 
 
 def parse_review(body: str) -> dict | None:

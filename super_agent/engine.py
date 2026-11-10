@@ -498,11 +498,13 @@ class Engine:
     def _sup_eligible(self, review: dict, record: dict | None) -> bool:
         """Does this verdict want the supervisor told?
 
-        ``fix_needed`` is the parser's answer and is recomputed every time;
-        ``sup_eligible`` on the stored record is the **decision snapshot**, and
-        it is the only thing a retry may trust: a retry re-enters here with a
-        stub review that carries the verdict and nothing else, and re-deriving
-        the answer would turn ``有条件通过（1 条 P1 必须修）`` into a pass.
+        ``fix_needed`` is the parser's answer and is recomputed on a fresh
+        parse; ``sup_eligible`` on the stored record is the **decision
+        snapshot**, and it is the only thing a retry may trust. The retry
+        re-enters with a stub review that carries the verdict and nothing else -
+        re-deriving from that stub would answer "not eligible" for a release the
+        first round already decided to announce, and the notice would be lost by
+        a re-check rather than by a decision.
 
         Neither answer available means "do not send" - guessing here would
         either withhold a release or send a false one.
@@ -644,12 +646,17 @@ class Engine:
         ``[user]``: the brief buckets by reason substring, and a local
         configuration gap must not sit in the "waiting for a decision" section.
 
-        ``once_key`` makes both idempotent: the retry and reminder passes run
-        every round, and a repeated line per round would bury the queue it is
-        writing to. The row is keyed by ``(thread, comment)`` either way.
+        Identity is ``(thread, comment, assignment, detail)`` - the same
+        comment can fail twice for different reasons (no sid, then a refused
+        dispatch) and two different assignments can share a comment id (a
+        ``None`` delivery id is not an identity). Keying on the comment alone
+        would fold those into one row, which is the loss this method exists to
+        prevent. The same failure across rounds still writes one row, because
+        the key does not mention the round.
         """
         reason = "route.supervisor_undeliverable[user]"
-        key = once_key or f"{thread}|{needs.cid_of(comment_id)}"
+        key = once_key or (f"{thread}|{needs.cid_of(comment_id)}|{assignment}|"
+                           f"{detail}")
         if key not in self._sup_notice_logged:
             self._sup_notice_logged.add(key)
             self.store.log_event({
@@ -661,11 +668,32 @@ class Engine:
             thread, {"state": "idle", "comments_seen": 0, "needs_person": []})
         existing = [entry for entry in numbers.get("needs_person") or []
                     if needs.cid_of(entry) == needs.cid_of(comment_id)
-                    and str(entry.get("reason") or "") == reason]
+                    and str(entry.get("reason") or "") == reason
+                    and str(entry.get("assignment") or "") == str(assignment or "")
+                    and str(entry.get("detail") or "") == str(detail or "")]
         if existing:
             return
         numbers.setdefault("needs_person", []).append({
-            "comment_id": comment_id, "reason": reason, "at": _now()})
+            "comment_id": comment_id, "reason": reason, "at": _now(),
+            "assignment": str(assignment or ""), "detail": str(detail or "")})
+
+    def _note_skipped(self, index: dict, assignment: str, thread: str,
+                      comment_id, detail: str) -> None:
+        """A held thread with no usable start time: said once, then queued.
+
+        The scan runs every round, so an unconditional ``log_event`` here wrote
+        the same line on every round - the same "bury the queue" problem the row
+        de-duplication already solves. One event and one row per assignment.
+        """
+        if f"skipped:{assignment}" not in self._sup_notice_logged:
+            self._sup_notice_logged.add(f"skipped:{assignment}")
+            self.store.log_event({
+                "type": "release_timeout.skipped", "at": _now(),
+                "thread": thread, "assignment": assignment,
+                "reason": "no usable start time"})
+        self._note_undeliverable(index, thread, comment_id, detail,
+                                 assignment=assignment,
+                                 once_key=f"notime:{assignment}")
 
     def _retry_supervisor_routes(self, index: dict) -> int:
         """Re-send supervisor notices a refused/suppressed dispatch never sent.
@@ -696,6 +724,14 @@ class Engine:
                     issue = rec.get("issue")
                     break
             if issue is None or cid is None:
+                # Dropping this quietly would leave the record ``ok=False``
+                # forever with nothing to look at - the same silence this bit
+                # exists to remove. ``_note_undeliverable`` writes the event and
+                # the person-facing row, once per record.
+                self._note_undeliverable(
+                    index, thread, cid,
+                    "retry cannot resolve the issue for this supervisor record",
+                    issue=issue, once_key=f"retry-issue:{key}")
                 continue
             review = {"verdict": str(record.get("verdict") or "")}
             result = self._route_supervisor(index, thread, int(issue),
@@ -751,14 +787,9 @@ class Engine:
             start = self._release_start(index, thread, rec)
             parsed = _parse_ts(start)
             if parsed is None:
-                self.store.log_event({
-                    "type": "release_timeout.skipped", "at": _now(),
-                    "thread": thread, "assignment": aid,
-                    "reason": "no usable start time"})
-                self._note_undeliverable(
-                    index, thread, rec.get("delivery_comment_id"),
-                    "release timeout start time is unusable", issue=rec.get("issue"),
-                    assignment=aid, once_key=f"notime:{aid}")
+                self._note_skipped(
+                    index, aid, thread, rec.get("delivery_comment_id"),
+                    "release timeout start time is unusable")
                 continue
             if (now - parsed).total_seconds() < timeout:
                 continue
@@ -1414,6 +1445,26 @@ class Engine:
             return f"running tasks: {detail['running_tasks']}"
         return ""
 
+    def _cycle_start(self, rec: dict) -> str:
+        """The start of the **current** hold cycle, not of the thread's history.
+
+        The ``close_reconcile`` record outlives a completed thread (nothing
+        deletes it), so ``first_checked_at`` carried forward would date the
+        second release to the first release's start - a "held for 313 days"
+        reminder on the very first round of a fresh cycle, which is worse than
+        silence. A cycle begins whenever the previous round's status was not
+        ``pending``; from then on the start is kept, so a run of pending rounds
+        cannot keep pushing its own deadline out.
+
+        This is the single exception to "``_reconcile_thread`` is untouched":
+        the reset has to happen where the record is written, and the record is
+        written only here.
+        """
+        previous = str(rec.get("status") or "")
+        if previous and previous != "pending":
+            return _now()
+        return str(rec.get("first_checked_at") or "") or _now()
+
     def _reconcile_thread(self, index: dict, thread: str) -> dict:
         """One observation of one held thread; the record lives in the index.
 
@@ -1441,7 +1492,7 @@ class Engine:
         record = {
             "status": "pending", "attempts": int(rec.get("attempts") or 0) + 1,
             "consecutive_ok": streak,
-            "first_checked_at": rec.get("first_checked_at") or _now(),
+            "first_checked_at": self._cycle_start(rec),
             "checked_at": _now(), "last_checked_round": round_no,
             "conditions": snap["conditions"], "detail": snap["detail"],
             "blocked_reason": self._close_blocked_reason(snap),
