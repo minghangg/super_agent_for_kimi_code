@@ -90,6 +90,19 @@ TAILS = ("项", "者")
 # Two tokens that disagree still answer the safe side. ``FIX_TOKEN_ANY_RE`` is
 # the un-anchored form, used only to notice a second token; it never decides on
 # its own.
+#
+# **The protocol, stated once:**
+#
+# 1. a wrapped token at the end of the line **is** this review's declaration;
+#    nothing else on the line can override it (see ``read_fix_token``).
+# 2. if you mean to *quote* someone else's token, **do not leave it at the end
+#    of the line** - put it mid-sentence, where it reads as a mention. The
+#    parser cannot tell "I quote" from "I declare"; only the position can.
+# 3. any wrapped token **anywhere** in the line that disagrees with the tail
+#    makes the answer fall back to the safe side (no announcement). That is
+#    deliberate: a line containing two conflicting declarations has not said
+#    one thing, and announcing a release off it is the failure this bit exists
+#    to stop. It costs a missed notice, never a false one.
 _TOKEN = r"fix_needed\s*:\s*(true|false)"
 FIX_TOKEN_RE = re.compile(r"<!--\s*" + _TOKEN + r"\s*-->\s*$", re.I)
 FIX_TOKEN_ANY_RE = re.compile(r"<!--\s*" + _TOKEN + r"\s*-->", re.I)

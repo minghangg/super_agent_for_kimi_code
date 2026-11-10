@@ -493,6 +493,16 @@ class AnUnmarkedVerdictIsSaidOutLoud(Base):
                 self.deliver_and_pass(engine, body=body)
                 self.assertEqual(self.rows(engine), [], body)
 
+    def test_a_reject_leaves_no_such_row_even_unmarked(self):
+        # A reject never reaches the supervisor whatever the marker says, so
+        # "please add the marker" would be advice with no effect - and one
+        # ``[user]`` row per reject piles up in the bucket a person reads.
+        engine = self.engine()
+        self.deliver_and_pass(engine, body=REJECT_BODY)
+        self.assertEqual(self.rows(engine), [])
+        self.assertEqual(self.bus.payloads("event.agent.supervisor"), [])
+        self.assertEqual(len(self.bus.payloads("event.agent.project_pm")), 1)
+
     def test_a_non_qa_comment_leaves_no_such_row(self):
         # ``_route_review`` only ever sees a ``[QA]`` verdict; a delivery or a
         # plain comment must not reach the row through a side effect.
@@ -502,20 +512,40 @@ class AnUnmarkedVerdictIsSaidOutLoud(Base):
         self.assertEqual(self.rows(engine), [])
 
     def test_a_retry_stub_does_not_write_the_row_again(self):
-        # ``_retry_routes`` re-enters with ``{"verdict": ...}`` and no
-        # ``fix_structured`` key, so ``is False`` must not match it: the row is
-        # about the verdict, not about how many times routing was attempted.
+        """A retry re-enters with ``{"verdict": ...}`` and no marker key.
+
+        The stub has to actually reach ``_route_review`` for this to test
+        anything. Anchoring the test on an empty ``routes`` table made the loop
+        body run zero times, so "no second line" held no matter what the branch
+        said - a green that could not go red. Here the route record is kept and
+        only the attempt counter is cleared, so ``_retry_routes`` really does
+        re-enter; the strict ``is False`` then keeps the row single, while
+        ``not review.get(...)`` would write a second one.
+        """
         engine = self.engine()
         self.deliver_and_pass(engine, body=PASS_UNMARKED)
-        before = len(self.rows_events())
+        self.assertEqual(len(self.rows(engine)), 1)
+
+        # A restart: a fresh engine, the PM attempt forgotten (that is what a
+        # refused dispatch leaves behind), the record kept so the loop has a
+        # body to run.
+        engine = self.engine()
         index = self.index(engine)
-        index["routes"] = {}
+        route_key = f"route:{THREAD}:9100"
+        self.assertIn(route_key, index["routes"], "the stub needs a record")
+        state = engine.store.load_outbox_state()
+        state["attempts"] = {}
+        engine.store.save_outbox_state(state)
+        index["routes"][route_key]["ok"] = None
         engine.store.save_index(index)
-        engine._retry_routes(self.index(engine))
+
+        self.assertEqual(engine._retry_routes(index), 1,
+                         "the stub must re-enter _route_review, not skip it")
         logged = [r for r in self.rows_events() if r["type"]
                   == "route.supervisor_undeliverable"]
-        self.assertEqual(len(logged), 1, "no second line from a retry stub")
-        self.assertGreaterEqual(len(self.rows_events()), before)
+        self.assertEqual(len(logged), 1,
+                         "one line per verdict, not one per retry")
+        self.assertEqual(len(self.rows(engine)), 1, "and one row")
 
 
 class TheMarkerIsTheOnlyWayToAnnounce(Base):

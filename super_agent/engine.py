@@ -365,13 +365,21 @@ class Engine:
             self._route_supervisor(index, thread, issue, comment, review,
                                    sup_key, action_id(sup_key, "bus_inject",
                                                       str(cid)))
-        if review.get("fix_structured") is False:
-            # An unmarked verdict answers the safe side (work is left) and so
+        if (review.get("fix_structured") is False
+                and str(review.get("verdict") or "") == "pass"):
+            # An unmarked *pass* answers the safe side (work is left) and so
             # tells the supervisor nothing - which is *safe* but *silent*: the
             # absence of a notice is not observable. Say it out loud once per
             # verdict, in the same ``[user]`` bucket as every other "this could
-            # not be sent" row. A retry stub carries no ``fix_structured`` key,
-            # so ``is False`` keeps the re-sends quiet.
+            # not be sent" row.
+            #
+            # A reject is excluded on purpose: it never reaches the supervisor
+            # whatever the marker says, so "please add the marker" would be
+            # advice with no effect - one ``[user]`` row per reject, piling up
+            # in the bucket a person reads.
+            #
+            # A retry stub carries no ``fix_structured`` key, so the strict
+            # identity test (never ``not``) keeps the re-sends quiet.
             self._note_undeliverable(
                 index, thread, cid,
                 "QA 结论未带 fix_needed 标记，已按「有必修项」处理并暂不通知 "
