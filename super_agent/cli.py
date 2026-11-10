@@ -486,36 +486,25 @@ def cmd_resolve(args) -> int:
 
     # W/A count KEYS, M counts ROWS - the same number in one line means two
     # different things here, so never mix them up.
+    #
+    # The planned/already split is decided by ``needs.mark`` itself, on a
+    # scratch copy: "is this key dismissed" must have exactly one definition,
+    # otherwise a second dismissal could rewrite the audit row that ``mark``
+    # is supposed to protect.
+    existing = needs_mod.marks(disk1)
+    scratch = {needs_mod.MARKS: {k: dict(v) for k, v in existing.items()}}
     planned, already = [], []
     for key, _rows in matched0.items():
-        if needs_mod.entry_key(key, cid) in needs_mod.marks(disk1):
-            already.append((key, len(matched1.get(key) or [])))
-        else:
-            planned.append((key, len(matched1.get(key) or [])))
-
-    def _row():
-        rows = next(iter(matched1.values()), matched0[next(iter(matched0))])
-        return rows
-
-    detail = _row()
-
-    # One row per key, so the event can name a by_comment/reason even when the
-    # rows differ; the reason is the first row's, which is what the audit reads.
-    def _side_row(key: str, count: int) -> dict:
-        return {
-            "state": state,
-            "reason": str((detail[0] if detail else {}).get("reason") or ""),
-            "at": _now(),
-            "by": str(args.by or ""),
-            "by_comment": None if getattr(args, "comment_ref", None) is None
-            else int(args.comment_ref),
-            "superseded_by": (str(getattr(args, "note", "") or "")
-                              if state == needs_mod.SUPERSEDED else None),
-            "entries": count,
-        }
-
-    side = {needs_mod.entry_key(key, cid): _side_row(key, count)
-            for key, count in planned}
+        count = len(matched1.get(key) or [])
+        got = needs_mod.mark(
+            scratch, key, cid, state=state, by=str(args.by or ""),
+            reason=str((matched0.get(key) or [{}])[0].get("reason") or ""),
+            by_comment=getattr(args, "comment_ref", None),
+            superseded_by=(str(getattr(args, "note", "") or "")
+                           if state == needs_mod.SUPERSEDED else None),
+            entries=count)
+        (planned if got["changed"] else already).append((key, count))
+    side = {k: v for k, v in scratch[needs_mod.MARKS].items() if k not in existing}
 
     written, failed, error = [], [], ""
     if side:
@@ -549,13 +538,14 @@ def cmd_resolve(args) -> int:
 
     if written:
         folded = sum(count for _key, count in written)
-        first = side[needs_mod.entry_key(written[0][0], cid)]
+        stored = needs_mod.marks(store.load_index())
+        first = stored.get(needs_mod.entry_key(written[0][0], cid)) or {}
         store.log_event({"type": f"needs_person.{state}", "at": _now(),
                          "issue": number, "comment_id": cid,
-                         "reason": first["reason"],
+                         "reason": first.get("reason") or "",
                          "by": str(args.by or ""),
-                         "by_comment": first["by_comment"],
-                         "superseded_by": first["superseded_by"],
+                         "by_comment": first.get("by_comment"),
+                         "superseded_by": first.get("superseded_by"),
                          "keys": [key for key, _n in written], "entries": folded,
                          "already": [key for key, _n in already],
                          "entries_skipped": sum(count for _key, count in already)})

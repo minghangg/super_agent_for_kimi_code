@@ -1558,25 +1558,25 @@ class Engine:
         for issue_key, rec in sorted((index.get("issues") or {}).items(),
                                      key=lambda kv: issuekey.issue_number(kv[0]) or 0):
             for entry in rec.get("needs_person") or []:
-                cid = needs.cid_of(entry)
-                row = table.get(needs.entry_key(issue_key, cid)) if cid is not None else None
-                if row is None:
-                    items.append({"issue": issue_key, "comment_id": entry.get("comment_id"),
-                                  "reason": entry.get("reason"), "at": entry.get("at"),
-                                  "source": "index", "action_id": None})
+                if not all and not needs.is_open(index, issue_key, entry):
                     continue
-                if not all:
-                    continue
-                items.append({"issue": issue_key, "comment_id": entry.get("comment_id"),
-                              "reason": entry.get("reason"), "at": entry.get("at"),
-                              "source": "index", "action_id": None,
-                              "state": row.get("state"),
-                              "entry_at": entry.get("at"),
-                              "resolved_at": row.get("at"),
-                              "resolved_by": row.get("by"),
-                              "resolved_by_comment": row.get("by_comment"),
-                              "superseded_by": row.get("superseded_by"),
-                              "entries": row.get("entries")})
+                item = {"issue": issue_key, "comment_id": entry.get("comment_id"),
+                        "reason": entry.get("reason"), "at": entry.get("at"),
+                        "source": "index", "action_id": None}
+                if all:
+                    cid = needs.cid_of(entry)
+                    row = (table.get(needs.entry_key(issue_key, cid))
+                           if cid is not None else None)
+                    if row is not None:
+                        item.update({
+                            "state": row.get("state"),
+                            "entry_at": entry.get("at"),
+                            "resolved_at": row.get("at"),
+                            "resolved_by": row.get("by"),
+                            "resolved_by_comment": row.get("by_comment"),
+                            "superseded_by": row.get("superseded_by"),
+                            "entries": row.get("entries")})
+                items.append(item)
         if outbox:
             for aid, rec in sorted(self.store.unfinished_outbox().items()):
                 status = str(rec.get("status") or "")
