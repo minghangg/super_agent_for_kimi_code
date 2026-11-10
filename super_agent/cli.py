@@ -31,6 +31,7 @@ from pathlib import Path
 
 from . import brief as brief_mod
 from . import config as config_mod
+from . import reporter as reporter_mod
 from . import session_events
 from . import assignments as asg_mod
 from . import issuekey
@@ -711,6 +712,46 @@ def cmd_context(args) -> int:
     return 0
 
 
+def cmd_reporter(args) -> int:
+    """First screen "what needs me": three buckets, then a collapsed second screen.
+
+    Read-only throughout. ``--no-quotes`` never constructs a live source at all
+    (not "builds one and skips the quotes"): the page then says, per row, why
+    the quote is missing instead of silently dropping it.
+    """
+    cfg, store = _build(args)
+    if args.no_quotes:
+        source = NullSource()
+    elif args.fixture:
+        try:
+            source = FixtureSource(args.fixture)
+        except Exception as exc:  # noqa: BLE001  report, never a traceback
+            print(f"reporter: 夹具不可读: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+    else:
+        repo = str((cfg.get("github") or {}).get("repo") or "")
+        source = LiveSource(repo) if repo else NullSource()
+    # The engine is built for its allowlist and role only; nothing here runs a
+    # round, so ``source`` above is the only backend that can be touched.
+    engine = _engine(cfg, store, None, source=NullSource())
+    try:
+        report, text = reporter_mod.collect_and_render(
+            engine, source=source, quotes=not args.no_quotes)
+    except Exception as exc:  # noqa: BLE001  report, never dump a traceback
+        print(f"reporter failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    if args.out:
+        path = Path(args.out).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        print(f"reporter: 状态={report['status']} 待处理="
+              f"{sum(v for v in report['counts'].values() if v) or 0} "
+              f"引用不可用={report['quotes_missing']} -> {path}")
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
 def _live_sids(live_file: str | None) -> set[str]:
     """Live sids from a saved ``sess.py list`` output, or by running it.
 
@@ -907,8 +948,20 @@ def build_parser() -> argparse.ArgumentParser:
                        help="per-comment clip (default 120)")
     p_ctx.set_defaults(func=cmd_context)
 
+    p_rep = sub.add_parser("reporter", help="read-only first screen: what needs me")
+    _add_common(p_rep, suppress=True)
+    p_rep.add_argument("--out", default=None,
+                       help="write the page to this path (default: stdout)")
+    p_rep.add_argument("--no-quotes", action="store_true",
+                       help="never construct a source; every row says why its "
+                            "quote is unavailable")
+    p_rep.add_argument("--fixture", default=None,
+                       help="read comment bodies from a fixture file instead of "
+                            "GitHub (same shape as context --fixture)")
+    p_rep.set_defaults(func=cmd_reporter)
+
     for sub_parser in (p_once, p_run, p_status, p_doctor, p_unblock, p_resolve,
-                       p_replay, p_rec, p_brief, p_ctx):
+                       p_replay, p_rec, p_brief, p_ctx, p_rep):
         sub_parser.set_defaults(_has_common=True)
 
     return parser
