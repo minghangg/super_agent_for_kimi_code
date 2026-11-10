@@ -226,6 +226,32 @@ class MustFixParsing(unittest.TestCase):
         # says *all* of it is done, which is a statement about the total.
         ("通过；必须修的 2 条已全部修完", "pass", False),
         ("通过；必须修 2 条，尚未全部修完", "pass", True),
+        # The negation family QA found in round 4: every one of these was a
+        # false "ready to close" while two character tables (``SINGLE_NEG`` /
+        # ``ALL_NEGATIONS``) disagreed by ``无/免/勿/非``. One table now answers
+        # for all of them, so this list is a regression net rather than the
+        # mechanism.
+        ("必须修 2 条，并非全部修完", "", True),
+        ("必须修 2 条，非全部修完", "", True),
+        ("必须修 2 条，非全部修复", "", True),
+        ("必须修 2 条，并非全部完成", "", True),
+        ("必须修 2 条，未全部修复", "", True),
+        ("必须修 2 条，尚未全部修复", "", True),
+        ("必须修 2 条，没有全部修复", "", True),
+        ("必须修 2 条，不全部修完", "", True),
+        ("必须修，未均已修完", "", True),
+        ("必须修，尚全部修完", "", True),
+        ("必须修，没全部修完", "", True),
+        ("必须修 2 条，无全部修复", "", True),
+        ("必须修 2 条，勿全部修复", "", True),
+        ("必须修 2 条，全部修复了吗", "", True),
+        # An "all done" phrase never outvotes the count the sentence states
+        # about itself: "all 2 done" with 3 required has one left. Neither does
+        # a phrase that admits it covers a part, or one that names a remainder.
+        ("必须修 3 条，已全部修完 2 条", "", True),
+        ("必须修 2 条，已全部修完 1 条", "", True),
+        ("必须修 2 条，已全部修完，另 1 条另说", "", True),
+        ("必须修 2 条，全部修完了一半", "", True),
     ]
 
     def review(self, text):
@@ -322,12 +348,20 @@ class MustFixParsing(unittest.TestCase):
         states "N required, M fixed" with ``N > M`` must answer
         ``fix_needed``, and every one with ``N <= M`` must not. A point fix
         passes the named shapes and still leaks here.
+
+        Violations are collected and asserted once. A ``subTest`` per line made
+        this one test the source of 99% of the suite's subtest count (16800 of
+        17005), which left that number unable to show anything about the rest
+        of the suite; the coverage is identical either way. ``\\n`` is not a
+        separator: :func:`markers.parse_review` reads ``first_line()`` only, so
+        anything after a newline is outside the review by construction.
         """
         requirements = ("必须修", "仍需修", "仍须修", "需要修", "须修", "需修",
                         "还需要修")
         separators = ("，", " ", "/", "；", "、")
         completions = ("已修", "已修完", "已完成", "已处理", "已补", "已改")
         measures = ("条", "处", "项", "")
+        violations = []
         checked = 0
         for req in requirements:
             for sep in separators:
@@ -338,12 +372,42 @@ class MustFixParsing(unittest.TestCase):
                                 text = (f"{req} {required} {measure}{sep}"
                                         f"{done} {fixed} {measure}")
                                 want = required > fixed
-                                with self.subTest(text=text):
-                                    self.assertEqual(
-                                        self.review(text)["fix_needed"], want,
-                                        text)
+                                got = self.review(text)["fix_needed"]
+                                if got != want:
+                                    violations.append((text, want, got))
                                 checked += 1
+        self.assertEqual(violations, [], f"{len(violations)} of {checked}")
         self.assertGreaterEqual(checked, 500)
+
+    def test_hard_11_the_negation_family_is_one_table(self):
+        """No negation form may make a requirement look settled.
+
+        The previous revision spread "negation" over three tables and the
+        difference between two of them (``无/免/勿/非``) produced every false
+        "ready to close" QA found. This sweep is deliberately wider than the
+        named shapes: every all-done phrase, every negation prefix and every
+        completion word, in both the counted and the uncounted form.
+        """
+        prefixes = ("未", "尚", "没", "不", "否", "无", "免", "勿", "非",
+                    "并未", "并非", "从未", "尚无", "没有", "不都")
+        violations = []
+        checked = 0
+        for word in markers.ALL_WORDS:
+            for prefix in prefixes:
+                for text in (f"必须修 2 条，{prefix}{word}",
+                             f"必须修，{prefix}{markers.DONE_WORDS[0]}"):
+                    checked += 1
+                    if not self.review(text)["fix_needed"]:
+                        violations.append(text)
+        self.assertEqual(violations, [], f"{len(violations)} of {checked}")
+
+    def test_hard_12_the_two_old_tables_are_aliases_of_one(self):
+        # The failure mode was two tables drifting apart, so the alias itself
+        # is the property: a character missing from one is missing from all.
+        self.assertEqual(markers.SINGLE_NEG, markers.NEGATION_CHARS)
+        self.assertEqual(markers.ALL_NEGATIONS, markers.NEGATION_CHARS)
+        self.assertEqual(set("无不免勿非") - set(markers.NEGATION_CHARS), set())
+        self.assertEqual(set("未尚没不否") - set(markers.NEGATION_CHARS), set())
 
     def test_hard_10_whole_word_negation_still_wins(self):
         # The new arithmetic must not break the ordinary pass: these five were

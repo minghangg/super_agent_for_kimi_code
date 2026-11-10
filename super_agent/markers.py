@@ -66,15 +66,34 @@ TAILS = ("项", "者")
 # for a perfectly shippable pass.
 MUST_FIX_WORDS = ("必须修", "还需要修", "仍需修", "仍须修", "需要修", "需修", "须修")
 
-# Negation spans. ``无需`` must be tried before any bare character: it covers
+# ---------------------------------------------------------------- negation
+#
+# **One table for "negation".** Three guards read it - the requirement span
+# (:func:`_spans_negate`), the "all of it is done" claim (:func:`_all_claim`)
+# and the bare completion word (:func:`_done_completion`). Because they share
+# the table, a character missing here is missing in all three: the previous
+# revision kept two character tables (``SINGLE_NEG``/``ALL_NEGATIONS``) whose
+# difference was ``无/免/勿/非``, and every false "ready to close" it produced
+# came from that difference - not from one missing word.
+NEGATION_CHARS = "未尚没不否无免勿非"
+
+# Whole-word negations, tried before a bare character: ``无需`` must win over
 # the ``需`` that starts ``需修``, and marking only the ``无`` would leave the
-# candidate looking clean.
+# candidate looking clean. Completion words are here too because "the P1 has
+# already been fixed" is not a demand for work.
 NEGATION_WORDS = ("无需", "无须", "不需", "不必", "不用", "没有", "尚无", "暂无",
                   "不存在", "未", "没", "已修", "已补", "已改", "免修", "勿", "非")
 
-# A candidate glued to one of these characters on its left (``非必须修``) is
-# negated even though no negation word spans it.
-SINGLE_NEG = "无不免勿非"
+# Old names are aliases of the one table, never a second copy: a caller that
+# still says ``SINGLE_NEG`` reads the same characters the other guards do.
+SINGLE_NEG = NEGATION_CHARS
+ALL_NEGATIONS = NEGATION_CHARS
+
+# How far in front of a claim its negation is read. One character is not
+# enough: ``并非全部修完`` hides ``非`` two characters back and ``未均已修完``
+# hides ``未`` three back.
+NEGATION_LOOKBACK = 3
+ALL_LOOKBACK = NEGATION_LOOKBACK
 
 # ``没有必须修的项``: a modifier plus an absence is a statement that nothing is
 # required, not a requirement.
@@ -97,6 +116,14 @@ INCOMPLETE_WORDS = ("未修完", "尚未修完", "未全部修完", "未修", "�
 # The zero must belong to the requirement (``必须修项为0``), not to an unrelated
 # counter that happens to sit on the same line (``P0=0 / P1=1 必须修``).
 ZERO_TAIL_RE = re.compile(r"^(?:项|条)?\s*(?:为|=)\s*0")
+# ``全部修复了吗`` asks rather than asserts; ``全部完成?`` likewise.
+QUESTION_RE = re.compile(r"^\s*(?:了)?\s*[吗么嘛？?]")
+# ``已全部修完 2 条``: the number the claim states about itself.
+SCOPE_RE = re.compile(r"^\s*(\d+|[零一二两三四五六七八九十]+)\s*(?:条|处|项)")
+# ``修完了一半``/``修复了部分``: the claim covers less than the whole.
+PART_TAIL_RE = re.compile(r"^\s*了?\s*(?:一半|部分|大半|些许)")
+# ``已全部修完，另 1 条另说``: an "all done" that names a remainder is not all.
+REMAINDER_RE = re.compile(r"^\s*[，,；;]?\s*[另余]\s*\d+\s*(?:条|处|项)")
 # How far around a requirement word its completion claim is read. A clause is
 # short; a whole line is not, and a distant "P2 已修完" must not speak for it.
 COMPLETION_WINDOW = 30
@@ -106,11 +133,10 @@ COMPLETION_WINDOW = 30
 # enough: ``没有全部修复`` hides its negation one character further back, and
 # ``尚未全部修复`` contains none of the words in :data:`INCOMPLETE_WORDS`
 # (``未修复`` is not a substring of ``未全部修复``). So the guard reads the few
-# characters in front of the claim instead of trusting a single neighbour.
+# characters in front of the claim - from :data:`NEGATION_CHARS`, the same table
+# every other negation guard reads - instead of trusting a single neighbour.
 ALL_WORDS = ("已全部修完", "全部修完", "已全部修复", "全部修复", "已全部完成",
              "全部完成", "均已修完", "均已修复", "已全部处理", "均已处理")
-ALL_NEGATIONS = "未尚没不否"
-ALL_LOOKBACK = 3
 
 # A count is written with a digit or a small Chinese numeral (``两条``/
 # ``已修一条``), and the measure word may be dropped (``已修 1``). ``处``/``项``
@@ -237,10 +263,10 @@ def _must_fix(text: str) -> str:
        ``必须修``) is not read as a second, clean hit.
     2. **a local overlap the whole-word table cannot cover.** ``非必须修`` has
        no negation word spanning it - the ``非`` is a single character glued to
-       the front - so a glued ``无不免勿非`` (and any interval that still
-       intersects a negation span) voids the candidate. This guard covers
-       *partial* overlaps; it is not what stops ``无需修改``, which the whole
-       word already did.
+       the front - so a glued character from :data:`NEGATION_CHARS` (and any
+       interval that still intersects a negation span) voids the candidate.
+       This guard covers *partial* overlaps; it is not what stops
+       ``无需修改``, which the whole word already did.
     3. **the completion claim is a count relation, not a distance.**
        ``2 条必须修，已修 1 条`` states its own arithmetic; reading the nearby
        ``已修`` as "nothing left" is how a partial round turns into a false
@@ -302,10 +328,14 @@ def _settled(text: str, start: int, end: int) -> bool:
     4. **a counted requirement with no fixed count is still pending** - unless
        the line says *all* of it is done (``已全部修完``). "The count is 2 and
        something was fixed" is not "the two are fixed", and a bare ``已修``
-       next to an unknown number must not settle anything;
-    5. **only with no counts at all** does a completion word speak for the
-       requirement itself, which is why ``必须修的 P1 已在本轮修完`` is settled
-       while ``已修`` with no stated total is not.
+       next to an unknown number must not settle anything. The claim is read
+       through the same negation table as every other guard, and it is still
+       only a phrase: the number it states about itself is compared, so
+       ``已全部修完 2 条`` against 3 required leaves one;
+    5. **only with no counts at all** does an un-negated completion word speak
+       for the requirement itself, which is why ``必须修的 P1 已在本轮修完`` is
+       settled while ``未均已修完``/``没全部修完`` are not - the negation is a
+       window in front of the word, not an entry in a phrase list.
 
     The default is "still needed". A false "ready to close" misleads the reader
     with no way to notice; a withheld one at least leaves a ``needs_person``
@@ -317,6 +347,7 @@ def _settled(text: str, start: int, end: int) -> bool:
     if ZERO_TAIL_RE.match(text[end:]) or ZERO_TAIL_RE.match(near):
         return True
     required, span = _count_span(REQUIRED_COUNT_RE, near)
+    claim = _all_claim(near)
     if required is not None:
         # The required count is consumed, so its digits cannot be read again as
         # "how many were fixed": ``必须修2条已修1条`` has one ``\d+条`` and it
@@ -325,30 +356,101 @@ def _settled(text: str, start: int, end: int) -> bool:
         if fixed is not None:
             return fixed >= required
         # A count with no fixed count states a remainder, not a completion -
-        # unless the line says *all* of it is done.
-        return _all_done(near)
+        # unless the line says *all* of it is done. An "all" phrase is only a
+        # phrase, though, so the count it states about itself still runs: the
+        # sentence saying "all done, 2 of them" with 3 required has one left.
+        if claim is None:
+            return False
+        scope = _claim_scope(near, claim)
+        return scope is None or scope >= required
     fixed = _first_count(FIXED_COUNT_RE, near)
     if fixed is not None:
         # Some were fixed and the total is not stated: not provably all.
         return False
-    if _all_done(near):
-        return True
-    return any(done in near for done in DONE_WORDS)
+    if claim is not None:
+        scope = _claim_scope(near, claim)
+        # ``全部修完了一半``/``部分`` covers less than the whole; with no total
+        # stated there is nothing it could be compared against, and "some" is
+        # not "all".
+        return scope is None
+    return _done_completion(near)
 
 
-def _all_done(text: str) -> bool:
-    """Does a negated "all of it is done" claim stand in ``text``?
+def _negated_at(text: str, position: int) -> bool:
+    """Does a negation character stand in the window just before ``position``?
+
+    ``ALL_LOOKBACK`` characters, not one: ``并非全部修完`` puts ``非`` three
+    characters in front of the claim, and ``未均已修完`` does the same with
+    ``未``. The table is :data:`NEGATION_CHARS`, so this guard, the glued
+    requirement guard and the whole-word table cannot disagree about what a
+    negation is.
+    """
+    before = text[max(0, position - NEGATION_LOOKBACK):position]
+    return any(ch in NEGATION_CHARS for ch in before)
+
+
+def _all_claim(text: str) -> tuple[int, int] | None:
+    """The span of the earliest un-negated "all of it is done" claim, or ``None``.
 
     ``尚未全部修复`` and ``没有全部修复`` say the opposite of ``全部修复``, and
     neither contains a word from :data:`INCOMPLETE_WORDS`. The window check is
     what keeps this from becoming the old "a completion word is visible" test
-    under a new name.
+    under a new name. A claim followed by a question is not a claim either:
+    ``全部修复了吗`` asks, it does not assert.
     """
-    for word in sorted(ALL_WORDS, key=len, reverse=True):
+    best: tuple[int, int] | None = None
+    for word in ALL_WORDS:
         start = text.find(word)
         while start != -1:
-            before = text[max(0, start - ALL_LOOKBACK):start]
-            if not any(ch in ALL_NEGATIONS for ch in before):
+            end = start + len(word)
+            if not _negated_at(text, start) and not _is_question(text, end):
+                if best is None or start < best[0]:
+                    best = (start, end)
+            start = text.find(word, start + 1)
+    return best
+
+
+def _all_done(text: str) -> bool:
+    """Is there an un-negated "all of it is done" claim in ``text``?"""
+    return _all_claim(text) is not None
+
+
+def _is_question(text: str, position: int) -> bool:
+    """Is the claim ending at ``position`` immediately asked about?"""
+    return bool(QUESTION_RE.match(text[position:]))
+
+
+def _claim_scope(text: str, span: tuple[int, int]) -> int | None:
+    """How much the claim in ``span`` says it covers itself, or ``None``.
+
+    ``已全部修完 2 条`` states its own number; ``修完了一半``/``部分`` states
+    less than the whole (``0`` is a value no requirement is satisfied by);
+    ``已全部修完`` alone states nothing, so the count relation has no input and
+    the phrase stands. This is the arithmetic the task's third fix asks for:
+    a phrase must not outvote a count the sentence gives.
+    """
+    rest = text[span[1]:]
+    if PART_TAIL_RE.match(rest) or REMAINDER_RE.match(rest):
+        return 0
+    match = SCOPE_RE.match(rest)
+    if not match:
+        return None
+    return _to_int(match.group(1))
+
+
+def _done_completion(text: str) -> bool:
+    """Does an un-negated completion word stand in ``text``?
+
+    The bare test this replaces (``any(done in text)``) read
+    ``未均已修完``/``没全部修完`` as "nothing left", because neither phrase is
+    a word in :data:`INCOMPLETE_WORDS`. Reading the same negation window in
+    front of each hit covers the whole family at once instead of one phrase at
+    a time.
+    """
+    for word in sorted(DONE_WORDS, key=len, reverse=True):
+        start = text.find(word)
+        while start != -1:
+            if not _negated_at(text, start):
                 return True
             start = text.find(word, start + 1)
     return False

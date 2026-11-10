@@ -328,6 +328,17 @@ class PartialFixNeverReachesTheSupervisor(Base):
         "必须修（2 条），已修 1",
         "两条必须修，已修一条",
         "必须修 3 条（已完成 1 条，2 条待办）",
+        # Round 4: the negation family that two disagreeing character tables
+        # let through end-to-end. Each of these reached the supervisor with a
+        # "【可关单】" line while work was still pending.
+        "必须修 2 条，并非全部修完",
+        "必须修 2 条，非全部修完",
+        "必须修 2 条，非全部修复",
+        "必须修 2 条，并非全部完成",
+        "必须修，未均已修完",
+        "必须修，尚全部修完",
+        "必须修，没全部修完",
+        "必须修 3 条，已全部修完 2 条",
     )
 
     def test_a_partial_fix_sends_nothing_to_the_supervisor(self):
@@ -343,6 +354,29 @@ class PartialFixNeverReachesTheSupervisor(Base):
                 index = self.index(engine)
                 self.assertFalse(
                     (index.get("supervisor_routes") or {}), body)
+
+    def test_a_negated_all_done_claim_reaches_no_one_but_the_pm(self):
+        """Round 4, end to end: the negation family, through ``run_once``.
+
+        ``markers`` answering correctly is necessary and not sufficient - the
+        consequence is what P0 named. These four are the shapes QA reproduced
+        as a real "【可关单】" line for the supervisor.
+        """
+        shapes = ("必须修 2 条，并非全部修完",
+                  "必须修 2 条，非全部修复",
+                  "必须修，未均已修完",
+                  "必须修 3 条，已全部修完 2 条")
+        for body in shapes:
+            with self.subTest(body=body):
+                self.fresh()
+                engine = self.engine()
+                self.deliver_and_pass(engine, body="[QA] 有条件通过（" + body + "）")
+                self.assertEqual(
+                    self.bus.payloads("event.agent.supervisor"), [], body)
+                self.assertEqual(
+                    len(self.bus.payloads("event.agent.project_pm")), 1, body)
+                self.assertFalse(
+                    (self.index(engine).get("supervisor_routes") or {}), body)
 
 
 class ReleaseTimeout(Base):
