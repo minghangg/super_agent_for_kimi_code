@@ -13,6 +13,11 @@ SIGINT/SIGTERM stop it after the round in flight, with exit code 0.
 
 Exit codes: 0 success, 1 a check or round failed (or ``run`` gave up after too
 many consecutive failures), 2 bad arguments.
+
+``resolve`` extends 2 on purpose: there it means "some keys were not written"
+(a failed save or a row missing after the read-back), not "bad arguments".
+Argparse's own parameter errors still exit 2 and print ``usage:``, so the two
+are told apart by the message.
 """
 from __future__ import annotations
 
