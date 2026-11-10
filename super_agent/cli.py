@@ -374,7 +374,7 @@ def cmd_status(args) -> int:
         if "state" in item:
             line += (f"  [{item['state']} by {item.get('resolved_by') or '-'}"
                      f" resolved_at={item.get('resolved_at') or '-'}"
-                     f" via comment {item.get('resolved_by_comment')}"
+                     f" via comment {item.get('resolved_by_comment') or '-'}"
                      f" entries={item.get('entries')}"
                      f" entry_at={item.get('entry_at') or '-'}]")
         print(line)
