@@ -66,6 +66,15 @@ DEFAULTS: dict = {
         # ``waiting_release`` and ``close_reconcile`` are the only states that
         # need it, so the cap bounds a poll loop rather than all assignments.
         "max_closed_thread_checks": 10,
+        # Where a shippable verdict goes (ISS-53). ``supervisor_sid`` wins when
+        # set; otherwise ``supervisor_keys`` are looked up in ``sessions.json``
+        # in order. The default list carries only the public role name: a
+        # private key belongs in the untracked overlay, never here.
+        "supervisor_sid": "",
+        "supervisor_keys": ["supervisor"],
+        # A thread held by close reconciliation for longer than this reminds
+        # the supervisor once (at most once per start time).
+        "release_timeout_s": 1800,
     },
 }
 
@@ -142,6 +151,16 @@ def validate(cfg: dict) -> dict:
     if not isinstance(max_checks, int) or isinstance(max_checks, bool) \
             or max_checks < 1:
         raise ConfigError("engine.max_closed_thread_checks must be an integer >= 1")
+    sup_sid = (cfg.get("engine") or {}).get("supervisor_sid", "")
+    if sup_sid is not None and not isinstance(sup_sid, str):
+        raise ConfigError("engine.supervisor_sid must be a string (or empty)")
+    sup_keys = (cfg.get("engine") or {}).get("supervisor_keys", ["supervisor"])
+    if not isinstance(sup_keys, list) or not all(isinstance(x, str) for x in sup_keys):
+        raise ConfigError("engine.supervisor_keys must be a list of session key strings")
+    timeout = (cfg.get("engine") or {}).get("release_timeout_s", 1800)
+    if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) \
+            or timeout <= 0:
+        raise ConfigError("engine.release_timeout_s must be a positive number")
     poll = (cfg.get("github") or {}).get("poll_interval_s")
     if not isinstance(poll, (int, float)) or poll <= 0:
         raise ConfigError("github.poll_interval_s must be a positive number")

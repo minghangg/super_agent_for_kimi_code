@@ -152,6 +152,106 @@ class ReviewParsing(unittest.TestCase):
         self.assertIsNone(markers.parse_review("plain remark"))
 
 
+class MustFixParsing(unittest.TestCase):
+    """The ``fix_needed`` bit, against the 28 first lines the workbench produces.
+
+    The assertion that matters is the pair ``(verdict, fix_needed)``: a pass
+    that still demands work must not reach the supervisor, and a pass that says
+    "nothing to fix" must. The five hard cases are named one by one so a
+    regression points at the exact shape instead of a table index.
+    """
+
+    # ``(first line without the [QA] prefix, verdict, fix_needed)``
+    SHAPES = [
+        ("结论：通过；无需修改", "pass", False),
+        ("结论：通过；无需修复", "pass", False),
+        ("结论：通过；P1 已修，无需修改", "pass", False),
+        ("有条件通过（1 条 P1 必须修，其余可随下轮）", "pass", True),
+        ("未修复项为 P3", "", False),
+        ("结论：通过；尚未修复的 P2 可随下轮", "pass", False),
+        ("P2 待修可随下轮", "", False),
+        ("通过（P0=0，可关单）", "pass", False),
+        ("#24 独立复核：**通过**（P0=0 / P1=3 / P2=2）", "pass", False),
+        ("结论：通过；必须修的 P1 已在本轮修完", "pass", False),
+        ("退回改（2 条 P0）", "reject", False),
+        ("## A. P1 是否修好", "", False),
+        ("**通过**（P0=0 / P1=1 必须修）", "pass", True),
+        ("结论：有条件通过（1 条 P1 必须修）", "pass", True),
+        ("通过；无须再修", "pass", False),
+        ("通过，不必修", "pass", False),
+        ("通过；必须修项为0", "pass", False),
+        ("通过；没有必须修的项", "pass", False),
+        ("通过；无需再修", "pass", False),
+        ("有条件通过（P1 需修）", "pass", True),
+        ("结论：通过；仍需修的 P1 见正文", "pass", True),
+        ("有条件通过（1 条 P1 仍须修）", "pass", True),
+        ("通过（P0=0 / P1=0 / P2=1）", "pass", False),
+        ("#47 第二轮复核：**通过**（P0=0 / P1=0）", "pass", False),
+        ("## 开发轮独立测试（ISS-47）", "", False),
+        ("## ISS-53 方案轮复核（零代码改动轮）", "", False),
+        ("通过；P2 未修好但不阻塞", "pass", False),
+        ("方案复核：有条件通过——P1 必须修", "pass", True),
+    ]
+
+    def review(self, text):
+        out = markers.parse_review("[QA] " + text)
+        self.assertIsNotNone(out, text)
+        return out
+
+    def assertShape(self, text, verdict, fix_needed):
+        out = self.review(text)
+        self.assertEqual(out["verdict"], verdict, text)
+        self.assertEqual(out["fix_needed"], fix_needed, text)
+        self.assertEqual(bool(out["fix_matched"]), fix_needed, text)
+
+    def test_every_shape_in_the_table(self):
+        for text, verdict, fix_needed in self.SHAPES:
+            with self.subTest(text=text):
+                self.assertShape(text, verdict, fix_needed)
+
+    def test_hard_1_no_need_to_modify(self):
+        self.assertShape("结论：通过；无需修改", "pass", False)
+
+    def test_hard_2_no_need_to_fix(self):
+        self.assertShape("结论：通过；无需修复", "pass", False)
+
+    def test_hard_3_already_fixed_and_nothing_left(self):
+        self.assertShape("结论：通过；P1 已修，无需修改", "pass", False)
+
+    def test_hard_4_conditional_pass_with_a_must_fix(self):
+        self.assertShape("有条件通过（1 条 P1 必须修，其余可随下轮）", "pass", True)
+
+    def test_hard_5_state_word_is_not_a_requirement(self):
+        # The word table deliberately holds no state words (``未修复``/``待修``):
+        # "P3 is unfixed" is not "the release must wait".
+        self.assertShape("未修复项为 P3", "", False)
+
+    def test_state_words_are_not_requirements(self):
+        for text in ("尚未修复的 P2 可随下轮", "P2 待修可随下轮", "未修复项为 P3"):
+            with self.subTest(text=text):
+                self.assertFalse(self.review(text)["fix_needed"], text)
+
+    def test_a_completed_fix_is_not_a_pending_fix(self):
+        self.assertFalse(
+            self.review("必须修的 P1 已在本轮修完")["fix_needed"])
+
+    def test_a_glued_single_character_negation_voids_the_hit(self):
+        self.assertFalse(self.review("非必须修，已全部处理")["fix_needed"])
+
+    def test_an_absence_after_a_modifier_is_not_a_requirement(self):
+        self.assertFalse(self.review("通过；没有必须修的项")["fix_needed"])
+
+    def test_the_verdict_path_is_untouched(self):
+        # ``fix_needed`` is appended; the four original keys and the way the
+        # verdict is decided stay exactly as they were.
+        out = self.review("**按停损规则，仅 P0 可退 —— 本轮结论：通过**")
+        self.assertEqual(sorted(out), ["fix_matched", "fix_needed", "line",
+                                       "marker", "matched", "verdict"])
+        self.assertEqual(out["verdict"], "pass")
+        self.assertEqual(out["matched"], "通过")
+        self.assertEqual(out["marker"], markers.QA)
+
+
 class _NullStore:
     root = None
 

@@ -11,10 +11,13 @@ Routing a ``[QA]`` verdict::
     comment c on thread T
     | first line [WK:name]  -> delivery (matches the worker's assignment)
     | first line [QA]       -> ALWAYS event.agent.project_pm, never a worker
+    |                          a pass with no must-fix ALSO goes to the
+    |                          supervisor (``event.agent.supervisor``)
     | first line [PM]/[supervisor] -> audit only
     + ordinary comment
        | waiting_review and a qa session is known -> send to qa
        | waiting_release / close_reconcile       -> audit only
+       | a thread held there past ``engine.release_timeout_s`` -> supervisor
        | the thread belongs to a project         -> project_pm (slow path)
        + cross-project or unlisted               -> needs_person
 
@@ -25,6 +28,11 @@ a workbench script writing a comment, or ``_archive_one``, which runs after the
 decision was made. Guarding the engine's decisions is not the same as
 guarding authority - the boundary is stated here so nobody reads the gate as
 more than it is.
+
+A supervisor notice is a **protocol**, not a wake-up: nothing in this repository
+consumes ``event.agent.*``. Until the workbench subscribes to
+``event.agent.supervisor``, the delivery is recorded and visible in the event
+stream and nowhere else.
 """
 from __future__ import annotations
 
@@ -48,6 +56,18 @@ def _now() -> str:
 
 def _now_ts() -> float:
     return time.time()
+
+
+def _parse_ts(value: str) -> datetime | None:
+    """Parse an ISO timestamp written by ``_now()``; ``None`` when unusable."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def _default_allowlist_path() -> Path:
@@ -108,6 +128,12 @@ class Engine:
         # Set the first time the cross-check being off changes an answer (see
         # ``_live_archived``): "off" is otherwise invisible in the event stream.
         self._crosscheck_off_logged = False
+        # Keys whose supervisor record carries no decision: logged once each,
+        # so a retry loop does not repeat the same warning every round.
+        self._undecidable_logged: set[str] = set()
+        # ``route.supervisor_undeliverable`` notices already written, keyed by
+        # thread+comment (or thread+assignment on the reminder path).
+        self._sup_notice_logged: set[str] = set()
 
     # ------------------------------------------------------------ allowlist
     def allowlist_allows(self, issue: int | None, action: str | None) -> tuple[bool, str]:
@@ -307,6 +333,11 @@ class Engine:
         comment, so a refused or suppressed dispatch can be retried next round
         under the **same** action id - at-most-once is the attempt counter, not
         the record's presence.
+
+        A shippable verdict also goes to the supervisor. That decision is taken
+        **before** the PM early return below, under its own action id and in its
+        own table: the PM attempt counter must never be the reason the
+        supervisor never hears about a release.
         """
         cid = int(comment["id"])
         key = f"route:{thread}:{cid}"
@@ -320,6 +351,20 @@ class Engine:
                 "comment_id": cid, "level": "warn", "consumers": ["doctor"],
                 "detail": "the verdict did not name a qa session key of this thread",
             })
+        sup_key = f"sup:{thread}:{cid}"
+        sup_routes = index.setdefault("supervisor_routes", {})
+        if not isinstance(sup_routes, dict):
+            sup_routes = index["supervisor_routes"] = {}
+        sup_rec = sup_routes.get(sup_key)
+        sup_rec = sup_rec if isinstance(sup_rec, dict) else None
+        if (sup_rec is not None and "sup_eligible" not in sup_rec
+                and "fix_needed" not in review):
+            self._undecidable(thread, cid, sup_key)
+        if self._sup_eligible(review, sup_rec) and not (
+                sup_rec is not None and sup_rec.get("ok")):
+            self._route_supervisor(index, thread, issue, comment, review,
+                                   sup_key, action_id(sup_key, "bus_inject",
+                                                      str(cid)))
         payload = {"thread": thread, "issue": int(issue),
                    "review_comment_id": cid,
                    "verdict": str(review.get("verdict") or ""),
@@ -448,6 +493,314 @@ class Engine:
             "keys": [thread], "entries": len(rows),
             "already": [], "entries_skipped": 0,
         })
+
+    # ------------------------------------------------------ supervisor routes
+    def _sup_eligible(self, review: dict, record: dict | None) -> bool:
+        """Does this verdict want the supervisor told?
+
+        ``fix_needed`` is the parser's answer and is recomputed every time;
+        ``sup_eligible`` on the stored record is the **decision snapshot**, and
+        it is the only thing a retry may trust: a retry re-enters here with a
+        stub review that carries the verdict and nothing else, and re-deriving
+        the answer would turn ``有条件通过（1 条 P1 必须修）`` into a pass.
+
+        Neither answer available means "do not send" - guessing here would
+        either withhold a release or send a false one.
+        """
+        if "fix_needed" in (review or {}):
+            return (str(review.get("verdict") or "") == "pass"
+                    and review.get("fix_needed") is False)
+        if isinstance(record, dict) and "sup_eligible" in record:
+            return bool(record["sup_eligible"])
+        return False
+
+    def _undecidable(self, thread: str, cid, sup_key: str) -> None:
+        """A record without ``sup_eligible`` is not silently "do not send".
+
+        Only reachable when a record was written by something other than
+        :meth:`_route_supervisor` (a hand edit) - the normal write always
+        carries the snapshot. Logged once per key so a retry loop does not
+        repeat it every round.
+        """
+        if sup_key in self._undecidable_logged:
+            return
+        self._undecidable_logged.add(sup_key)
+        self.store.log_event({
+            "type": "route.supervisor_undecidable", "at": _now(),
+            "thread": thread, "comment_id": cid, "to": "supervisor",
+            "detail": "the supervisor record carries no sup_eligible decision",
+        })
+
+    def _supervisor_sid(self) -> str:
+        """The supervisor's session id, resolved fresh every round.
+
+        Configured ``supervisor_sid`` first, then the session keys in order -
+        reusing the same resolver the rest of the engine uses, so an overlay
+        that redirects the workbench moves this with it. Nothing is cached: a
+        key that was missing last round may exist now.
+        """
+        engine_cfg = self.cfg.get("engine") or {}
+        sid = str(engine_cfg.get("supervisor_sid") or "").strip()
+        if sid:
+            return sid
+        keys = engine_cfg.get("supervisor_keys") or ["supervisor"]
+        if not isinstance(keys, (list, tuple)):
+            keys = [keys]
+        try:
+            path = session_events.resolve_sessions_path(self.cfg)
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return ""
+        if not isinstance(data, dict):
+            return ""
+        for key_name in keys:
+            entry = data.get(str(key_name))
+            if isinstance(entry, dict):
+                found = str(entry.get("id") or entry.get("session") or "")
+            else:
+                found = str(entry or "")
+            if found:
+                return found
+        return ""
+
+    def _route_supervisor(self, index: dict, thread: str, issue: int,
+                          comment: dict, review: dict, sup_key: str,
+                          sup_base: str) -> dict:
+        """Tell the supervisor a release is ready; at most once per verdict.
+
+        The record is written **before** the dispatch, the same order the PM
+        path uses: a crash between the two loses one send, never the decision,
+        and the retry pass reads ``sup_eligible`` back from that record.
+
+        Every way of not delivering also says so: no reachable supervisor lands
+        in ``needs_person`` under ``route.supervisor_undeliverable[user]`` - the
+        ``[user]`` belongs to the *reason*, not to the event type, because this
+        is a local configuration gap that a person has to close, not a decision
+        waiting on the supervisor.
+        """
+        cid = int(comment["id"])
+        sup_routes = index.setdefault("supervisor_routes", {})
+        if not isinstance(sup_routes, dict):
+            sup_routes = index["supervisor_routes"] = {}
+        record = sup_routes.get(sup_key)
+        record = dict(record) if isinstance(record, dict) else {
+            "thread": thread, "comment_id": cid, "at": _now(),
+            "verdict": str(review.get("verdict") or ""),
+            "fix_needed": review.get("fix_needed"),
+        }
+        record["sup_eligible"] = True
+        record["action_id"] = sup_base
+        sup_routes[sup_key] = record
+        if self.store.action_attempted(sup_base) > 0:
+            return {"dispatched": False, "reason": "already attempted",
+                    "action_id": sup_base}
+        sid = self._supervisor_sid()
+        if not sid:
+            record["ok"] = False
+            record["undeliverable"] = True
+            self._note_undeliverable(
+                index, thread, cid,
+                "no supervisor sid: engine.supervisor_sid is empty and none of "
+                "engine.supervisor_keys resolve", issue=issue, to="supervisor",
+                once_key=f"sid:{sup_key}")
+            return {"dispatched": False, "reason": "no supervisor sid",
+                    "action_id": sup_base}
+        record["undeliverable"] = False
+        payload = {"thread": thread, "issue": int(issue),
+                   "review_comment_id": cid,
+                   "verdict": str(review.get("verdict") or ""),
+                   "fix_needed": bool(review.get("fix_needed")),
+                   "sid": sid, "at": _now(),
+                   "text": self._release_text(issue, cid)}
+        result = self._dispatch(self._route_action(
+            thread, issue, cid, payload, "event.agent.supervisor",
+            target_role="supervisor", origin_role=markers.QA.lower(),
+            assignment_id=sup_key))
+        record["ok"] = bool(result.get("ok")) if result.get("dispatched") else False
+        record["refused"] = bool(result.get("refused"))
+        record["action_id"] = result.get("action_id") or sup_base
+        self.store.log_event({
+            "type": "route.decided", "at": _now(), "thread": thread,
+            "comment_id": cid, "to": "supervisor",
+            "verdict": payload["verdict"],
+            "dispatched": bool(result.get("dispatched")),
+            "refused": bool(result.get("refused")),
+            "reason": result.get("reason") or "",
+        })
+        return result
+
+    @staticmethod
+    def _release_text(issue, cid) -> str:
+        """The one line a person reads: the issue and the verdict that closed it."""
+        return f"【可关单】#{int(issue)}，QA cid {cid}（P0=0，无必修项）"
+
+    def _note_undeliverable(self, index: dict, thread: str, comment_id,
+                            detail: str, *, issue=None, to="supervisor",
+                            assignment: str = "", once_key: str = "") -> None:
+        """Record a supervisor notice that could not be sent - never silently.
+
+        One event for the machine (``type`` is a key, so it carries no ``[user]``)
+        and one ``needs_person`` row for a person, whose **reason** does carry
+        ``[user]``: the brief buckets by reason substring, and a local
+        configuration gap must not sit in the "waiting for a decision" section.
+
+        ``once_key`` makes both idempotent: the retry and reminder passes run
+        every round, and a repeated line per round would bury the queue it is
+        writing to. The row is keyed by ``(thread, comment)`` either way.
+        """
+        reason = "route.supervisor_undeliverable[user]"
+        key = once_key or f"{thread}|{needs.cid_of(comment_id)}"
+        if key not in self._sup_notice_logged:
+            self._sup_notice_logged.add(key)
+            self.store.log_event({
+                "type": "route.supervisor_undeliverable", "at": _now(),
+                "thread": thread, "comment_id": comment_id, "to": to,
+                "assignment": assignment, "issue": issue, "detail": detail,
+            })
+        numbers = index.setdefault("issues", {}).setdefault(
+            thread, {"state": "idle", "comments_seen": 0, "needs_person": []})
+        existing = [entry for entry in numbers.get("needs_person") or []
+                    if needs.cid_of(entry) == needs.cid_of(comment_id)
+                    and str(entry.get("reason") or "") == reason]
+        if existing:
+            return
+        numbers.setdefault("needs_person", []).append({
+            "comment_id": comment_id, "reason": reason, "at": _now()})
+
+    def _retry_supervisor_routes(self, index: dict) -> int:
+        """Re-send supervisor notices a refused/suppressed dispatch never sent.
+
+        Only ``index["supervisor_routes"]`` is read: the PM retry pass owns
+        ``index["routes"]`` alone, and the two tables never see each other's
+        keys. The stored ``sup_eligible`` is the decision - a retry never
+        re-judges the verdict.
+        """
+        sent = 0
+        for key, record in sorted((index.get("supervisor_routes") or {}).items()):
+            if not isinstance(record, dict) or record.get("ok"):
+                continue
+            if "sup_eligible" not in record:
+                self._undecidable(str(record.get("thread") or ""),
+                                  record.get("comment_id"), key)
+                continue
+            if record.get("sup_eligible") is not True:
+                continue
+            base = str(record.get("action_id") or "")
+            if not base or self.store.action_attempted(base) > 0:
+                continue
+            thread = str(record.get("thread") or "")
+            cid = record.get("comment_id")
+            issue = None
+            for rec in (index.get("assignments") or {}).values():
+                if str(rec.get("thread") or "") == thread:
+                    issue = rec.get("issue")
+                    break
+            if issue is None or cid is None:
+                continue
+            review = {"verdict": str(record.get("verdict") or "")}
+            result = self._route_supervisor(index, thread, int(issue),
+                                            {"id": cid, "body": "", "author": ""},
+                                            review, key, base)
+            if result.get("dispatched"):
+                sent += 1
+        return sent
+
+    # -------------------------------------------------- release-time reminders
+    def _release_start(self, index: dict, thread: str, assignment: dict) -> str:
+        """The stable start time of a held thread, or ``""`` when there is none.
+
+        ``first_checked_at`` is written once by ``_reconcile_thread`` and kept;
+        ``updated_at`` is rewritten by ``enter_close_reconcile`` every round and
+        would keep pushing the deadline out forever. The fallbacks are the
+        archive record, and nothing else is guessed.
+        """
+        rec = (index.get("close_reconcile") or {}).get(thread)
+        if isinstance(rec, dict) and str(rec.get("first_checked_at") or ""):
+            return str(rec["first_checked_at"])
+        tombstone = assignment.get("tombstone")
+        if isinstance(tombstone, dict) and str(tombstone.get("at") or ""):
+            return str(tombstone["at"])
+        return str(assignment.get("archived_at") or "")
+
+    def _remind_release_timeouts(self, index: dict) -> int:
+        """Remind the supervisor once about a thread held too long.
+
+        The scan covers **both** held states: an open Issue turns every
+        ``waiting_release`` into ``close_reconcile`` in the same round, so
+        scanning only the former would watch a set that is empty by design.
+
+        A reminder dispatches, logs, and - when it cannot be delivered - appends
+        ``needs_person``. It never touches ``status``, ``qa_verdict``, the
+        ``close_reconcile`` record or the archive outbox: reconciliation and
+        reminding stay independent.
+        """
+        engine_cfg = self.cfg.get("engine") or {}
+        try:
+            timeout = float(engine_cfg.get("release_timeout_s") or 1800)
+        except (TypeError, ValueError):
+            timeout = 1800.0
+        now = datetime.now(timezone.utc)
+        sent = 0
+        for aid, rec in sorted((index.get("assignments") or {}).items()):
+            if not isinstance(rec, dict):
+                continue
+            if str(rec.get("status") or "") not in ("waiting_release",
+                                                    "close_reconcile"):
+                continue
+            thread = str(rec.get("thread") or "")
+            start = self._release_start(index, thread, rec)
+            parsed = _parse_ts(start)
+            if parsed is None:
+                self.store.log_event({
+                    "type": "release_timeout.skipped", "at": _now(),
+                    "thread": thread, "assignment": aid,
+                    "reason": "no usable start time"})
+                self._note_undeliverable(
+                    index, thread, rec.get("delivery_comment_id"),
+                    "release timeout start time is unusable", issue=rec.get("issue"),
+                    assignment=aid, once_key=f"notime:{aid}")
+                continue
+            if (now - parsed).total_seconds() < timeout:
+                continue
+            base = action_id(f"release_timeout:{aid}", "bus_inject", start)
+            if self.store.action_attempted(base) > 0:
+                continue
+            sid = self._supervisor_sid()
+            issue = rec.get("issue")
+            if not sid:
+                self._note_undeliverable(
+                    index, thread, rec.get("delivery_comment_id"),
+                    "release timeout with no resolvable supervisor sid",
+                    issue=issue, assignment=aid,
+                    once_key=f"nosid:{aid}:{start}")
+                continue
+            result = self._dispatch({
+                "kind": "bus_inject", "event": "event.agent.supervisor",
+                "issue": issue, "thread": thread, "input_ref": start,
+                "assignment_id": f"release_timeout:{aid}",
+                "origin_role": "engine", "target_role": "supervisor",
+                "payload": {"thread": thread, "issue": issue,
+                            "assignment": aid, "kind": "release_timeout",
+                            "status": str(rec.get("status") or ""),
+                            "started_at": start, "sid": sid, "at": _now(),
+                            "text": f"【超时未关】#{issue} 已滞留 "
+                                    f"{int((now - parsed).total_seconds())}s"
+                                    f"（起点 {start}）"},
+            })
+            if not result.get("dispatched"):
+                self._note_undeliverable(
+                    index, thread, rec.get("delivery_comment_id"),
+                    f"release timeout dispatch refused: "
+                    f"{result.get('reason') or 'unknown'}", issue=issue,
+                    assignment=aid, once_key=f"timeout:{aid}:{start}")
+                continue
+            sent += 1
+            self.store.log_event({
+                "type": "release_timeout.reminded", "at": _now(),
+                "thread": thread, "assignment": aid, "status":
+                str(rec.get("status") or ""), "started_at": start,
+                "ok": bool(result.get("ok"))})
+        return sent
 
     # --------------------------------------------------------------- dispatch
     def _dispatch(self, action: dict, *, reuse_action_id: str | None = None) -> dict:
@@ -1406,6 +1759,7 @@ class Engine:
 
         summary["notifications_retried"] = self._retry_waiting_review(index)
         self._retry_routes(index)
+        self._retry_supervisor_routes(index)
         # Archive last: a review that arrived this round is archived this
         # round, and the archived-sid guard applies from the next dispatch on.
         self._archived_cache = None
@@ -1433,6 +1787,7 @@ class Engine:
         # and ``run_count`` is already incremented, so the two-round streak can
         # only be advanced by a genuine next round.
         self._round_closed_threads(index)
+        self._remind_release_timeouts(index)
         needs.merge_into(index, self.store.load_index())
         self.store.save_index(index)
         self.store.log_event({"type": "run.completed", "at": _now(),
