@@ -470,20 +470,87 @@ class Dedupe(Base):
         self.assertEqual(len(report["items"]), 2)
         self.assertTrue(all(it["cid"] is None for it in report["items"]))
 
-    def test_two_verbs_on_one_delivery_are_two_rows(self):
-        """P1-B(2): ``archive:55`` and ``bus_inject:55`` are different calls."""
+    def test_two_verbs_without_an_assignment_are_two_rows(self):
+        """No layer states "this delivery is blocked": both calls stand alone."""
         self.write_index(self.index_with([]))
         self.begin_uncertain("a-archive", verb="archive", input_ref="55",
-                             assignment_id="asg_7_worker_1",
                              reason="archive timed out")
         self.begin_uncertain("a-inject", verb="bus_inject", input_ref="55",
-                             assignment_id="asg_7_worker_1",
                              reason="bus_inject timed out")
         report = rep.collect(Engine(self.cfg, self.store, NullSource()))
         self.assertEqual(len(report["items"]), 2)
         page = rep.render(report)
         self.assertIn("bus_inject timed out", page)
         self.assertIn("archive timed out", page)
+
+    # --------------------------------------------- round 4: representative row
+    def _blocked_assignment(self, cid=55) -> dict:
+        return {"id": "asg_7_worker_1", "thread": THREAD, "issue": 7,
+                "role": "worker", "status": "blocked",
+                "updated_at": "2026-01-01T00:00:00+00:00",
+                "tombstone": {"reason": "archive timed out", "cid": cid,
+                              "at": "2026-01-01T00:00:00+00:00", "attempt": 1}}
+
+    def test_assignment_is_not_attributed_to_another_action(self):
+        """Counterexample 1 (P1-A): the assignment never claimed ``bus_inject``.
+
+        The old heuristic copied the single outbox verb onto the assignment, so
+        an ``archive`` failure was reported as a ``bus_inject`` failure and the
+        bus error disappeared. The representative row keeps its own (empty) verb
+        and the outbox row is listed as "另 1 条".
+        """
+        self.write_index(self.index_with([], assignments={
+            "asg_7_worker_1": self._blocked_assignment()}))
+        self.begin_uncertain("asg_7_worker_1:bus_inject:55", verb="bus_inject",
+                             input_ref="55", assignment_id="asg_7_worker_1",
+                             reason="bus down")
+        report = rep.collect(Engine(self.cfg, self.store, NullSource()))
+        self.assertEqual(len(report["items"]), 1)
+        item = report["items"][0]
+        self.assertEqual(item["source"], "assignment")
+        self.assertFalse((item.get("extra") or {}).get("verb"),
+                         "the assignment must not borrow the outbox verb")
+        self.assertEqual(item["repeats"], 1)
+        page = rep.render(report)
+        self.assertIn("bus down", page)
+        self.assertIn("archive timed out", page)
+        head = page.split('class="item-head"', 1)[1].split("</p>", 1)[0]
+        self.assertNotIn("bus_inject", head)
+
+    def test_two_failed_calls_on_one_delivery_merge_into_one_row(self):
+        """Counterexample 2 (P1-B): three rows became one, with both reasons."""
+        self.write_index(self.index_with([], assignments={
+            "asg_7_worker_1": self._blocked_assignment()}))
+        self.begin_uncertain("asg_7_worker_1:archive:55", verb="archive",
+                             input_ref="55", assignment_id="asg_7_worker_1",
+                             reason="archive timed out")
+        self.begin_uncertain("asg_7_worker_1:bus_inject:55", verb="bus_inject",
+                             input_ref="55", assignment_id="asg_7_worker_1",
+                             reason="bus down")
+        report = rep.collect(Engine(self.cfg, self.store, NullSource()))
+        self.assertEqual(len(report["items"]), 1)
+        self.assertEqual(report["items"][0]["repeats"], 2)
+        page = rep.render(report)
+        self.assertIn("另 2 条同一投递的记录", page)
+        self.assertIn("bus down", page)
+        self.assertIn("archive timed out", page)
+
+    def test_two_outbox_rows_plus_assignment_keeps_both_reasons(self):
+        """Counterexample 4 (P2-1): content differences survive the merge."""
+        self.write_index(self.index_with([], assignments={
+            "asg_7_worker_1": self._blocked_assignment()}))
+        self.begin_uncertain("asg_7_worker_1:archive:55", verb="archive",
+                             input_ref="55", assignment_id="asg_7_worker_1",
+                             reason="reason alpha")
+        self.begin_uncertain("asg_7_worker_1:comment:55", verb="comment",
+                             input_ref="55", assignment_id="asg_7_worker_1",
+                             reason="reason beta")
+        report = rep.collect(Engine(self.cfg, self.store, NullSource()))
+        self.assertEqual(len(report["items"]), 1)
+        self.assertEqual(report["items"][0]["repeats"], 2)
+        page = rep.render(report)
+        for reason in ("reason alpha", "reason beta"):
+            self.assertIn(reason, page)
 
     def test_duplicate_count_is_rendered(self):
         """P1-B(3): a merged repeat must leave a visible trace."""
@@ -502,7 +569,8 @@ class Dedupe(Base):
                            "engine": {}, "storage": {},
                            "unknown_reasons": [], "warnings": [],
                            "quotes_missing": 0})
-        self.assertIn("另 1 条相同记录", page)
+        self.assertIn("另 1 条同一投递的记录", page)
+        self.assertIn("archive：same reason", page)
 
     def test_same_row_read_twice_with_a_second_of_drift_is_one_row(self):
         """P2-1: ``at`` is not part of the identity."""
@@ -513,7 +581,9 @@ class Dedupe(Base):
         report = rep.collect(Engine(self.cfg, self.store, NullSource()))
         self.assertEqual(len(report["items"]), 1)
         self.assertEqual(report["items"][0]["repeats"], 1)
-        self.assertIn("另 1 条相同记录", rep.render(report))
+        page = rep.render(report)
+        self.assertIn("另 1 条同一投递的记录", page)
+        self.assertIn("stable row", page)
 
     def test_display_keeps_the_raw_key(self):
         index = self.index_with([{"comment_id": 11, "reason": "x"}], key="7")

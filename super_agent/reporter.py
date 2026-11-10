@@ -322,7 +322,7 @@ def _item(category: str, source: str, *, key, cid, at, reason, locator,
     return {"category": category, "source": source, "key": key,
             "number": number, "cid": None if cid is None else int(cid),
             "at": at, "reason": str(reason or ""), "locator": str(locator),
-            "extra": dict(extra or {}), "also_from": [], "repeats": 0,
+            "extra": dict(extra or {}), "also_from": [], "also": [], "repeats": 0,
             "quote": "", "quote_error": "", "expiry": {"at": "", "state": "unknown",
                                                        "age_s": None}}
 
@@ -501,40 +501,8 @@ def _cid_from_input_ref(rec: dict):
     return number if number is not None and number > 0 else None
 
 
-def _adopt_verbs(items: list[dict], repos_for: dict | None = None) -> None:
-    """Give verb-less rows the verb of the single outbox row they describe.
-
-    The signature includes ``verb`` (two calls on one delivery are two events),
-    but an index row and an assignment row do not carry a verb: only the outbox
-    knows whether the blocked call was ``archive`` or ``bus_inject``. When
-    exactly one outbox row covers that ``(thread, comment)`` the attribution is
-    unambiguous, so the other rows adopt it and the three views collapse into
-    one item - which is the whole point of having them.
-
-    ``repos_for`` resolves a bare key the same way :func:`_signature` does, so a
-    row keyed ``"7"`` can still match a row keyed ``owner/demo#7``.
-
-    With several candidate verbs nothing is adopted: guessing which call failed
-    is how the wrong failure gets shown under the right name.
-    """
-    verbs: dict = {}
-    for item in items:
-        if item["source"] != "outbox" or item.get("cid") is None:
-            continue
-        verb = str((item.get("extra") or {}).get("verb") or "")
-        if verb:
-            verbs.setdefault(_delivery_key(item, repos_for), set()).add(verb)
-    for item in items:
-        if str((item.get("extra") or {}).get("verb") or ""):
-            continue
-        if item.get("cid") is None:
-            continue
-        owners = verbs.get(_delivery_key(item, repos_for)) or set()
-        if len(owners) == 1:
-            item.setdefault("extra", {})["verb"] = next(iter(owners))
-
-
 def _delivery_key(item: dict, repos_for: dict | None = None):
+    """``(repo, number, cid)``: one delivery, whichever layer reported it."""
     repo, number = issuekey.split_key(item.get("key"))
     if not repo and number is not None and repos_for:
         owner = repos_for.get(number) or set()
@@ -543,10 +511,21 @@ def _delivery_key(item: dict, repos_for: dict | None = None):
     return (repo or "", number, item.get("cid"))
 
 
+def _verb(item: dict) -> str:
+    """The action verb, or ``""`` when the row has none - which is a real value.
+
+    Index rows and assignment rows do not know which call failed; only the
+    outbox does. ``""`` is therefore not "missing data to be filled in from
+    somewhere else", it is the honest answer, and it is what makes such a row
+    the right representative (see :func:`_dedupe`).
+    """
+    return str((item.get("extra") or {}).get("verb") or "")
+
+
 def _signature(item: dict, repos_for: dict | None = None):
     """Dedupe identity of one item.
 
-    Five rules, and the order matters:
+    Four rules, and the order matters:
 
     1. **No comment id -> its own row, keyed by locator, reason and verb.** A
        bare locator is not enough: two ``needs_person`` rows under one issue key
@@ -554,19 +533,18 @@ def _signature(item: dict, repos_for: dict | None = None):
        second one silently. ``at`` is deliberately **not** part of the key - two
        reads of the same row differ by a second and would then never merge;
        ``reason`` and ``verb`` are the stable content.
-    2. **A comment id -> ``(thread, cid, verb)``.** The thread is the repository
-       *and* the number (``issuekey`` exists because the same number in two
-       repos is two threads). ``verb`` belongs in the key for the same reason
-       ``store.action_id`` includes it: ``archive:55`` and ``bus_inject:55`` are
-       two different calls on one delivery, and merging them made the second
-       one's failure invisible.
+    2. **A comment id -> ``(thread, cid, verb)``, with ``""`` as a verb.** The
+       thread is the repository *and* the number (``issuekey`` exists because
+       the same number in two repos is two threads). The verb belongs in the key
+       for the same reason ``store.action_id`` includes it: ``archive:55`` and
+       ``bus_inject:55`` are two different calls on one delivery.
     3. **A bare number matches at most one repository.** ``"7"`` and
        ``owner/demo#7`` are one row only when ``7`` resolves to a single repo in
        this page. With two repos holding issue 7 the bare key is ambiguous and
        stays separate - guessing would silently attach a row to the wrong thread.
     """
     locator = str(item.get("locator") or "")
-    verb = str((item.get("extra") or {}).get("verb") or "")
+    verb = _verb(item)
     cid = item.get("cid")
     if cid is None:
         return ("id", locator, str(item.get("reason") or ""), verb)
@@ -580,34 +558,91 @@ def _signature(item: dict, repos_for: dict | None = None):
     return ("issue", repo or "", number, int(cid), verb)
 
 
-def _dedupe(items: list[dict]) -> list[dict]:
-    """Drop exact repeats; remember every row that was folded away.
+#: Which row speaks for a delivery when several layers describe it. An
+#: assignment knows *why* it is blocked (the tombstone) and an index row knows
+#: the triage reason, so both outrank a bare outbox record for that role.
+_REP_RANK = {"assignment": 0, "index": 1, "outbox": 2}
 
-    A merge is only ever allowed for the same identity (see :func:`_signature`),
-    and a dropped row is never just forgotten: another source lands in
-    ``also_from``, and a repeat of the same source bumps ``repeats``. A row that
-    disappears without a trace is the failure mode this whole function exists to
-    prevent.
+
+def _absorb(rep: dict, item: dict) -> None:
+    """Record a folded-away row on the representative - content included.
+
+    Only the source used to be kept, so two *different* failure reasons on one
+    delivery vanished into a single row that showed one of them. Every absorbed
+    row keeps its source, verb, reason and locator here, and the page prints
+    them; a count nobody can read is the same loss as a dropped row.
+    """
+    entry = {"source": item["source"], "verb": _verb(item),
+             "reason": str(item.get("reason") or ""),
+             "locator": str(item.get("locator") or "")}
+    rep.setdefault("also", []).append(entry)
+    rep["repeats"] = len(rep["also"])
+    # Only the *other* layers are worth a chip: repeating the row's own source
+    # would print "index+index" and read like a second, different view.
+    rep["also_from"] = sorted({e["source"] for e in rep["also"]
+                               if e["source"] != rep["source"]})
+
+
+def _merge_delivery(group: list[dict]) -> dict | None:
+    """The representative for one delivery, or ``None`` when nothing merges.
+
+    A verb-less row (assignment/index) represents the delivery whenever one
+    exists: it carries the tombstone and the triage reason, and its lack of a
+    verb is the truthful statement "this layer does not know which call failed".
+    Copying a verb from an outbox row would assert something the assignment
+    never claimed - and when the outbox row is a *different* call that also
+    failed, copying it hides that failure entirely.
+
+    With no verb-less row, each verb stays its own row: ``archive:55`` and
+    ``bus_inject:55`` are two calls, and only the layers that say so can merge
+    them.
+    """
+    verbless = [item for item in group if not _verb(item)]
+    if not verbless:
+        return None
+    return min(verbless, key=lambda item: (_REP_RANK.get(item["source"], 9),
+                                           str(item.get("locator") or "")))
+
+
+def _dedupe(items: list[dict]) -> list[dict]:
+    """Fold the layers that describe one event, keeping every reason.
+
+    Rows without a comment id merge only on their full signature (locator,
+    reason, verb). Rows with one are grouped per delivery and answered by a
+    single representative; everything folded into it lands in ``also``, so
+    ``repeats == len(also)`` is the count of what the reader is *not* seeing as
+    its own row - and the page lists those reasons.
     """
     repos_for: dict = {}
     for item in items:
         repo, number = issuekey.split_key(item.get("key"))
         if repo and number is not None:
             repos_for.setdefault(number, set()).add(repo)
-    _adopt_verbs(items, repos_for)
-    out, seen = [], {}
+
+    out: list[dict] = []
+    plain: dict = {}
+    deliveries: dict = {}
     for item in items:
-        sig = _signature(item, repos_for)
-        first = seen.get(sig)
-        if first is None:
-            seen[sig] = item
-            out.append(item)
+        if item.get("cid") is None:
+            sig = _signature(item, repos_for)
+            first = plain.get(sig)
+            if first is None:
+                plain[sig] = item
+                out.append(item)
+            else:
+                _absorb(first, item)
             continue
-        if item["source"] != first["source"]:
-            if item["source"] not in first["also_from"]:
-                first["also_from"].append(item["source"])
-        else:
-            first["repeats"] = int(first.get("repeats") or 0) + 1
+        deliveries.setdefault(_delivery_key(item, repos_for), []).append(item)
+
+    for group in deliveries.values():
+        rep = _merge_delivery(group)
+        if rep is None:
+            out.extend(group)          # no shared representative: keep them all
+            continue
+        out.append(rep)
+        for item in group:
+            if item is not rep:
+                _absorb(rep, item)
     return out
 
 
@@ -865,12 +900,21 @@ def _render_item(item: dict) -> list[str]:
     facts.append("</dl>")
     out = ['<li class="item">',
            '<p class="item-head">' + "".join(head) + "</p>"] + facts
-    repeats = int(item.get("repeats") or 0)
-    if repeats:
-        # A count that only lives in the dict is the same silent loss as
-        # dropping the row: the page has to say the others are there.
-        out.append(f'<p class="muted">另 {repeats} 条相同记录'
-                   f'（同一来源、同一内容；已合并显示）</p>')
+    also = list(item.get("also") or [])
+    if also:
+        # A count nobody can read is the same loss as a dropped row. The reasons
+        # differ between the merged rows, so they are listed, not summarised.
+        out.append(f'<p class="muted">另 {len(also)} 条同一投递的记录：</p>')
+        out.append('<ul class="merged">')
+        for entry in also[:5]:
+            label = entry.get("source") or "-"
+            if entry.get("verb"):
+                label += f"/{entry['verb']}"
+            reason = _clip(entry.get("reason") or "（无原因）", 120)
+            out.append(f'<li>{_esc(label)}：{_esc(reason)}</li>')
+        out.append("</ul>")
+        if len(also) > 5:
+            out.append(f'<p class="muted">还有 {len(also) - 5} 条未列出。</p>')
     out.append("</li>")
     return out
 
@@ -1105,6 +1149,9 @@ STYLE = """
   .facts dd { min-inline-size: 0; overflow-wrap: anywhere; }
   .plain { display: grid; grid-template-columns: minmax(0, 1fr);
     gap: var(--space-1); font-size: var(--size-2); }
+  .merged { display: grid; grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-1); font-size: var(--size-2);
+    padding-inline-start: var(--space-4); }
   .warn { color: var(--color-warn); font-size: var(--size-2); }
   .details { border-style: dashed; }
 }
