@@ -31,6 +31,7 @@ from pathlib import Path
 
 from . import brief as brief_mod
 from . import config as config_mod
+from . import github_source
 from . import reporter as reporter_mod
 from . import session_events
 from . import assignments as asg_mod
@@ -729,8 +730,18 @@ def cmd_reporter(args) -> int:
             print(f"reporter: 夹具不可读: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 1
     else:
-        repo = str((cfg.get("github") or {}).get("repo") or "")
-        source = LiveSource(repo) if repo else NullSource()
+        # ``github.source`` decides, exactly as ``github_source.build`` does for
+        # the engine: ``none`` stays offline even when a repo is configured.
+        # Building a LiveSource unconditionally would have made the page reach
+        # the network on a state dir that says it must not.
+        try:
+            source = github_source.build(cfg)
+        except Exception as exc:  # noqa: BLE001  report, never a traceback
+            print(f"reporter: 数据源不可用: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        if isinstance(source, github_source.BrokenSource):
+            print(f"reporter: 数据源不可用: {source.error}", file=sys.stderr)
+            source = NullSource()
     # The engine is built for its allowlist and role only; nothing here runs a
     # round, so ``source`` above is the only backend that can be touched.
     engine = _engine(cfg, store, None, source=NullSource())

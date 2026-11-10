@@ -322,26 +322,31 @@ def _item(category: str, source: str, *, key, cid, at, reason, locator,
                                                        "age_s": None}}
 
 
-def _bucket_for_reason(reason) -> str:
+def _bucket_for_reason(reason, cfg: dict | None = None) -> str:
     """Map ``brief._classify`` onto the three first-screen buckets.
 
     ``_classify`` is the project's one classification rule (user markers first,
     then urgent markers, else a decision). Its private name is used on purpose:
     duplicating the marker tables here is how the two would drift apart. A
     change there must fail the drift test, not silently re-bucket rows.
+
+    ``cfg`` is the engine's config, so markers a project adds under
+    ``engine.user_markers``/``engine.urgent_markers`` apply here exactly as they
+    do in ``brief``. Passing ``{}`` would silently fall back to the defaults and
+    re-bucket every custom marker.
     """
-    user, urgent = brief_mod._markers({})          # defaults, no config read
+    user, urgent = brief_mod._markers(cfg or {})
     bucket = brief_mod._classify(reason, (user, urgent))
     return CATEGORY_USER if bucket == brief_mod.PRIORITY_USER else CATEGORY_ROLE
 
 
-def _from_status(row: dict) -> dict:
+def _from_status(row: dict, cfg: dict | None = None) -> dict:
     key = row.get("issue")
     cid = row.get("comment_id")
     locator = str(key)
     if needs_mod.cid_of(cid) is not None:
         locator = f"{locator} comment {int(cid)}"
-    return _item(_bucket_for_reason(row.get("reason")), "index", key=key,
+    return _item(_bucket_for_reason(row.get("reason"), cfg), "index", key=key,
                  cid=cid, at=row.get("at"), reason=row.get("reason"),
                  locator=locator)
 
@@ -358,6 +363,13 @@ def _index_items(engine) -> tuple[list[dict], str]:
     supplement can only ever add: a real ``resolved``/``superseded`` row is
     never resurrected. Backlog: make ``needs.is_open`` validate ``state``.
 
+    The membership test below is a plain string compare, exactly like
+    ``needs._state`` (``needs.py:190``) - so ``"Resolved"`` or ``" resolved "``
+    is treated as an unusable row on both sides. That is the same latent
+    case/whitespace defect, shared on purpose so the two cannot disagree; it is
+    not a deliberate design of this ticket, and fixing it means fixing
+    ``needs._state`` for everyone.
+
     ``engine.status()`` also raises on a structurally broken index; the caller
     only gets here after the structure check passed, and any remaining failure
     is reported as "unknown" instead of a traceback.
@@ -366,13 +378,14 @@ def _index_items(engine) -> tuple[list[dict], str]:
         primary = engine.status(all=False)
     except Exception as exc:  # noqa: BLE001  a broken index must not kill the page
         return [], f"engine.status() 失败: {type(exc).__name__}: {exc}"
+    cfg = getattr(engine, "cfg", {}) or {}
     items, seen = [], set()
     for row in primary.get("items") or []:
         if not isinstance(row, dict) or row.get("source") != "index":
             continue
-        found = _from_status(row)
+        found = _from_status(row, cfg)
         items.append(found)
-        seen.add((found["number"], found["cid"]))
+        seen.add((found["locator"], found["cid"]))
     try:
         broad = engine.status(all=True)
     except Exception:  # noqa: BLE001  the narrow call already answered
@@ -384,15 +397,15 @@ def _index_items(engine) -> tuple[list[dict], str]:
             continue                      # no stored row: already open via is_open
         if str(row.get("state")) in needs_mod.STATES:
             continue                      # a real ruling: stay suppressed
-        found = _from_status(row)
-        if (found["number"], found["cid"]) in seen:
+        found = _from_status(row, cfg)
+        if (found["locator"], found["cid"]) in seen:
             continue
         items.append(found)
-        seen.add((found["number"], found["cid"]))
+        seen.add((found["locator"], found["cid"]))
     return items, ""
 
 
-def _assignment_items(index: dict | None) -> list[dict]:
+def _assignment_items(index: dict | None, cfg: dict | None = None) -> list[dict]:
     if not isinstance(index, dict):
         return []
     out = []
@@ -405,7 +418,12 @@ def _assignment_items(index: dict | None) -> list[dict]:
             continue
         tomb = rec.get("tombstone") if isinstance(rec.get("tombstone"), dict) else {}
         key = str(rec.get("thread") or rec.get("issue") or "")
-        out.append(_item(CATEGORY_BLOCKED, "assignment", key=key, cid=None,
+        # ``mark_blocked`` records the delivery that failed, so the blocked item
+        # has a real comment id whenever one was consumed. Passing it makes the
+        # row locatable by comment; a block that never reached a delivery keeps
+        # ``cid=None`` and then the action id is its identity.
+        cid = tomb.get("cid")
+        out.append(_item(CATEGORY_BLOCKED, "assignment", key=key, cid=cid,
                          at=rec.get("updated_at") or tomb.get("at"),
                          reason=tomb.get("reason") or status, locator=aid,
                          extra={"status": status, "delivery": tomb.get("cid"),
@@ -433,31 +451,61 @@ def _outbox_items(probe: dict) -> list[dict]:
             continue                     # prepared: the engine replays it
         issue = rec.get("issue")
         key = "" if issue is None else str(issue)
-        out.append(_item(category, "outbox", key=key, cid=None,
+        out.append(_item(category, "outbox", key=key,
+                         cid=rec.get("comment_id"),
                          at=rec.get("updated_at"),
                          reason=rec.get("reason") or status, locator=aid,
                          extra={"status": status, "verb": rec.get("verb")}))
     return out
 
 
-def _signature(item: dict):
-    """Dedupe identity: the issue *number* plus the comment id.
+def _signature(item: dict, repos_for: dict | None = None):
+    """Dedupe identity of one item.
 
-    Both sides are normalised through ``issuekey.issue_number`` before they are
-    compared, so a bare key and a qualified key, an int and its string form, are
-    one row. The raw key stays on the item for display.
+    Three rules, and the order matters:
+
+    1. **No comment id -> its own row.** ``("id", locator)``: two outbox actions
+       with ``cid=None`` are two different things, and collapsing them into one
+       key dropped one of them from the page without a trace. Identical locators
+       still merge, so a re-read row is not duplicated.
+    2. **A comment id -> ``(thread, cid)``.** The thread is the repository *and*
+       the number (``issuekey`` exists because the same number in two repos is
+       two threads); merging across repos would be a data loss, not a
+       normalisation.
+    3. **A bare number matches at most one repository.** ``"7"`` and
+       ``owner/demo#7`` are one row only when ``7`` resolves to a single repo in
+       this page. With two repos holding issue 7 the bare key is ambiguous and
+       stays separate - guessing would silently attach a row to the wrong thread.
     """
-    number = item.get("number")
-    if number is None:
-        return ("raw", str(item.get("key")), item.get("cid"))
+    locator = str(item.get("locator") or "")
     cid = item.get("cid")
-    return ("issue", int(number), None if cid is None else int(cid))
+    if cid is None:
+        return ("id", locator)
+    repo, number = issuekey.split_key(item.get("key"))
+    if number is None and isinstance(item.get("number"), int):
+        number = item.get("number")
+    if not repo and number is not None and repos_for:
+        owner = repos_for.get(number) or set()
+        if len(owner) == 1:
+            repo = next(iter(owner))
+    return ("issue", repo or "", number, int(cid))
 
 
 def _dedupe(items: list[dict]) -> list[dict]:
+    """Drop exact repeats; remember which other sources carried the same item.
+
+    A merge is only ever allowed for the same identity (see :func:`_signature`),
+    and the dropped row's source is recorded in ``also_from`` so nothing about
+    it disappears from the page.
+    """
+    repos_for: dict = {}
+    for item in items:
+        repo, number = issuekey.split_key(item.get("key"))
+        if repo and number is not None:
+            repos_for.setdefault(number, set()).add(repo)
     out, seen = [], {}
     for item in items:
-        sig = _signature(item)
+        sig = _signature(item, repos_for)
         first = seen.get(sig)
         if first is None:
             seen[sig] = item
@@ -615,7 +663,7 @@ def collect(engine, *, source=None, quotes: bool = True, now=None) -> dict:
     if index_ok:
         got, status_error = _index_items(engine)
         items.extend(got)
-        items.extend(_assignment_items(health["index"].get("data")))
+        items.extend(_assignment_items(health["index"].get("data"), cfg))
     items.extend(_outbox_items(health["outbox"]))
     items = _dedupe(items)
 

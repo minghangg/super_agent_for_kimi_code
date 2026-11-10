@@ -151,15 +151,26 @@ class SourceHealth(Base):
         self.assertIn("缺失", page)
         self.assertIn("无需行动", page)
 
-    def test_health_read_return_value_is_not_the_criterion(self):
-        """``health.read`` answers ``{}`` for a corrupt file - we must not care."""
-        with mock.patch.object(reporter_health(), "read", return_value={}) as read:
-            engine = self.engine(index=self.index_with([]))
-            self.store.health_path.write_text("{}", encoding="utf-8")
-            report = rep.collect(engine)
-        read.assert_not_called()
-        self.assertEqual(report["status"], "none")
-        self.assertEqual(report["engine"]["health"]["state"], "bad")
+    def test_health_criterion_is_the_file_not_health_read(self):
+        """Behaviour, not a mock: ``health.read`` cannot produce either answer.
+
+        ``health.read`` returns the same ``{}`` for a corrupt file and for an
+        absent one, so it can never distinguish these two cases. Patching it
+        proves nothing (a mutant that called it would stay green); asserting the
+        two different verdicts does.
+        """
+        self.engine(index=self.index_with([]))
+        self.store.health_path.write_text(json.dumps({"pid": 1}), encoding="utf-8")
+        partial = rep.collect(Engine(self.cfg, self.store, NullSource()))
+        self.assertEqual(partial["engine"]["health"]["state"], "ok")
+        self.assertTrue(rep.probe_source_health(self.store)["health"]["valid"])
+
+        self.store.health_path.write_text("{}", encoding="utf-8")
+        empty = rep.collect(Engine(self.cfg, self.store, NullSource()))
+        self.assertEqual(empty["engine"]["health"]["state"], "bad")
+        self.assertFalse(rep.probe_source_health(self.store)["health"]["valid"])
+        self.assertIn("空对象", empty["sources"]["health"]["error"])
+        self.assertNotEqual(partial["engine"]["health"], empty["engine"]["health"])
 
     def test_missing_outbox_is_an_empty_outbox(self):
         engine = self.engine(index=self.index_with([]))
@@ -167,11 +178,6 @@ class SourceHealth(Base):
         self.assertTrue(report["outbox_ok"])
         self.assertTrue(any("不存在" in w for w in report["warnings"]))
         self.assertEqual(report["status"], "none")
-
-
-def reporter_health():
-    from super_agent import health
-    return health
 
 
 class NoActionPredicate(Base):
@@ -250,7 +256,13 @@ class DamagedDismissalRow(Base):
 
 
 class Dedupe(Base):
-    """P1-4: identity is ``(issue number, cid)`` after normalisation."""
+    """P1 (repair round): identity must never collapse two different items.
+
+    The old key was ``(issue number, cid)``, so every ``cid=None`` row shared one
+    key and all but the first vanished from the page. These tests pin the three
+    rules of ``_signature`` instead: no cid means its own row, a cid pairs with
+    the *thread* (repo + number), and a bare number matches at most one repo.
+    """
 
     def _seed(self, index, actions):
         self.write_index(index)
@@ -270,30 +282,93 @@ class Dedupe(Base):
         self.assertIn(report["items"][0]["key"], ("7", THREAD))
 
     def test_int_and_str_keys_are_one_row(self):
+        """Called on ``_dedupe`` directly: ``json.dumps`` would collapse the keys.
+
+        A dict literal with ``7`` and ``"7"`` cannot reach the store as two keys -
+        JSON has only string keys, so writing then reading back leaves one entry
+        and the assertion would pass no matter what ``_signature`` does.
+        """
+        items = [
+            self._item_for_key(7, "int"),
+            self._item_for_key("7", "str"),
+        ]
+        self.assertEqual(len(rep._dedupe(items)), 1)
+
+    def _item_for_key(self, key, reason):
+        locator = f"{key} comment 11"
+        return rep._item(rep.CATEGORY_ROLE, "index", key=key, cid=11, at=None,
+                         reason=reason, locator=locator)
+
+    def test_two_outbox_actions_are_two_rows(self):
+        """The P1 itself: two cid-less actions must not become one row."""
+        engine = self._seed(self.index_with([]), {
+            "asg_7_worker_1:archive:9": {
+                "action_id": "asg_7_worker_1:archive:9", "status": "uncertain",
+                "issue": "7", "reason": "archive timed out",
+                "updated_at": 1_700_000_000, "verb": "archive"},
+            "asg_7_worker_1:comment:9": {
+                "action_id": "asg_7_worker_1:comment:9", "status": "waiting_person",
+                "issue": "7", "reason": "comment needs a person",
+                "updated_at": 1_700_000_100, "verb": "comment"},
+        })
+        report = rep.collect(engine)
+        self.assertEqual(len(report["items"]), 2)
+        page = rep.render(report)
+        for locator in ("asg_7_worker_1:archive:9", "asg_7_worker_1:comment:9"):
+            self.assertIn(locator, page)
+        for reason in ("archive timed out", "comment needs a person"):
+            self.assertIn(reason, page)
+
+    def test_same_number_in_two_repos_are_two_rows(self):
+        """Same issue number, different repos, same comment id: not one thread."""
         index = {"version": 1, "meta": {}, "assignments": {},
                  "issues": {
-                     7: {"needs_person": [{"comment_id": 11, "reason": "int"}]},
-                     "7": {"needs_person": [{"comment_id": "11", "reason": "str"}]},
+                     "a/x#7": {"needs_person": [{"comment_id": 11,
+                                                 "reason": "repo a needs a person"}]},
+                     "b/y#7": {"needs_person": [{"comment_id": 11,
+                                                 "reason": "repo b needs a person"}]},
                  }}
         engine = self._seed(index, {})
         report = rep.collect(engine)
-        self.assertEqual(len(report["items"]), 1)
-        self.assertEqual(report["items"][0]["cid"], 11)
+        self.assertEqual(len(report["items"]), 2)
+        page = rep.render(report)
+        for reason in ("repo a needs a person", "repo b needs a person"):
+            self.assertIn(reason, page)
+
+    def test_bare_key_is_one_row_only_when_one_repo_holds_it(self):
+        single = {"version": 1, "meta": {}, "assignments": {},
+                  "issues": {"7": {"needs_person": [{"comment_id": 11,
+                                                     "reason": "bare"}]},
+                             THREAD: {"needs_person": [{"comment_id": 11,
+                                                        "reason": "qualified"}]}}}
+        engine = self._seed(single, {})
+        self.assertEqual(len(rep.collect(engine)["items"]), 1)
+        ambiguous = {"version": 1, "meta": {}, "assignments": {},
+                     "issues": {"7": {"needs_person": [{"comment_id": 11,
+                                                        "reason": "bare"}]},
+                                "a/x#7": {"needs_person": [{"comment_id": 11,
+                                                            "reason": "repo a"}]},
+                                "b/y#7": {"needs_person": [{"comment_id": 11,
+                                                            "reason": "repo b"}]}}}
+        engine = self._seed(ambiguous, {})
+        self.assertEqual(len(rep.collect(engine)["items"]), 3)
 
     def test_outbox_row_merges_into_assignment_row(self):
+        """The two layers describe one action: same thread + same delivery id."""
         index = self.index_with([], assignments={
             "asg_7_worker_1": {"id": "asg_7_worker_1", "thread": THREAD,
                                "issue": 7, "role": "worker",
                                "status": "waiting_person",
                                "updated_at": "2026-01-01T00:00:00+00:00",
                                "tombstone": {"reason": "no sid recorded",
+                                             "cid": 55,
                                              "at": "2026-01-01T00:00:00+00:00"}},
         })
         engine = self._seed(index, {
             "asg_7_worker_1:archive:9": {
                 "action_id": "asg_7_worker_1:archive:9", "status": "waiting_person",
                 "issue": "7", "reason": "no sid recorded",
-                "updated_at": 1_700_000_000, "verb": "archive"},
+                "comment_id": 55, "updated_at": 1_700_000_000, "verb": "archive"},
         })
         report = rep.collect(engine)
         blocked = [it for it in report["items"]
@@ -301,6 +376,26 @@ class Dedupe(Base):
         self.assertEqual(len(blocked), 1)
         self.assertEqual(sorted(blocked[0]["also_from"]), ["outbox"])
         self.assertEqual(blocked[0]["source"], "assignment")
+
+    def test_unrelated_outbox_row_does_not_merge(self):
+        """Same action id prefix but a different delivery: two rows, not one."""
+        index = self.index_with([], assignments={
+            "asg_7_worker_1": {"id": "asg_7_worker_1", "thread": THREAD,
+                               "issue": 7, "role": "worker",
+                               "status": "blocked",
+                               "updated_at": "2026-01-01T00:00:00+00:00",
+                               "tombstone": {"reason": "no sid recorded",
+                                             "cid": 55,
+                                             "at": "2026-01-01T00:00:00+00:00"}},
+        })
+        engine = self._seed(index, {
+            "asg_7_worker_1:comment:9": {
+                "action_id": "asg_7_worker_1:comment:9", "status": "waiting_person",
+                "issue": "7", "reason": "a different delivery", "comment_id": 66,
+                "updated_at": 1_700_000_000, "verb": "comment"},
+        })
+        report = rep.collect(engine)
+        self.assertEqual(len(report["items"]), 2)
 
     def test_display_keeps_the_raw_key(self):
         index = self.index_with([{"comment_id": 11, "reason": "x"}], key="7")
@@ -311,7 +406,16 @@ class Dedupe(Base):
 
 
 class ClassifyDrift(Base):
-    """P1-5: the expected table is written down, not re-derived."""
+    """P1-5: the expected table is written down, not re-derived.
+
+    .. note::
+
+       ``EXPECTED`` below is a **contract, not a snapshot of the implementation**.
+       Editing an entry changes product semantics (which bucket a real person
+       sees an item in), so it needs a design review - not a quick green test.
+       The table is deliberately duplicated here instead of being imported from
+       the module: an expectation derived from the code cannot drift-detect.
+    """
 
     EXPECTED = {
         "[user] 需要用户拍板": rep.CATEGORY_USER,
@@ -345,6 +449,42 @@ class ClassifyDrift(Base):
         source = Path(rep.__file__).read_text(encoding="utf-8")
         self.assertNotIn('"用户拍板"', source)
         self.assertNotIn('"[release]"', source)
+
+
+class ConfiguredMarkers(Base):
+    """P2-2: markers added in the config must reach the page, not just ``brief``."""
+
+    CUSTOM = "请老板拍板"
+
+    def _cfg(self) -> dict:
+        return _cfg(engine={"user_markers": list(brief_mod.USER_MARKERS)
+                            + [self.CUSTOM]})
+
+    def test_custom_marker_buckets_to_user(self):
+        cfg = self._cfg()
+        self.assertEqual(rep._bucket_for_reason(f"x {self.CUSTOM} y", cfg),
+                         rep.CATEGORY_USER)
+        self.assertEqual(rep._bucket_for_reason(f"x {self.CUSTOM} y"),
+                         rep.CATEGORY_ROLE)   # defaults alone do not match it
+
+    def test_custom_marker_applies_to_collected_items(self):
+        engine = self.engine(
+            index=self.index_with([{"comment_id": 11,
+                                    "reason": f"[decision] {self.CUSTOM}"}]),
+            cfg=self._cfg())
+        report = rep.collect(engine)
+        self.assertEqual(report["counts"][rep.CATEGORY_USER], 1)
+        self.assertEqual(report["counts"][rep.CATEGORY_ROLE], 0)
+        self.assertIn(self.CUSTOM, rep.render(report))
+
+    def test_collect_passes_the_engine_cfg(self):
+        """A cfg-blind reporter would show this under 裁决 instead of 拍板."""
+        engine = self.engine(
+            index=self.index_with([{"comment_id": 11, "reason": self.CUSTOM}]),
+            cfg=self._cfg())
+        self.assertEqual(engine.cfg["engine"]["user_markers"][-1], self.CUSTOM)
+        self.assertEqual(rep.collect(engine)["items"][0]["category"],
+                         rep.CATEGORY_USER)
 
 
 class Dismissal(Base):
@@ -634,20 +774,25 @@ class Blocked(Base):
 
 class Cli(Base):
     def test_no_quotes_never_builds_a_source(self):
+        """``--no-quotes`` short-circuits before any backend is constructed."""
         from super_agent import cli
+        from super_agent import github_source
         cfg_path = self.root / "cfg.json"
         cfg_path.write_text(json.dumps({"github": {"source": "live",
                                                   "repo": "owner/demo"}}),
                             encoding="utf-8")
         out = self.root / "page.html"
-        with mock.patch.object(cli, "LiveSource",
+        with mock.patch.object(github_source, "LiveSource",
                                side_effect=AssertionError("live source built")) as live, \
-             mock.patch.object(cli, "FixtureSource",
-                               side_effect=AssertionError("fixture built")):
+             mock.patch.object(github_source, "FixtureSource",
+                               side_effect=AssertionError("fixture built")), \
+             mock.patch.object(github_source, "build",
+                               side_effect=AssertionError("build called")) as build:
             code = cli.main(["reporter", "--config", str(cfg_path),
                              "--state-dir", str(self.state), "--no-quotes",
                              "--out", str(out)])
         live.assert_not_called()
+        build.assert_not_called()
         self.assertEqual(code, 0)
         self.assertIn("</html>", out.read_text(encoding="utf-8"))
 
@@ -690,6 +835,68 @@ class Cli(Base):
         code = cli.main(["reporter", "--state-dir", str(self.state),
                          "--fixture", str(bad)])
         self.assertEqual(code, 1)
+
+
+    def test_source_none_with_repo_does_not_build_a_live_source(self):
+        """``github.source=none`` wins over a configured repo (P2-3)."""
+        from super_agent import cli
+        from super_agent import github_source
+        cfg_path = self.root / "cfg.json"
+        cfg_path.write_text(json.dumps({"github": {"source": "none",
+                                                   "repo": "owner/demo"}}),
+                            encoding="utf-8")
+        out = self.root / "page.html"
+        self.store.save_index(self.index_with([{"comment_id": 11, "reason": "x"}]))
+        with mock.patch.object(github_source, "LiveSource",
+                               side_effect=AssertionError("live source built")) as live:
+            code = cli.main(["reporter", "--config", str(cfg_path),
+                             "--state-dir", str(self.state), "--out", str(out)])
+        live.assert_not_called()
+        self.assertEqual(code, 0)
+        page = out.read_text(encoding="utf-8")
+        self.assertIn("数据源不可用（github.source=none）", page)
+
+    def test_source_fixture_in_cfg_is_honoured(self):
+        """The config's ``github.source=fixture`` is the backend, not live."""
+        from super_agent import cli
+        from super_agent import github_source
+        self.store.save_index(self.index_with([{"comment_id": 11, "reason": "x"}]))
+        fixture = self.root / "fx.json"
+        fixture.write_text(json.dumps({"issues": {"7": {
+            "title": "t", "comments": [{"id": 11, "body": "from the fixture"}]}}}),
+            encoding="utf-8")
+        cfg_path = self.root / "cfg.json"
+        cfg_path.write_text(json.dumps({"github": {"source": "fixture",
+                                                   "fixture": str(fixture)}}),
+                            encoding="utf-8")
+        out = self.root / "page.html"
+        with mock.patch.object(github_source, "LiveSource",
+                               side_effect=AssertionError("live source built")):
+            code = cli.main(["reporter", "--config", str(cfg_path),
+                             "--state-dir", str(self.state), "--out", str(out)])
+        self.assertEqual(code, 0)
+        self.assertIn("from the fixture", out.read_text(encoding="utf-8"))
+
+    def test_fixture_flag_overrides_cfg_source(self):
+        from super_agent import cli
+        from super_agent import github_source
+        self.store.save_index(self.index_with([{"comment_id": 11, "reason": "x"}]))
+        flag_fixture = self.root / "flag.json"
+        flag_fixture.write_text(json.dumps({"issues": {"7": {
+            "title": "t", "comments": [{"id": 11, "body": "from --fixture"}]}}}),
+            encoding="utf-8")
+        cfg_path = self.root / "cfg.json"
+        cfg_path.write_text(json.dumps({"github": {"source": "live",
+                                                   "repo": "owner/demo"}}),
+                            encoding="utf-8")
+        out = self.root / "page.html"
+        with mock.patch.object(github_source, "LiveSource",
+                               side_effect=AssertionError("live source built")):
+            code = cli.main(["reporter", "--config", str(cfg_path),
+                             "--state-dir", str(self.state),
+                             "--fixture", str(flag_fixture), "--out", str(out)])
+        self.assertEqual(code, 0)
+        self.assertIn("from --fixture", out.read_text(encoding="utf-8"))
 
 
 class _FakeComments:
