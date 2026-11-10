@@ -551,6 +551,102 @@ class Arbitration(Base):
         self.assertEqual(index["assignments"], {"asg": {"b": 2}})
 
 
+class DamagedRow(Base):
+    """A damaged side-table value must read as OPEN, never as a dismissal.
+
+    The failure being pinned is a visibility one: a truncated write used to make
+    ``is_open`` return False, and ``status`` then hid a real item. Showing an
+    extra row is the cheaper mistake, so anything that is not an object counts
+    as "no ruling". Same fail-closed family as ISS-29 / #42.
+    """
+
+    BAD = ("corrupted", None, '{"state":', ["a"])
+
+    def damaged(self, value) -> dict:
+        return {"needs_person_resolved": {"owner/demo#1|9100": value}}
+
+    def test_every_damaged_shape_reads_as_open(self):
+        for value in self.BAD:
+            with self.subTest(value=value):
+                self.assertTrue(needs.is_open(self.damaged(value), THREAD,
+                                              {"comment_id": 9100}))
+
+    def test_a_real_row_is_still_dismissed(self):
+        index = {"needs_person_resolved": {"owner/demo#1|9100": {
+            "state": "resolved", "reason": "r", "at": "t", "by": "supervisor",
+            "by_comment": None, "superseded_by": None, "entries": 1}}}
+        self.assertFalse(needs.is_open(index, THREAD, {"comment_id": 9100}))
+
+    def test_a_missing_key_still_reads_as_open(self):
+        self.assertTrue(needs.is_open({"needs_person_resolved": {}}, THREAD,
+                                      {"comment_id": 9100}))
+        self.assertTrue(needs.is_open({}, THREAD, {"comment_id": 9100}))
+
+    def test_damaged_row_is_not_handed_out_as_an_audit(self):
+        for value in self.BAD:
+            with self.subTest(value=value):
+                self.assertIsNone(needs.stored_row(self.damaged(value), THREAD, 9100))
+        self.assertEqual(
+            needs.stored_row({"needs_person_resolved": {"owner/demo#1|9100": {
+                "state": "resolved"}}}, THREAD, 9100), {"state": "resolved"})
+
+    def test_a_damaged_row_loses_to_a_real_one(self):
+        two = {"needs_person_resolved": {"k": "corrupted"}}
+        real = {"needs_person_resolved": {"k": {"state": "resolved", "at": "t",
+                                                "by": "x", "entries": 3}}}
+        needs.merge_into(two, real)
+        self.assertEqual(two["needs_person_resolved"]["k"], real["needs_person_resolved"]["k"])
+
+    def test_two_damaged_rows_are_left_alone(self):
+        index = {"needs_person_resolved": {"k": "corrupted"}}
+        self.assertEqual(needs.merge_into(index, {"needs_person_resolved": {"k": None}}), 0)
+        self.assertEqual(index["needs_person_resolved"]["k"], "corrupted")
+
+    def test_status_shows_the_item_instead_of_hiding_it(self):
+        self.store.save_index({
+            "version": 1, "meta": {}, "assignments": {},
+            "issues": {THREAD: {"state": "needs_person", "needs_person": [
+                {"comment_id": 9100, "reason": "marker '[decision]'",
+                 "at": "2026-11-10T10:00:00+00:00"}]}},
+            "needs_person_resolved": {"owner/demo#1|9100": "corrupted"},
+        })
+        rc, text = self.status()
+        self.assertEqual(rc, 0, text)
+        self.assertIn("9100", text)
+        self.assertNotIn("无", text)
+
+    def test_status_all_does_not_crash_on_a_damaged_row(self):
+        self.store.save_index({
+            "version": 1, "meta": {}, "assignments": {},
+            "issues": {THREAD: {"state": "needs_person", "needs_person": [
+                {"comment_id": 9100, "reason": "marker '[decision]'",
+                 "at": "2026-11-10T10:00:00+00:00"}]}},
+            "needs_person_resolved": {"owner/demo#1|9100": '{"state":'},
+        })
+        rc, text = self.status("--all")
+        self.assertEqual(rc, 0, text)
+        self.assertIn("9100", text)
+        self.assertNotIn("Traceback", text)
+        # No audit bracket: there is no ruling to report, so the line stays the
+        # default shape rather than printing a state of None.
+        self.assertNotIn("[None", text)
+
+    def test_resolve_over_a_damaged_row_still_works(self):
+        self.seed()
+        index = self.store.load_index()
+        index["needs_person_resolved"] = {"owner/demo#1|9100": "corrupted"}
+        self.store.save_index(index)
+
+        rc, text = self.resolve()
+        self.assertEqual(rc, 0, text)
+        self.assertNotIn("Traceback", text)
+        row = self.index()["needs_person_resolved"]["owner/demo#1|9100"]
+        self.assertIsInstance(row, dict)
+        self.assertEqual(row["state"], "resolved")
+        rc, text = self.status()
+        self.assertIn("无", text)
+
+
 class Unit(Base):
     def test_is_open_without_a_comment_id_stays_true(self):
         self.assertTrue(needs.is_open({"needs_person_resolved": {}}, THREAD,

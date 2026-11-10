@@ -79,11 +79,30 @@ def is_open(index, thread, entry) -> bool:
     Pure read: it NEVER writes an event and never touches the index. An entry
     without a usable ``comment_id`` is reported open - guessing an identity
     would be worse than showing the row.
+
+    A damaged row is open too. A side-table value that is not an object (a
+    truncated write, ``None``, a stray string) carries no ruling, and reading it
+    as "dismissed" would silently hide a real item; showing one extra row is the
+    cheaper mistake. Same fail-closed family as ISS-29 and the "wait longer
+    rather than cry wolf" rule of #42.
     """
     cid = cid_of(entry)
     if cid is None:
         return True
-    return entry_key(thread, cid) not in marks(index)
+    return not isinstance(marks(index).get(entry_key(thread, cid)), dict)
+
+
+def stored_row(index, thread, comment_id) -> dict | None:
+    """The stored row for ``(thread, comment_id)``, or None when there is none.
+
+    A value that is not an object is reported as None: it is not a ruling, and
+    a caller that wanted the audit must not be handed something it cannot read.
+    """
+    cid = cid_of(comment_id)
+    if cid is None:
+        return None
+    found = marks(index).get(entry_key(thread, cid))
+    return found if isinstance(found, dict) else None
 
 
 def mark(index, thread, comment_id, *, state, by, reason="", by_comment=None,
@@ -138,6 +157,8 @@ def merge_into(index, disk_index) -> int:
     changed = 0
     for key, row in other.items():
         merged = _winner(table.get(key), row)
+        if merged is None:          # both sides damaged: not a ruling, leave as is
+            continue
         if table.get(key) != merged:
             table[key] = merged
             changed += 1
@@ -158,6 +179,8 @@ def merge_into_side(index, rows) -> int:
     changed = 0
     for key, row in (rows or {}).items():
         merged = _winner(table.get(key), row)
+        if merged is None:
+            continue
         if table.get(key) != merged:
             table[key] = merged
             changed += 1
@@ -165,10 +188,10 @@ def merge_into_side(index, rows) -> int:
 
 
 def _state(row) -> str:
-    return str((row or {}).get("state") or "open")
+    return str(row.get("state") or "open") if isinstance(row, dict) else "open"
 
 
-def _winner(a, b) -> dict:
+def _winner(a, b) -> dict | None:
     """Arbitrate two rows for the same key. The winner is kept verbatim.
 
     Union by key. Never delete a key present on either side.
@@ -186,14 +209,21 @@ def _winner(a, b) -> dict:
 
     A missing ``at`` sorts before every timestamp, so an undated row never
     overwrites a dated one.
+
+    A value that is not an object is not a ruling, so it loses to a real row and
+    counts as absent when both sides are damaged (``None`` is returned and the
+    caller leaves the key alone). It is still read as "open", so a damaged row
+    can never hide an item.
     """
-    if not isinstance(a, dict):
-        return dict(b or {})
-    if not isinstance(b, dict):
-        return dict(a)
-    win, lose = (a, b) if _beats(a, b) else (b, a)
+    left = a if isinstance(a, dict) else None
+    right = b if isinstance(b, dict) else None
+    if left is None:
+        return dict(right) if right is not None else None
+    if right is None:
+        return dict(left)
+    win = left if _beats(left, right) else right
     row = dict(win)
-    row["entries"] = max(int(a.get("entries") or 0), int(b.get("entries") or 0))
+    row["entries"] = max(int(left.get("entries") or 0), int(right.get("entries") or 0))
     return row
 
 

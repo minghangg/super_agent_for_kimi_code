@@ -1553,7 +1553,6 @@ class Engine:
         """
         index = self.store.load_index()
         counters = self.store.load_counters()
-        table = needs.marks(index)
         items = []
         for issue_key, rec in sorted((index.get("issues") or {}).items(),
                                      key=lambda kv: issuekey.issue_number(kv[0]) or 0):
@@ -1564,9 +1563,7 @@ class Engine:
                         "reason": entry.get("reason"), "at": entry.get("at"),
                         "source": "index", "action_id": None}
                 if all:
-                    cid = needs.cid_of(entry)
-                    row = (table.get(needs.entry_key(issue_key, cid))
-                           if cid is not None else None)
+                    row = needs.stored_row(index, issue_key, entry)
                     if row is not None:
                         item.update({
                             "state": row.get("state"),

@@ -496,8 +496,13 @@ def cmd_resolve(args) -> int:
     # scratch copy: "is this key dismissed" must have exactly one definition,
     # otherwise a second dismissal could rewrite the audit row that ``mark``
     # is supposed to protect.
+    #
+    # Only real rows go into the copy. A damaged value is not a ruling (it reads
+    # as open, see ``needs.is_open``), so it must not block the dismissal - and
+    # copying it with ``dict()`` is what used to raise on a truncated write.
     existing = needs_mod.marks(disk1)
-    scratch = {needs_mod.MARKS: {k: dict(v) for k, v in existing.items()}}
+    scratch = {needs_mod.MARKS: {k: dict(v) for k, v in existing.items()
+                                 if isinstance(v, dict)}}
     planned, already = [], []
     for key, _rows in matched0.items():
         count = len(matched1.get(key) or [])
@@ -509,7 +514,11 @@ def cmd_resolve(args) -> int:
                            if state == needs_mod.SUPERSEDED else None),
             entries=count)
         (planned if got["changed"] else already).append((key, count))
-    side = {k: v for k, v in scratch[needs_mod.MARKS].items() if k not in existing}
+    side = {}
+    for key, _count in planned:
+        built = needs_mod.stored_row(scratch, key, cid)
+        if built is not None:
+            side[needs_mod.entry_key(key, cid)] = built
 
     written, failed, error = [], [], ""
     if side:
@@ -544,7 +553,8 @@ def cmd_resolve(args) -> int:
     if written:
         folded = sum(count for _key, count in written)
         stored = needs_mod.marks(store.load_index())
-        first = stored.get(needs_mod.entry_key(written[0][0], cid)) or {}
+        first = stored.get(needs_mod.entry_key(written[0][0], cid))
+        first = first if isinstance(first, dict) else {}
         store.log_event({"type": f"needs_person.{state}", "at": _now(),
                          "issue": number, "comment_id": cid,
                          "reason": first.get("reason") or "",
@@ -559,7 +569,7 @@ def cmd_resolve(args) -> int:
               f"({folded} entries folded)")
         return 0
 
-    row = needs_mod.marks(disk1).get(needs_mod.entry_key(already[0][0], cid)) or {}
+    row = needs_mod.stored_row(disk1, already[0][0], cid) or {}
     print(f"already {state} {cid} under all {len(already)} keys "
           f"(at {row.get('at')}, by {row.get('by')})", file=sys.stderr)
     return 1
