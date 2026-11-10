@@ -34,7 +34,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import github_source, health, issuekey, markers, session_events
+from . import github_source, health, issuekey, markers, needs, session_events
 from . import assignments as asg_mod
 from .allowlist import ProjectAllowlist
 from .store import Store, action_id
@@ -1392,6 +1392,9 @@ class Engine:
                 summary.setdefault("archive_blocked", []).extend(result["blocked"])
 
         # Index is written once per round, atomically: a crash leaves the old one.
+        # The dismissal side table is monotonic, so unioning whatever is on disk
+        # now keeps a ``resolve`` run during this round from being overwritten.
+        needs.merge_into(index, self.store.load_index())
         index["meta"].update({
             "updated_at": _now(), "mode": self.mode, "role": self.role,
             "dispatch_enabled": self.dispatch_enabled,
@@ -1403,6 +1406,7 @@ class Engine:
         # and ``run_count`` is already incremented, so the two-round streak can
         # only be advanced by a genuine next round.
         self._round_closed_threads(index)
+        needs.merge_into(index, self.store.load_index())
         self.store.save_index(index)
         self.store.log_event({"type": "run.completed", "at": _now(),
                               "processed": summary["processed"],
@@ -1502,7 +1506,7 @@ class Engine:
             cursor.setdefault("issues", {}).setdefault(key, cur)
 
     # ------------------------------------------------------------- status/doctor
-    def status(self, *, outbox: bool = False) -> dict:
+    def status(self, *, outbox: bool = False, all: bool = False) -> dict:
         """Items that need a person. ``outbox=True`` adds the outbox layer.
 
         ``index.json`` holds triage results; ``outbox_state.json`` holds actions
@@ -1510,16 +1514,42 @@ class Engine:
         outbox and were invisible here, so a brief that pointed at ``status`` for
         them named a command that returned nothing. ``outbox`` defaults to False
         so the printed shape of plain ``status`` does not change.
+
+        ``all=True`` drops the dismissal filter and tags each index item with
+        the dismissal audit (``state``/``entry_at``/``resolved_at``/...). The
+        extra keys only exist on that path, and only in the returned dict -
+        nothing is written back to the index.
+
+        Two timestamps, never one: ``entry_at`` belongs to the triage row and
+        ``replay`` rewrites it; ``resolved_at`` is the side-table time and is
+        what any report about the dismissal must use.
         """
         index = self.store.load_index()
         counters = self.store.load_counters()
+        table = needs.marks(index)
         items = []
         for issue_key, rec in sorted((index.get("issues") or {}).items(),
                                      key=lambda kv: issuekey.issue_number(kv[0]) or 0):
             for entry in rec.get("needs_person") or []:
+                cid = needs.cid_of(entry)
+                row = table.get(needs.entry_key(issue_key, cid)) if cid is not None else None
+                if row is None:
+                    items.append({"issue": issue_key, "comment_id": entry.get("comment_id"),
+                                  "reason": entry.get("reason"), "at": entry.get("at"),
+                                  "source": "index", "action_id": None})
+                    continue
+                if not all:
+                    continue
                 items.append({"issue": issue_key, "comment_id": entry.get("comment_id"),
                               "reason": entry.get("reason"), "at": entry.get("at"),
-                              "source": "index", "action_id": None})
+                              "source": "index", "action_id": None,
+                              "state": row.get("state"),
+                              "entry_at": entry.get("at"),
+                              "resolved_at": row.get("at"),
+                              "resolved_by": row.get("by"),
+                              "resolved_by_comment": row.get("by_comment"),
+                              "superseded_by": row.get("superseded_by"),
+                              "entries": row.get("entries")})
         if outbox:
             for aid, rec in sorted(self.store.unfinished_outbox().items()):
                 status = str(rec.get("status") or "")
