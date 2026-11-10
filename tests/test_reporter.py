@@ -94,18 +94,23 @@ class Base(unittest.TestCase):
         return target
 
     def begin_uncertain(self, aid: str, *, verb: str, input_ref: str,
-                        issue: int = 7, assignment_id: str | None = None) -> dict:
+                        issue: int = 7, assignment_id: str | None = None,
+                        reason: str = "unconfirmed") -> dict:
         """A genuinely ``uncertain`` action, written by the store itself.
 
         This is the shape production produces: ``begin_action`` then
         ``mark_uncertain``. Note what the record is *missing* - ``comment_id``
         never reaches the state file on this path - which is the whole reason
         ``input_ref`` is parsed for a delivery id.
+
+        ``assignment_id`` stays ``None`` by default because that is what the
+        ``needs_person`` dispatch produces (``engine.py:1522``): no assignment,
+        and ``input_ref`` falls back to the issue number.
         """
         rec = self.store.begin_action(aid, verb=verb, kind=verb,
                                       assignment_id=assignment_id,
                                       input_ref=input_ref, issue=issue)
-        self.store.mark_uncertain(rec["action_id"], "unconfirmed")
+        self.store.mark_uncertain(rec["action_id"], reason)
         return self.store.outbox_action(rec["action_id"]) or {}
 
     def index_with(self, rows, *, key=THREAD, assignments=None) -> dict:
@@ -293,14 +298,16 @@ class Dedupe(Base):
     def test_two_outbox_actions_are_two_rows(self):
         """Counterexample 2: two cid-less actions must not become one row."""
         self.write_index(self.index_with([]))
-        self.begin_uncertain("a-archive", verb="archive", input_ref="inject:9")
-        self.begin_uncertain("a-comment", verb="comment", input_ref="not-a-number")
+        self.begin_uncertain("a-archive", verb="archive", input_ref="inject:9",
+                             reason="archive attempt failed")
+        self.begin_uncertain("a-comment", verb="comment", input_ref="not-a-number",
+                             reason="comment send failed")
         report = rep.collect(Engine(self.cfg, self.store, NullSource()))
         self.assertEqual(len(report["items"]), 2)
         page = rep.render(report)
         for locator in ("a-archive", "a-comment"):
             self.assertIn(locator, page)
-        for reason in ("unconfirmed",):
+        for reason in ("archive attempt failed", "comment send failed"):
             self.assertIn(reason, page)
 
     def test_same_number_in_two_repos_are_two_rows(self):
@@ -397,6 +404,116 @@ class Dedupe(Base):
         page = rep.render(report)
         for reason in ("row-A-no-cid", "row-B-no-cid"):
             self.assertIn(reason, page)
+
+    # ------------------------------------------------- P1-A: input_ref semantics
+    def test_needs_person_fallback_is_not_a_comment_id(self):
+        """P1-A-1: ``input_ref`` without an assignment is an *issue* number.
+
+        ``engine.py:1522`` dispatches the needs_person notification without an
+        ``input_ref``, so ``_dispatch`` falls back to the issue number. Reading
+        that as a comment id invented a ``comment 19`` chip for a comment that
+        does not exist. The record here is written by the real store with no
+        ``assignment_id``, exactly like production.
+        """
+        self.write_index(self.index_with([]))
+        rec = self.begin_uncertain("needs-person:bus_inject:19", verb="bus_inject",
+                                   input_ref="19", issue=19)
+        self.assertIsNone(rec.get("assignment_id"))
+        report = rep.collect(Engine(self.cfg, self.store, NullSource()))
+        self.assertEqual(len(report["items"]), 1)
+        item = report["items"][0]
+        self.assertIsNone(item["cid"])
+        page = rep.render(report)
+        self.assertNotIn("comment 19", page)
+        self.assertNotIn('chip">comment', page)
+        self.assertIn("needs-person:bus_inject:19", page)
+
+    def test_failed_notification_does_not_swallow_the_real_item(self):
+        """P1-A-2: a real ``#19 comment 19`` entry stays visible next to it."""
+        key = "o/d#19"
+        self.write_index({"version": 1, "meta": {}, "assignments": {},
+                          "issues": {key: {"needs_person": [
+                              {"comment_id": 19, "reason": "real item on 19"}]}}})
+        self.begin_uncertain("needs-person:bus_inject:19", verb="bus_inject",
+                             input_ref="19", issue=19, reason="bus down")
+        report = rep.collect(Engine(self.cfg, self.store, NullSource()))
+        self.assertEqual(len(report["items"]), 2)
+        page = rep.render(report)
+        self.assertIn("bus down", page)
+        self.assertIn("real item on 19", page)
+
+    def test_two_failed_notifications_both_visible(self):
+        """P1-A-3: two notifications for one issue, same ``input_ref``, two rows.
+
+        Both have no cid, so they share a locator... except the store gives each
+        attempt its own ``#<n>`` key. Different reasons keep them apart even if
+        that changed, and the merge counter is rendered either way.
+        """
+        self.write_index(self.index_with([]))
+        self.begin_uncertain("needs-person:bus_inject:19", verb="bus_inject",
+                             input_ref="19", issue=19, reason="bus down")
+        self.begin_uncertain("needs-person:bus_inject:19", verb="bus_inject",
+                             input_ref="19", issue=19, reason="bus still down")
+        report = rep.collect(Engine(self.cfg, self.store, NullSource()))
+        page = rep.render(report)
+        self.assertIn("bus down", page)
+        self.assertIn("bus still down", page)
+
+    def test_zero_input_ref_is_not_a_comment_id(self):
+        """P1-B(1): ``"0"`` is not a valid comment id, so two actions stay two."""
+        self.write_index(self.index_with([]))
+        self.begin_uncertain("a-one", verb="archive", input_ref="0",
+                             assignment_id="asg_7_worker_1")
+        self.begin_uncertain("a-two", verb="archive", input_ref="00",
+                             assignment_id="asg_7_worker_1")
+        report = rep.collect(Engine(self.cfg, self.store, NullSource()))
+        self.assertEqual(len(report["items"]), 2)
+        self.assertTrue(all(it["cid"] is None for it in report["items"]))
+
+    def test_two_verbs_on_one_delivery_are_two_rows(self):
+        """P1-B(2): ``archive:55`` and ``bus_inject:55`` are different calls."""
+        self.write_index(self.index_with([]))
+        self.begin_uncertain("a-archive", verb="archive", input_ref="55",
+                             assignment_id="asg_7_worker_1",
+                             reason="archive timed out")
+        self.begin_uncertain("a-inject", verb="bus_inject", input_ref="55",
+                             assignment_id="asg_7_worker_1",
+                             reason="bus_inject timed out")
+        report = rep.collect(Engine(self.cfg, self.store, NullSource()))
+        self.assertEqual(len(report["items"]), 2)
+        page = rep.render(report)
+        self.assertIn("bus_inject timed out", page)
+        self.assertIn("archive timed out", page)
+
+    def test_duplicate_count_is_rendered(self):
+        """P1-B(3): a merged repeat must leave a visible trace."""
+        item = rep._item(rep.CATEGORY_ROLE, "outbox", key="7", cid=None,
+                         at="2026-01-01T00:00:00+00:00", reason="same reason",
+                         locator="a-action", extra={"verb": "archive"})
+        same = rep._item(rep.CATEGORY_ROLE, "outbox", key="7", cid=None,
+                         at="2026-01-01T00:00:10+00:00", reason="same reason",
+                         locator="a-action", extra={"verb": "archive"})
+        items = rep._dedupe([item, same])
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["repeats"], 1)
+        page = rep.render({"status": "action", "counts": {rep.CATEGORY_ROLE: 1},
+                           "items": items, "role": "supervisor", "at": "now",
+                           "state_dir": "/x", "sources": {}, "projects": [],
+                           "engine": {}, "storage": {},
+                           "unknown_reasons": [], "warnings": [],
+                           "quotes_missing": 0})
+        self.assertIn("另 1 条相同记录", page)
+
+    def test_same_row_read_twice_with_a_second_of_drift_is_one_row(self):
+        """P2-1: ``at`` is not part of the identity."""
+        self.write_index(self.index_with([
+            {"reason": "stable row", "at": "2026-01-01T00:00:00+00:00"},
+            {"reason": "stable row", "at": "2026-01-01T00:00:01+00:00"},
+        ]))
+        report = rep.collect(Engine(self.cfg, self.store, NullSource()))
+        self.assertEqual(len(report["items"]), 1)
+        self.assertEqual(report["items"][0]["repeats"], 1)
+        self.assertIn("另 1 条相同记录", rep.render(report))
 
     def test_display_keeps_the_raw_key(self):
         index = self.index_with([{"comment_id": 11, "reason": "x"}], key="7")

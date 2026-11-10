@@ -458,7 +458,7 @@ def _outbox_items(probe: dict) -> list[dict]:
         key = "" if issue is None else str(issue)
         out.append(_item(category, "outbox", key=key,
                          cid=(rec.get("comment_id")
-                              or _cid_from_input_ref(rec.get("input_ref"))),
+                              or _cid_from_input_ref(rec)),
                          at=rec.get("updated_at"),
                          reason=rec.get("reason") or status, locator=aid,
                          extra={"status": status, "verb": rec.get("verb"),
@@ -466,47 +466,110 @@ def _outbox_items(probe: dict) -> list[dict]:
     return out
 
 
-def _cid_from_input_ref(input_ref):
-    """The delivery id an action was run for, when ``input_ref`` is just a number.
+def _cid_from_input_ref(rec: dict):
+    """The comment id a *dispatch* was made for, or ``None``.
 
-    ``engine`` writes ``input_ref=str(delivery)`` for an archive, but
-    ``Store._transition`` does not persist ``comment_id`` for
-    ``mark_uncertain``/``mark_reconciled``, so on the failure path the outbox
-    record has the id only here. Parsing it is what lets the outbox row and the
-    assignment row (which *does* carry ``tombstone.cid``) be recognised as one
-    item instead of being reported twice.
+    ``input_ref`` carries a different thing per action kind - this is the field
+    whose overloading produced the phantom ``comment 19`` chip:
 
-    Anything that is not a bare number returns ``None`` and the row keeps its
-    own identity: ``"inject:3"`` and friends must never be coerced.
+    ==================  ==========================  ====================
+    kind                ``input_ref`` means        has ``assignment_id``
+    ==================  ==========================  ====================
+    ``archive``         the delivery (= comment)    yes
+    ``waiting_review``  the delivery (= comment)    yes
+    ``needs_person``    the **issue number**        no
+    ``route``           a comment id                no
+    ==================  ==========================  ====================
+
+    Only the first two are served here, and the gate is structural rather than
+    a list of names: ``engine`` always attaches an ``assignment_id`` when it
+    dispatches for an assignment, and the ``needs_person`` notification
+    (``engine.py:1522``) never does. So "no assignment" means "``input_ref`` is
+    not a delivery id". Reading it as one would invent a comment that does not
+    exist and, worse, collide with a real entry for that number.
+
+    The engine's own defect - the needs_person dispatch not passing
+    ``input_ref`` at all - is out of scope for this ticket; this gate is what
+    keeps the reporter honest until it is fixed.
+
+    A value that is not a positive integer returns ``None``: a comment id is
+    never 0, so ``"0"`` and ``"00"`` must not become one shared identity.
     """
-    number = needs_mod.cid_of(input_ref)
-    return number if number is not None and number >= 0 else None
+    if not isinstance(rec, dict) or not rec.get("assignment_id"):
+        return None
+    number = needs_mod.cid_of(rec.get("input_ref"))
+    return number if number is not None and number > 0 else None
+
+
+def _adopt_verbs(items: list[dict], repos_for: dict | None = None) -> None:
+    """Give verb-less rows the verb of the single outbox row they describe.
+
+    The signature includes ``verb`` (two calls on one delivery are two events),
+    but an index row and an assignment row do not carry a verb: only the outbox
+    knows whether the blocked call was ``archive`` or ``bus_inject``. When
+    exactly one outbox row covers that ``(thread, comment)`` the attribution is
+    unambiguous, so the other rows adopt it and the three views collapse into
+    one item - which is the whole point of having them.
+
+    ``repos_for`` resolves a bare key the same way :func:`_signature` does, so a
+    row keyed ``"7"`` can still match a row keyed ``owner/demo#7``.
+
+    With several candidate verbs nothing is adopted: guessing which call failed
+    is how the wrong failure gets shown under the right name.
+    """
+    verbs: dict = {}
+    for item in items:
+        if item["source"] != "outbox" or item.get("cid") is None:
+            continue
+        verb = str((item.get("extra") or {}).get("verb") or "")
+        if verb:
+            verbs.setdefault(_delivery_key(item, repos_for), set()).add(verb)
+    for item in items:
+        if str((item.get("extra") or {}).get("verb") or ""):
+            continue
+        if item.get("cid") is None:
+            continue
+        owners = verbs.get(_delivery_key(item, repos_for)) or set()
+        if len(owners) == 1:
+            item.setdefault("extra", {})["verb"] = next(iter(owners))
+
+
+def _delivery_key(item: dict, repos_for: dict | None = None):
+    repo, number = issuekey.split_key(item.get("key"))
+    if not repo and number is not None and repos_for:
+        owner = repos_for.get(number) or set()
+        if len(owner) == 1:
+            repo = next(iter(owner))
+    return (repo or "", number, item.get("cid"))
 
 
 def _signature(item: dict, repos_for: dict | None = None):
     """Dedupe identity of one item.
 
-    Four rules, and the order matters:
+    Five rules, and the order matters:
 
-    1. **No comment id -> its own row, keyed by locator AND content.** A bare
-       locator is not enough: two ``needs_person`` rows under one issue key with
-       no comment id share it, and keying on the locator alone dropped the
-       second one silently. ``reason``/``at`` separate them, so a genuine
-       re-read of the same row still merges.
-    2. **A comment id -> ``(thread, cid)``.** The thread is the repository *and*
-       the number (``issuekey`` exists because the same number in two repos is
-       two threads); merging across repos would be a data loss, not a
-       normalisation.
+    1. **No comment id -> its own row, keyed by locator, reason and verb.** A
+       bare locator is not enough: two ``needs_person`` rows under one issue key
+       with no comment id share it, and keying on the locator alone dropped the
+       second one silently. ``at`` is deliberately **not** part of the key - two
+       reads of the same row differ by a second and would then never merge;
+       ``reason`` and ``verb`` are the stable content.
+    2. **A comment id -> ``(thread, cid, verb)``.** The thread is the repository
+       *and* the number (``issuekey`` exists because the same number in two
+       repos is two threads). ``verb`` belongs in the key for the same reason
+       ``store.action_id`` includes it: ``archive:55`` and ``bus_inject:55`` are
+       two different calls on one delivery, and merging them made the second
+       one's failure invisible.
     3. **A bare number matches at most one repository.** ``"7"`` and
        ``owner/demo#7`` are one row only when ``7`` resolves to a single repo in
        this page. With two repos holding issue 7 the bare key is ambiguous and
        stays separate - guessing would silently attach a row to the wrong thread.
     """
     locator = str(item.get("locator") or "")
+    verb = str((item.get("extra") or {}).get("verb") or "")
     cid = item.get("cid")
     if cid is None:
-        return ("id", locator, str(item.get("reason") or ""),
-                str(item.get("at") or ""))
+        return ("id", locator, str(item.get("reason") or ""), verb)
     repo, number = issuekey.split_key(item.get("key"))
     if number is None and isinstance(item.get("number"), int):
         number = item.get("number")
@@ -514,7 +577,7 @@ def _signature(item: dict, repos_for: dict | None = None):
         owner = repos_for.get(number) or set()
         if len(owner) == 1:
             repo = next(iter(owner))
-    return ("issue", repo or "", number, int(cid))
+    return ("issue", repo or "", number, int(cid), verb)
 
 
 def _dedupe(items: list[dict]) -> list[dict]:
@@ -531,6 +594,7 @@ def _dedupe(items: list[dict]) -> list[dict]:
         repo, number = issuekey.split_key(item.get("key"))
         if repo and number is not None:
             repos_for.setdefault(number, set()).add(repo)
+    _adopt_verbs(items, repos_for)
     out, seen = [], {}
     for item in items:
         sig = _signature(item, repos_for)
@@ -799,8 +863,16 @@ def _render_item(item: dict) -> list[str]:
         facts.append(f"<dt>记录</dt><dd>{_esc(detail)}</dd>")
     facts.append(f"<dt>详情</dt><dd><code>{_esc(item.get('detail') or '-')}</code></dd>")
     facts.append("</dl>")
-    return ['<li class="item">',
-            '<p class="item-head">' + "".join(head) + "</p>"] + facts + ["</li>"]
+    out = ['<li class="item">',
+           '<p class="item-head">' + "".join(head) + "</p>"] + facts
+    repeats = int(item.get("repeats") or 0)
+    if repeats:
+        # A count that only lives in the dict is the same silent loss as
+        # dropping the row: the page has to say the others are there.
+        out.append(f'<p class="muted">另 {repeats} 条相同记录'
+                   f'（同一来源、同一内容；已合并显示）</p>')
+    out.append("</li>")
+    return out
 
 
 def _health_line(engine_state: dict) -> str:
