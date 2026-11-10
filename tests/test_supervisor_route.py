@@ -30,7 +30,10 @@ from super_agent.engine import Engine
 from super_agent.store import Store, action_id
 
 THREAD = "owner/demo#1"
-PASS_BODY = "[QA] 通过（P0=0，可关单）"
+# The structured marker is the only thing that says "nothing is left"; without
+# it the answer is the safe side (work remains) and no release is announced.
+PASS_BODY = "[QA] 通过（P0=0，可关单） <!-- fix_needed: false -->"
+PASS_UNMARKED = "[QA] 通过（P0=0，可关单）"
 REJECT_BODY = "[QA] 退回改（2 条 P0）"
 
 GOOD = {
@@ -198,10 +201,21 @@ class ShippableVerdictReachesTheSupervisor(Base):
         self.assertEqual(self.bus.payloads("event.agent.supervisor"), [])
 
     def test_a_pass_with_a_must_fix_stays_with_the_pm(self):
+        # No marker, so the safe side: the line reads like a conditional pass
+        # and is treated exactly like one that does not.
         engine = self.engine()
         self.deliver_and_pass(engine, body="[QA] 有条件通过（1 条 P1 必须修）")
         self.assertEqual(len(self.bus.payloads("event.agent.project_pm")), 1)
         self.assertEqual(self.bus.payloads("event.agent.supervisor"), [])
+
+    def test_an_unmarked_pass_is_not_announced(self):
+        # The failure this change removes: a plain pass line with no marker used
+        # to be read as "nothing to fix" from its wording alone.
+        engine = self.engine()
+        self.deliver_and_pass(engine, body=PASS_UNMARKED)
+        self.assertEqual(len(self.bus.payloads("event.agent.project_pm")), 1)
+        self.assertEqual(self.bus.payloads("event.agent.supervisor"), [])
+        self.assertFalse(self.index(engine).get("supervisor_routes") or {})
 
 
 class SupervisorRecordsHaveTheirOwnTable(Base):
@@ -306,31 +320,38 @@ class DecidedBeforeThePmEarlyReturn(Base):
         self.assertEqual(engine._retry_supervisor_routes(index), 0)
 
 
-class PartialFixNeverReachesTheSupervisor(Base):
-    """The end-to-end shape of P0-1: a partial fix must not send "ready to close".
+class UnmarkedReviewSendsNothing(Base):
+    """No marker means "work is left", so a release is never announced.
 
-    ``markers`` answers the parsing question and ``test_markers`` pins it. This
-    class pins the consequence: with a partial-fix verdict the supervisor gets
-    **no** event, because the message it would receive says "P0=0, no must-fix
-    items" and there is nothing in it the reader could use to notice the lie.
+    Every wording shape the earlier revisions tried to decide from is kept
+    here: they are still real review lines, and each one used to reach the
+    supervisor with a "【可关单】" line while work was pending. The answer no
+    longer depends on how they read - none of them carries the marker, so none
+    of them is announced. That is the whole point of the change, and it is the
+    one property a wording table could never hold.
     """
 
-    PARTIAL = (
+    UNMARKED = (
+        # The shapes that made the bit exist in the first place.
+        "通过（P0=0，可关单）",
+        "结论：通过；无需修改",
+        "结论：通过；无需修复",
+        "结论：通过；P1 已修，无需修改",
+        "通过；无须再修",
+        "通过，不必修",
+        "通过；无需再修",
+        "通过；必须修项为0",
+        "通过；没有必须修的项",
+        "结论：通过；必须修的 P1 已在本轮修完",
+        # Counted requirements, partial fixes, all-done phrases.
+        "有条件通过（1 条 P1 必须修，其余可随下轮）",
         "有条件通过（2 条必须修，已修 1 条）",
         "必须修 2 条，已修 1 条",
         "必须修 3 条（已修 0 条）",
         "必须修（未修完）",
-        "通过；必须修；尚未全部修完",
-        # The three shapes the third round added: no measure word, no separator,
-        # and a bracketed total. Each used to read the total as the fixed count.
-        "必须修 2 条，已修 1",
-        "必须修2条已修1条",
-        "必须修（2 条），已修 1",
-        "两条必须修，已修一条",
-        "必须修 3 条（已完成 1 条，2 条待办）",
-        # Round 4: the negation family that two disagreeing character tables
-        # let through end-to-end. Each of these reached the supervisor with a
-        # "【可关单】" line while work was still pending.
+        "通过；必须修的 2 条已全部修完",
+        # The negation family: each of these reached the supervisor while work
+        # was still pending, under two character tables that disagreed.
         "必须修 2 条，并非全部修完",
         "必须修 2 条，非全部修完",
         "必须修 2 条，非全部修复",
@@ -339,10 +360,20 @@ class PartialFixNeverReachesTheSupervisor(Base):
         "必须修，尚全部修完",
         "必须修，没全部修完",
         "必须修 3 条，已全部修完 2 条",
+        # The shapes that killed the wording layer outright: the phrase is not
+        # wrong, its subject is a different batch. No regex answers "which
+        # batch", which is why the answer is now written down instead of read.
+        "有条件通过（必须修 2 条，P2 的 5 条已全部修完）",
+        "有条件通过（必须修 2 条，其余 P2 已全部修完）",
+        "有条件通过（必须修 2 条，上一轮的 P1 已全部修完）",
+        "有条件通过（必须修 2 条，其他都已全部修完）",
+        "有条件通过（必须修，P2 的 5 条已全部修完）",
+        "有条件通过（必须修，其余已全部修完）",
+        "有条件通过（必须修 2 条，已全部修完大部分）",
     )
 
-    def test_a_partial_fix_sends_nothing_to_the_supervisor(self):
-        for body in self.PARTIAL:
+    def test_an_unmarked_review_sends_nothing_to_the_supervisor(self):
+        for body in self.UNMARKED:
             with self.subTest(body=body):
                 self.fresh()
                 engine = self.engine()
@@ -355,28 +386,61 @@ class PartialFixNeverReachesTheSupervisor(Base):
                 self.assertFalse(
                     (index.get("supervisor_routes") or {}), body)
 
-    def test_a_negated_all_done_claim_reaches_no_one_but_the_pm(self):
-        """Round 4, end to end: the negation family, through ``run_once``.
-
-        ``markers`` answering correctly is necessary and not sufficient - the
-        consequence is what P0 named. These four are the shapes QA reproduced
-        as a real "【可关单】" line for the supervisor.
-        """
-        shapes = ("必须修 2 条，并非全部修完",
-                  "必须修 2 条，非全部修复",
-                  "必须修，未均已修完",
-                  "必须修 3 条，已全部修完 2 条")
-        for body in shapes:
+    def test_a_marker_that_does_not_parse_is_an_absent_marker(self):
+        for body in ("通过（P0=0） <!-- fix_need: false -->",
+                     "通过（P0=0） <!-- fix_needed= false -->",
+                     "通过（P0=0） <!-- fix_needed: ture -->",
+                     "通过（P0=0） <!-- FIX_NEEDED= FALSE -->"):
             with self.subTest(body=body):
                 self.fresh()
                 engine = self.engine()
-                self.deliver_and_pass(engine, body="[QA] 有条件通过（" + body + "）")
+                self.deliver_and_pass(engine, body="[QA] " + body)
                 self.assertEqual(
                     self.bus.payloads("event.agent.supervisor"), [], body)
                 self.assertEqual(
                     len(self.bus.payloads("event.agent.project_pm")), 1, body)
-                self.assertFalse(
-                    (self.index(engine).get("supervisor_routes") or {}), body)
+
+    def test_two_markers_that_disagree_send_nothing(self):
+        # The line does not say one thing; the safe side is "work is left".
+        self.fresh()
+        engine = self.engine()
+        self.deliver_and_pass(
+            engine,
+            body="[QA] 通过 <!-- fix_needed: true --> <!-- fix_needed: false -->")
+        self.assertEqual(self.bus.payloads("event.agent.supervisor"), [])
+        self.assertEqual(len(self.bus.payloads("event.agent.project_pm")), 1)
+
+
+class TheMarkerIsTheOnlyWayToAnnounce(Base):
+    """The positive direction: only a readable ``fix_needed: false`` announces."""
+
+    def test_the_marker_with_false_announces_the_release(self):
+        self.fresh()
+        engine = self.engine()
+        self.deliver_and_pass(engine)
+        payloads = self.bus.payloads("event.agent.supervisor")
+        self.assertEqual(len(payloads), 1)
+        self.assertFalse(payloads[0]["fix_needed"])
+        self.assertEqual(payloads[0]["verdict"], "pass")
+
+    def test_the_marker_with_true_sends_nothing(self):
+        self.fresh()
+        engine = self.engine()
+        self.deliver_and_pass(
+            engine, body="[QA] 通过（P0=0） <!-- fix_needed: true -->")
+        self.assertEqual(self.bus.payloads("event.agent.supervisor"), [])
+        self.assertEqual(len(self.bus.payloads("event.agent.project_pm")), 1)
+
+    def test_a_marked_reject_still_sends_nothing(self):
+        # ``fix_needed: false`` says "no work left", not "the verdict is pass";
+        # the supervisor is still told only about a release.
+        self.fresh()
+        engine = self.engine()
+        self.deliver_and_pass(
+            engine, body="[QA] 退回改（2 条 P0） <!-- fix_needed: false -->")
+        self.assertEqual(self.bus.payloads("event.agent.supervisor"), [])
+        self.assertEqual(len(self.bus.payloads("event.agent.project_pm")), 1)
+
 
 
 class ReleaseTimeout(Base):

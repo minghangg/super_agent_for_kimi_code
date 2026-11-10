@@ -1,4 +1,4 @@
-"""Delivery marker parsing and the triage order it depends on.
+"""Delivery marker parsing, the triage order it depends on, and the fix marker.
 
 ``gh_issue.py`` prefixes a worker comment with ``[WK:<worker-name>]``. Three
 things must hold:
@@ -8,6 +8,12 @@ things must hold:
 * the delivery judgement comes **before** role-author noise, otherwise a
   worker whose role is configured has its own delivery ignored;
 * a comment without a marker keeps the historical behaviour byte for byte.
+
+The ``fix_needed`` bit is **not** read from prose: it is the structured marker
+``<!-- fix_needed: true|false -->`` on the first line, and its absence means
+"work is left" - the safe side. Four earlier revisions tried to infer it from
+the wording and each inference layer produced false "ready to close" lines;
+those tables and functions are gone, so the tests for them are gone too.
 
 Run: ``python -m pytest tests/test_markers.py -q``
 """
@@ -152,106 +158,36 @@ class ReviewParsing(unittest.TestCase):
         self.assertIsNone(markers.parse_review("plain remark"))
 
 
-class MustFixParsing(unittest.TestCase):
-    """The ``fix_needed`` bit, against the 28 first lines the workbench produces.
+class FixTokenParsing(unittest.TestCase):
+    """``fix_needed`` comes from the marker, never from the wording.
 
-    The assertion that matters is the pair ``(verdict, fix_needed)``: a pass
-    that still demands work must not reach the supervisor, and a pass that says
-    "nothing to fix" must. The five hard cases are named one by one so a
-    regression points at the exact shape instead of a table index.
+    The table is ``(first line after the [QA] prefix, fix_needed,
+    fix_structured)``. ``fix_structured`` is the difference between "the QA
+    said so" and "nobody said anything, so we assume the safe side" - it is
+    what a caller would use to ask a person to add the marker.
     """
 
-    # ``(first line without the [QA] prefix, verdict, fix_needed)``
     SHAPES = [
-        ("结论：通过；无需修改", "pass", False),
-        ("结论：通过；无需修复", "pass", False),
-        ("结论：通过；P1 已修，无需修改", "pass", False),
-        ("有条件通过（1 条 P1 必须修，其余可随下轮）", "pass", True),
-        ("未修复项为 P3", "", False),
-        ("结论：通过；尚未修复的 P2 可随下轮", "pass", False),
-        ("P2 待修可随下轮", "", False),
-        ("通过（P0=0，可关单）", "pass", False),
-        ("#24 独立复核：**通过**（P0=0 / P1=3 / P2=2）", "pass", False),
-        ("结论：通过；必须修的 P1 已在本轮修完", "pass", False),
-        ("退回改（2 条 P0）", "reject", False),
-        ("## A. P1 是否修好", "", False),
-        ("**通过**（P0=0 / P1=1 必须修）", "pass", True),
-        ("结论：有条件通过（1 条 P1 必须修）", "pass", True),
-        ("通过；无须再修", "pass", False),
-        ("通过，不必修", "pass", False),
-        ("通过；必须修项为0", "pass", False),
-        ("通过；没有必须修的项", "pass", False),
-        ("通过；无需再修", "pass", False),
-        ("有条件通过（P1 需修）", "pass", True),
-        ("结论：通过；仍需修的 P1 见正文", "pass", True),
-        ("有条件通过（1 条 P1 仍须修）", "pass", True),
-        ("通过（P0=0 / P1=0 / P2=1）", "pass", False),
-        ("#47 第二轮复核：**通过**（P0=0 / P1=0）", "pass", False),
-        ("## 开发轮独立测试（ISS-47）", "", False),
-        ("## ISS-53 方案轮复核（零代码改动轮）", "", False),
-        ("通过；P2 未修好但不阻塞", "pass", False),
-        ("方案复核：有条件通过——P1 必须修", "pass", True),
-        # A partial fix is still a fix. Every line here writes a requirement
-        # and a completion word in the same clause; reading the completion
-        # word as "nothing left" sends a false "ready to close", which is the
-        # one direction this bit must never take.
-        ("有条件通过（2 条必须修，已修 1 条）", "pass", True),
-        ("必须修的 P0-1 已修，P0-2 未修", "", True),
-        ("通过；必须修；尚未全部修完", "pass", True),
-        ("必须修 2 条，已修 1 条", "", True),
-        ("必须修，其中 1 条已修", "", True),
-        ("必须修 3 条（已修 0 条）", "", True),
-        ("必须修（未修完）", "", True),
-        ("必须修 2 条，其中 1 条已修", "", True),
-        ("通过；2 条必须修，0 条已修", "pass", True),
-        # The count relation has to survive the shapes a review actually writes:
-        # with no measure word, with no punctuation between the two counts, with
-        # a bracketed total, with a Chinese numeral, and with ``处`` instead of
-        # ``条``. Every one of these used to fall through to "a completion word
-        # is visible, so nothing is left".
-        ("必须修 2 条，已修 1", "", True),
-        ("必须修2条已修1条", "", True),
-        ("必须修 2 条 已修 1 条", "", True),
-        ("两条必须修，已修一条", "", True),
-        ("必须修（2 条），已修 1", "", True),
-        ("必须修 2 条，已完成 1 条", "", True),
-        ("必须修 3 条（已完成 1 条，2 条待办）", "", True),
-        ("必须修改 2 处，已修 1 处", "", True),
-        ("必须修 2 条 / 已修 1 条", "", True),
-        # The safe side of the same relation must stay settled: all of them
-        # fixed, and more fixed than required.
-        ("必须修 2 条，已修 2 条", "", False),
-        ("必须修 1 条，已修 3 条", "", False),
-        # A counted requirement with no fixed count is pending - unless the line
-        # says *all* of it is done, which is a statement about the total.
-        ("通过；必须修的 2 条已全部修完", "pass", False),
-        ("通过；必须修 2 条，尚未全部修完", "pass", True),
-        # The negation family QA found in round 4: every one of these was a
-        # false "ready to close" while two character tables (``SINGLE_NEG`` /
-        # ``ALL_NEGATIONS``) disagreed by ``无/免/勿/非``. One table now answers
-        # for all of them, so this list is a regression net rather than the
-        # mechanism.
-        ("必须修 2 条，并非全部修完", "", True),
-        ("必须修 2 条，非全部修完", "", True),
-        ("必须修 2 条，非全部修复", "", True),
-        ("必须修 2 条，并非全部完成", "", True),
-        ("必须修 2 条，未全部修复", "", True),
-        ("必须修 2 条，尚未全部修复", "", True),
-        ("必须修 2 条，没有全部修复", "", True),
-        ("必须修 2 条，不全部修完", "", True),
-        ("必须修，未均已修完", "", True),
-        ("必须修，尚全部修完", "", True),
-        ("必须修，没全部修完", "", True),
-        ("必须修 2 条，无全部修复", "", True),
-        ("必须修 2 条，勿全部修复", "", True),
-        ("必须修 2 条，全部修复了吗", "", True),
-        # An "all done" phrase never outvotes the count the sentence states
-        # about itself: "all 2 done" with 3 required has one left. Neither does
-        # a phrase that admits it covers a part, or one that names a remainder.
-        ("必须修 3 条，已全部修完 2 条", "", True),
-        ("必须修 2 条，已全部修完 1 条", "", True),
-        ("必须修 2 条，已全部修完，另 1 条另说", "", True),
-        ("必须修 2 条，全部修完了一半", "", True),
+        ("通过  <!-- fix_needed: false -->", False, True),
+        ("通过  <!-- fix_needed: true -->", True, True),
+        ("有条件通过（1 条 P1 必须修）<!-- fix_needed: true -->", True, True),
+        ("通过 <!--fix_needed:false-->", False, True),
+        ("通过 <!-- FIX_NEEDED: FALSE -->", False, True),
+        ("通过 <!-- fix_needed: True -->", True, True),
+        # No marker at all: the safe side, and not structured.
+        ("通过（P0=0，可关单）", True, False),
+        ("有条件通过（1 条 P1 必须修）", True, False),
+        ("通过；无需修改", True, False),
+        ("通过；已全部修完", True, False),
+        # A marker that does not parse is an absent marker, never a guess.
+        ("通过 <!-- fix_need: false -->", True, False),
+        ("通过 <!-- fix_needed= false -->", True, False),
+        ("通过 <!-- fix_needed: ture -->", True, False),
+        ("通过 <!-- fix_needed: 0 -->", True, False),
+        ("通过 <!-- FIX_NEEDED= FALSE -->", True, False),
+        # Two markers that disagree: the safe side, and not structured.
+        ("通过 <!-- fix_needed: true --> <!-- fix_needed: false -->",
+         True, False),
     ]
 
     def review(self, text):
@@ -259,191 +195,72 @@ class MustFixParsing(unittest.TestCase):
         self.assertIsNotNone(out, text)
         return out
 
-    def assertShape(self, text, verdict, fix_needed):
-        out = self.review(text)
-        self.assertEqual(out["verdict"], verdict, text)
-        self.assertEqual(out["fix_needed"], fix_needed, text)
-        self.assertEqual(bool(out["fix_matched"]), fix_needed, text)
-
     def test_every_shape_in_the_table(self):
-        for text, verdict, fix_needed in self.SHAPES:
-            with self.subTest(text=text):
-                self.assertShape(text, verdict, fix_needed)
-
-    def test_hard_1_no_need_to_modify(self):
-        self.assertShape("结论：通过；无需修改", "pass", False)
-
-    def test_hard_2_no_need_to_fix(self):
-        self.assertShape("结论：通过；无需修复", "pass", False)
-
-    def test_hard_3_already_fixed_and_nothing_left(self):
-        self.assertShape("结论：通过；P1 已修，无需修改", "pass", False)
-
-    def test_hard_4_conditional_pass_with_a_must_fix(self):
-        self.assertShape("有条件通过（1 条 P1 必须修，其余可随下轮）", "pass", True)
-
-    def test_hard_5_state_word_is_not_a_requirement(self):
-        # The word table deliberately holds no state words (``未修复``/``待修``):
-        # "P3 is unfixed" is not "the release must wait".
-        self.assertShape("未修复项为 P3", "", False)
-
-    def test_hard_6_partial_fix_is_still_a_fix(self):
-        # The completion guard used to read "a completion word within 12
-        # characters" as "nothing left". A review that states its own
-        # arithmetic - "2 required, 1 fixed" - then produced a false
-        # "ready to close". Completion is a count relation, not a distance.
-        for text in ("有条件通过（2 条必须修，已修 1 条）",
-                     "必须修的 P0-1 已修，P0-2 未修",
-                     "通过；必须修；尚未全部修完",
-                     "必须修 2 条，已修 1 条",
-                     "必须修，其中 1 条已修",
-                     "必须修 3 条（已修 0 条）",
-                     "必须修（未修完）",
-                     "必须修 2 条，其中 1 条已修",
-                     "必须修 2 条，已修 1",
-                     "必须修2条已修1条",
-                     "必须修 2 条 已修 1 条",
-                     "两条必须修，已修一条",
-                     "必须修（2 条），已修 1",
-                     "必须修 2 条，已完成 1 条",
-                     "必须修 3 条（已完成 1 条，2 条待办）",
-                     "必须修改 2 处，已修 1 处",
-                     "必须修 2 条 / 已修 1 条"):
-            with self.subTest(text=text):
-                out = self.review(text)
-                self.assertTrue(out["fix_needed"], text)
-                self.assertEqual(out["fix_matched"], "必须修", text)
-
-    def test_hard_7_a_counted_requirement_needs_a_count_relation(self):
-        # "2 required, 2 fixed" and "1 required, 3 fixed" are the safe side of
-        # the same arithmetic; a fix that only ever answers True would pass the
-        # partial cases above and fail these.
-        for text in ("必须修 2 条，已修 2 条",
-                     "必须修 1 条，已修 3 条",
-                     "必须修 2 条（已修 2 条）"):
-            with self.subTest(text=text):
-                self.assertFalse(self.review(text)["fix_needed"], text)
-
-    def test_hard_8_no_count_relation_is_a_remainder_not_a_completion(self):
-        # A total with no fixed count says how much is left, not that it is
-        # done. Only an explicit "all of it" claim settles the total, and its
-        # negation has to win over it.
-        self.assertTrue(self.review("必须修 2 条，已修完")["fix_needed"])
-        self.assertTrue(
-            self.review("通过；必须修 2 条，尚未全部修完")["fix_needed"])
-        # ``未修复`` is not a substring of ``未全部修复``, so the "all" claim
-        # needs its own negation window rather than an entry in the word list.
-        for text in ("通过；必须修 2 条，尚未全部修复",
-                     "通过；必须修 2 条，未全部修复",
-                     "通过；必须修 2 条，没有全部修复"):
-            with self.subTest(text=text):
-                self.assertTrue(self.review(text)["fix_needed"], text)
-        self.assertFalse(
-            self.review("通过；必须修的 2 条已全部修完")["fix_needed"])
-
-    def test_hard_9_the_generative_sweep(self):
-        """Requirement words x separators x completion words x measure words.
-
-        The point is the **ratio**, not any single line: every combination that
-        states "N required, M fixed" with ``N > M`` must answer
-        ``fix_needed``, and every one with ``N <= M`` must not. A point fix
-        passes the named shapes and still leaks here.
-
-        Violations are collected and asserted once. A ``subTest`` per line made
-        this one test the source of 99% of the suite's subtest count (16800 of
-        17005), which left that number unable to show anything about the rest
-        of the suite; the coverage is identical either way. ``\\n`` is not a
-        separator: :func:`markers.parse_review` reads ``first_line()`` only, so
-        anything after a newline is outside the review by construction.
-        """
-        requirements = ("必须修", "仍需修", "仍须修", "需要修", "须修", "需修",
-                        "还需要修")
-        separators = ("，", " ", "/", "；", "、")
-        completions = ("已修", "已修完", "已完成", "已处理", "已补", "已改")
-        measures = ("条", "处", "项", "")
         violations = []
-        checked = 0
-        for req in requirements:
-            for sep in separators:
-                for done in completions:
-                    for measure in measures:
-                        for required in range(1, 5):
-                            for fixed in range(0, 5):
-                                text = (f"{req} {required} {measure}{sep}"
-                                        f"{done} {fixed} {measure}")
-                                want = required > fixed
-                                got = self.review(text)["fix_needed"]
-                                if got != want:
-                                    violations.append((text, want, got))
-                                checked += 1
-        self.assertEqual(violations, [], f"{len(violations)} of {checked}")
-        self.assertGreaterEqual(checked, 500)
+        for text, want, want_structured in self.SHAPES:
+            out = self.review(text)
+            if (out["fix_needed"], out["fix_structured"]) != (want,
+                                                             want_structured):
+                violations.append((text, want, want_structured,
+                                   out["fix_needed"], out["fix_structured"]))
+        self.assertEqual(violations, [])
 
-    def test_hard_11_the_negation_family_is_one_table(self):
-        """No negation form may make a requirement look settled.
+    def test_two_agreeing_markers_are_readable(self):
+        out = self.review("通过 <!-- fix_needed: false --> <!-- "
+                          "fix_needed: false -->")
+        self.assertFalse(out["fix_needed"])
+        self.assertTrue(out["fix_structured"])
 
-        The previous revision spread "negation" over three tables and the
-        difference between two of them (``无/免/勿/非``) produced every false
-        "ready to close" QA found. This sweep is deliberately wider than the
-        named shapes: every all-done phrase, every negation prefix and every
-        completion word, in both the counted and the uncounted form.
-        """
-        prefixes = ("未", "尚", "没", "不", "否", "无", "免", "勿", "非",
-                    "并未", "并非", "从未", "尚无", "没有", "不都")
-        violations = []
-        checked = 0
-        for word in markers.ALL_WORDS:
-            for prefix in prefixes:
-                for text in (f"必须修 2 条，{prefix}{word}",
-                             f"必须修，{prefix}{markers.DONE_WORDS[0]}"):
-                    checked += 1
-                    if not self.review(text)["fix_needed"]:
-                        violations.append(text)
-        self.assertEqual(violations, [], f"{len(violations)} of {checked}")
+    def test_the_matched_text_is_the_marker_itself(self):
+        # ``fix_matched`` is for the event log: it must be the marker as
+        # written, not an inferred word.
+        out = self.review("通过 <!-- fix_needed: false -->")
+        self.assertEqual(out["fix_matched"], "fix_needed: false")
+        self.assertEqual(self.review("通过")["fix_matched"], "")
 
-    def test_hard_12_the_two_old_tables_are_aliases_of_one(self):
-        # The failure mode was two tables drifting apart, so the alias itself
-        # is the property: a character missing from one is missing from all.
-        self.assertEqual(markers.SINGLE_NEG, markers.NEGATION_CHARS)
-        self.assertEqual(markers.ALL_NEGATIONS, markers.NEGATION_CHARS)
-        self.assertEqual(set("无不免勿非") - set(markers.NEGATION_CHARS), set())
-        self.assertEqual(set("未尚没不否") - set(markers.NEGATION_CHARS), set())
+    def test_only_the_first_line_is_read(self):
+        # A body that quotes the marker later is discussion; a marker after a
+        # newline cannot speak for the verdict.
+        out = markers.parse_review("[QA] 通过\n<!-- fix_needed: false -->")
+        self.assertTrue(out["fix_needed"], "the second line is not a marker")
+        self.assertFalse(out["fix_structured"])
 
-    def test_hard_10_whole_word_negation_still_wins(self):
-        # The new arithmetic must not break the ordinary pass: these five were
-        # the original reason the bit exists.
-        for text in ("结论：通过；无需修改",
-                     "结论：通过；无需修复",
-                     "通过；无须再修",
-                     "通过，不必修",
-                     "非必须修，已全部处理"):
-            with self.subTest(text=text):
-                self.assertFalse(self.review(text)["fix_needed"], text)
+    def test_no_wording_makes_a_requirement_look_settled(self):
+        # The whole reason the prose layer is gone: these lines read like
+        # "nothing left" and none of them carries a marker.
+        for text in ("通过；必须修 2 条，P2 的 5 条已全部修完",
+                     "通过；必须修 2 条，其余 P2 已全部修完",
+                     "通过；必须修 2 条，上一轮的 P1 已全部修完",
+                     "通过；必须修，其余已全部修完",
+                     "通过；必须修 2 条，已全部修完大部分",
+                     "通过；无需修改",
+                     "通过；必须修的 2 条已全部修完"):
+            out = self.review(text)
+            self.assertTrue(out["fix_needed"], text)
+            self.assertFalse(out["fix_structured"], text)
 
-    def test_state_words_are_not_requirements(self):
-        for text in ("尚未修复的 P2 可随下轮", "P2 待修可随下轮", "未修复项为 P3"):
-            with self.subTest(text=text):
-                self.assertFalse(self.review(text)["fix_needed"], text)
-
-    def test_a_completed_fix_is_not_a_pending_fix(self):
-        self.assertFalse(
-            self.review("必须修的 P1 已在本轮修完")["fix_needed"])
-
-    def test_a_glued_single_character_negation_voids_the_hit(self):
-        self.assertFalse(self.review("非必须修，已全部处理")["fix_needed"])
-
-    def test_an_absence_after_a_modifier_is_not_a_requirement(self):
-        self.assertFalse(self.review("通过；没有必须修的项")["fix_needed"])
+    def test_a_pass_with_the_marker_says_nothing_is_left(self):
+        out = self.review("通过（P0=0，可关单） <!-- fix_needed: false -->")
+        self.assertEqual(out["verdict"], "pass")
+        self.assertFalse(out["fix_needed"])
+        self.assertTrue(out["fix_structured"])
 
     def test_the_verdict_path_is_untouched(self):
         # ``fix_needed`` is appended; the four original keys and the way the
         # verdict is decided stay exactly as they were.
         out = self.review("**按停损规则，仅 P0 可退 —— 本轮结论：通过**")
-        self.assertEqual(sorted(out), ["fix_matched", "fix_needed", "line",
-                                       "marker", "matched", "verdict"])
+        self.assertEqual(sorted(out), ["fix_matched", "fix_needed",
+                                       "fix_structured", "line", "marker",
+                                       "matched", "verdict"])
         self.assertEqual(out["verdict"], "pass")
         self.assertEqual(out["matched"], "通过")
         self.assertEqual(out["marker"], markers.QA)
+
+    def test_the_token_does_not_change_the_verdict(self):
+        self.assertEqual(self.review("不通过 <!-- fix_needed: false -->")
+                         ["verdict"], "reject")
+        self.assertEqual(self.review("不通过 <!-- fix_needed: true -->")
+                         ["verdict"], "reject")
 
 
 class _NullStore:
