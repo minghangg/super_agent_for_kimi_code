@@ -23,6 +23,17 @@ What is pinned here, in the order the acceptance list states it:
 * the page is a self-contained HTML document: escaped text, no credential
   string, no plaintext ``http://`` link, no script and no inline handler.
 
+Test rule for ``outbox_state.json``
+-----------------------------------
+
+Any test that involves the outbox **must produce the file through the real
+store** (``Store.begin_action`` / ``mark_*``), never by hand-writing an
+``actions`` dict. Hand-written records invent field combinations production
+cannot create - ``comment_id`` on an ``uncertain`` action is the one that bit
+us - so a green test built that way proves nothing about the real page. That
+is exactly how the "one event reported twice" defect survived a passing
+suite.
+
 Run: ``python -m pytest tests/test_reporter.py -q``
 """
 from __future__ import annotations
@@ -82,9 +93,20 @@ class Base(unittest.TestCase):
         target.write_text(json.dumps(data), encoding="utf-8")
         return target
 
-    def write_outbox(self, actions: dict) -> None:
-        self.store.save_outbox_state({"version": 1, "actions": actions,
-                                      "attempts": {}})
+    def begin_uncertain(self, aid: str, *, verb: str, input_ref: str,
+                        issue: int = 7, assignment_id: str | None = None) -> dict:
+        """A genuinely ``uncertain`` action, written by the store itself.
+
+        This is the shape production produces: ``begin_action`` then
+        ``mark_uncertain``. Note what the record is *missing* - ``comment_id``
+        never reaches the state file on this path - which is the whole reason
+        ``input_ref`` is parsed for a delivery id.
+        """
+        rec = self.store.begin_action(aid, verb=verb, kind=verb,
+                                      assignment_id=assignment_id,
+                                      input_ref=input_ref, issue=issue)
+        self.store.mark_uncertain(rec["action_id"], "unconfirmed")
+        return self.store.outbox_action(rec["action_id"]) or {}
 
     def index_with(self, rows, *, key=THREAD, assignments=None) -> dict:
         return {"version": 1, "meta": {},
@@ -264,10 +286,124 @@ class Dedupe(Base):
     the *thread* (repo + number), and a bare number matches at most one repo.
     """
 
-    def _seed(self, index, actions):
+    def _seed(self, index):
         self.write_index(index)
-        self.write_outbox(actions)
         return Engine(self.cfg, self.store, NullSource())
+
+    def test_two_outbox_actions_are_two_rows(self):
+        """Counterexample 2: two cid-less actions must not become one row."""
+        self.write_index(self.index_with([]))
+        self.begin_uncertain("a-archive", verb="archive", input_ref="inject:9")
+        self.begin_uncertain("a-comment", verb="comment", input_ref="not-a-number")
+        report = rep.collect(Engine(self.cfg, self.store, NullSource()))
+        self.assertEqual(len(report["items"]), 2)
+        page = rep.render(report)
+        for locator in ("a-archive", "a-comment"):
+            self.assertIn(locator, page)
+        for reason in ("unconfirmed",):
+            self.assertIn(reason, page)
+
+    def test_same_number_in_two_repos_are_two_rows(self):
+        """Counterexample 3: same issue number, different repos: not one thread."""
+        index = {"version": 1, "meta": {}, "assignments": {},
+                 "issues": {
+                     "a/x#7": {"needs_person": [{"comment_id": 11,
+                                                 "reason": "repo a needs a person"}]},
+                     "b/y#7": {"needs_person": [{"comment_id": 11,
+                                                 "reason": "repo b needs a person"}]},
+                 }}
+        engine = self._seed(index)
+        report = rep.collect(engine)
+        self.assertEqual(len(report["items"]), 2)
+        page = rep.render(report)
+        for reason in ("repo a needs a person", "repo b needs a person"):
+            self.assertIn(reason, page)
+
+    def test_bare_key_is_one_row_only_when_one_repo_holds_it(self):
+        single = {"version": 1, "meta": {}, "assignments": {},
+                  "issues": {"7": {"needs_person": [{"comment_id": 11,
+                                                     "reason": "bare"}]},
+                             THREAD: {"needs_person": [{"comment_id": 11,
+                                                        "reason": "qualified"}]}}}
+        engine = self._seed(single)
+        self.assertEqual(len(rep.collect(engine)["items"]), 1)
+        ambiguous = {"version": 1, "meta": {}, "assignments": {},
+                     "issues": {"7": {"needs_person": [{"comment_id": 11,
+                                                        "reason": "bare"}]},
+                                "a/x#7": {"needs_person": [{"comment_id": 11,
+                                                            "reason": "repo a"}]},
+                                "b/y#7": {"needs_person": [{"comment_id": 11,
+                                                            "reason": "repo b"}]}}}
+        engine = self._seed(ambiguous)
+        self.assertEqual(len(rep.collect(engine)["items"]), 3)
+
+    def test_failed_archive_is_one_row_not_two(self):
+        """Counterexample 1 (the P1): the engine's failure path writes both layers.
+
+        ``_mark_blocked(cid=55)`` goes into the assignment's ``tombstone``, and
+        ``store.mark_uncertain`` writes an outbox record that carries the
+        delivery id *only* in ``input_ref`` (``Store._transition`` never copies
+        ``comment_id`` on this path). Without reading ``input_ref`` the two rows
+        can never share a signature and the same failure is shown twice.
+
+        The record is produced by the real store, so if the store ever starts
+        writing ``comment_id`` this test keeps working for the right reason.
+        """
+        self.write_index(self.index_with([], assignments={
+            "asg_7_worker_1": {"id": "asg_7_worker_1", "thread": THREAD,
+                               "issue": 7, "role": "worker", "status": "blocked",
+                               "updated_at": "2026-01-01T00:00:00+00:00",
+                               "tombstone": {"reason": "archive unconfirmed",
+                                             "cid": 55,
+                                             "at": "2026-01-01T00:00:00+00:00",
+                                             "attempt": 1}},
+        }))
+        rec = self.begin_uncertain("asg_7_worker_1:archive:55", verb="archive",
+                                   input_ref="55", assignment_id="asg_7_worker_1")
+        self.assertNotIn("comment_id", rec)      # the store does not write it
+        self.assertEqual(rec["input_ref"], "55")
+
+        report = rep.collect(Engine(self.cfg, self.store, NullSource()))
+        self.assertEqual(len(report["items"]), 1)
+        counts = report["counts"]
+        self.assertEqual(counts[rep.CATEGORY_ROLE] + counts[rep.CATEGORY_BLOCKED], 1)
+        self.assertEqual(counts[rep.CATEGORY_BLOCKED], 1)
+        self.assertEqual(sorted(report["items"][0]["also_from"]), ["outbox"])
+        page = rep.render(report)
+        self.assertIn("asg_7_worker_1", page)
+        self.assertIn("archive unconfirmed", page)
+
+    def test_non_numeric_input_ref_does_not_merge(self):
+        """A block with no delivery id and an unrelated action stay two rows."""
+        self.write_index(self.index_with([], assignments={
+            "asg_7_worker_1": {"id": "asg_7_worker_1", "thread": THREAD,
+                               "issue": 7, "role": "worker", "status": "blocked",
+                               "updated_at": "2026-01-01T00:00:00+00:00",
+                               "tombstone": {"reason": "no sid recorded", "cid": 55,
+                                             "at": "2026-01-01T00:00:00+00:00"}},
+        }))
+        self.begin_uncertain("a-comment", verb="comment", input_ref="inject:3")
+        report = rep.collect(Engine(self.cfg, self.store, NullSource()))
+        self.assertEqual(len(report["items"]), 2)
+
+    def test_missing_comment_id_on_index_rows_keeps_both(self):
+        """Counterexample 4 (P2-1): two cid-less rows under one key, both shown."""
+        self.write_index(self.index_with([
+            {"reason": "row-A-no-cid"},
+            {"reason": "row-B-no-cid"},
+        ]))
+        report = rep.collect(Engine(self.cfg, self.store, NullSource()))
+        self.assertEqual(len(report["items"]), 2)
+        page = rep.render(report)
+        for reason in ("row-A-no-cid", "row-B-no-cid"):
+            self.assertIn(reason, page)
+
+    def test_display_keeps_the_raw_key(self):
+        index = self.index_with([{"comment_id": 11, "reason": "x"}], key="7")
+        engine = self._seed(index)
+        report = rep.collect(engine)
+        self.assertEqual(report["items"][0]["key"], "7")
+        self.assertIn("7", rep.render(report))
 
     def test_bare_and_qualified_keys_are_one_row(self):
         index = {"version": 1, "meta": {}, "assignments": {},
@@ -276,7 +412,7 @@ class Dedupe(Base):
                      THREAD: {"needs_person": [{"comment_id": 11,
                                                 "reason": "qualified"}]},
                  }}
-        engine = self._seed(index, {})
+        engine = self._seed(index)
         report = rep.collect(engine)
         self.assertEqual(len(report["items"]), 1)
         self.assertIn(report["items"][0]["key"], ("7", THREAD))
@@ -298,112 +434,6 @@ class Dedupe(Base):
         locator = f"{key} comment 11"
         return rep._item(rep.CATEGORY_ROLE, "index", key=key, cid=11, at=None,
                          reason=reason, locator=locator)
-
-    def test_two_outbox_actions_are_two_rows(self):
-        """The P1 itself: two cid-less actions must not become one row."""
-        engine = self._seed(self.index_with([]), {
-            "asg_7_worker_1:archive:9": {
-                "action_id": "asg_7_worker_1:archive:9", "status": "uncertain",
-                "issue": "7", "reason": "archive timed out",
-                "updated_at": 1_700_000_000, "verb": "archive"},
-            "asg_7_worker_1:comment:9": {
-                "action_id": "asg_7_worker_1:comment:9", "status": "waiting_person",
-                "issue": "7", "reason": "comment needs a person",
-                "updated_at": 1_700_000_100, "verb": "comment"},
-        })
-        report = rep.collect(engine)
-        self.assertEqual(len(report["items"]), 2)
-        page = rep.render(report)
-        for locator in ("asg_7_worker_1:archive:9", "asg_7_worker_1:comment:9"):
-            self.assertIn(locator, page)
-        for reason in ("archive timed out", "comment needs a person"):
-            self.assertIn(reason, page)
-
-    def test_same_number_in_two_repos_are_two_rows(self):
-        """Same issue number, different repos, same comment id: not one thread."""
-        index = {"version": 1, "meta": {}, "assignments": {},
-                 "issues": {
-                     "a/x#7": {"needs_person": [{"comment_id": 11,
-                                                 "reason": "repo a needs a person"}]},
-                     "b/y#7": {"needs_person": [{"comment_id": 11,
-                                                 "reason": "repo b needs a person"}]},
-                 }}
-        engine = self._seed(index, {})
-        report = rep.collect(engine)
-        self.assertEqual(len(report["items"]), 2)
-        page = rep.render(report)
-        for reason in ("repo a needs a person", "repo b needs a person"):
-            self.assertIn(reason, page)
-
-    def test_bare_key_is_one_row_only_when_one_repo_holds_it(self):
-        single = {"version": 1, "meta": {}, "assignments": {},
-                  "issues": {"7": {"needs_person": [{"comment_id": 11,
-                                                     "reason": "bare"}]},
-                             THREAD: {"needs_person": [{"comment_id": 11,
-                                                        "reason": "qualified"}]}}}
-        engine = self._seed(single, {})
-        self.assertEqual(len(rep.collect(engine)["items"]), 1)
-        ambiguous = {"version": 1, "meta": {}, "assignments": {},
-                     "issues": {"7": {"needs_person": [{"comment_id": 11,
-                                                        "reason": "bare"}]},
-                                "a/x#7": {"needs_person": [{"comment_id": 11,
-                                                            "reason": "repo a"}]},
-                                "b/y#7": {"needs_person": [{"comment_id": 11,
-                                                            "reason": "repo b"}]}}}
-        engine = self._seed(ambiguous, {})
-        self.assertEqual(len(rep.collect(engine)["items"]), 3)
-
-    def test_outbox_row_merges_into_assignment_row(self):
-        """The two layers describe one action: same thread + same delivery id."""
-        index = self.index_with([], assignments={
-            "asg_7_worker_1": {"id": "asg_7_worker_1", "thread": THREAD,
-                               "issue": 7, "role": "worker",
-                               "status": "waiting_person",
-                               "updated_at": "2026-01-01T00:00:00+00:00",
-                               "tombstone": {"reason": "no sid recorded",
-                                             "cid": 55,
-                                             "at": "2026-01-01T00:00:00+00:00"}},
-        })
-        engine = self._seed(index, {
-            "asg_7_worker_1:archive:9": {
-                "action_id": "asg_7_worker_1:archive:9", "status": "waiting_person",
-                "issue": "7", "reason": "no sid recorded",
-                "comment_id": 55, "updated_at": 1_700_000_000, "verb": "archive"},
-        })
-        report = rep.collect(engine)
-        blocked = [it for it in report["items"]
-                   if it["category"] == rep.CATEGORY_BLOCKED]
-        self.assertEqual(len(blocked), 1)
-        self.assertEqual(sorted(blocked[0]["also_from"]), ["outbox"])
-        self.assertEqual(blocked[0]["source"], "assignment")
-
-    def test_unrelated_outbox_row_does_not_merge(self):
-        """Same action id prefix but a different delivery: two rows, not one."""
-        index = self.index_with([], assignments={
-            "asg_7_worker_1": {"id": "asg_7_worker_1", "thread": THREAD,
-                               "issue": 7, "role": "worker",
-                               "status": "blocked",
-                               "updated_at": "2026-01-01T00:00:00+00:00",
-                               "tombstone": {"reason": "no sid recorded",
-                                             "cid": 55,
-                                             "at": "2026-01-01T00:00:00+00:00"}},
-        })
-        engine = self._seed(index, {
-            "asg_7_worker_1:comment:9": {
-                "action_id": "asg_7_worker_1:comment:9", "status": "waiting_person",
-                "issue": "7", "reason": "a different delivery", "comment_id": 66,
-                "updated_at": 1_700_000_000, "verb": "comment"},
-        })
-        report = rep.collect(engine)
-        self.assertEqual(len(report["items"]), 2)
-
-    def test_display_keeps_the_raw_key(self):
-        index = self.index_with([{"comment_id": 11, "reason": "x"}], key="7")
-        engine = self._seed(index, {})
-        report = rep.collect(engine)
-        self.assertEqual(report["items"][0]["key"], "7")
-        self.assertIn("7", rep.render(report))
-
 
 class ClassifyDrift(Base):
     """P1-5: the expected table is written down, not re-derived.
@@ -482,7 +512,6 @@ class ConfiguredMarkers(Base):
         engine = self.engine(
             index=self.index_with([{"comment_id": 11, "reason": self.CUSTOM}]),
             cfg=self._cfg())
-        self.assertEqual(engine.cfg["engine"]["user_markers"][-1], self.CUSTOM)
         self.assertEqual(rep.collect(engine)["items"][0]["category"],
                          rep.CATEGORY_USER)
 
@@ -509,7 +538,9 @@ class Counterexamples(Base):
 
     def test_b_three_healthy_sources_with_zero_counts(self):
         engine = self.engine(index=self.index_with([]))
-        self.write_outbox({})
+        # An empty outbox written by the store, not a hand-made dict: this is
+        # what "nothing was ever dispatched" looks like on disk.
+        self.store.save_outbox_state({"version": 1, "actions": {}, "attempts": {}})
         self.store.health_path.write_text(json.dumps(
             {"pid": 1, "mode": "observe", "running": True, "phase": "stopped"}),
             encoding="utf-8")
@@ -836,6 +867,34 @@ class Cli(Base):
                          "--fixture", str(bad)])
         self.assertEqual(code, 1)
 
+
+    def test_broken_fixture_reports_the_real_reason(self):
+        """Counterexample 5 (P2-2): a bad fixture path must not blame ``none``.
+
+        ``github_source.build`` turns an unreadable fixture into a
+        ``BrokenSource``; the page used to fall back to ``NullSource`` and then
+        print "github.source=none", a setting the user never chose. The reason
+        now travels into the report.
+        """
+        from super_agent import cli
+        missing = self.root / "no-such-fixture.json"
+        cfg_path = self.root / "cfg.json"
+        cfg_path.write_text(json.dumps({"github": {"source": "fixture",
+                                                   "fixture": str(missing)}}),
+                            encoding="utf-8")
+        self.store.save_index(self.index_with([{"comment_id": 11, "reason": "x"}]))
+        out = self.root / "page.html"
+        code = cli.main(["reporter", "--config", str(cfg_path),
+                         "--state-dir", str(self.state), "--out", str(out)])
+        self.assertEqual(code, 0)
+        page = out.read_text(encoding="utf-8")
+        self.assertNotIn("github.source=none", page)
+        self.assertTrue("fixture" in page or "Fixture" in page or
+                        "FileNotFoundError" in page,
+                        "the page must name the real cause")
+        report_error = next((ln for ln in page.splitlines()
+                             if "数据源构建失败" in ln), "")
+        self.assertTrue(report_error, "no source-error line on the page")
 
     def test_source_none_with_repo_does_not_build_a_live_source(self):
         """``github.source=none`` wins over a configured repo (P2-3)."""

@@ -271,14 +271,19 @@ def _comment_id(row):
 class _Quotes:
     """Comment first lines, fetched once per issue. Missing is never silent."""
 
-    def __init__(self, source, *, enabled: bool):
+    def __init__(self, source, *, enabled: bool, source_error: str = ""):
         self.source = source
         self.enabled = enabled
+        self.source_error = str(source_error or "")
         self._cache: dict[int, list] = {}
 
     def _reason_unusable(self) -> str:
         if not self.enabled:
             return "--no-quotes 指定，本轮不读引用"
+        # A source the caller could not build explains itself. Saying
+        # "github.source=none" here would blame a setting the user never chose.
+        if self.source_error:
+            return f"数据源不可用: {self.source_error}"
         if self.source is None:
             return "未提供数据源"
         if isinstance(self.source, NullSource):
@@ -317,7 +322,7 @@ def _item(category: str, source: str, *, key, cid, at, reason, locator,
     return {"category": category, "source": source, "key": key,
             "number": number, "cid": None if cid is None else int(cid),
             "at": at, "reason": str(reason or ""), "locator": str(locator),
-            "extra": dict(extra or {}), "also_from": [],
+            "extra": dict(extra or {}), "also_from": [], "repeats": 0,
             "quote": "", "quote_error": "", "expiry": {"at": "", "state": "unknown",
                                                        "age_s": None}}
 
@@ -452,22 +457,42 @@ def _outbox_items(probe: dict) -> list[dict]:
         issue = rec.get("issue")
         key = "" if issue is None else str(issue)
         out.append(_item(category, "outbox", key=key,
-                         cid=rec.get("comment_id"),
+                         cid=(rec.get("comment_id")
+                              or _cid_from_input_ref(rec.get("input_ref"))),
                          at=rec.get("updated_at"),
                          reason=rec.get("reason") or status, locator=aid,
-                         extra={"status": status, "verb": rec.get("verb")}))
+                         extra={"status": status, "verb": rec.get("verb"),
+                                "input_ref": rec.get("input_ref")}))
     return out
+
+
+def _cid_from_input_ref(input_ref):
+    """The delivery id an action was run for, when ``input_ref`` is just a number.
+
+    ``engine`` writes ``input_ref=str(delivery)`` for an archive, but
+    ``Store._transition`` does not persist ``comment_id`` for
+    ``mark_uncertain``/``mark_reconciled``, so on the failure path the outbox
+    record has the id only here. Parsing it is what lets the outbox row and the
+    assignment row (which *does* carry ``tombstone.cid``) be recognised as one
+    item instead of being reported twice.
+
+    Anything that is not a bare number returns ``None`` and the row keeps its
+    own identity: ``"inject:3"`` and friends must never be coerced.
+    """
+    number = needs_mod.cid_of(input_ref)
+    return number if number is not None and number >= 0 else None
 
 
 def _signature(item: dict, repos_for: dict | None = None):
     """Dedupe identity of one item.
 
-    Three rules, and the order matters:
+    Four rules, and the order matters:
 
-    1. **No comment id -> its own row.** ``("id", locator)``: two outbox actions
-       with ``cid=None`` are two different things, and collapsing them into one
-       key dropped one of them from the page without a trace. Identical locators
-       still merge, so a re-read row is not duplicated.
+    1. **No comment id -> its own row, keyed by locator AND content.** A bare
+       locator is not enough: two ``needs_person`` rows under one issue key with
+       no comment id share it, and keying on the locator alone dropped the
+       second one silently. ``reason``/``at`` separate them, so a genuine
+       re-read of the same row still merges.
     2. **A comment id -> ``(thread, cid)``.** The thread is the repository *and*
        the number (``issuekey`` exists because the same number in two repos is
        two threads); merging across repos would be a data loss, not a
@@ -480,7 +505,8 @@ def _signature(item: dict, repos_for: dict | None = None):
     locator = str(item.get("locator") or "")
     cid = item.get("cid")
     if cid is None:
-        return ("id", locator)
+        return ("id", locator, str(item.get("reason") or ""),
+                str(item.get("at") or ""))
     repo, number = issuekey.split_key(item.get("key"))
     if number is None and isinstance(item.get("number"), int):
         number = item.get("number")
@@ -492,11 +518,13 @@ def _signature(item: dict, repos_for: dict | None = None):
 
 
 def _dedupe(items: list[dict]) -> list[dict]:
-    """Drop exact repeats; remember which other sources carried the same item.
+    """Drop exact repeats; remember every row that was folded away.
 
     A merge is only ever allowed for the same identity (see :func:`_signature`),
-    and the dropped row's source is recorded in ``also_from`` so nothing about
-    it disappears from the page.
+    and a dropped row is never just forgotten: another source lands in
+    ``also_from``, and a repeat of the same source bumps ``repeats``. A row that
+    disappears without a trace is the failure mode this whole function exists to
+    prevent.
     """
     repos_for: dict = {}
     for item in items:
@@ -511,8 +539,11 @@ def _dedupe(items: list[dict]) -> list[dict]:
             seen[sig] = item
             out.append(item)
             continue
-        if item["source"] != first["source"] and item["source"] not in first["also_from"]:
-            first["also_from"].append(item["source"])
+        if item["source"] != first["source"]:
+            if item["source"] not in first["also_from"]:
+                first["also_from"].append(item["source"])
+        else:
+            first["repeats"] = int(first.get("repeats") or 0) + 1
     return out
 
 
@@ -635,13 +666,19 @@ def _storage(store) -> dict:
 
 
 # -------------------------------------------------------------------- collect
-def collect(engine, *, source=None, quotes: bool = True, now=None) -> dict:
+def collect(engine, *, source=None, quotes: bool = True, now=None,
+            source_error: str = "") -> dict:
     """Read the state dir and build the report. Never writes, never raises on data.
 
     ``source`` supplies comment first lines (fixture/live); ``None`` means "no
     quote is available" and every line says why. ``quotes=False`` is the
     ``--no-quotes`` path: it must not touch a source at all - the caller is
     expected to pass ``NullSource`` and to have skipped constructing a live one.
+
+    ``source_error`` is why the caller had to fall back to ``NullSource`` (a
+    fixture that does not exist, an unreadable repo config). It is shown
+    verbatim instead of the generic "github.source=none": blaming a setting the
+    user did not choose is the same mistake as showing "unknown" as "none".
     """
     store = getattr(engine, "store", None)
     if store is None:
@@ -667,7 +704,7 @@ def collect(engine, *, source=None, quotes: bool = True, now=None) -> dict:
     items.extend(_outbox_items(health["outbox"]))
     items = _dedupe(items)
 
-    quote_reader = _Quotes(source, enabled=quotes)
+    quote_reader = _Quotes(source, enabled=quotes, source_error=source_error)
     for item in items:
         text, why = quote_reader.first_line(item["number"], item["cid"])
         item["quote"], item["quote_error"] = text, why
@@ -709,6 +746,7 @@ def collect(engine, *, source=None, quotes: bool = True, now=None) -> dict:
         "counts": counts,
         "items": items,
         "unknown_reasons": reasons,
+        "source_error": str(source_error or ""),
         "quotes_missing": sum(1 for it in items if not it["quote"]),
         "warnings": warnings,
         "projects": _projects(engine, health["index"].get("data")),
@@ -1042,6 +1080,8 @@ def _render_status(report: dict) -> list[str]:
         for reason in reasons:
             out.append(f'<li>未知原因：{_esc(reason)}</li>')
         out.append("</ul>")
+    if report.get("source_error"):
+        out.append(f'<p class="warn">数据源构建失败：{_esc(report["source_error"])}</p>')
     if report.get("quotes_missing"):
         out.append(f'<p class="muted">引用不可用：{int(report["quotes_missing"])} '
                    '条（每行注明原因）</p>')
@@ -1127,7 +1167,8 @@ def render(report: dict) -> str:
 
 
 def collect_and_render(engine, *, source=None, quotes: bool = True,
-                       now=None) -> tuple[dict, str]:
+                       now=None, source_error: str = "") -> tuple[dict, str]:
     """``collect`` + ``render`` in one call, for callers that print the page."""
-    report = collect(engine, source=source, quotes=quotes, now=now)
+    report = collect(engine, source=source, quotes=quotes, now=now,
+                     source_error=source_error)
     return report, render(report)

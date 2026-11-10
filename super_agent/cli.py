@@ -721,6 +721,7 @@ def cmd_reporter(args) -> int:
     the quote is missing instead of silently dropping it.
     """
     cfg, store = _build(args)
+    source_error = ""
     if args.no_quotes:
         source = NullSource()
     elif args.fixture:
@@ -740,14 +741,18 @@ def cmd_reporter(args) -> int:
             print(f"reporter: 数据源不可用: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 1
         if isinstance(source, github_source.BrokenSource):
-            print(f"reporter: 数据源不可用: {source.error}", file=sys.stderr)
+            # Keep the real reason: a fixture path typo must not be reported as
+            # ``github.source=none``, which the user never configured.
+            source_error = f"{source.error}"
+            print(f"reporter: 数据源不可用: {source_error}", file=sys.stderr)
             source = NullSource()
     # The engine is built for its allowlist and role only; nothing here runs a
     # round, so ``source`` above is the only backend that can be touched.
     engine = _engine(cfg, store, None, source=NullSource())
     try:
         report, text = reporter_mod.collect_and_render(
-            engine, source=source, quotes=not args.no_quotes)
+            engine, source=source, quotes=not args.no_quotes,
+            source_error=source_error)
     except Exception as exc:  # noqa: BLE001  report, never dump a traceback
         print(f"reporter failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
