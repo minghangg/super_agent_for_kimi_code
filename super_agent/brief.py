@@ -30,7 +30,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import health, issuekey, session_events
+from . import health, issuekey, needs, session_events
 
 PRIORITY_SKELETON = -1
 PRIORITY_USER = 0
@@ -256,6 +256,10 @@ def _index_items(index: dict | None, *, markers=None) -> list[Item]:
             continue
         for entry in rec.get("needs_person") or []:
             if not isinstance(entry, dict):
+                continue
+            # A dismissed entry is still in the index; it is only suppressed
+            # here, so the audit trail (and ``status --all``) keeps it.
+            if not needs.is_open(index, key, entry):
                 continue
             reason = str(entry.get("reason") or "")
             bucket = _classify(reason, markers)

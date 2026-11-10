@@ -28,6 +28,8 @@ from . import brief as brief_mod
 from . import config as config_mod
 from . import session_events
 from . import assignments as asg_mod
+from . import issuekey
+from . import needs as needs_mod
 from .bus_client import BusClient
 from .github_source import FixtureSource, LiveSource
 from .engine import build_engine
@@ -350,7 +352,8 @@ def cmd_status(args) -> int:
     engine = _engine(cfg, store, _bus(cfg), source=NullSource(),
                       session_api=_session_api(getattr(args, "session_api", None)))
     # --outbox 只加东西，不改变默认输出；brief 的「取回」命令靠它才真的取得到
-    report = engine.status(outbox=bool(getattr(args, "outbox", False)))
+    show_all = bool(getattr(args, "all", False))
+    report = engine.status(outbox=bool(getattr(args, "outbox", False)), all=show_all)
     print(f"status  role={engine.role} mode={report['mode']} "
           f"external_actions={report['external_actions']}")
     if not report["items"]:
@@ -361,8 +364,15 @@ def cmd_status(args) -> int:
             print(f"- action {item['action_id']} issue #{item['issue']} "
                   f"({item.get('status') or item['reason']}) at {item['at']}")
             continue
-        print(f"- issue #{item['issue']} comment {item['comment_id']} "
-              f"({item['reason']}) at {item['at']}")
+        line = (f"- issue #{item['issue']} comment {item['comment_id']} "
+                f"({item['reason']}) at {item['at']}")
+        if "state" in item:
+            line += (f"  [{item['state']} by {item.get('resolved_by') or '-'}"
+                     f" resolved_at={item.get('resolved_at') or '-'}"
+                     f" via comment {item.get('resolved_by_comment')}"
+                     f" entries={item.get('entries')}"
+                     f" entry_at={item.get('entry_at') or '-'}]")
+        print(line)
     return 0
 
 
@@ -414,6 +424,150 @@ def cmd_unblock(args) -> int:
     print(f"unblocked {args.id} ({rec.get('thread')}) -> working; "
           f"tombstone attempt={int((rec.get('tombstone') or {}).get('attempt') or 0)}")
     return 0
+
+
+def _resolve_keys(index: dict, number: int) -> list:
+    """Every issue key that carries this issue number, legacy and qualified."""
+    return [k for k in sorted((index.get("issues") or {}), key=str)
+            if issuekey.issue_number(k) == number]
+
+
+def _resolve_rows(index: dict, keys, cid: int) -> dict:
+    """``{key: [entries with this cid]}`` - only the keys that actually match."""
+    out = {}
+    for key in keys:
+        rows = [entry for entry in
+                ((index.get("issues") or {}).get(key) or {}).get("needs_person") or []
+                if needs_mod.cid_of(entry) == cid]
+        if rows:
+            out[key] = rows
+    return out
+
+
+def cmd_resolve(args) -> int:
+    """Dismiss one ``needs_person`` entry, under every key form of its issue.
+
+    Exit codes here differ from the rest of the CLI on purpose: **2 means
+    "some keys were not written"**, not "bad arguments" (argparse still uses 2
+    for that, and it prints ``usage:``). 0 = at least one key newly resolved,
+    1 = nothing left to do or nothing matched.
+
+    The index that gets saved is the one re-read immediately before the save,
+    and the only thing added to it is the side-table row: ``issues``,
+    ``cursor`` and ``comments_seen`` are never rewritten by this command.
+    """
+    cfg, store = _build(args)
+    cid = int(args.comment)
+    state = getattr(args, "state", None) or needs_mod.RESOLVED
+    number = issuekey.issue_number(getattr(args, "issue", ""))
+    if number is None:
+        print(f"resolve: cannot read an issue number from {args.issue!r}", file=sys.stderr)
+        return 1
+
+    disk0 = store.load_index()
+    keys0 = _resolve_keys(disk0, number)
+    if not keys0:
+        known = ", ".join(sorted((disk0.get("issues") or {}), key=str)) or "(none)"
+        print(f"resolve: no issue #{number} in the index; keys present: {known}",
+              file=sys.stderr)
+        return 1
+    matched0 = _resolve_rows(disk0, keys0, cid)
+    if not matched0:
+        known = sorted({needs_mod.cid_of(e) for k in keys0
+                        for e in ((disk0.get("issues") or {}).get(k) or {})
+                        .get("needs_person") or []})
+        print(f"resolve: comment {cid} is not a needs_person entry of #{number}; "
+              f"comment ids present: {known}", file=sys.stderr)
+        return 1
+
+    # Re-read right before the save: the file on disk is the only truth.
+    disk1 = store.load_index()
+    matched1 = _resolve_rows(disk1, _resolve_keys(disk1, number), cid)
+
+    # W/A count KEYS, M counts ROWS - the same number in one line means two
+    # different things here, so never mix them up.
+    planned, already = [], []
+    for key, _rows in matched0.items():
+        if needs_mod.entry_key(key, cid) in needs_mod.marks(disk1):
+            already.append((key, len(matched1.get(key) or [])))
+        else:
+            planned.append((key, len(matched1.get(key) or [])))
+
+    def _row():
+        rows = next(iter(matched1.values()), matched0[next(iter(matched0))])
+        return rows
+
+    detail = _row()
+
+    # One row per key, so the event can name a by_comment/reason even when the
+    # rows differ; the reason is the first row's, which is what the audit reads.
+    def _side_row(key: str, count: int) -> dict:
+        return {
+            "state": state,
+            "reason": str((detail[0] if detail else {}).get("reason") or ""),
+            "at": _now(),
+            "by": str(args.by or ""),
+            "by_comment": None if getattr(args, "comment_ref", None) is None
+            else int(args.comment_ref),
+            "superseded_by": (str(getattr(args, "note", "") or "")
+                              if state == needs_mod.SUPERSEDED else None),
+            "entries": count,
+        }
+
+    side = {needs_mod.entry_key(key, cid): _side_row(key, count)
+            for key, count in planned}
+
+    written, failed, error = [], [], ""
+    if side:
+        try:
+            needs_mod.merge_into_side(disk1, side)
+            store.save_index(disk1)
+        except OSError as exc:
+            failed = [(key, count) for key, count in planned]   # one atomic save
+            error = f"{type(exc).__name__}: {exc}"
+        else:
+            back = needs_mod.marks(store.load_index())
+            for key, count in planned:
+                (written if needs_mod.entry_key(key, cid) in back else failed).append(
+                    (key, count))
+
+    if disk1.get("issues") != disk0.get("issues"):
+        store.log_event({"type": "needs_person.resolve_raced", "at": _now(),
+                         "issue": number, "comment_id": cid,
+                         "keys": [key for key, _n in planned],
+                         "detail": "issues changed while resolving"})
+
+    if failed:
+        store.log_event({"type": "needs_person.resolve_failed", "at": _now(),
+                         "issue": number, "comment_id": cid,
+                         "keys": [key for key, _n in failed],
+                         "error": error or "read-back did not find the side-table row"})
+        print(f"resolve {cid}: {len(failed)} failed "
+              f"(keys: {', '.join(k for k, _n in failed)}): "
+              f"{error or 'row missing after save'}", file=sys.stderr)
+        return 2
+
+    if written:
+        folded = sum(count for _key, count in written)
+        first = side[needs_mod.entry_key(written[0][0], cid)]
+        store.log_event({"type": f"needs_person.{state}", "at": _now(),
+                         "issue": number, "comment_id": cid,
+                         "reason": first["reason"],
+                         "by": str(args.by or ""),
+                         "by_comment": first["by_comment"],
+                         "superseded_by": first["superseded_by"],
+                         "keys": [key for key, _n in written], "entries": folded,
+                         "already": [key for key, _n in already],
+                         "entries_skipped": sum(count for _key, count in already)})
+        print(f"resolve {cid}: {len(written) + len(already)} keys: "
+              f"{len(already)} already, {len(written)} newly {state} "
+              f"({folded} entries folded)")
+        return 0
+
+    row = needs_mod.marks(disk1).get(needs_mod.entry_key(already[0][0], cid)) or {}
+    print(f"already {state} {cid} under all {len(already)} keys "
+          f"(at {row.get('at')}, by {row.get('by')})", file=sys.stderr)
+    return 1
 
 
 def cmd_replay(args) -> int:
@@ -661,6 +815,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.add_argument("--outbox", action="store_true",
                           help="also list waiting_person/uncertain outbox "
                                "actions (default: index.json only)")
+    p_status.add_argument("--all", action="store_true",
+                          help="also list dismissed entries, with the audit "
+                               "(resolved_at=/by/via comment/entries)")
     p_status.set_defaults(func=cmd_status)
 
     p_doctor = sub.add_parser("doctor", help="check bus, source, cursor, assignments")
@@ -674,6 +831,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_unblock.add_argument("--reason", default="",
                            help="why the block is over (recorded in the event)")
     p_unblock.set_defaults(func=cmd_unblock)
+
+    p_resolve = sub.add_parser(
+        "resolve", help="dismiss one needs_person entry (exit 2 = some keys not written)")
+    _add_common(p_resolve, suppress=True)
+    p_resolve.add_argument("--issue", required=True,
+                           help="owner/name#12, #12, or 12 (every key form is "
+                                "resolved, legacy and qualified alike)")
+    p_resolve.add_argument("--comment", type=int, required=True,
+                           help="comment id of the needs_person entry")
+    p_resolve.add_argument("--by", required=True,
+                           help="who is dismissing it (recorded in the event)")
+    p_resolve.add_argument("--comment-ref", type=int, default=None,
+                           help="comment that carries the ruling (audit only)")
+    p_resolve.add_argument("--state", choices=list(needs_mod.STATES),
+                           default=needs_mod.RESOLVED,
+                           help="resolved (a person decided, default) or "
+                                "superseded (the premise is gone)")
+    p_resolve.add_argument("--note", default="",
+                           help="with --state superseded: what superseded it")
+    p_resolve.set_defaults(func=cmd_resolve)
 
     p_replay = sub.add_parser("replay", help="rebuild one issue's index entry")
     _add_common(p_replay, suppress=True)
@@ -725,8 +902,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="per-comment clip (default 120)")
     p_ctx.set_defaults(func=cmd_context)
 
-    for sub_parser in (p_once, p_run, p_status, p_doctor, p_unblock, p_replay,
-                       p_rec, p_brief, p_ctx):
+    for sub_parser in (p_once, p_run, p_status, p_doctor, p_unblock, p_resolve,
+                       p_replay, p_rec, p_brief, p_ctx):
         sub_parser.set_defaults(_has_common=True)
 
     return parser
