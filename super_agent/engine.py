@@ -420,7 +420,34 @@ class Engine:
                                         review, log_unverified=False)
             if result.get("dispatched"):
                 sent += 1
+                self._supersede_route(index, thread, cid, base)
         return sent
+
+    def _supersede_route(self, index: dict, thread: str, cid, base: str) -> None:
+        """A route that finally landed makes its old dismissals moot.
+
+        Only the rows this route itself appended are counted, and a cid that
+        never became ``needs_person`` gets no mark at all. Nothing is rewritten
+        or deleted: the entries stay, they are just no longer shown.
+        """
+        rows = [entry for entry in
+                ((index.get("issues") or {}).get(thread) or {}).get("needs_person") or []
+                if needs.cid_of(entry) == needs.cid_of(cid)
+                and str(entry.get("reason") or "") == "route.undeliverable"]
+        if not rows:
+            return
+        marked = needs.mark(index, thread, cid, state=needs.SUPERSEDED, by="engine",
+                            reason="route.undeliverable",
+                            superseded_by=str(base or ""), entries=len(rows))
+        if not marked.get("changed"):
+            return
+        self.store.log_event({
+            "type": "needs_person.superseded", "at": _now(), "thread": thread,
+            "comment_id": needs.cid_of(cid), "reason": "route.undeliverable",
+            "by": "engine", "superseded_by": str(base or ""),
+            "keys": [thread], "entries": len(rows),
+            "already": [], "entries_skipped": 0,
+        })
 
     # --------------------------------------------------------------- dispatch
     def _dispatch(self, action: dict, *, reuse_action_id: str | None = None) -> dict:
