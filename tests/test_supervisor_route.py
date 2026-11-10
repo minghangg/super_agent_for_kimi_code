@@ -410,6 +410,113 @@ class UnmarkedReviewSendsNothing(Base):
         self.assertEqual(self.bus.payloads("event.agent.supervisor"), [])
         self.assertEqual(len(self.bus.payloads("event.agent.project_pm")), 1)
 
+    def test_a_review_that_quotes_the_marker_sends_nothing(self):
+        """Round 5, end to end: a marker mentioned in prose is not a marker.
+
+        This is the shape the protocol's own reviews produce - "上轮记录是
+        ``<!-- fix_needed: false -->``" / "QA 应写 ``fix_needed: false`` 表示
+        无必修项". Each quotes the token and concludes the opposite, so a
+        substring match announces a release the sentence denies.
+        """
+        for body in (
+                "本轮通过。QA 应写 fix_needed: false 表示无必修项，"
+                "但本单有 1 条 P1 必须修",
+                "有条件通过（1 条 P1 必须修）。上轮记录是 "
+                "<!-- fix_needed: false -->，本轮仍须修",
+                "讨论 fix_needed: false 的语义：本轮结论是有条件通过"
+                "（1 条 P1 必须修）",
+                "有条件通过 <!-- fix_needed: false --> 但正文说还有必须修"):
+            with self.subTest(body=body):
+                self.fresh()
+                engine = self.engine()
+                self.deliver_and_pass(engine, body="[QA] " + body)
+                self.assertEqual(
+                    self.bus.payloads("event.agent.supervisor"), [], body)
+                self.assertEqual(
+                    len(self.bus.payloads("event.agent.project_pm")), 1, body)
+                self.assertFalse(
+                    (self.index(engine).get("supervisor_routes") or {}), body)
+
+
+class AnUnmarkedVerdictIsSaidOutLoud(Base):
+    """``fix_structured is False`` is a row for a person, not silence.
+
+    The safe default (no marker means work is left) is right and it is silent:
+    nothing reaches the supervisor, and "nothing arrived" is not observable. The
+    row is what makes "the QA forgot the marker" a thing a person can see.
+    """
+
+    def rows(self, engine):
+        index = self.index(engine)
+        return [e for e in (index["issues"][THREAD].get("needs_person") or [])
+                if str(e.get("reason") or "").startswith(
+                    "route.supervisor_undeliverable")]
+
+    def test_an_unmarked_verdict_leaves_one_row_for_a_person(self):
+        engine = self.engine()
+        self.deliver_and_pass(engine, body=PASS_UNMARKED)
+        rows = self.rows(engine)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["reason"],
+                         "route.supervisor_undeliverable[user]")
+        self.assertEqual(brief._classify(rows[0]["reason"]),
+                         brief.PRIORITY_USER)
+        self.assertIn("fix_needed", rows[0]["detail"])
+        logged = [r for r in self.rows_events() if r["type"]
+                  == "route.supervisor_undeliverable"]
+        self.assertEqual(len(logged), 1)
+        self.assertNotIn("[user]", logged[0]["type"])
+        # The route itself is unchanged: the PM still hears about it.
+        self.assertEqual(len(self.bus.payloads("event.agent.project_pm")), 1)
+        self.assertEqual(self.bus.payloads("event.agent.supervisor"), [])
+
+    def rows_events(self):
+        return [json.loads(x) for x in
+                (self.state / "events.jsonl").read_text("utf-8").splitlines()
+                if x.strip()]
+
+    def test_the_row_is_written_once_across_rounds(self):
+        engine = self.engine()
+        self.deliver_and_pass(engine, body=PASS_UNMARKED)
+        for _ in range(3):
+            engine.run_once()
+        self.assertEqual(len(self.rows(engine)), 1, "one row, not one a round")
+
+    def test_a_marked_verdict_leaves_no_such_row(self):
+        # Both directions: a marker means the QA said something, so there is
+        # nothing to ask them to add.
+        for body in (PASS_BODY,
+                     "[QA] 通过（P0=0） <!-- fix_needed: true -->"):
+            with self.subTest(body=body):
+                self.fresh()
+                engine = self.engine()
+                self.deliver_and_pass(engine, body=body)
+                self.assertEqual(self.rows(engine), [], body)
+
+    def test_a_non_qa_comment_leaves_no_such_row(self):
+        # ``_route_review`` only ever sees a ``[QA]`` verdict; a delivery or a
+        # plain comment must not reach the row through a side effect.
+        engine = self.engine()
+        self.source.add(9001, "[WK:wk-probe-1] done")
+        engine.run_once()
+        self.assertEqual(self.rows(engine), [])
+
+    def test_a_retry_stub_does_not_write_the_row_again(self):
+        # ``_retry_routes`` re-enters with ``{"verdict": ...}`` and no
+        # ``fix_structured`` key, so ``is False`` must not match it: the row is
+        # about the verdict, not about how many times routing was attempted.
+        engine = self.engine()
+        self.deliver_and_pass(engine, body=PASS_UNMARKED)
+        before = len(self.rows_events())
+        index = self.index(engine)
+        index["routes"] = {}
+        engine.store.save_index(index)
+        engine._retry_routes(self.index(engine))
+        logged = [r for r in self.rows_events() if r["type"]
+                  == "route.supervisor_undeliverable"]
+        self.assertEqual(len(logged), 1, "no second line from a retry stub")
+        self.assertGreaterEqual(len(self.rows_events()), before)
+
 
 class TheMarkerIsTheOnlyWayToAnnounce(Base):
     """The positive direction: only a readable ``fix_needed: false`` announces."""

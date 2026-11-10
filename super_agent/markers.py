@@ -72,15 +72,28 @@ TAILS = ("项", "者")
 
 # ------------------------------------------------------------- fix_needed bit
 #
-# The whole mechanism is this one pattern. It is deliberately narrow: an ASCII
-# key, exactly one colon, one of two ASCII words. ``fix_need: false`` (typo in
-# the key), ``fix_needed= false`` (wrong separator) and ``fix_needed: ture``
-# (typo in the value) are **not** readable markers, and an unreadable marker is
-# treated as absent - the safe direction.
+# The whole mechanism is this pair of patterns. It is deliberately narrow: an
+# ASCII key, one colon, one of two ASCII words, **wrapped in an HTML comment**
+# and **at the end of the line**.
 #
-# Case carries no meaning: ``TRUE`` and ``true`` are the same answer, because a
-# person pasting the token must not have to remember a casing rule.
-FIX_TOKEN_RE = re.compile(r"fix_needed\s*:\s*(true|false)", re.I)
+# Both extra conditions exist to separate a *statement* from a *mention*:
+#
+# * ``<!-- -->`` is invisible in rendered Markdown, so nobody writes it inside
+#   an ordinary sentence. A bare ``fix_needed: false`` in running prose is a
+#   sentence *about* the marker, not a marker.
+# * anchoring at ``$`` excludes the shapes a review about this very protocol
+#   produces: "上轮记录是 <!-- fix_needed: false -->，本轮仍须修" and
+#   "本轮通过。QA 应写 fix_needed: false 表示无必修项，但本单有 1 条 P1 必须修".
+#   In both, the token is a quotation or an instruction, and the clause's own
+#   conclusion says the opposite.
+#
+# Two tokens that disagree still answer the safe side. ``FIX_TOKEN_ANY_RE`` is
+# the un-anchored form, used only to notice a second token; it never decides on
+# its own.
+_TOKEN = r"fix_needed\s*:\s*(true|false)"
+FIX_TOKEN_RE = re.compile(r"<!--\s*" + _TOKEN + r"\s*-->\s*$", re.I)
+FIX_TOKEN_ANY_RE = re.compile(r"<!--\s*" + _TOKEN + r"\s*-->", re.I)
+FIX_TOKEN_CORE_RE = re.compile(_TOKEN, re.I)
 TRUE, FALSE = "true", "false"
 
 
@@ -156,24 +169,36 @@ def _first_hit(text: str) -> tuple[str, str] | None:
 def read_fix_token(text: str) -> tuple[bool, str, bool]:
     """``(fix_needed, matched, structured)`` from the structured marker.
 
+    Only a **comment-wrapped token at the end of the line** is a statement. A
+    token quoted or described earlier in the line is prose about the marker:
+    ``上轮记录是 <!-- fix_needed: false -->，本轮仍须修`` and
+    ``QA 应写 fix_needed: false 表示无必修项，但本单有 1 条 P1 必须修`` both
+    carry the token and both conclude the opposite. Anchoring it at the line's
+    end is what tells the two apart without reading the sentence.
+
     Three answers, and the default is the third:
 
-    * one readable ``fix_needed: true``/``false`` - that value, ``structured``;
-    * two markers that disagree - ``True`` (the safe side) and **not**
-      structured, because the line does not say one thing. Announcing a release
-      off a self-contradicting line is the failure this bit exists to stop;
-    * none, or one that does not parse - ``True`` and not structured.
+    * one trailing marker, and no other wrapped marker disagreeing with it -
+      that value, ``structured``. **A trailing marker outvotes the prose**: it
+      is the QA's deliberate declaration, the sentence is the description (see
+      :func:`parse_review`);
+    * wrapped markers that disagree - ``True`` (the safe side) and **not**
+      structured. The line does not say one thing, and announcing a release off
+      a self-contradicting line is the failure this bit exists to stop;
+    * no trailing marker - ``True`` and not structured.
 
-    ``matched`` is the marker as written (``fix_needed: false``), for the event
-    log; it is empty whenever the answer did not come from a readable marker.
+    ``matched`` is the marker as written (``<!-- fix_needed: false -->``), for
+    the event log; it is empty whenever the answer did not come from a readable
+    marker.
     """
-    values = [m.group(1).lower() for m in FIX_TOKEN_RE.finditer(text or "")]
-    if not values:
+    wrapped = [m.group(1).lower() for m in FIX_TOKEN_ANY_RE.finditer(text or "")]
+    tail = FIX_TOKEN_RE.search(text or "")
+    if tail is None:
         return True, "", False
-    if len(set(values)) > 1:
+    if len(set(wrapped)) > 1:
         return True, "", False
-    matched = FIX_TOKEN_RE.search(text).group(0)
-    return values[0] == TRUE, matched, True
+    core = FIX_TOKEN_CORE_RE.search(tail.group(0))
+    return tail.group(1).lower() == TRUE, core.group(0), True
 
 
 def parse_review(body: str) -> dict | None:

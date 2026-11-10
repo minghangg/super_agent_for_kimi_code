@@ -174,6 +174,11 @@ class FixTokenParsing(unittest.TestCase):
         ("通过 <!--fix_needed:false-->", False, True),
         ("通过 <!-- FIX_NEEDED: FALSE -->", False, True),
         ("通过 <!-- fix_needed: True -->", True, True),
+        # The full-width colon works because ``_strip_qa_prefix`` normalises to
+        # NFKC before this pattern sees the line. That is an ordering
+        # dependency, so it is pinned here instead of trusted.
+        ("通过 <!-- fix_needed：false -->", False, True),
+        ("通过　<!-- fix_needed: false -->　", False, True),
         # No marker at all: the safe side, and not structured.
         ("通过（P0=0，可关单）", True, False),
         ("有条件通过（1 条 P1 必须修）", True, False),
@@ -185,6 +190,10 @@ class FixTokenParsing(unittest.TestCase):
         ("通过 <!-- fix_needed: ture -->", True, False),
         ("通过 <!-- fix_needed: 0 -->", True, False),
         ("通过 <!-- FIX_NEEDED= FALSE -->", True, False),
+        # Unwrapped: a token in running prose, which is a mention, not a
+        # statement. ``<!-- -->`` is invisible in rendered Markdown, so nobody
+        # writes it by accident inside a sentence - its presence is the signal.
+        ("通过 fix_needed: false", True, False),
         # Two markers that disagree: the safe side, and not structured.
         ("通过 <!-- fix_needed: true --> <!-- fix_needed: false -->",
          True, False),
@@ -210,6 +219,38 @@ class FixTokenParsing(unittest.TestCase):
                           "fix_needed: false -->")
         self.assertFalse(out["fix_needed"])
         self.assertTrue(out["fix_structured"])
+
+    def test_the_marker_must_be_the_last_thing_on_the_line(self):
+        """A token inside the sentence is a mention, not this review's answer.
+
+        This is the whole reason for anchoring: a review *about* the marker
+        protocol quotes it, describes it, or discusses it, and every one of
+        those lines concludes the opposite of the quoted token.
+        """
+        for text in ("有条件通过（1 条 P1 必须修）。上轮记录是 "
+                     "<!-- fix_needed: false -->，本轮仍须修",
+                     "本轮通过。QA 应写 fix_needed: false 表示无必修项，"
+                     "但本单有 1 条 P1 必须修",
+                     "讨论 fix_needed: false 的语义：本轮结论是有条件通过"
+                     "（1 条 P1 必须修）"):
+            with self.subTest(text=text):
+                out = self.review(text)
+                self.assertTrue(out["fix_needed"], text)
+                self.assertFalse(out["fix_structured"], text)
+                self.assertEqual(out["fix_matched"], "", text)
+
+    def test_a_trailing_marker_beats_the_prose(self):
+        """The trailing marker is a declaration; the sentence is a description.
+
+        When the two disagree the marker wins - that is the protocol (#46): the
+        structured bit is what the QA wrote down on purpose, and re-deriving the
+        answer from the prose is the layer this design removed. Pinned here so
+        "the marker wins" is a tested rule, not an accident of the code order.
+        """
+        out = self.review("有条件通过（1 条 P1 必须修）<!-- fix_needed: false -->")
+        self.assertFalse(out["fix_needed"])
+        self.assertTrue(out["fix_structured"])
+        self.assertEqual(out["fix_matched"], "fix_needed: false")
 
     def test_the_matched_text_is_the_marker_itself(self):
         # ``fix_matched`` is for the event log: it must be the marker as
