@@ -100,11 +100,39 @@ ZERO_TAIL_RE = re.compile(r"^(?:项|条)?\s*(?:为|=)\s*0")
 # How far around a requirement word its completion claim is read. A clause is
 # short; a whole line is not, and a distant "P2 已修完" must not speak for it.
 COMPLETION_WINDOW = 30
-FIXED_COUNT_RE = re.compile(r"已修\s*(\d+)\s*条|(\d+)\s*条\s*已修")
+
+# An explicit "all of it" claim settles a *counted* requirement that states no
+# fixed count (``必须修的 2 条已全部修完``). A one-character lookbehind is not
+# enough: ``没有全部修复`` hides its negation one character further back, and
+# ``尚未全部修复`` contains none of the words in :data:`INCOMPLETE_WORDS`
+# (``未修复`` is not a substring of ``未全部修复``). So the guard reads the few
+# characters in front of the claim instead of trusting a single neighbour.
+ALL_WORDS = ("已全部修完", "全部修完", "已全部修复", "全部修复", "已全部完成",
+             "全部完成", "均已修完", "均已修复", "已全部处理", "均已处理")
+ALL_NEGATIONS = "未尚没不否"
+ALL_LOOKBACK = 3
+
+# A count is written with a digit or a small Chinese numeral (``两条``/
+# ``已修一条``), and the measure word may be dropped (``已修 1``). ``处``/``项``
+# are what a review writes for a non-line unit (``必须修改 2 处``), so the
+# measure word is a set, not ``条`` alone - requiring ``条`` is what made the
+# parser fall back to "a completion word is visible, so it is done".
+_CN_NUMERALS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+                "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+_NUM = r"(\d+|[零一二两三四五六七八九十]+)"
+_QTY = r"(?:条|处|项)"
+# ``必须修``'s count is one modifier, one bracket and one measure word away at
+# most: ``必须修的 2 条``, ``必须修（2 条）``, ``必须修改 2 处``.
+_FIX_WORDS_RE = "|".join(["已修复", "已修完", "已修", "已完成", "已处理",
+                          "已补", "已改"])
+FIXED_COUNT_RE = re.compile(
+    rf"(?:{_FIX_WORDS_RE})\s*{_NUM}\s*{_QTY}?"
+    rf"|{_NUM}\s*{_QTY}?\s*(?:{_FIX_WORDS_RE})")
 _REQ_WORDS_RE = "|".join(re.escape(w) for w in
                          sorted(MUST_FIX_WORDS, key=len, reverse=True))
 REQUIRED_COUNT_RE = re.compile(
-    rf"(?:{_REQ_WORDS_RE})\s*(\d+)\s*条|(\d+)\s*条\s*(?:{_REQ_WORDS_RE})")
+    rf"(?:{_REQ_WORDS_RE})\s*(?:的|改)?\s*[（(]?\s*{_NUM}\s*{_QTY}?"
+    rf"|{_NUM}\s*{_QTY}?\s*(?:{_REQ_WORDS_RE})")
 
 
 def first_line(body: str) -> str:
@@ -266,12 +294,18 @@ def _settled(text: str, start: int, end: int) -> bool:
        the requirement keeps it pending, whatever else the clause claims;
     2. **an explicit zero is settled** - ``必须修项为0`` needs no other proof;
     3. **the arithmetic decides.** ``2 条必须修，已修 1 条`` says exactly how much
-       is left. A partial count (``已修 N 条`` with no total) means "some were
+       is left, so the two counts are read from **disjoint spans**: the required
+       count is masked out before the fixed count is searched, because
+       ``必须修2条已修1条`` would otherwise let the ``2`` be read as "two
+       fixed". A partial count (``已修 N 条`` with no total) means "some were
        fixed", which is not "all were fixed";
-    4. **only with no counts at all** does a completion word speak for the
-       requirement itself - and there it must be a completion of that
-       requirement, which is why ``必须修的 P1 已在本轮修完`` is settled while a
-       bare ``已修`` next to an unknown number is not.
+    4. **a counted requirement with no fixed count is still pending** - unless
+       the line says *all* of it is done (``已全部修完``). "The count is 2 and
+       something was fixed" is not "the two are fixed", and a bare ``已修``
+       next to an unknown number must not settle anything;
+    5. **only with no counts at all** does a completion word speak for the
+       requirement itself, which is why ``必须修的 P1 已在本轮修完`` is settled
+       while ``已修`` with no stated total is not.
 
     The default is "still needed". A false "ready to close" misleads the reader
     with no way to notice; a withheld one at least leaves a ``needs_person``
@@ -282,25 +316,76 @@ def _settled(text: str, start: int, end: int) -> bool:
         return False
     if ZERO_TAIL_RE.match(text[end:]) or ZERO_TAIL_RE.match(near):
         return True
-    required = _first_count(REQUIRED_COUNT_RE, near)
+    required, span = _count_span(REQUIRED_COUNT_RE, near)
+    if required is not None:
+        # The required count is consumed, so its digits cannot be read again as
+        # "how many were fixed": ``必须修2条已修1条`` has one ``\d+条`` and it
+        # belongs to the total, not to the fixed count.
+        fixed = _first_count(FIXED_COUNT_RE, _blank(near, span))
+        if fixed is not None:
+            return fixed >= required
+        # A count with no fixed count states a remainder, not a completion -
+        # unless the line says *all* of it is done.
+        return _all_done(near)
     fixed = _first_count(FIXED_COUNT_RE, near)
-    if required is not None and fixed is not None:
-        return fixed >= required
     if fixed is not None:
         # Some were fixed and the total is not stated: not provably all.
         return False
+    if _all_done(near):
+        return True
     return any(done in near for done in DONE_WORDS)
+
+
+def _all_done(text: str) -> bool:
+    """Does a negated "all of it is done" claim stand in ``text``?
+
+    ``尚未全部修复`` and ``没有全部修复`` say the opposite of ``全部修复``, and
+    neither contains a word from :data:`INCOMPLETE_WORDS`. The window check is
+    what keeps this from becoming the old "a completion word is visible" test
+    under a new name.
+    """
+    for word in sorted(ALL_WORDS, key=len, reverse=True):
+        start = text.find(word)
+        while start != -1:
+            before = text[max(0, start - ALL_LOOKBACK):start]
+            if not any(ch in ALL_NEGATIONS for ch in before):
+                return True
+            start = text.find(word, start + 1)
+    return False
+
+
+def _blank(text: str, span: tuple[int, int]) -> str:
+    """``text`` with ``span`` replaced by spaces, so positions stay comparable."""
+    start, end = span
+    return text[:start] + " " * (end - start) + text[end:]
+
+
+def _to_int(raw: str) -> int:
+    """A digit run or a small Chinese numeral (``两``/``十二``/``二十``)."""
+    if raw.isdigit():
+        return int(raw)
+    if "十" not in raw:
+        return _CN_NUMERALS.get(raw, 0)
+    head, _, tail = raw.partition("十")
+    high = _CN_NUMERALS.get(head, 1) if head else 1
+    low = _CN_NUMERALS.get(tail, 0) if tail else 0
+    return high * 10 + low
+
+
+def _count_span(pattern, text: str) -> tuple[int | None, tuple[int, int]]:
+    """``(value, span)`` of the first count ``pattern`` states, or ``(None, (0,0))``."""
+    match = pattern.search(text)
+    if not match:
+        return None, (0, 0)
+    for group in match.groups():
+        if group is not None:
+            return _to_int(group), match.span()
+    return None, match.span()
 
 
 def _first_count(pattern, text: str) -> int | None:
     """The first integer ``pattern`` captures, whichever group held it."""
-    match = pattern.search(text)
-    if not match:
-        return None
-    for group in match.groups():
-        if group is not None:
-            return int(group)
-    return None
+    return _count_span(pattern, text)[0]
 
 
 def parse_review(body: str) -> dict | None:

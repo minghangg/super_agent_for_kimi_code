@@ -204,6 +204,28 @@ class MustFixParsing(unittest.TestCase):
         ("必须修（未修完）", "", True),
         ("必须修 2 条，其中 1 条已修", "", True),
         ("通过；2 条必须修，0 条已修", "pass", True),
+        # The count relation has to survive the shapes a review actually writes:
+        # with no measure word, with no punctuation between the two counts, with
+        # a bracketed total, with a Chinese numeral, and with ``处`` instead of
+        # ``条``. Every one of these used to fall through to "a completion word
+        # is visible, so nothing is left".
+        ("必须修 2 条，已修 1", "", True),
+        ("必须修2条已修1条", "", True),
+        ("必须修 2 条 已修 1 条", "", True),
+        ("两条必须修，已修一条", "", True),
+        ("必须修（2 条），已修 1", "", True),
+        ("必须修 2 条，已完成 1 条", "", True),
+        ("必须修 3 条（已完成 1 条，2 条待办）", "", True),
+        ("必须修改 2 处，已修 1 处", "", True),
+        ("必须修 2 条 / 已修 1 条", "", True),
+        # The safe side of the same relation must stay settled: all of them
+        # fixed, and more fixed than required.
+        ("必须修 2 条，已修 2 条", "", False),
+        ("必须修 1 条，已修 3 条", "", False),
+        # A counted requirement with no fixed count is pending - unless the line
+        # says *all* of it is done, which is a statement about the total.
+        ("通过；必须修的 2 条已全部修完", "pass", False),
+        ("通过；必须修 2 条，尚未全部修完", "pass", True),
     ]
 
     def review(self, text):
@@ -251,11 +273,88 @@ class MustFixParsing(unittest.TestCase):
                      "必须修，其中 1 条已修",
                      "必须修 3 条（已修 0 条）",
                      "必须修（未修完）",
-                     "必须修 2 条，其中 1 条已修"):
+                     "必须修 2 条，其中 1 条已修",
+                     "必须修 2 条，已修 1",
+                     "必须修2条已修1条",
+                     "必须修 2 条 已修 1 条",
+                     "两条必须修，已修一条",
+                     "必须修（2 条），已修 1",
+                     "必须修 2 条，已完成 1 条",
+                     "必须修 3 条（已完成 1 条，2 条待办）",
+                     "必须修改 2 处，已修 1 处",
+                     "必须修 2 条 / 已修 1 条"):
             with self.subTest(text=text):
                 out = self.review(text)
                 self.assertTrue(out["fix_needed"], text)
                 self.assertEqual(out["fix_matched"], "必须修", text)
+
+    def test_hard_7_a_counted_requirement_needs_a_count_relation(self):
+        # "2 required, 2 fixed" and "1 required, 3 fixed" are the safe side of
+        # the same arithmetic; a fix that only ever answers True would pass the
+        # partial cases above and fail these.
+        for text in ("必须修 2 条，已修 2 条",
+                     "必须修 1 条，已修 3 条",
+                     "必须修 2 条（已修 2 条）"):
+            with self.subTest(text=text):
+                self.assertFalse(self.review(text)["fix_needed"], text)
+
+    def test_hard_8_no_count_relation_is_a_remainder_not_a_completion(self):
+        # A total with no fixed count says how much is left, not that it is
+        # done. Only an explicit "all of it" claim settles the total, and its
+        # negation has to win over it.
+        self.assertTrue(self.review("必须修 2 条，已修完")["fix_needed"])
+        self.assertTrue(
+            self.review("通过；必须修 2 条，尚未全部修完")["fix_needed"])
+        # ``未修复`` is not a substring of ``未全部修复``, so the "all" claim
+        # needs its own negation window rather than an entry in the word list.
+        for text in ("通过；必须修 2 条，尚未全部修复",
+                     "通过；必须修 2 条，未全部修复",
+                     "通过；必须修 2 条，没有全部修复"):
+            with self.subTest(text=text):
+                self.assertTrue(self.review(text)["fix_needed"], text)
+        self.assertFalse(
+            self.review("通过；必须修的 2 条已全部修完")["fix_needed"])
+
+    def test_hard_9_the_generative_sweep(self):
+        """Requirement words x separators x completion words x measure words.
+
+        The point is the **ratio**, not any single line: every combination that
+        states "N required, M fixed" with ``N > M`` must answer
+        ``fix_needed``, and every one with ``N <= M`` must not. A point fix
+        passes the named shapes and still leaks here.
+        """
+        requirements = ("必须修", "仍需修", "仍须修", "需要修", "须修", "需修",
+                        "还需要修")
+        separators = ("，", " ", "/", "；", "、")
+        completions = ("已修", "已修完", "已完成", "已处理", "已补", "已改")
+        measures = ("条", "处", "项", "")
+        checked = 0
+        for req in requirements:
+            for sep in separators:
+                for done in completions:
+                    for measure in measures:
+                        for required in range(1, 5):
+                            for fixed in range(0, 5):
+                                text = (f"{req} {required} {measure}{sep}"
+                                        f"{done} {fixed} {measure}")
+                                want = required > fixed
+                                with self.subTest(text=text):
+                                    self.assertEqual(
+                                        self.review(text)["fix_needed"], want,
+                                        text)
+                                checked += 1
+        self.assertGreaterEqual(checked, 500)
+
+    def test_hard_10_whole_word_negation_still_wins(self):
+        # The new arithmetic must not break the ordinary pass: these five were
+        # the original reason the bit exists.
+        for text in ("结论：通过；无需修改",
+                     "结论：通过；无需修复",
+                     "通过；无须再修",
+                     "通过，不必修",
+                     "非必须修，已全部处理"):
+            with self.subTest(text=text):
+                self.assertFalse(self.review(text)["fix_needed"], text)
 
     def test_state_words_are_not_requirements(self):
         for text in ("尚未修复的 P2 可随下轮", "P2 待修可随下轮", "未修复项为 P3"):

@@ -321,6 +321,13 @@ class PartialFixNeverReachesTheSupervisor(Base):
         "必须修 3 条（已修 0 条）",
         "必须修（未修完）",
         "通过；必须修；尚未全部修完",
+        # The three shapes the third round added: no measure word, no separator,
+        # and a bracketed total. Each used to read the total as the fixed count.
+        "必须修 2 条，已修 1",
+        "必须修2条已修1条",
+        "必须修（2 条），已修 1",
+        "两条必须修，已修一条",
+        "必须修 3 条（已完成 1 条，2 条待办）",
     )
 
     def test_a_partial_fix_sends_nothing_to_the_supervisor(self):
