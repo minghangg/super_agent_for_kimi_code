@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -51,6 +52,8 @@ class DecideWatchConfig:
     undelivered_path: Path | None = None
     bind_path: Path | None = None
     ledger_path: Path | None = None
+    supervisor_notice_ledger_path: Path | None = None
+    supervisor_notice_last_path: Path | None = None
     session_script: Path | None = None
     supervisor_key: str = "supervisor"
     alarm_state_file: str = "session_alarm_state.json"
@@ -518,6 +521,328 @@ def handle(events: list[dict], rsid: str, dry: bool, max_age: float) -> int:
         if notify(rsid, describe(ev), dry):
             n += 1
     return n
+
+
+# --------------------------------------------------------------------- 主管投递哨（ISS-55）
+# `event.agent.supervisor` 的**投递消费端**：事件由 engine 注入，本段把它真投进
+# `payload.sid` 指定的会话。三条硬约束（ISS-55 任务书）：
+#   ① 独立一腿，**不进 `WATCH_TYPES`**——`handle()` 用「此刻的 supervisor 键」作目标，
+#      而 `payload.sid` 是发件那一刻解析的，换血后两者会指向不同会话；
+#   ② at-most-once 靠**事件指纹台账**，seq 游标与拍板哨共用（`/events` 排他：
+#      只有 `seq > since` 才会返回，所以「本轮不投且不退游标」＝永久漏投）；
+#   ③ `retry_later` 必须**台账驱动**重试，且台账存**完整 text**（截断会发半句话）。
+SUPERVISOR_NOTICE_EVENT = "event.agent.supervisor"
+SUPERVISOR_FAILED_EVENT = "event.session.supervisor_delivery_failed"
+SUPERVISOR_NOTICE_HEARTBEAT = "supervisor_notice"
+NOTICE_RETRY_LIMIT = 3          # 连续这么多轮仍 unknown ⇒ probe_unknown 终态
+EXIT_NOTICE_UNREGISTERED = 12   # 心跳名未注册（启动即报错，绝不带病起跑）
+_NOTICE_LAST_KEYS = ("last_ok_at", "last_ok_seq", "last_fail_at", "last_fail_state",
+                     "last_fail_seq", "pending_indeterminate", "delta")
+
+
+def _notice_ledger_path() -> Path:
+    return _path("supervisor_notice_ledger_path", "supervisor_notice_ledger.jsonl")
+
+
+def _notice_last_path() -> Path:
+    return _path("supervisor_notice_last_path", "supervisor_notice_last.json")
+
+
+def notice_fingerprint(ev: dict) -> str:
+    """事件指纹：`sha1(seq|ts|type|md5(payload 规范 JSON))[:16]`。
+
+    `sort_keys=True` 是硬要求：同一 payload 只要键序不同就该是同一条，
+    否则 daemon 重启重扫会把「重放」当「新事件」再投一遍。
+    """
+    payload = ev.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    canon = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                       separators=(",", ":"))
+    digest = hashlib.md5(canon.encode("utf-8")).hexdigest()
+    raw = f"{int(ev.get('seq') or 0)}|{ev.get('ts')}|{ev.get('type')}|{digest}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _notice_rows() -> dict:
+    """台账**最新态**：同一指纹后写的行覆盖先写的行（追加式，只读时折叠）。"""
+    out: dict = {}
+    try:
+        text = _notice_ledger_path().read_text(encoding="utf-8")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and row.get("fp"):
+            out[str(row["fp"])] = row
+    return out
+
+
+def _notice_append(row: dict) -> None:
+    try:
+        p = _notice_ledger_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        log(f"[supervisor-notice] 台账写盘失败：{exc}")
+
+
+def _notice_last_read() -> dict:
+    try:
+        d = json.loads(_notice_last_path().read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _notice_last_write(**fields) -> None:
+    st = _notice_last_read()
+    for key in _NOTICE_LAST_KEYS:
+        st.setdefault(key, None)
+    st.update(fields)
+    st["updated"] = datetime.now().isoformat(timespec="seconds")
+    try:
+        p = _notice_last_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
+    except OSError as exc:
+        log(f"[supervisor-notice] last.json 写盘失败：{exc}")
+
+
+def _probe_notice_target(sid: str) -> tuple[bool | None, str]:
+    """三态探测，**查不到 ≠ 死了**：`exists is None` 一律 unknown（走 retry_later）。
+
+    探针异常也只降成 unknown：一次网络抖动不该把通知判死。这层 catch 只包**单次探测**，
+    不是新腿的业务 try（业务异常必须冲出 `_loop`，否则腿死了而进程心跳照旧 ok）。
+    """
+    try:
+        exists, detail = _probe_session(sid)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"probe 异常 {type(exc).__name__}: {exc}"
+    if exists is None:
+        why = detail if isinstance(detail, str) else json.dumps(detail, ensure_ascii=False)[:200]
+        return None, why or "无法判定目标会话"
+    if exists is False:
+        return False, "会话不存在（probe=False）"
+    if isinstance(detail, dict) and detail.get("archived"):
+        return False, "会话已归档（archived=True）"
+    return True, ""
+
+
+def _attempt_notice(row: dict, dry: bool) -> tuple[str, str]:
+    """尝试投递一行台账，返回 `(state, detail)`。**绝不使用事件外层 sid**。"""
+    sid = str(row.get("sid") or "")
+    text = str(row.get("text") or "")
+    if not sid.strip() or not text.strip():
+        return "refused_payload", "payload 缺 sid/text（事件外层 sid 恒为 file，绝不用它）"
+    exists, why = _probe_notice_target(sid)
+    if exists is None:
+        return "retry_later", why
+    if exists is False:
+        return "refused_archived", why
+    if dry:
+        log(f"[dry-run] 将投递给 {sid[:14]}…：{text[:60]}")
+        return "delivered", "(dry-run 未真发)"
+    try:
+        res = _send(sid, text)
+    except Exception as exc:  # noqa: BLE001  send 异常＝本轮没投出去，留台账下轮再试
+        return "retry_later", f"send 异常 {type(exc).__name__}: {exc}"
+    rc = int(getattr(res, "returncode", 0) or 0)
+    if rc == 4:
+        # sess.py 的退役清单拦截（tools/sess.py:614-623）：拒投**不是** delivered
+        return "refused_retired", "send rc=4：退役清单拦截"
+    if rc != 0:
+        tail = (getattr(res, "stderr", "") or getattr(res, "stdout", "") or "").strip()
+        return "retry_later", f"send rc={rc}：{tail[:160]}"
+    return "delivered", ""
+
+
+def _inject_notice_failure(row: dict, port: int, detail: str) -> None:
+    """出声通道 a1：往 daemon 注入 `event.session.supervisor_delivery_failed`。
+
+    复用 `_emit_supervisor_dead_event` 的同款调用；注入失败要**留一行日志**，
+    否则事后看日志会以为「既没告警也没问题」。
+    """
+    try:
+        body = {
+            "type": "file",
+            "event": SUPERVISOR_FAILED_EVENT,
+            "payload": {
+                "sid": row.get("sid"),
+                "seq": row.get("seq"),
+                "kind": row.get("kind"),
+                "assignment": row.get("assignment"),
+                "state": row.get("state"),
+                "reason": str(detail or "")[:300],
+                "checked_at": datetime.now().isoformat(timespec="seconds"),
+            },
+        }
+        _event_post("/events/inject", body, port=port or wss_bus().PORT)
+    except Exception as exc:  # noqa: BLE001
+        log(f"[supervisor-notice] 事件腿不可用（daemon down：{type(exc).__name__}）"
+            f"——日志那条腿已写，但 /healthz 看不到本次投递失败")
+
+
+def _notice_row_from_event(ev: dict) -> dict:
+    payload = ev.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    text = payload.get("text")
+    text = text if isinstance(text, str) else ""
+    return {
+        "fp": notice_fingerprint(ev),
+        "seq": int(ev.get("seq") or 0),
+        "ts": ev.get("ts"),
+        "sid": str(payload.get("sid") or ""),
+        # 未知形状按 A（可关单）处理：kind 只影响文案，不影响投不投
+        "kind": str(payload.get("kind") or "close_ok"),
+        "assignment": str(payload.get("assignment") or ""),
+        "text": text,             # **完整正文**：重试要发全文
+        "text_head": text[:100],  # 给人看的前缀，重试绝不用它
+        "attempts": 0,
+    }
+
+
+def _run_notice_row(row: dict, *, dry: bool, port: int, rows: dict) -> str:
+    state, detail = _attempt_notice(row, dry)
+    attempts = int(row.get("attempts") or 0) + 1
+    if state == "retry_later" and attempts >= NOTICE_RETRY_LIMIT:
+        state = "probe_unknown"
+        detail = f"连续 {attempts} 轮无法判定 ⇒ 终态，不再重试：{detail}"
+    out = {**row, "state": state, "attempts": attempts,
+           "detail": detail,
+           "state_at": datetime.now().isoformat(timespec="seconds")}
+    _notice_append(out)
+    rows[row["fp"]] = out
+    if state == "delivered":
+        _notice_last_write(last_ok_at=out["state_at"], last_ok_seq=out["seq"])
+        log(f"[supervisor-notice] 已投 seq={out['seq']} kind={out['kind']}"
+            f" sid={str(out['sid'])[:14]}…")
+    elif state != "retry_later":
+        _notice_last_write(last_fail_at=out["state_at"], last_fail_state=state,
+                           last_fail_seq=out["seq"])
+        _inject_notice_failure(out, port, detail)
+        log(f"[supervisor-notice] ⚠ seq={out['seq']} 终态 {state}：{detail}")
+    else:
+        log(f"[supervisor-notice] seq={out['seq']} 本轮未投（{detail}）"
+            f"⇒ 存台账，第 {attempts}/{NOTICE_RETRY_LIMIT} 轮")
+    return state
+
+
+def handle_supervisor_notices(evs, now: float | None = None, *,
+                              dry: bool = False, port: int = 0,
+                              attempted: set | None = None) -> int:
+    """消费本轮的 `event.agent.supervisor`，返回实际投出的条数。
+
+    指纹已在台账里 ⇒ 跳过（同 seq 重放、daemon 重启重扫都不重发）。
+    `attempted` 是**本轮**已试过的指纹集合，与 `_retry_pending` 共用一个，
+    这样一轮只算一轮（`NOTICE_RETRY_LIMIT` 数的是轮，不是调用次数）。
+    **不要给它包 try**：腿异常必须冲出 `_loop`，否则「腿死而进程心跳照旧 ok」。
+    """
+    now = time.time() if now is None else now
+    attempted = set() if attempted is None else attempted
+    rows = _notice_rows()
+    delivered = 0
+    for ev in evs or []:
+        if str(ev.get("type") or "") != SUPERVISOR_NOTICE_EVENT:
+            continue
+        fp = notice_fingerprint(ev)
+        if fp in rows:
+            continue
+        row = _notice_row_from_event(ev)
+        if dry:
+            log(f"[dry-run] 将投递 seq={row['seq']} kind={row['kind']}：{row['text'][:60]}")
+            continue
+        attempted.add(fp)
+        if _run_notice_row(row, dry=dry, port=port, rows=rows) == "delivered":
+            delivered += 1
+    _notice_tick_tail(rows, delivered)
+    return delivered
+
+
+def _retry_pending(*, dry: bool = False, port: int = 0,
+                   attempted: set | None = None) -> int:
+    """台账驱动重试：取所有 `state == "retry_later"` 的行逐条重判并重投。
+
+    `/events` 是排他的（只返回 `seq > since`）且 `_loop` 每轮无条件推进游标，
+    所以**等事件重投等于永远等不到**——必须从台账里拿回完整 text 再发一次。
+
+    `attempted` 里已有的指纹本轮跳过：同一进程轮里「消费＋重试」各试一次
+    会偷偷把 3 轮折成 2 轮就升级。
+    """
+    attempted = set() if attempted is None else attempted
+    rows = _notice_rows()
+    delivered = 0
+    for fp, row in list(rows.items()):
+        if row.get("state") != "retry_later" or fp in attempted:
+            continue
+        if dry:
+            log(f"[dry-run] 台账重试 seq={row.get('seq')}：{str(row.get('text'))[:60]}")
+            continue
+        attempted.add(fp)
+        if _run_notice_row(row, dry=dry, port=port, rows=rows) == "delivered":
+            delivered += 1
+    _notice_tick_tail(rows, delivered)
+    return delivered
+
+
+def _notice_tick_tail(rows: dict, delivered: int) -> None:
+    """收尾：pending_indeterminate 落 last.json（a2）＋ 腿心跳（a3）。"""
+    pending = sum(1 for r in rows.values() if r.get("state") == "retry_later")
+    _notice_last_write(pending_indeterminate=pending)
+    # 未注册时 wss_bus 的 write_heartbeat 直接 return ⇒ 心跳文件不生成；
+    # 那种情况已被 notice_registration_problem() 在启动时拦死。
+    _write_hb(SUPERVISOR_NOTICE_HEARTBEAT, {"pending_indeterminate": pending,
+                                            "delivered": delivered})
+
+
+def notice_cursor_rollback(cursor_seq: int, daemon_seq: int) -> int | None:
+    """游标超前 daemon ⇒ 回退。记 `delta = cursor - daemon`，**不假装追平**。
+
+    判据用 `cursor > data["seq"]`，**不用 `oldest_seq`**：事件环不持久，重启后为 0。
+    """
+    if daemon_seq and int(cursor_seq) > int(daemon_seq):
+        delta = int(cursor_seq) - int(daemon_seq)
+        log(f"[supervisor-notice] ⚠ 游标回退：cursor={cursor_seq} > "
+            f"daemon_seq={daemon_seq}（delta={delta}）——不推进、不假装追平")
+        _notice_last_write(delta=delta,
+                           rollback_at=datetime.now().isoformat(timespec="seconds"))
+        return delta
+    return None
+
+
+def _extra_guardian_names() -> dict:
+    """事件源没有 `guardian_thresholds()` 时的兜底：直接读同语义的注册文件。"""
+    try:
+        data = json.loads((_state_root() / "guardian_extra.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def notice_registration_problem() -> str:
+    """启动断言：心跳名必须已注册，否则**启动即报错**。
+
+    未注册时 `write_heartbeat` 直接 return ⇒ 心跳文件不生成 ⇒ `_guardian_summary()`
+    只遍历注册表里的名字 ⇒ `/healthz` 里连 `missing` 都不报，整条腿彻底不可见。
+    """
+    name = SUPERVISOR_NOTICE_HEARTBEAT
+    fn = getattr(_cfg().event_source, "guardian_thresholds", None)
+    try:
+        names = fn() if callable(fn) else _extra_guardian_names()
+    except Exception as exc:  # noqa: BLE001
+        return f"读心跳注册表失败（{type(exc).__name__}: {exc}）⇒ 无法确认 {name!r} 可见"
+    if isinstance(names, dict) and name in names:
+        return ""
+    return (f"心跳名 {name!r} 未注册（guardian_thresholds 里没有它）⇒ 该腿心跳不会生成、"
+            f"/healthz 里连 missing 都不报；拒绝启动。请先在 state/guardian_extra.json 注册")
 
 
 # --------------------------------------------------------------------- 收单事件化（issue #15 第一笔）
@@ -1350,6 +1675,13 @@ def main(argv=None) -> int:
         return install_autostart(dry_run=args.dry_run, backend=args.backend)
     if args.uninstall_autostart:
         return uninstall_autostart(backend=args.backend, dry_run=args.dry_run)
+    # ISS-55 ③：心跳名未注册 ⇒ 这条腿在 `/healthz` 里彻底不可见（连 missing 都不报）。
+    # 必须启动即报错，不带病起跑。注册动作由主管在 state/guardian_extra.json 亲手做。
+    reg_problem = notice_registration_problem()
+    if reg_problem:
+        print(f"[decide_watch] 拒绝运行：{reg_problem}", file=sys.stderr)
+        delivery_log(f"拒绝运行：{reg_problem}")
+        return EXIT_NOTICE_UNREGISTERED
     port = args.port or wss_bus().PORT
 
     cur = {} if args.no_cursor else load_cursor()
@@ -1398,12 +1730,14 @@ def _loop(args, port: int, since: int, boot_now: str, backoff: float) -> int:
             delivery_log(f"delivery_tick 异常（不阻断主循环）：{type(exc).__name__}: {exc}")
         data = fetch_events(since, args.wait, port)
         if data is None:
-            backoff = min(backoff * 2, BACKOFF_MAX)
-            log(f"daemon 不可达，{backoff:.1f}s 后重试；"
-                f"若长期不可用请用 the injected fallback poller fallback")
+            # 退避序列 1,2,4,8,16,30：**先睡当前值再翻倍**（先翻倍会让第一轮睡 2s，
+            # 与验收要求的起点 1 不符）。
             if args.once:
                 return 1
+            log(f"daemon 不可达，{backoff:.1f}s 后重试；"
+                f"若长期不可用请用 the injected fallback poller fallback")
             time.sleep(backoff)
+            backoff = min(backoff * 2, BACKOFF_MAX)
             continue
         backoff = BACKOFF_MIN
         oldest = int(data.get("oldest_seq") or 0)
@@ -1417,6 +1751,15 @@ def _loop(args, port: int, since: int, boot_now: str, backoff: float) -> int:
         evs = data.get("events") or []
         rsid = supervisor_sid(args.supervisor)
         handle(evs, rsid, args.dry_run, args.max_age)
+        # ISS-55：主管投递哨独立一腿。**落在上面那个 try 之外**（方案 A8）——
+        # 它抛异常就该冲出 `_loop` → `finally: release_lock()` → 进程退出 → 心跳消失，
+        # 这样「腿死了」可被发现；再包一层 try 就重演「腿死而进程心跳照旧 ok」。
+        # 游标回退只记 delta、不假装追平；已投过的靠指纹判重，绝不会因回退重发。
+        notice_cursor_rollback(since, int(data.get("seq") or 0))
+        attempted: set = set()          # 一轮 = 一次「消费＋重试」，升级按轮数算
+        handle_supervisor_notices(evs, dry=args.dry_run, port=port,
+                                  attempted=attempted)
+        _retry_pending(dry=args.dry_run, port=port, attempted=attempted)
         nxt = int(data.get("next_seq") or (since + 1))
         if evs:
             since = max(int(e.get("seq") or since) for e in evs)

@@ -39,6 +39,15 @@ class Bus:
         self.oldest = oldest
         self.health_calls = []
 
+    def guardian_thresholds(self):
+        """ISS-55 ③：生产里这条注册由主管亲手写进 state/guardian_extra.json；
+        夹具在同一个位置给出一条同名注册，测试才能走到轮询主体。"""
+        return {
+            "delivery_watch": ("heartbeat/delivery.json", 900.0, "收单哨"),
+            "decide_watch": ("heartbeat/decide.json", 900.0, "主循环"),
+            "supervisor_notice": ("heartbeat/supervisor_notice.json", 900.0, "投递哨"),
+        }
+
     def bus_get(self, path, timeout=0, port=0):
         return {"events": list(self.events), "next_seq": self.seq,
                 "oldest_seq": self.oldest, "boot_id": "isolated"}
