@@ -8,7 +8,7 @@ This directory records the reasoning behind `super_agent_for_kimi_code` — not 
 
 ---
 
-## The five papers · 五篇
+## The papers · 各篇
 
 | # | Paper · 篇目 | Chinese | English |
 |---|---|---|---|
@@ -17,6 +17,8 @@ This directory records the reasoning behind `super_agent_for_kimi_code` — not 
 | 03 | **Simplified agent-to-agent communication** — short instructions plus references<br>**Agent 间简化通信** — 短指令加引用 | [中文](03-agent-communication.zh.md) | [English](03-agent-communication.en.md) |
 | 04 | **Human-facing Reporter** — an honest, read-only status view<br>**面向人的 Reporter** — 诚实、只读的状态视图 | [中文](04-human-reporter.zh.md) | [English](04-human-reporter.en.md) |
 | 05 | **Artifact recycle bin** — tiered retention and safe reclaim<br>**产物回收站** — 分级保留与安全回收 | [中文](05-artifact-recycle-bin.zh.md) | [English](05-artifact-recycle-bin.en.md) |
+| 06 | **Token economics** — why this architecture spends fewer tokens: pre-work over re-work, thin roles, replace-don't-top-up<br>**Token 经济学** — 为什么这套架构更省 token：前置优于返工、角色薄化、换新而非续用 | [中文](06-token-economics.zh.md) | [English](06-token-economics.en.md) |
+| 07 | **Perpetual context** — the thesis: stop racing for bigger windows; an ant colony, not a bigger brain<br>**永续上下文** — 本系列立意篇：别再追逐更大的窗口；要蚁群，不要更大的脑 | [中文](07-perpetual-context.zh.md) | [English](07-perpetual-context.en.md) |
 
 ---
 
@@ -42,11 +44,15 @@ Four problems, four answers, one architecture:
 
 If you only have five minutes, read 01 and stop. It contains the whole shape.
 
+If you are asking "why should I care", read 07 — the thesis — then 06 for the accounting behind it.
+
 If you are evaluating whether this design is sound, read 01 → 03 → 05. Those three carry the load: the architecture, the communication discipline, and the retention boundary.
 
 If you care about the human side — what the operator sees and asks — read 04 last. It is the least load-bearing and the easiest to change.
 
 只有五分钟：读 01 就够，形全部在里面。
+
+如果你在问「这跟我有什么关系」：先读立意篇 07，再读 06 看背后的账。
 
 在评估这个设计站不站得住：按 01 → 03 → 05 读。这三篇承重：架构、通信纪律、保留边界。
 

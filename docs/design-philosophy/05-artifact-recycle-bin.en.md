@@ -2,7 +2,7 @@
 
 # 05 · Artifact recycle bin and metadata retention
 
-> Series: design philosophy ｜ [01 Core architecture](01-core-architecture.en.md) ｜ [02 Requirements Analyst](02-requirements-analyst.en.md) ｜ [03 Agent-to-agent communication](03-agent-communication.en.md) ｜ [04 Human-facing Reporter](04-human-reporter.en.md) ｜ 05 Artifact recycle bin
+> Series: design philosophy ｜ [01 Core architecture](01-core-architecture.en.md) ｜ [02 Requirements Analyst](02-requirements-analyst.en.md) ｜ [03 Agent-to-agent communication](03-agent-communication.en.md) ｜ [04 Human-facing Reporter](04-human-reporter.en.md) ｜ 05 Artifact recycle bin ｜ [06 Token economics](06-token-economics.en.md) ｜ [07 Perpetual context](07-perpetual-context.en.md)
 > Version: 2026-11-07
 > Goal: intermediate artifacts are usable while work is running, reclaimable for a bounded period after close-out, and traceable throughout — without a heavy database.
 > Nature: a design proposal. It changes no rules, runs no cleanup and authorizes no automatic deletion.

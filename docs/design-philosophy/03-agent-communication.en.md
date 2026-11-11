@@ -2,7 +2,7 @@
 
 # 03 · Simplified agent-to-agent communication
 
-> Series: design philosophy ｜ [01 Core architecture](01-core-architecture.en.md) ｜ [02 Requirements Analyst](02-requirements-analyst.en.md) ｜ 03 Agent-to-agent communication ｜ [04 Human-facing Reporter](04-human-reporter.en.md) ｜ [05 Artifact recycle bin](05-artifact-recycle-bin.en.md)
+> Series: design philosophy ｜ [01 Core architecture](01-core-architecture.en.md) ｜ [02 Requirements Analyst](02-requirements-analyst.en.md) ｜ 03 Agent-to-agent communication ｜ [04 Human-facing Reporter](04-human-reporter.en.md) ｜ [05 Artifact recycle bin](05-artifact-recycle-bin.en.md) ｜ [06 Token economics](06-token-economics.en.md) ｜ [07 Perpetual context](07-perpetual-context.en.md)
 > Version: 2026-11-07
 > Goal: less long-text relaying, less multi-round confirmation and less duplicate investigation between agents — while keeping requirement and acceptance semantics intact.
 > Nature: a design report. It authorizes no rule change, no code and no privilege change.

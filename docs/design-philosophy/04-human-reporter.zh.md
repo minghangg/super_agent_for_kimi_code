@@ -2,7 +2,7 @@
 
 # 04 · 面向人的 Reporter 状态中心
 
-> 系列：设计哲学（design-philosophy）｜[01 核心架构](01-core-architecture.zh.md) ｜ [02 需求分析员](02-requirements-analyst.zh.md) ｜ [03 Agent 间通信](03-agent-communication.zh.md) ｜ 04 面向人的 Reporter ｜ [05 产物回收站](05-artifact-recycle-bin.zh.md)
+> 系列：设计哲学（design-philosophy）｜[01 核心架构](01-core-architecture.zh.md) ｜ [02 需求分析员](02-requirements-analyst.zh.md) ｜ [03 Agent 间通信](03-agent-communication.zh.md) ｜ 04 面向人的 Reporter ｜ [05 产物回收站](05-artifact-recycle-bin.zh.md)｜ [06 Token 经济学](06-token-economics.zh.md) ｜ [07 永续上下文](07-perpetual-context.zh.md)
 > 版本：2026-11-07
 > 定位：为用户提供只读、准确、按需下钻的状态视图，代替询问多个 Agent 或阅读评论流水。
 > 性质：设计报告，不授权修改规则、开发代码、开启 Web 服务或改变角色权限。

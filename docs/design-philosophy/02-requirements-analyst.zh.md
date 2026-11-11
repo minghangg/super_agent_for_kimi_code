@@ -2,7 +2,7 @@
 
 # 02 · Requirements Analyst：需求预审与澄清
 
-> 系列：设计哲学（design-philosophy）｜[01 核心架构](01-core-architecture.zh.md) ｜ 02 需求分析员 ｜ [03 Agent 间通信](03-agent-communication.zh.md) ｜ [04 面向人的 Reporter](04-human-reporter.zh.md) ｜ [05 产物回收站](05-artifact-recycle-bin.zh.md)
+> 系列：设计哲学（design-philosophy）｜[01 核心架构](01-core-architecture.zh.md) ｜ 02 需求分析员 ｜ [03 Agent 间通信](03-agent-communication.zh.md) ｜ [04 面向人的 Reporter](04-human-reporter.zh.md) ｜ [05 产物回收站](05-artifact-recycle-bin.zh.md)｜ [06 Token 经济学](06-token-economics.zh.md) ｜ [07 永续上下文](07-perpetual-context.zh.md)
 > 版本：v3 补充 · 2026-11-07
 > 约束：非官方、单用户、多项目、资源有限、无重型数据库。
 > 性质：设计建议，不授权修改章程、创建角色会话、开启 Web 服务或实施开发。

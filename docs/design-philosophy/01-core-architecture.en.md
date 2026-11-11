@@ -2,7 +2,7 @@
 
 # 01 · Core Architecture
 
-> Series: design philosophy ｜ 01 Core architecture ｜ [02 Requirements Analyst](02-requirements-analyst.en.md) ｜ [03 Agent-to-agent communication](03-agent-communication.en.md) ｜ [04 Human-facing Reporter](04-human-reporter.en.md) ｜ [05 Artifact recycle bin](05-artifact-recycle-bin.en.md)
+> Series: design philosophy ｜ 01 Core architecture ｜ [02 Requirements Analyst](02-requirements-analyst.en.md) ｜ [03 Agent-to-agent communication](03-agent-communication.en.md) ｜ [04 Human-facing Reporter](04-human-reporter.en.md) ｜ [05 Artifact recycle bin](05-artifact-recycle-bin.en.md) ｜ [06 Token economics](06-token-economics.en.md) ｜ [07 Perpetual context](07-perpetual-context.en.md)
 > Version: v3 · 2026-11-07
 > Constraints: unofficial project, one person maintaining several projects, limited resources, no heavy database.
 > Nature: a design baseline. It does not authorize creating repositories, changing rules, or starting implementation.

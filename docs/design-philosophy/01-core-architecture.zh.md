@@ -2,7 +2,7 @@
 
 # 01 · 核心架构
 
-> 系列：设计哲学（design-philosophy）｜01 核心架构 ｜ [02 需求分析员](02-requirements-analyst.zh.md) ｜ [03 Agent 间通信](03-agent-communication.zh.md) ｜ [04 面向人的 Reporter](04-human-reporter.zh.md) ｜ [05 产物回收站](05-artifact-recycle-bin.zh.md)
+> 系列：设计哲学（design-philosophy）｜01 核心架构 ｜ [02 需求分析员](02-requirements-analyst.zh.md) ｜ [03 Agent 间通信](03-agent-communication.zh.md) ｜ [04 面向人的 Reporter](04-human-reporter.zh.md) ｜ [05 产物回收站](05-artifact-recycle-bin.zh.md)｜ [06 Token 经济学](06-token-economics.zh.md) ｜ [07 永续上下文](07-perpetual-context.zh.md)
 > 版本：v3 · 2026-11-07
 > 约束：非官方项目、单人维护多项目、资源有限、不使用复杂数据库。
 > 性质：设计基线，不授权创建仓库、修改规则或直接实施开发。

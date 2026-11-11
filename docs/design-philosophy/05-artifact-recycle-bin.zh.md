@@ -2,7 +2,7 @@
 
 # 05 · 临时产物 Recycle Bin 与元数据回收
 
-> 系列：设计哲学（design-philosophy）｜[01 核心架构](01-core-architecture.zh.md) ｜ [02 需求分析员](02-requirements-analyst.zh.md) ｜ [03 Agent 间通信](03-agent-communication.zh.md) ｜ [04 面向人的 Reporter](04-human-reporter.zh.md) ｜ 05 产物回收站
+> 系列：设计哲学（design-philosophy）｜[01 核心架构](01-core-architecture.zh.md) ｜ [02 需求分析员](02-requirements-analyst.zh.md) ｜ [03 Agent 间通信](03-agent-communication.zh.md) ｜ [04 面向人的 Reporter](04-human-reporter.zh.md) ｜ 05 产物回收站｜ [06 Token 经济学](06-token-economics.zh.md) ｜ [07 永续上下文](07-perpetual-context.zh.md)
 > 版本：2026-11-07
 > 定位：中间产物「工作期间可用、关单后限期可回收、全程可追溯」，但不建立复杂数据库。
 > 性质：设计方案，不修改规则、不执行清理、不授权自动删除。

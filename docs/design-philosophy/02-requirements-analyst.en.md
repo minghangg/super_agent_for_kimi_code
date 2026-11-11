@@ -2,7 +2,7 @@
 
 # 02 · Requirements Analyst: requirement pre-review and clarification
 
-> Series: design philosophy ｜ [01 Core architecture](01-core-architecture.en.md) ｜ 02 Requirements Analyst ｜ [03 Agent-to-agent communication](03-agent-communication.en.md) ｜ [04 Human-facing Reporter](04-human-reporter.en.md) ｜ [05 Artifact recycle bin](05-artifact-recycle-bin.en.md)
+> Series: design philosophy ｜ [01 Core architecture](01-core-architecture.en.md) ｜ 02 Requirements Analyst ｜ [03 Agent-to-agent communication](03-agent-communication.en.md) ｜ [04 Human-facing Reporter](04-human-reporter.en.md) ｜ [05 Artifact recycle bin](05-artifact-recycle-bin.en.md) ｜ [06 Token economics](06-token-economics.en.md) ｜ [07 Perpetual context](07-perpetual-context.en.md)
 > Version: v3 supplement · 2026-11-07
 > Constraints: unofficial, single user, many projects, limited resources, no heavy database.
 > Nature: a design proposal. It authorizes no charter change, no role session creation, no web service and no implementation.
