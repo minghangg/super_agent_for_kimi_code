@@ -59,16 +59,22 @@ class Bus:
         self.gets.append((path, timeout))
         if self.down:
             raise OSError("daemon unreachable")
-        since = 0
+        since, limit = 0, 5000
         for part in str(path).split("?", 1)[-1].split("&"):
             if part.startswith("since="):
                 try:
                     since = int(part.split("=", 1)[1])
                 except ValueError:
                     since = 0
-        # 真实 /events 是排他的：只返回 seq > since
+            elif part.startswith("limit="):
+                try:
+                    limit = int(part.split("=", 1)[1])
+                except ValueError:
+                    limit = 5000
+        # 真实 /events 两处语义都要复刻：排他下界（seq > since）＋ 尾部截断
+        # （`out[-limit:]`，wss_bus.py:2485）。少了截断，P1-A 的反例就是假绿。
         visible = [e for e in self.events if int(e.get("seq") or 0) > since]
-        return {"events": visible, "next_seq": self.seq,
+        return {"events": visible[-limit:], "next_seq": self.seq,
                 "seq": self.seq,          # 真实 /events 必带；回退判据靠它
                 "oldest_seq": self.oldest, "boot_id": "isolated"}
 
@@ -519,6 +525,117 @@ class Fingerprint(NoticeFixture):
         self.assertEqual(self.sends, [])
         self.assertEqual(self.ledger_rows()[-1]["state"], "refused_payload")
         self.assertEqual(self.injections[-1][1]["event"], dw.SUPERVISOR_FAILED_EVENT)
+
+
+class P1A_RescanCoversWholeRing(NoticeFixture):
+    """`since=0` 重扫必须能拿到环**早期**的事件，不只看环尾 200 条。"""
+
+    def _run_loop(self, stop_after_handle: int = 2):
+        class _Stop(Exception):
+            pass
+
+        calls = {"n": 0}
+        real_handle = dw.handle_supervisor_notices
+
+        def _handle(evs, **kw):
+            calls["n"] += 1
+            if calls["n"] > stop_after_handle:
+                raise _Stop()
+            return real_handle(evs, **kw)
+
+        with mock.patch.object(dw, "acquire_lock", return_value=(True, "")), \
+                mock.patch.object(dw, "release_lock"), \
+                mock.patch.object(dw, "handle_supervisor_notices", side_effect=_handle), \
+                contextlib.redirect_stdout(io.StringIO()):
+            try:
+                dw.main([])
+            except _Stop:
+                return
+        self.fail("round limit never reached")
+
+    def test_key_event_at_ring_head_is_delivered_after_a_rollback(self):
+        """关键未投事件在环最前，后面压 400 条噪音，且游标超前触发回退重扫。
+
+        把 `limit` 改回 200 ⇒ 服务端只给尾部 200 条，环首那条被截掉 ⇒ 本用例变红。
+        """
+        key = self.notice(seq=100, text="关键：环最早的那条未投事件")
+        noise = [self.notice(seq=101 + i, text=f"噪音{i}") for i in range(400)]
+        self.bus.events = [key] + noise
+        self.bus.seq = 600
+        dw.save_cursor(1000, "isolated")        # 游标超前 ⇒ 触发回退重扫
+
+        self._run_loop(stop_after_handle=2)
+
+        texts = [t for _s, t in self.sends]
+        self.assertIn("关键：环最早的那条未投事件", texts,
+                      "limit 小于环容量时，这条会被尾部截断吃掉")
+        # 重扫不重复：指纹判重，关键事件只发 1 次
+        self.assertEqual(texts.count("关键：环最早的那条未投事件"), 1)
+
+    def test_fetch_limit_covers_the_daemon_ring(self):
+        """常量本身要 ≥ daemon 环容量（`wss_bus.py:97` RING_SIZE=5000）。"""
+        self.assertGreaterEqual(dw.NOTICE_FETCH_LIMIT, 5000)
+
+    def test_request_carries_the_limit(self):
+        dw.fetch_events(0, 0.0, 58800)
+        path = self.bus.gets[-1][0]
+        self.assertIn(f"limit={dw.NOTICE_FETCH_LIMIT}", path)
+        self.assertNotIn("limit=200", path)
+
+
+class P1B_RetryTotalLimit(NoticeFixture):
+    """`rc=1` 必须收敛：有总上限、有终态、**且出声**。"""
+
+    def _rounds(self, n):
+        for _ in range(n):
+            dw._retry_pending(attempted=set())
+
+    def test_rc_1_stops_at_the_total_limit_and_speaks(self):
+        self.send_rc = 1
+        self.send_stderr = "send: 上游明确拒绝"
+        dw.handle_supervisor_notices([self.notice(seq=200)])
+        self._rounds(dw.NOTICE_RETRY_MAX_TOTAL + 5)
+
+        # ① 发送次数 = 上限（既不是 0 也不是无穷）
+        self.assertEqual(len(self.sends), dw.NOTICE_RETRY_MAX_TOTAL)
+        # ② 终态
+        row = self.ledger_rows()[-1]
+        self.assertEqual(row["state"], "undelivered")
+        self.assertEqual(row["attempts"], dw.NOTICE_RETRY_MAX_TOTAL)
+        # ③ 失败事件恰 1 次
+        types = [b["event"] for _p, b in self.injections]
+        self.assertEqual(types.count(dw.SUPERVISOR_FAILED_EVENT), 1)
+        # ④ last_fail_state 已写
+        self.assertEqual(self.last()["last_fail_state"], "undelivered")
+
+    def test_undelivered_never_returns_to_the_retry_path(self):
+        self.send_rc = 1
+        dw.handle_supervisor_notices([self.notice(seq=201)])
+        self._rounds(dw.NOTICE_RETRY_MAX_TOTAL + 2)
+        before = len(self.sends)
+        self._rounds(5)                       # 终态之后再多跑几轮
+        self.assertEqual(len(self.sends), before, "undelivered 不该再发")
+        self.assertEqual(len(self.injections), 1, "出声也只该一次")
+
+    def test_rc_1_logs_progress_against_the_total_limit(self):
+        """上限之前的日志要报总上限，不能永远显示「第 N/3 轮」。"""
+        self.send_rc = 1
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            dw.handle_supervisor_notices([self.notice(seq=202)])
+        self.assertEqual(self.ledger_rows()[-1]["state"], "retry_later")
+        self.assertEqual(self.ledger_rows()[-1]["attempts"], 1)
+        self.assertIn(f"/{dw.NOTICE_RETRY_MAX_TOTAL}", out.getvalue())
+
+    def test_probe_unknown_still_converges_at_its_own_limit(self):
+        """既有语义不许被总上限吞掉：探测未知仍是 3 轮就收敛。"""
+        self.probe_answer = (None, "探针不可达")
+        dw.handle_supervisor_notices([self.notice(seq=203)])
+        self._rounds(2)
+        row = self.ledger_rows()[-1]
+        self.assertEqual(row["state"], "probe_unknown")
+        self.assertEqual(row["attempts"], dw.NOTICE_RETRY_LIMIT)
+        self.assertEqual(len(self.sends), 0)
 
 
 if __name__ == "__main__":

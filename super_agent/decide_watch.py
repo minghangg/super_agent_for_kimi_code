@@ -491,10 +491,15 @@ def describe(ev: dict) -> str:
 
 
 def fetch_events(since: int, wait: float, port: int) -> dict | None:
-    """`/events?since=&wait=` 长轮询；daemon 不可用返回 None。"""
+    """`/events?since=&wait=` 长轮询；daemon 不可用返回 None。
+
+    `limit` 必须覆盖整个环：`since=0` 的回退重扫若只取 200 条，环里更早的
+    未投事件永远拿不到，而随后 `since` 会被推到环尾（`_loop`）⇒ 它们永不重扫。
+    """
     try:
-        return _event_get(f"/events?since={int(since)}&wait={wait}&limit=200",
-                               timeout=wait + 10, port=port)
+        return _event_get(f"/events?since={int(since)}&wait={wait}"
+                          f"&limit={NOTICE_FETCH_LIMIT}",
+                          timeout=wait + 10, port=port)
     except Exception as exc:  # noqa: BLE001
         log(f"/events 取数失败：{type(exc).__name__}: {exc}")
         return None
@@ -535,6 +540,12 @@ SUPERVISOR_NOTICE_EVENT = "event.agent.supervisor"
 SUPERVISOR_FAILED_EVENT = "event.session.supervisor_delivery_failed"
 SUPERVISOR_NOTICE_HEARTBEAT = "supervisor_notice"
 NOTICE_RETRY_LIMIT = 3          # 连续这么多轮仍 unknown ⇒ probe_unknown 终态
+NOTICE_RETRY_MAX_TOTAL = 20     # 总重试上限（任意原因）⇒ undelivered 终态
+# 单次 `/events` 取多少条。**必须等于 daemon 的环容量**（`super_agent/wss_bus.py:97`
+# `RING_SIZE = 5000`）：回退重扫靠 `since=0` 重拉整个环，写小了就等于只重扫环的
+# 尾部，更早的未投事件永远拿不到，而 `since` 随后会跳到环尾 ⇒ 它们永不重扫。
+# 服务端会 `min(limit, RING_SIZE)` 钳住，所以写大安全，写小才是缺陷。
+NOTICE_FETCH_LIMIT = 5000
 EXIT_NOTICE_UNREGISTERED = 12   # 心跳名未注册（启动即报错，绝不带病起跑）
 _NOTICE_LAST_KEYS = ("last_ok_at", "last_ok_seq", "last_fail_at", "last_fail_state",
                      "last_fail_seq", "pending_indeterminate", "delta")
@@ -749,6 +760,12 @@ def _run_notice_row(row: dict, *, dry: bool, port: int, rows: dict) -> str:
     if state == "retry_later" and unknown and attempts >= NOTICE_RETRY_LIMIT:
         state = "probe_unknown"
         detail = f"连续 {attempts} 轮无法判定 ⇒ 终态，不再重试：{detail}"
+    elif state == "retry_later" and attempts >= NOTICE_RETRY_MAX_TOTAL:
+        # 原因明确的失败（如 rc=1 上游一直拒绝）也必须收敛：没有总上限就是每轮
+        # 真发一次、永不终止；而 `retry_later` 只写日志、不出声 ⇒ 典型的「只上弦不响」。
+        state = "undelivered"
+        detail = (f"重试 {attempts} 轮仍失败（上限 {NOTICE_RETRY_MAX_TOTAL}）"
+                  f"⇒ 终态，不再重试：{detail}")
     out = {**row, "state": state, "attempts": attempts,
            "detail": detail,
            "state_at": datetime.now().isoformat(timespec="seconds")}
@@ -765,7 +782,8 @@ def _run_notice_row(row: dict, *, dry: bool, port: int, rows: dict) -> str:
         log(f"[supervisor-notice] ⚠ seq={out['seq']} 终态 {state}：{detail}")
     else:
         log(f"[supervisor-notice] seq={out['seq']} 本轮未投（{detail}）"
-            f"⇒ 存台账，第 {attempts}/{NOTICE_RETRY_LIMIT} 轮")
+            f"⇒ 存台账，第 {attempts}/{NOTICE_RETRY_MAX_TOTAL} 轮"
+            f"（探测未知时 {NOTICE_RETRY_LIMIT} 轮即收敛）")
     return state
 
 
