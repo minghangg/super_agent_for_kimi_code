@@ -13,12 +13,13 @@ The industry is racing toward larger context windows. This paper argues that the
 
 A context window is not a container that keeps overflowing because it is too small. It is a container that keeps overflowing because **the wrong things are put into it**. Making it larger delays the overflow and simultaneously makes each turn more expensive, because every token in the window is re-read on every turn.
 
-The thesis, in four parts:
+The thesis, in five parts:
 
 1. **The supervisor's context should be perpetual.** A working relationship between one person and their top-level agent should last months. It should not be periodically destroyed and rebuilt, and it should not fill up with project detail.
 2. **Project memory belongs outside the supervisor.** It lives in the record — in Issues, in documents, in the artifact store. The supervisor holds *pointers and judgements*, not *contents*.
 3. **Therefore the correct architecture is an ant colony, not a bigger brain.** A queen ant does not know where the food is. The colony finds it, remembers it, and the queen ant keeps doing the one thing only she can do: deciding.
 4. **Rotation then becomes cheap and safe.** When a session is rotated, only a minimal set of global facts moves. Everything else is re-read from the record on demand. Memory loss stops being a risk because memory was never in the session.
+5. **The shape composes fractally.** A supervisor and its team present the same contract as a single worker — a team *is* a module. Link modules under a supervisor-of-supervisors and you have a larger engineering organisation, with every node's context still small. "This only works for small projects" is answered by adding a level, not by adding a bigger window.
 
 This is the highest-leverage claim in the whole series, and it is also the one most easily misread. It does not say context is unimportant. It says context is **too important to be filled with things that have a better home**.
 
@@ -189,6 +190,49 @@ That combination is what makes cross-project judgement possible without context 
 
 The discipline is: **the supervisor's value is in the questions it can ask, not the answers it holds.** An agent holding answers is a cache. An agent holding questions is an orchestrator. Caches go stale; questions stay sharp.
 
+### 3.5 Fractal composition: a team is a module
+
+The ant colony argument has a corollary that is easy to miss, and it is the answer to the most common objection to this whole design.
+
+**A supervisor and its team is itself a module.**
+
+Look at what a module is: a boundary with a contract. Give it an input, get an output, and the caller does not need to know what happens inside. A worker satisfies this — give it a brief, get a delivered change. But so does an entire team: give it a goal, get a delivered change. **The interface is identical.** The only differences are cost, latency and how much can be done before the caller has to look again.
+
+That identity is what makes the architecture **fractal** — self-similar at every scale:
+
+```text
+level 2   supervisor-of-supervisors      holds M pointers to level-1 modules
+             │
+      ┌──────┼──────┐
+      ▼      ▼      ▼
+level 1   supervisor  supervisor  supervisor     each is a module, same contract
+             │             │            │
+      ┌──────┼─────┐       │            │
+      ▼      ▼     ▼       ▼            ▼
+level 0   worker  worker  worker  worker  worker  worker    base case: no
+                                                             supervision inside
+```
+
+At every level the rule is the same, and that is the load-bearing part: **a node at level *k* holds intent, authorization, open decisions and M pointers — never contents.** Its context is O(M), not O(the work below it). M is bounded by how many things one node can meaningfully track, which is a human-attention constant, not a project-count constant.
+
+So the objection "this only works because your projects are small" misreads what is being scaled. **What scales is not the node; it is the number of levels.** Adding a hundred projects does not make the top supervisor's context a hundred times larger — it adds a level, and every node at every level stays small.
+
+Three consequences worth stating.
+
+**Substitutability.** Because a team and a worker present the same contract, a team can occupy a slot that a worker used to occupy, and vice versa. You can start with one worker, replace it with a team when the work grows, and nothing above notices. That is what "module" means, and it is why the design does not have to be rewritten when a project grows — the slot does not change, only what fills it.
+
+**Uniform failure semantics.** At every level, failure means the same thing: the module did not deliver, or delivered something the level above rejects. Escalation is always one level up. There is no special case for "this is a big project" and no second set of rules for scale.
+
+**Bounded, not free.** Composition is not free. Each level adds a restatement of intent, and each restatement loses fidelity — the "why" degrades as it descends. Each level adds latency. Each level adds one more place where a wrong premise can be introduced. Fractal composition makes scale *possible* and its cost *predictable*; it does not make it cheap. A five-level structure whose top node has a tiny context still has five chances to mistranslate the goal.
+
+The base case and the recursion, stated plainly:
+
+- **Base case:** one worker, one brief, one deliverable. No supervision inside.
+- **Step:** wrap N modules with one supervisor whose context holds their contracts and their open decisions. The result is a module.
+- **Therefore:** any number of levels, each satisfying the same property.
+
+And the reason this is not merely "add hierarchy": hierarchy is only a shape. The claim here is that **the interface is invariant across levels**, so the same discipline — thin role, pointers not contents, record not session — applies unchanged everywhere. A hierarchy whose interfaces differ at each level is just a taller tree with the same context problem at the top. A fractal one keeps every node small, which is a different thing entirely.
+
 ## 4. Criteria: what goes in, what goes out
 
 Four questions, applied to any candidate piece of information.
@@ -276,9 +320,11 @@ So the pack is not just "identity, intent, authorization". It is also "**a map o
 
 ### 5.3 "This only works because your projects are small"
 
-Partly true, and worth stating plainly. A team with a hundred projects would need a hierarchical index, and the supervisor's map would itself become large. Our design assumes a number of projects small enough that the map fits comfortably.
+Partly true at one level, and **false as a general objection** — see §3.5. A single node's context is O(M) in the number of modules it supervises, and M is a human-attention constant. Scaling to a hundred projects does not inflate the top node; it adds a level, and every node at every level stays small.
 
-The claim is not that this scales to any size. The claim is that **it scales much further than putting contents in context does**, because the map grows with the number of projects while contents grow with the number of projects *times* their history.
+What remains true: a *single* supervisor cannot hold a hundred modules. That is a reason to add a level, not a reason the architecture fails. The map grows one level, not one magnitude.
+
+The honest residual cost is fidelity loss per level, stated in §3.5 — composition is bounded, not free.
 
 ### 5.4 "You are just describing a database with extra steps"
 
@@ -295,7 +341,8 @@ What we reject is the opposite arrangement: a model that is *also* the storage. 
 - **It does not make the supervisor omniscient.** It makes the supervisor *honest about its ignorance*, which is different and more useful.
 - **It does not eliminate the cross-pollination loss.** Distributed teams genuinely miss things that a single context would have caught. The supervisor partially compensates; it does not fully.
 - **It does not settle the model question.** Whether a given model is good enough at "knowing when to look something up" is an empirical question, and it is the load-bearing one for this design.
+- **It does not make composition free.** Every added level restates the intent and loses some fidelity. A fractal structure scales, and it degrades predictably — but a five-level structure has five chances to mistranslate the goal, and no amount of small contexts fixes that.
 
 ## 7. The claim, in one paragraph
 
-The industry's answer to context limits is a bigger window. Ours is a smaller context that never needs to be rebuilt. The difference is not a matter of degree: a bigger window keeps the same architecture and makes each turn more expensive; a perpetual context changes what the architecture holds and makes each turn cheaper. A supervisor should know the user's intent, the current authorizations, the open decisions, and where everything else lives — and nothing else. Everything else belongs in the record, where it can be found when it matters and costs nothing when it does not. The ant colony finds the food. The queen ant decides. That division of labour is what makes both of them able to work for a very long time.
+The industry's answer to context limits is a bigger window. Ours is a smaller context that never needs to be rebuilt. The difference is not a matter of degree: a bigger window keeps the same architecture and makes each turn more expensive; a perpetual context changes what the architecture holds and makes each turn cheaper. A supervisor should know the user's intent, the current authorizations, the open decisions, and where everything else lives — and nothing else. Everything else belongs in the record, where it can be found when it matters and costs nothing when it does not. And because a team presents the same contract as a worker, the shape repeats: put a supervisor over supervisors and the organisation grows while every node stays small. The ant colony finds the food. The queen ant decides. That division of labour is what makes both of them able to work for a very long time — and what makes a colony of colonies work too.
