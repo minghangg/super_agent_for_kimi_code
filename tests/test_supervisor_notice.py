@@ -328,6 +328,94 @@ class CounterSeven_UnregisteredHeartbeat(NoticeFixture):
         self.assertIsNone(dw.notice_registration_problem() or None)
 
 
+class SendRcTiers(NoticeFixture):
+    """`tools/sess.py:72-75` 六档退出码，逐档都要有独立用例，且**每条都断言发送次数**。
+
+    只断言终态字符串不够：rc=3/5 的旧实现在终态上最终也会变成 `probe_unknown`，
+    光看状态名抓不到「同一事件实发 3 次」这个 P0。
+    """
+
+    def _run_rounds(self, rounds=3):
+        attempted: set = set()
+        dw.handle_supervisor_notices([self.notice(seq=100)], attempted=attempted)
+        dw._retry_pending(attempted=attempted)
+        for _ in range(rounds - 1):
+            attempted = set()
+            dw._retry_pending(attempted=attempted)
+
+    def test_rc_3_is_indeterminate_sent_exactly_once(self):
+        self.send_rc = 3
+        self.send_stderr = "send: 不确定（可能已投、禁止重发）"
+        self._run_rounds(3)
+        self.assertEqual(len(self.sends), 1, "rc=3 可能已投，跑 3 轮也只能发 1 次")
+        row = self.ledger_rows()[-1]
+        self.assertEqual(row["state"], "indeterminate")
+        self.assertEqual(row["attempts"], 1)
+        self.assertEqual(self.last()["last_fail_state"], "indeterminate")
+        self.assertEqual(len(self.injections), 1)
+
+    def test_rc_5_is_indeterminate_sent_exactly_once(self):
+        self.send_rc = 5
+        self._run_rounds(3)
+        self.assertEqual(len(self.sends), 1, "rc=5 已受理，跑 3 轮也只能发 1 次")
+        self.assertEqual(self.ledger_rows()[-1]["state"], "indeterminate")
+        self.assertEqual(self.last()["last_fail_state"], "indeterminate")
+
+    def test_indeterminate_never_returns_to_the_retry_path(self):
+        """终态之后 `_retry_pending` 再也不碰它——这是 at-most-once 的最后一道闸。"""
+        self.send_rc = 3
+        self._run_rounds(2)
+        self.assertEqual(len(self.sends), 1)
+        for _ in range(3):
+            dw._retry_pending(attempted=set())
+        self.assertEqual(len(self.sends), 1)
+        self.assertEqual(len(self.injections), 1, "出声也只该一次")
+
+    def test_rc_2_is_refused_payload_and_not_retried(self):
+        self.send_rc = 2
+        self.send_stderr = "send: 正文为空，拒绝投递"
+        self._run_rounds(3)
+        self.assertEqual(len(self.sends), 1)
+        self.assertEqual(self.ledger_rows()[-1]["state"], "refused_payload")
+
+    def test_rc_1_retries_and_then_succeeds(self):
+        """rc=1 是「上游明确拒绝、没有投出去」，堵死它会让可恢复的失败永远发不出去。"""
+        self.send_rc = 1
+        self.send_stderr = "send: 上游明确拒绝"
+        dw.handle_supervisor_notices([self.notice(seq=101)])
+        self.assertEqual(len(self.sends), 1)
+        self.assertEqual(self.ledger_rows()[-1]["state"], "retry_later")
+
+        self.send_rc = 0
+        dw._retry_pending(attempted=set())
+        self.assertEqual(len(self.sends), 2)
+        self.assertEqual(self.ledger_rows()[-1]["state"], "delivered")
+
+    def test_rc_0_is_delivered(self):
+        self.send_rc = 0
+        dw.handle_supervisor_notices([self.notice(seq=102)])
+        self.assertEqual(len(self.sends), 1)
+        self.assertEqual(self.ledger_rows()[-1]["state"], "delivered")
+
+    def test_every_rc_tier_is_asserted_on_sends_not_only_on_state(self):
+        """六档各自的 (终态, 发送次数)。每档用**独立夹具**，避免台账与 sends 串味。"""
+        expected = {0: ("delivered", 1), 1: ("retry_later", 3),
+                    2: ("refused_payload", 1), 3: ("indeterminate", 1),
+                    4: ("refused_retired", 1), 5: ("indeterminate", 1)}
+        for rc, (state, sends) in expected.items():
+            with self.subTest(rc=rc):
+                self.setUp()
+                try:
+                    self.send_rc = rc
+                    dw.handle_supervisor_notices([self.notice(seq=110)])
+                    for _ in range(2):
+                        dw._retry_pending(attempted=set())
+                    self.assertEqual(self.ledger_rows()[-1]["state"], state, f"rc={rc}")
+                    self.assertEqual(len(self.sends), sends, f"rc={rc} 发送次数")
+                finally:
+                    self.tearDown()
+
+
 class CounterEight_CursorRollback(NoticeFixture):
     def test_cursor_ahead_of_daemon_records_delta_and_resends_nothing(self):
         ev = self.notice(seq=41)
@@ -346,6 +434,54 @@ class CounterEight_CursorRollback(NoticeFixture):
         self.assertEqual(rc, 0)
         self.assertEqual(self.last()["delta"], 10)
         self.assertEqual(len(self.sends), 1)          # 回退不重发已投过的
+        # 游标确实退回去了（不再是那个超前的 50），且没超过 daemon 的 seq
+        self.assertLessEqual(json.loads(dw.CURSOR().read_text(encoding="utf-8"))["seq"], 40)
+
+    def test_rollback_window_resends_nothing_delivered_and_catches_the_rest(self):
+        """P1-A：回退窗口里既要有已投的也要有未投的。
+
+        已投的 `seq=41` 靠指纹判重；未投的 `seq=42/43` 必须补投。只记 `delta`
+        不重扫的实现会让 42/43 永久丢失（`/events?since=50` 永远取不到它们）。
+        """
+        delivered = self.notice(seq=41, text="回退前已投")
+        dw.handle_supervisor_notices([delivered])
+        self.assertEqual(len(self.sends), 1)
+
+        dw.save_cursor(50, "isolated")
+        self.bus.seq = 43                     # daemon 回退：环里现在只到 43
+        self.bus.events = [delivered,
+                           self.notice(seq=42, text="回退窗口内未投一"),
+                           self.notice(seq=43, text="回退窗口内未投二")]
+        args = mock.Mock(dry_run=False, once=False, wait=0.0, supervisor="",
+                         max_age=dw.MAX_AGE_S)
+
+        class _Stop(Exception):
+            pass
+
+        calls = {"n": 0}
+        real_handle = dw.handle_supervisor_notices
+
+        def _handle(evs, **kw):
+            calls["n"] += 1
+            if calls["n"] > 1:      # 回退轮不调它；下一轮补投，再下一轮收网
+                raise _Stop()
+            return real_handle(evs, **kw)
+
+        with mock.patch.object(dw, "acquire_lock", return_value=(True, "")), \
+                mock.patch.object(dw, "release_lock"), \
+                mock.patch.object(dw, "handle_supervisor_notices", side_effect=_handle), \
+                contextlib.redirect_stdout(io.StringIO()):
+            try:
+                dw.main([])
+            except _Stop:
+                pass
+        # 回退那一轮只退回重扫、不投；下一轮才是真正的补投
+        self.assertEqual([t for _s, t in self.sends],
+                         ["回退前已投", "回退窗口内未投一", "回退窗口内未投二"])
+        states = {(r["seq"], r["state"]) for r in self.ledger_rows()}
+        self.assertIn((41, "delivered"), states)
+        self.assertIn((43, "delivered"), states)
+        self.assertEqual(self.last()["delta"], 7)
 
     def test_rollback_is_a_no_op_when_cursor_is_in_sync(self):
         self.assertIsNone(dw.notice_cursor_rollback(40, 40))
@@ -359,6 +495,18 @@ class Fingerprint(NoticeFixture):
         b = {"seq": 1, "ts": 2.0, "type": dw.SUPERVISOR_NOTICE_EVENT,
              "payload": {"issue": 1, "text": "t", "sid": "s"}}
         self.assertEqual(dw.notice_fingerprint(a), dw.notice_fingerprint(b))
+
+    def test_same_seq_different_payload_is_a_different_event(self):
+        """判重靠 payload，不是靠 seq——这是 QA 变异①（指纹退化成 seq）要抓的点。"""
+        first = self.notice(seq=7, text="同一事件")
+        dw.handle_supervisor_notices([first])
+        dw.handle_supervisor_notices([first])
+        self.assertEqual(len(self.sends), 1, "同一事件重放只能发 1 次")
+
+        other = self.notice(seq=7, text="同 seq 不同 payload")
+        dw.handle_supervisor_notices([other])
+        self.assertEqual(len(self.sends), 2, "同 seq 不同事件必须照投")
+        self.assertNotEqual(dw.notice_fingerprint(first), dw.notice_fingerprint(other))
 
     def test_event_outer_sid_is_never_used_as_the_target(self):
         ev = self.notice(seq=90, sid="session_probe_fixture")

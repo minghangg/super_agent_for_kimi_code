@@ -637,32 +637,65 @@ def _probe_notice_target(sid: str) -> tuple[bool | None, str]:
     return True, ""
 
 
-def _attempt_notice(row: dict, dry: bool) -> tuple[str, str]:
-    """尝试投递一行台账，返回 `(state, detail)`。**绝不使用事件外层 sid**。"""
+# `tools/sess.py:72-75` 的退出码契约，**逐档照抄**——消费端只能与它对齐：
+#   0 = 已投递；1 = 上游明确拒绝（未投，可重试）；2 = 参数错（重试无意义）；
+#   3 = 不确定（**可能已投、禁止重发**）；4 = 退役清单拦下；5 = daemon 已受理但
+#   wire 未见该 promptId（**可能已投**）。
+# 3 与 5 都是「可能已经投出去了」：再发一次就可能双发，直接破坏本腿的 at-most-once。
+# 所以它们落 `indeterminate`——发过一次、不再重试、终态并出声，把不确定性交给人和
+# 心跳去发现，而不是用重发去「赌」。
+SEND_RC_DELIVERED = 0
+SEND_RC_UPSTREAM_REFUSED = 1
+SEND_RC_BAD_ARGS = 2
+SEND_RC_INDETERMINATE = (3, 5)
+SEND_RC_RETIRED = 4
+
+
+def _attempt_notice(row: dict, dry: bool) -> tuple[str, str, bool]:
+    """尝试投递一行台账，返回 `(state, detail, unknown)`。**绝不使用事件外层 sid**。
+
+    `send` 的退出码按 `tools/sess.py:72-75` 逐档映射（见上方常量）：
+    `0`→delivered、`1`→retry_later、`2`→refused_payload、`3|5`→indeterminate、
+    `4`→refused_retired。**rc=3/5 绝不重试**：契约写着「可能已投」。
+
+    第三个返回值 `unknown` 只为 `retry_later` 服务：只有「**无法判定**」才该在
+    连续 N 轮后升级成 `probe_unknown`。`rc=1` 是**原因明确**的上游拒绝，它也待重试，
+    但把它算进 probe 未知会让台账把「对方说不行」记成「我们看不清」。
+    """
     sid = str(row.get("sid") or "")
     text = str(row.get("text") or "")
     if not sid.strip() or not text.strip():
-        return "refused_payload", "payload 缺 sid/text（事件外层 sid 恒为 file，绝不用它）"
+        return "refused_payload", "payload 缺 sid/text（事件外层 sid 恒为 file，绝不用它）", False
     exists, why = _probe_notice_target(sid)
     if exists is None:
-        return "retry_later", why
+        return "retry_later", why, True          # 探测无法判定
     if exists is False:
-        return "refused_archived", why
+        return "refused_archived", why, False
     if dry:
         log(f"[dry-run] 将投递给 {sid[:14]}…：{text[:60]}")
-        return "delivered", "(dry-run 未真发)"
+        return "delivered", "(dry-run 未真发)", False
     try:
         res = _send(sid, text)
     except Exception as exc:  # noqa: BLE001  send 异常＝本轮没投出去，留台账下轮再试
-        return "retry_later", f"send 异常 {type(exc).__name__}: {exc}"
+        return "retry_later", f"send 异常 {type(exc).__name__}: {exc}", True
     rc = int(getattr(res, "returncode", 0) or 0)
-    if rc == 4:
+    tail = (getattr(res, "stderr", "") or getattr(res, "stdout", "") or "").strip()
+    if rc == SEND_RC_DELIVERED:
+        return "delivered", "", False
+    if rc == SEND_RC_RETIRED:
         # sess.py 的退役清单拦截（tools/sess.py:614-623）：拒投**不是** delivered
-        return "refused_retired", "send rc=4：退役清单拦截"
-    if rc != 0:
-        tail = (getattr(res, "stderr", "") or getattr(res, "stdout", "") or "").strip()
-        return "retry_later", f"send rc={rc}：{tail[:160]}"
-    return "delivered", ""
+        return "refused_retired", "send rc=4：退役清单拦截", False
+    if rc == SEND_RC_BAD_ARGS:
+        # 参数错／正文为空：同样的入参再发一次还是错，不可重试
+        return "refused_payload", f"send rc=2：参数错，不可重试 {tail[:160]}", False
+    if rc in SEND_RC_INDETERMINATE:
+        # **禁止重发**：可能已投。终态 indeterminate，交给人／心跳发现。
+        return "indeterminate", (f"send rc={rc}：可能已投、按 sess.py 契约禁止重发 "
+                                 f"{tail[:160]}"), False
+    if rc == SEND_RC_UPSTREAM_REFUSED:
+        return "retry_later", f"send rc=1：上游明确拒绝，可重试 {tail[:160]}", False
+    # 契约外的码：不认识就不敢当「已投」也不敢当「没投」——同样按不确定处理
+    return "indeterminate", f"send rc={rc}（契约外）：按不确定处理 {tail[:160]}", False
 
 
 def _inject_notice_failure(row: dict, port: int, detail: str) -> None:
@@ -711,9 +744,9 @@ def _notice_row_from_event(ev: dict) -> dict:
 
 
 def _run_notice_row(row: dict, *, dry: bool, port: int, rows: dict) -> str:
-    state, detail = _attempt_notice(row, dry)
+    state, detail, unknown = _attempt_notice(row, dry)
     attempts = int(row.get("attempts") or 0) + 1
-    if state == "retry_later" and attempts >= NOTICE_RETRY_LIMIT:
+    if state == "retry_later" and unknown and attempts >= NOTICE_RETRY_LIMIT:
         state = "probe_unknown"
         detail = f"连续 {attempts} 轮无法判定 ⇒ 终态，不再重试：{detail}"
     out = {**row, "state": state, "attempts": attempts,
@@ -796,22 +829,30 @@ def _retry_pending(*, dry: bool = False, port: int = 0,
 def _notice_tick_tail(rows: dict, delivered: int) -> None:
     """收尾：pending_indeterminate 落 last.json（a2）＋ 腿心跳（a3）。"""
     pending = sum(1 for r in rows.values() if r.get("state") == "retry_later")
+    # 终态 indeterminate（rc=3/5，可能已投）与「等重试」是两件事：前者已经不能再发，
+    # 后者还会再试。心跳分两个计数，免得把「已定的悬案」误读成「还在排队」。
+    stuck = sum(1 for r in rows.values() if r.get("state") == "indeterminate")
     _notice_last_write(pending_indeterminate=pending)
     # 未注册时 wss_bus 的 write_heartbeat 直接 return ⇒ 心跳文件不生成；
     # 那种情况已被 notice_registration_problem() 在启动时拦死。
     _write_hb(SUPERVISOR_NOTICE_HEARTBEAT, {"pending_indeterminate": pending,
+                                            "indeterminate": stuck,
                                             "delivered": delivered})
 
 
 def notice_cursor_rollback(cursor_seq: int, daemon_seq: int) -> int | None:
-    """游标超前 daemon ⇒ 回退。记 `delta = cursor - daemon`，**不假装追平**。
+    """游标超前 daemon ⇒ 回退。返回 `delta = cursor - daemon`，否则 None。
 
     判据用 `cursor > data["seq"]`，**不用 `oldest_seq`**：事件环不持久，重启后为 0。
+    恢复动作在 `_loop` 里做：把 `since` 退回 0 做**全量重扫**——**不是**退到
+    `daemon_seq`，那反而一条都取不到（`/events?since` 排他，窗口事件的 seq 恰好
+    ≤ 现 daemon 的 `seq`）。重扫时已投的靠指纹判重不再发，未投的正好补上。
+    只记 `delta` 不重扫＝把窗口内的事件永久丢掉。
     """
     if daemon_seq and int(cursor_seq) > int(daemon_seq):
         delta = int(cursor_seq) - int(daemon_seq)
         log(f"[supervisor-notice] ⚠ 游标回退：cursor={cursor_seq} > "
-            f"daemon_seq={daemon_seq}（delta={delta}）——不推进、不假装追平")
+            f"daemon_seq={daemon_seq}（delta={delta}）——游标归零做全量重扫")
         _notice_last_write(delta=delta,
                            rollback_at=datetime.now().isoformat(timespec="seconds"))
         return delta
@@ -1740,6 +1781,19 @@ def _loop(args, port: int, since: int, boot_now: str, backoff: float) -> int:
             backoff = min(backoff * 2, BACKOFF_MAX)
             continue
         backoff = BACKOFF_MIN
+        # ISS-55 P1-A：游标超前 daemon ⇒ **必须真的退回去重扫**，只记 delta 会把
+        # 回退窗口里的事件永久丢掉。
+        #
+        # 退回的**不是** `daemon_seq`：`/events?since` 是排他的（只给 `seq > since`），
+        # 而窗口里那些事件（`daemon_seq+1 .. old_cursor`）的 seq 恰恰 ≤ 现 daemon 的
+        # `seq`，以 `daemon_seq` 为下界一条都取不到——那等于换个姿势再丢一次。
+        # 所以退回 0 做**全量重扫**（与上面「早于环形缓冲起点 ⇒ since = 0」同一套处置）：
+        # 环只留最近 N 条，重扫成本有限；已投过的靠**指纹判重**一条都不会重发，
+        # 没投过的正好补上。这就是 P1-A 要的「既不重发、也不丢」。
+        delta = notice_cursor_rollback(since, int(data.get("seq") or 0))
+        if delta is not None:
+            since = 0          # 不落盘：进程若在此重启，main() 会再判一次回退，不丢事件
+            continue
         oldest = int(data.get("oldest_seq") or 0)
         dropped = data.get("dropped") or []
         if since and oldest and since + 1 < oldest:
@@ -1754,8 +1808,7 @@ def _loop(args, port: int, since: int, boot_now: str, backoff: float) -> int:
         # ISS-55：主管投递哨独立一腿。**落在上面那个 try 之外**（方案 A8）——
         # 它抛异常就该冲出 `_loop` → `finally: release_lock()` → 进程退出 → 心跳消失，
         # 这样「腿死了」可被发现；再包一层 try 就重演「腿死而进程心跳照旧 ok」。
-        # 游标回退只记 delta、不假装追平；已投过的靠指纹判重，绝不会因回退重发。
-        notice_cursor_rollback(since, int(data.get("seq") or 0))
+        # 回退已在上面处理（退回 daemon_seq 重扫）；已投过的靠指纹判重，绝不会因回退重发。
         attempted: set = set()          # 一轮 = 一次「消费＋重试」，升级按轮数算
         handle_supervisor_notices(evs, dry=args.dry_run, port=port,
                                   attempted=attempted)
