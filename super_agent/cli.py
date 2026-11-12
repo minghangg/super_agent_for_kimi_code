@@ -22,6 +22,7 @@ are told apart by the message.
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import sys
 import threading
@@ -37,6 +38,7 @@ from . import session_events
 from . import assignments as asg_mod
 from . import issuekey
 from . import needs as needs_mod
+from . import store as store_mod
 from .bus_client import BusClient
 from .github_source import FixtureSource, LiveSource
 from .engine import build_engine
@@ -71,6 +73,26 @@ def _repo_allowlist() -> str:
     return str(candidate) if candidate.is_file() else ""
 
 
+def _legacy_root(cfg: dict, root: Path) -> Path:
+    """Where the pre-migration runtime root is looked for.
+
+    ``legacy_state_dir`` overrides it when set. The default is the ``state``
+    sibling of the chosen root: with the default root ``<cwd>/data`` that is
+    ``<cwd>/state``, which is exactly where the previous release wrote, so an
+    upgrade keeps reading its own data.
+
+    It is deliberately **not** ``<repo>/state``: an explicit ``--state-dir X``
+    would then resurrect an unrelated ``state/`` from the checkout the process
+    happens to run in (measured: it made every isolated test read the
+    developer's real runtime). Sibling resolution ties the fallback to the root
+    being used, so ``--state-dir X`` only ever falls back to ``X/../state``.
+    """
+    raw = str(cfg.get("legacy_state_dir") or "").strip()
+    if raw:
+        return Path(os.path.expanduser(raw)).resolve()
+    return (root.parent / "state").resolve()
+
+
 def _build(args) -> tuple[dict, Store]:
     overrides: dict = {}
     if args.mode:
@@ -90,7 +112,13 @@ def _build(args) -> tuple[dict, Store]:
     if allow_path:
         cfg.setdefault("engine", {})["project_allowlist"] = allow_path
     store_cfg = cfg.get("store") or {}
-    store = Store(config_mod.state_root(cfg, args.state_dir),
+    root = config_mod.state_root(cfg, args.state_dir)
+    legacy = _legacy_root(cfg, root)
+    if legacy != root:
+        root, note = store_mod.choose_root(root, legacy=legacy)
+        if note:
+            print(f"WARN {note}", file=sys.stderr)
+    store = Store(root,
                   max_event_lines=int(store_cfg.get("max_event_lines") or 10_000),
                   max_outbox_lines=int(store_cfg.get("max_outbox_lines") or 5_000),
                   outbox_stale_s=float(store_cfg.get("outbox_stale_s") or 300))

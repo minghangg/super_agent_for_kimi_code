@@ -16,15 +16,16 @@
 
 ## 3. 运行态放哪（与 #52 的三层骨架对齐）
 
-`#52` 定的是 `auth/` `rules/` `data/` 三层：**`data/` 是运行态、`rules/` 是规则生效位**。本仓落地方式：
+`#52` 定的是 `auth/` `rules/` `data/` 三层：**`data/` 是运行态、`rules/` 是规则生效位**。三层均已落地：
 
-- 运行态落在 `state/`（当前）——它是 `data/` 的前身，已被 `.gitignore` 忽略：`index.json`、`events.jsonl`、`outbox*.json*`、`health.json`、`cursor.json`、`monitor.log` 全在其中。
-- 迁移到 `data/` 时**只改目录名，不改语义**：运行态仍然「可删、可重建、永不入库」。`#52` 实施时可直接沿用本节，不需要重新定义边界。
+- 运行态落在 `data/`（新根，默认）与 `state/`（旧根，迁移期并存，两者都已被 `.gitignore` 忽略）。`Store` 构造时先跑 `store.check_migration()`：`.migrating` 标记在、或 6 个关键 JSON 之一解析失败，即拒绝启动。选根由 `cli._build()` 调 `store.choose_root()`：`data/` 里有任何引擎文件就用它；没有而旧根有，则回退读旧根并 WARN。旧根默认是**所选根的同级 `state/`**（默认根下即 `<cwd>/state`，与上一版的落点相同），可用 `legacy_state_dir` 覆盖。
+- `auth/` **不入 git、不在克隆里预置**：`.gitignore` 整目录忽略，连占位文件也不跟踪，`git clone` 之后没有这个目录。需要放指针时自己 `mkdir -p auth` 再写文件；它一旦有文件被跟踪，门禁就判 `runtime path tracked (prefix auth/)` 并 rc=1。只放指针，不放值。说明在 `docs/auth.md`。
+- `rules/candidates/**` 是备选池（14 份脱敏件＋`INDEX.md`），`rules/active/` 是生效位，由 `python -m super_agent.rules_init` 选择落位。迁移到 `data/` 时**只改目录名，不改语义**：运行态仍然「可删、可重建、永不入库」。
 - 根目录出现的散落运行文件一律视为**配置未注入的回退产物**（见第 5 节），不入库、不登记为产物。
 
 ## 4. 规则从哪来
 
-- 本仓**不复制**工作台的规则实体（流程手册、助手章程、项目规则）。通用纪律以本仓 `README` 与测试为准。
+- 本仓**不复制**工作台的规则实体（流程手册、助手章程、项目规则）。入池件按 `rules/candidates/INDEX.md` 的 13 条脱敏规则改写后落 `rules/candidates/**`；未改写的原件仍留在工作台仓。
 - 私有工作台的 `rules/shared/**` 通过绝对路径注入，不镜像进本仓；需要引用时只写「规则名」，不写路径。
 - 需要在本仓新增约定时，写进本节，**不新开文件**。
 

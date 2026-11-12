@@ -42,8 +42,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 # Directories that are run state, credentials or reports, never source. If one
-# of them shows up in ``git ls-files`` it was committed by accident.
-RUNTIME_PREFIXES = ("state/", ".kimi/", "auth/")
+# of them shows up in ``git ls-files`` it was committed by accident. ``data/``
+# is the post-migration runtime root; ``state/`` stays listed next to it because
+# both roots coexist while the migration is still in progress and the old one is
+# only dropped once the migration is complete.
+RUNTIME_PREFIXES = ("state/", "data/", ".kimi/", "auth/")
 
 
 def _joined(*parts: str) -> str:
@@ -87,6 +90,24 @@ PATTERNS = {
         r"\b" + _joined("AK", "IA") + r"[0-9A-Z]{16}\b"),
     "token: private key block": re.compile(
         _joined("-----BEGIN ", "[A-Z ]*PRIV", "ATE KEY-----")),
+
+    # A key name followed by an assignment and a long literal. The four token
+    # shapes above are "shape is the secret"; this one catches a self-chosen
+    # value (``DB_PASSWORD=<long literal>``), which is the common form inside
+    # ``auth/``. Three guards keep prose and code green:
+    #
+    # * the value must not start with ``.`` or ``/`` and must not be a bare
+    #   path (``secret_key_path = /home/user/.ssh/id_ed25519``);
+    # * the value must not be immediately followed by ``(``, so a call such as
+    #   ``token = kimi_paths.token()`` or ``token = load_token_from_env()`` is a
+    #   reference to a secret, not the secret;
+    # * an all-``X``/``x`` run is a documentation mask, not a value.
+    "credential value": re.compile(
+        r"(?i)(?:api[_-]?key|secret[_-]?key|access[_-]?key|secret|token"
+        r"|password|passwd|credential|private[_-]?key|authorization)"
+        r"\s*[:=]\s*[\"']?(?![./])(?![A-Za-z0-9/_+.-]*[./][A-Za-z0-9/_+.-]*$)"
+        r"[A-Za-z0-9/_+.-]{16,}(?![A-Za-z0-9_+./-]*\()(?<![Xx]{8})"
+        r"|\bbearer\s+[A-Za-z0-9._~+/-]{16,}=*"),
 }
 
 

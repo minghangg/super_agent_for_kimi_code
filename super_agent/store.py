@@ -118,6 +118,74 @@ def _count_lines(path: Path) -> int:
         return 0
 
 
+# The runtime root moved from ``state/`` to ``data/``. A migration that stops
+# half way must not be read as a clean start: an empty index silently resets
+# ``action_attempted()`` to 0, which is exactly the at-most-once guard.
+MIGRATION_MARKER = ".migrating"
+
+# Non-JSONL state files whose loader swallows a parse error and returns empty
+# defaults. Each one is checked before the first write: a half-written file is
+# refused instead of being read as an empty state.
+STRICT_JSON = ("index.json", "outbox_state.json", "cursor.json", "health.json",
+               "counters.json", "run_heartbeat.json")
+
+# Anything here means "this root has been written by the engine". The fallback
+# from ``data/`` to ``state/`` keys off presence, never off a file count: the
+# engine writes only what a round needs, so a complete run leaves 5 of 9.
+ENGINE_FILES = ("index.json", "events.jsonl", "outbox.jsonl", "outbox_state.json",
+                "cursor.json", "counters.json", "run_heartbeat.json",
+                "health.json", "engine.pid")
+
+
+def check_migration(root: Path) -> None:
+    """Refuse to start on a half-finished migration.
+
+    Two criteria, neither of which counts files:
+
+    * the ``.migrating`` marker exists (the migration was interrupted);
+    * one of :data:`STRICT_JSON` exists but does not parse (the copy was cut).
+
+    ``events.jsonl``/``outbox.jsonl`` are deliberately absent: they are
+    append-only JSONL, a torn last line is tolerated by the readers, and
+    refusing them would reject a normal round.
+    """
+    marker = root / MIGRATION_MARKER
+    if marker.is_file():
+        raise RuntimeError(
+            f"迁移未完成：{marker} 存在。先跑 tools/migrate_state_to_data.py，"
+            "或确认无需迁移后手工删除该标记。")
+    for name in STRICT_JSON:
+        path = root / name
+        if not path.is_file():
+            continue
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise RuntimeError(
+                f"运行态文件损坏：{path} 不是合法 JSON（疑似迁移搬到一半被中断）。"
+                "拒绝启动；请从快照恢复或重跑迁移脚本。")
+
+
+def choose_root(data: str | Path, legacy: str | Path = "state") -> tuple[Path, str]:
+    """Pick the runtime root and describe the choice.
+
+    ``data/`` wins whenever it holds any engine file. The legacy ``state/`` is
+    read only when ``data/`` holds none *and* ``state/`` holds at least one -
+    the case of a user who upgrades before migrating. Both present is reported
+    so the stale copy gets deleted; neither present is a fresh install.
+    """
+    data = Path(data)
+    legacy = Path(legacy)
+    data_has = any((data / name).is_file() for name in ENGINE_FILES)
+    legacy_has = any((legacy / name).is_file() for name in ENGINE_FILES)
+    if not data_has and legacy_has:
+        return legacy, f"runtime state read from legacy path {legacy}"
+    if data_has and legacy_has:
+        return data, (f"both {data} and {legacy} contain engine state; using "
+                      f"{data} (delete {legacy} after you confirm the migration)")
+    return data, ""
+
+
 class Store:
     def __init__(self, root: str | Path, *, max_event_lines: int = 10_000,
                  max_outbox_lines: int = 5_000, outbox_stale_s: float = 300):
@@ -134,6 +202,7 @@ class Store:
         self.heartbeat_path = self.root / "run_heartbeat.json"
         self.health_path = self.root / "health.json"
         self.pid_path = self.root / "engine.pid"
+        check_migration(self.root)
         self.root.mkdir(parents=True, exist_ok=True)
         self._lines = {
             self.events_path: _count_lines(self.events_path),

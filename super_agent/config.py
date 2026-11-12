@@ -25,7 +25,10 @@ from pathlib import Path
 DEFAULTS: dict = {
     "role": "supervisor",
     "mode": "observe",
-    "state_dir": "state",
+    "state_dir": "data",
+    # Where the pre-migration runtime root is looked for. "" means "the
+    # ``state`` sibling of the chosen root" (see ``cli._legacy_root``).
+    "legacy_state_dir": "",
     "bus": {
         "host": "127.0.0.1",
         "port": 58800,

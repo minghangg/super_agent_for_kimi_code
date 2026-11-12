@@ -3,6 +3,8 @@ __pycache__/
 .venv/
 .pytest_cache/
 state/
+data/
+auth/
 monitor.log
 *.tmp
 *.last-good

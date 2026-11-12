@@ -118,6 +118,85 @@ class RuntimePaths(unittest.TestCase):
         self.assertEqual(gate.scan_runtime_paths(ROOT), [])
 
 
+class RuntimePrefixes(unittest.TestCase):
+    """``data/`` is the post-migration runtime root and must be gated too."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        git(self.root, "init", "-q", "-b", "main")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def track(self, name: str) -> None:
+        path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n", encoding="utf-8")
+        git(self.root, "add", "-f", name)
+
+    def test_data_directory_turns_red(self):
+        self.track("data/events.jsonl")
+        hits = gate.scan_runtime_paths(self.root)
+        self.assertTrue(any("prefix data/" in h for h in hits), hits)
+
+    def test_state_directory_still_turns_red(self):
+        self.track("state/events.jsonl")
+        hits = gate.scan_runtime_paths(self.root)
+        self.assertTrue(any("prefix state/" in h for h in hits), hits)
+
+    def test_ordinary_directory_stays_green(self):
+        self.track("docs/auth.md")
+        self.assertEqual(gate.scan_runtime_paths(self.root), [])
+
+    def test_prefixes_cover_both_roots(self):
+        self.assertIn("state/", gate.RUNTIME_PREFIXES)
+        self.assertIn("data/", gate.RUNTIME_PREFIXES)
+
+
+class CredentialValue(unittest.TestCase):
+    """The ``credential value`` shape: key name, assignment, long literal.
+
+    Every value below is assembled from fragments, exactly as the gate builds
+    its own patterns, so this file passes the scan it performs.
+    """
+
+    def red_shapes(self):
+        secret = "Super" + "Secret1234567890"
+        hex40 = "9f8e7d6c5b4a" + "39281706f5e4d3c2b1a0"
+        letters = "abcdefghijklmnop" + "qrstuvwx"
+        jwt = "eyJhbGciOiJIUzI1NiIs" + "InR5cCI6IkpXVCJ9"
+        return (
+            "DB_PASSWORD" + "=" + secret,
+            "api_key" + ": " + hex40,
+            "token" + " = \"" + letters + "\"",
+            "Authorization" + ": Bear" + "er " + jwt,
+        )
+
+    def green_shapes(self):
+        return (
+            "token" + " = kimi_paths.token()",
+            "token" + " = load_token_from_env()",
+            "API_KEY" + "=",
+            "GITHUB_TOKEN" + "=<your-token-here>",
+            "TOKEN" + "=abc123",
+            "TOKEN" + ": '" + "XXXXXXXXXXXXXXXXXXXX" + "'",
+            "token 只在本机使用",
+        )
+
+    def test_red_shapes_match(self):
+        pattern = gate.PATTERNS["credential value"]
+        for line in self.red_shapes():
+            with self.subTest(line=line):
+                self.assertTrue(pattern.search(line), line)
+
+    def test_green_shapes_do_not_match(self):
+        pattern = gate.PATTERNS["credential value"]
+        for line in self.green_shapes():
+            with self.subTest(line=line):
+                self.assertFalse(pattern.search(line), line)
+
+
 class Remote(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
