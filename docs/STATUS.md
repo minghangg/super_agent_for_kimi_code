@@ -13,7 +13,7 @@
 ## 在办与待开工
 
 - **#22 待开工**：M3 看门狗退役清单＋逐项回退手册；退役对象为 decide_watch 哨、monitor 巡查、pmw 轮询、reporter 心跳监护。
-- **#52 迁移期占位**：`auth/` `rules/` `data/` 三层骨架近期不实施；`data/` 就是运行态，当前由 `state/` 承担（见 `AGENTS.md` §3）。
+- **#52 已实施**：`auth/` `rules/` `data/` 三层骨架落地（`836368c`）；运行态默认根为 `data/`，旧根 `state/` 由 `choose_root()` 回退读取并 WARN（见 `AGENTS.md` §3）。
 
 ## 挂起
 
