@@ -3,7 +3,7 @@
 A newly created session must open with the session contract, not with a bare
 ping: the first message asks the agent to read the contract file once and then
 confirm. The wording is copied verbatim from the workbench dispatcher
-(``tools/from_yuanhai/dispatch_session/dispatch.py:57-82``) so both sides produce
+(its ``warmup_prompt``, lines 57-82) so both sides produce
 identical sessions; only the path differs, because this side never hardcodes a
 private workbench root.
 

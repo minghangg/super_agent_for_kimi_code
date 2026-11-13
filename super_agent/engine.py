@@ -19,6 +19,14 @@ Routing a ``[QA]`` verdict::
     |                          blocked -> the same frame, ``exception: true``
     |                          working -> no frame at all (silence)
     |                          unreadable / no coordinate -> treated as blocked
+    | first line [AT]       -> three-state verdict of its **own** kind:
+    |                          ready     -> event.agent.supervisor
+    |                          questions -> the same frame with
+    |                                       ``question_url`` (not an
+    |                                       exception: a question is
+    |                                       a stop, not a failure)
+    |                          blocked   -> the same frame, ``exception: true``
+    |                          unreadable / no coordinate -> treated as blocked
     + ordinary comment
        | waiting_review and a qa session is known -> send to qa
        | waiting_release / close_reconcile       -> logged, no route
@@ -61,7 +69,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import github_source, health, issuekey, markers, needs, session_events
+from . import (at_serve, github_source, health, issuekey, markers, needs,
+               session_events)
 from . import assignments as asg_mod
 from .allowlist import ProjectAllowlist
 from .store import Store, action_id
@@ -259,6 +268,10 @@ class Engine:
         if pm_verdict:
             return "pm_verdict", (f"pm verdict "
                                   f"{pm_verdict['state'] or 'unreadable'!r}")
+        at_verdict = markers.parse_at_verdict(body)
+        if at_verdict:
+            return "at_verdict", (f"at verdict "
+                                  f"{at_verdict['state'] or 'unreadable'!r}")
         author = str(comment.get("author") or "").strip().lower()
         if self.role and author == self.role.lower():
             return "ignored", "authored by configured role"
@@ -357,6 +370,81 @@ class Engine:
         the one action nobody downstream can take back.
         """
         keys = self._pm_session_keys(thread)
+        claimed = str(comment.get("session_key") or "")
+        if claimed:
+            return claimed in keys
+        return bool(keys)
+
+    # ------------------------------------------------------------- at routing
+    def _at_session_keys(self, thread: str) -> set[str]:
+        """Session keys that count as *this thread's* AT.
+
+        The same two sources as the QA and PM checks, unioned so a rotation
+        does not lose the check: the ``at`` entry of
+        ``issue_sessions.json[thread]`` (``name`` and ``session``), and every
+        ``at-*`` key in ``sessions.json``.
+
+        The prefix is ``at-`` and not ``at``: a bare ``at`` prefix also claims
+        keys that merely start with those two letters, and this check decides
+        whether a questionnaire link is put in front of a person.
+        """
+        keys: set[str] = set()
+        ledger = self._issue_session_entry(thread)
+        for role, entry in ledger.items():
+            if str(role).lower() != "at" or not isinstance(entry, dict):
+                continue
+            for field in ("name", "session"):
+                value = str(entry.get(field) or "")
+                if value:
+                    keys.add(value)
+        try:
+            path = self._session_stream()[1]
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        if isinstance(data, dict):
+            keys.update(str(k) for k in data if str(k).startswith("at-"))
+        return keys
+
+    def _at_sid(self, thread: str) -> str:
+        """The AT session a questionnaire answer is sent back to, or ``""``.
+
+        **Only this thread's own binding counts** - the ``at`` entry of
+        ``issue_sessions.json[thread]``. There is deliberately **no** fallback
+        to "the first ``at-*`` key in ``sessions.json``".
+
+        That fallback looked harmless ("there is usually one AT") and is not:
+        it answers *an* AT, not *this thread's* AT, so on a machine working two
+        projects the answer to project A's question is delivered into project
+        B's session. A wrong recipient is the one failure a person cannot see -
+        the question was filed, the page said "submitted", the answer went
+        somewhere. ``""`` instead makes the questionnaire say "no AT session to
+        answer", which is visible, actionable, and true.
+
+        Failing closed also keeps the rule the rest of the engine already
+        follows: no coordinate, no verdict; no attribution, no frame.
+
+        The binding is looked up through :meth:`_issue_session_keys`, so a
+        record written by ``gh_issue.bind`` under the workbench's
+        ``<project>#<n>`` spelling is found by the engine's
+        ``<owner>/<repo>#<n>`` thread without either side changing its format.
+        """
+        entry = self._issue_session_entry(thread).get("at")
+        if isinstance(entry, dict) and str(entry.get("session") or ""):
+            return str(entry["session"])
+        return ""
+
+    def _at_verified(self, thread: str, comment: dict) -> bool:
+        """Does this comment come from an AT key of this thread?
+
+        The same rule as :meth:`_pm_verified`: a named ``session_key`` is
+        checked against the whitelist exactly, and without that field the
+        answer is "the thread has an AT at all". A miss does **not** let the
+        verdict through - a ``questions`` frame puts a link in front of a
+        person and asks them to answer it, so an unattributed one is a phishing
+        shape, not just a loose end.
+        """
+        keys = self._at_session_keys(thread)
         claimed = str(comment.get("session_key") or "")
         if claimed:
             return claimed in keys
@@ -892,6 +980,269 @@ class Engine:
         """
         return bool(self._pm_verdict(index, thread)
                     or thread in self._pm_pending)
+
+    # --------------------------------------------------------- at verdicts
+    def _at_verdict(self, index: dict, thread: str) -> dict | None:
+        """The AT verdict recorded for ``thread``, if any."""
+        record = (index.get("at_verdicts") or {}).get(thread)
+        return record if isinstance(record, dict) else None
+
+    def _record_at_verdict(self, index: dict, thread: str, verdict: dict,
+                           cid) -> dict:
+        """Commit the verdict to the **AT** ledger, newest comment wins.
+
+        Two books, and this function is the reason they stay two:
+        ``pm_verdicts`` is not read or written here, and ``pm_stall`` is not
+        touched. An AT answer that silently reset the PM watchdog would hide a
+        PM that never spoke, and the two silences are different facts.
+
+        The watchdog this *does* reset is ``at_stall`` - its own.
+        """
+        ledger = index.setdefault("at_verdicts", {})
+        if not isinstance(ledger, dict):
+            ledger = index["at_verdicts"] = {}
+        record = {"thread": thread, "comment_id": int(cid),
+                  "state": str(verdict.get("state") or ""),
+                  "matched": str(verdict.get("matched") or ""),
+                  "issue": verdict.get("issue"), "at": _now()}
+        ledger[thread] = record
+        if isinstance(index.get("at_stall"), dict):
+            index["at_stall"].pop(thread, None)
+        return record
+
+    @staticmethod
+    def _at_frame_key(thread: str, cid) -> str:
+        """``at:<thread>:<cid>`` - one namespace inside ``release_frames``.
+
+        The table is reused, the key is not shared: a release key is derived
+        from the *delivery* a frame judges, an AT frame is keyed by the comment
+        that produced it (a question is about the comment, not a delivery, and
+        two questions on one reworked thread are two questions). The prefix is
+        what keeps an AT comment from ever being read as "this release rang".
+        """
+        return f"at:{thread}:{cid}"
+
+    def _at_announced(self, index: dict, thread: str, cid) -> dict | None:
+        """The AT frame already sent for this comment, or ``None``."""
+        rows = index.get("release_frames")
+        if not isinstance(rows, dict):
+            return None
+        row = rows.get(self._at_frame_key(thread, cid))
+        return row if isinstance(row, dict) else None
+
+    def _mark_at_frame(self, index: dict, thread: str, cid, *, kind: str) -> dict:
+        """Record that this AT comment's frame landed - after it landed."""
+        rows = index.setdefault("release_frames", {})
+        if not isinstance(rows, dict):
+            rows = index["release_frames"] = {}
+        key = self._at_frame_key(thread, cid)
+        row = rows.get(key)
+        row = dict(row) if isinstance(row, dict) else {"key": key, "at": _now()}
+        row.update({"thread": thread, "source": "at",
+                    "comment_id": int(cid), "kind": kind})
+        rows[key] = row
+        return row
+
+    def _at_question_url(self, thread: str, issue: int, cid,
+                         verdict: dict) -> str:
+        """File the questionnaire and return its loopback link.
+
+        Filing is a file under ``<store root>/atserve/``; it does **not** need
+        the service to be up. The frame still carries the link when the service
+        is down, because "the question exists and here is where it lives" is
+        true either way, and the service answers plainly instead of the reader
+        being shown a submission that never happened.
+
+        ``engine.at_question_port`` selects the port the link names; the
+        service and the engine must be given the same one.
+        """
+        engine_cfg = self.cfg.get("engine") or {}
+        try:
+            port = int(engine_cfg.get("at_question_port")
+                       or at_serve.DEFAULT_PORT)
+        except (TypeError, ValueError):
+            port = at_serve.DEFAULT_PORT
+        try:
+            qid = at_serve.create_question(
+                root=self.store.root, thread=thread, issue=int(issue),
+                comment_id=int(cid), sid=self._at_sid(thread),
+                question=str(verdict.get("line") or ""))
+        except OSError as exc:
+            self.store.log_event({
+                "type": "at.question_unfiled", "at": _now(), "thread": thread,
+                "comment_id": int(cid),
+                "detail": f"{type(exc).__name__}: {exc}"})
+            return ""
+        return at_serve.url(port, qid)
+
+    def _on_at_verdict(self, index: dict, thread: str, issue: int,
+                       comment: dict, verdict: dict) -> tuple[str, str]:
+        """Apply one ``[AT]`` verdict and route it.
+
+        Four answers:
+
+        * ``questions`` - a supervisor frame carrying ``question_url``. It is
+          **not** an exception frame: a question is a normal stop on the path,
+          and marking it as a failure teaches the reader to skip the failures;
+        * ``ready``   - a supervisor frame saying the work can be dispatched;
+        * ``blocked`` - the same frame with ``exception: true``;
+        * unreadable (``""``) - **treated as blocked**, for the same reason as
+          the PM side: an answer that arrived and was dropped is invisible.
+
+        At most once per comment: the frame is written to ``release_frames``
+        under ``at:<thread>:<cid>`` after it lands, so a re-read comment is
+        silent while a *different* comment on the same thread still rings.
+
+        This function reads and writes nothing in ``pm_verdicts``/``pm_stall``,
+        and the QA/PM release gate never reads ``at_verdicts``. That is the J4
+        property, and it is a property of the tables, not of the call order.
+        """
+        cid = int(comment["id"])
+        state = str(verdict.get("state") or "")
+        if not self._at_verified(thread, comment):
+            self.store.log_event({
+                "type": "at.unverified", "at": _now(), "thread": thread,
+                "comment_id": cid, "consumers": ["doctor"],
+                "detail": "the verdict did not name an at session key of this "
+                          "thread"})
+            self._pm_needs_person(index, thread, cid,
+                                  "at.verdict_unverified[user]",
+                                  "at verdict from unverified author")
+            return "needs_person", "at verdict from unverified author"
+        named = verdict.get("issue")
+        if named is not None and int(named) != int(issue):
+            self.store.log_event({
+                "type": "at.verdict_wrong_issue", "at": _now(),
+                "thread": thread, "comment_id": cid,
+                "named_issue": int(named), "thread_issue": int(issue)})
+            self._pm_needs_person(
+                index, thread, cid, "at.verdict_wrong_issue[user]",
+                f"verdict names issue #{int(named)} but thread is #{int(issue)}")
+            return "needs_person", (f"verdict names issue #{int(named)} but "
+                                    f"thread is #{int(issue)}")
+        self._record_at_verdict(index, thread, verdict, cid)
+        if self._at_announced(index, thread, cid) is not None:
+            self.store.log_event({
+                "type": "route.supervisor_skipped", "at": _now(),
+                "thread": thread, "comment_id": cid, "to": "supervisor",
+                "reason": "this at verdict already rang",
+                "announced_by": "at"})
+            return "at_verdict", ""
+        if state == "questions":
+            kind, exception, reason = "at_question", False, ""
+        elif state == "ready":
+            kind, exception, reason = "at_ready", False, ""
+        else:
+            kind, exception = "at_blocked", True
+            if not state:
+                reason = (verdict.get("coords_error")
+                          or "no unmarked at verdict; treated as blocked")
+            else:
+                reason = "at reports blocked"
+        url = (self._at_question_url(thread, issue, cid, verdict)
+               if state == "questions" else "")
+        result = self._route_at_frame(index, thread, issue, comment, verdict,
+                                      exception=exception, kind=kind,
+                                      reason=reason, question_url=url)
+        dispatched = bool(result.get("dispatched"))
+        ok = bool(result.get("ok")) if dispatched else False
+        if dispatched and ok:
+            self._mark_at_frame(index, thread, cid, kind=kind)
+        elif dispatched:
+            self._note_undeliverable(
+                index, thread, cid,
+                "at frame was dispatched but the send was not confirmed; it "
+                "may or may not have arrived - check before resending",
+                issue=issue, to="supervisor",
+                once_key=f"atuncertain:{thread}:{cid}")
+        else:
+            self._note_undeliverable(
+                index, thread, cid,
+                "at verdict could not be delivered: "
+                f"{result.get('reason') or 'unknown'}",
+                issue=issue, to="supervisor", once_key=f"at:{thread}:{cid}")
+        return "at_verdict", ""
+
+    def _route_at_frame(self, index: dict, thread: str, issue: int,
+                        comment: dict, verdict: dict, *, exception: bool,
+                        kind: str, reason: str = "", question_url: str = "",
+                        action_key: str = "", body_text: str = "") -> dict:
+        """Send one AT frame on ``event.agent.supervisor``; at most once.
+
+        Same order as :meth:`_route_pm_frame` - snapshot first, dispatch
+        second - so a crash between them loses one send and never the
+        decision. There is no retry pass for AT frames (the PM one is its own
+        leg); a frame that could not be dispatched leaves a ``needs_person``
+        row through :meth:`_note_undeliverable`, which is what makes the loss
+        readable instead of silent.
+        """
+        cid = int(comment["id"]) if comment.get("id") is not None else 0
+        key = action_key or self._at_frame_key(thread, cid)
+        base = action_id(key, "bus_inject", str(cid))
+        frames = index.setdefault("at_frames", {})
+        if not isinstance(frames, dict):
+            frames = index["at_frames"] = {}
+        record = frames.get(key)
+        record = dict(record) if isinstance(record, dict) else {
+            "thread": thread, "comment_id": cid, "at": _now()}
+        record.update({"exception": bool(exception), "issue": int(issue),
+                       "kind": kind, "question_url": question_url,
+                       "text": body_text or self._at_frame_text(
+                           issue, cid, verdict, exception=exception, kind=kind,
+                           question_url=question_url),
+                       "action_id": base})
+        frames[key] = record
+        if self.store.action_attempted(base) > 0:
+            return {"dispatched": False, "reason": "already attempted",
+                    "action_id": base}
+        sid = self._supervisor_sid()
+        if not sid:
+            record["ok"] = False
+            record["undeliverable"] = True
+            self._note_undeliverable(
+                index, thread, cid,
+                "no supervisor sid: engine.supervisor_sid is empty and none of "
+                "engine.supervisor_keys resolve", issue=issue,
+                to="supervisor", once_key=f"atsid:{key}")
+            return {"dispatched": False, "reason": "no supervisor sid",
+                    "action_id": base}
+        record["undeliverable"] = False
+        payload = {"thread": thread, "issue": int(issue),
+                   "review_comment_id": cid, "kind": kind,
+                   "state": str(verdict.get("state") or ""),
+                   "exception": bool(exception), "reason": reason,
+                   "question_url": question_url,
+                   "sid": sid, "at": _now(), "text": record["text"]}
+        result = self._dispatch(self._route_action(
+            thread, issue, cid, payload, "event.agent.supervisor",
+            target_role="supervisor", origin_role="at",
+            assignment_id=key))
+        record["ok"] = bool(result.get("ok")) if result.get("dispatched") else False
+        record["refused"] = bool(result.get("refused"))
+        record["action_id"] = result.get("action_id") or base
+        self.store.log_event({
+            "type": "route.decided", "at": _now(), "thread": thread,
+            "comment_id": cid, "to": "supervisor", "origin": "at",
+            "kind": kind, "state": str(verdict.get("state") or ""),
+            "exception": bool(exception),
+            "dispatched": bool(result.get("dispatched")),
+            "refused": bool(result.get("refused")),
+            "reason": result.get("reason") or "",
+        })
+        return result
+
+    @staticmethod
+    def _at_frame_text(issue, cid, verdict: dict, *, exception: bool, kind: str,
+                       question_url: str = "") -> str:
+        """The one line a person reads for an AT frame."""
+        state = str(verdict.get("state") or "") or "unreadable"
+        if kind == "at_question":
+            return (f"【AT 有疑问】#{int(issue)}（cid {cid}），请回答："
+                    f"{question_url or '（问卷链接未生成，见事件日志）'}")
+        if exception:
+            return (f"【AT 例外】#{int(issue)} AT 结论 {state}"
+                    f"（cid {cid}），需要人看一眼")
+        return f"【AT 可派单】#{int(issue)}（cid {cid}），可以派单"
 
     # ------------------------------------------------------- release identity
     def _release_key(self, index: dict, thread: str, cid,
@@ -1475,6 +1826,118 @@ class Engine:
     def _pm_stall_text(thread: str, issue, rounds: int) -> str:
         return f"【PM 停摆】#{int(issue or 0)} QA 已通过，但 {rounds} 轮无 PM 结论"
 
+    # ------------------------------------------------------- at stall watchdog
+    def _check_at_stall(self, index: dict) -> int:
+        """Ask once about a registered AT that stopped answering.
+
+        **``at_stall_rounds`` defaults to 15, and that 15 is an independent
+        value.** It is not derived from ``release_timeout_s`` and it is not
+        copied from ``pm_stall_rounds``: the PM watchdog's number is chosen to
+        sit inside the release budget, this one is the AT's own budget. Tune it
+        by watching it fire, not by arithmetic on another role's setting.
+
+        The ledger is ``index["at_stall"]`` and never ``pm_stall``. A PM that
+        never answered and an AT that never spoke are two different silences
+        over two different questions; sharing the counter would let one role's
+        answer erase the other role's alarm (J4/J5). Nothing here reads
+        ``pm_verdicts``, so a missing PM book cannot change this answer.
+
+        "Registered" means an ``at`` entry in ``issue_sessions.json[thread]`` -
+        a thread no AT was ever bound to is not watched, because a watchdog
+        with nobody to watch fires on everything.
+
+        Counting is by round; one frame per hold, and a new hold (leaving and
+        re-entering the register) is a new notice through ``at_stall_seq``.
+        """
+        engine_cfg = self.cfg.get("engine") or {}
+        try:
+            limit = int(engine_cfg.get("at_stall_rounds") or 15)
+        except (TypeError, ValueError):
+            limit = 15
+        if limit <= 0:
+            return 0
+        stall = index.setdefault("at_stall", {})
+        if not isinstance(stall, dict):
+            stall = index["at_stall"] = {}
+        registered: dict[str, dict] = {}
+        # The scan reads whatever spelling ``gh_issue.bind`` wrote
+        # (``<project>#<n>``) and normalises it through ``_thread_key``, so the
+        # watchdog's counter and ``_at_verdict`` speak one key space. Without
+        # this the binding is registered under a key nothing ever asks about,
+        # and the watchdog watches a thread that does not exist.
+        for raw_key, entry in (self._load_issue_sessions() or {}).items():
+            if not isinstance(entry, dict) or not isinstance(entry.get("at"), dict):
+                continue
+            _repo, number = issuekey.split_key(raw_key)
+            if number is None:
+                continue
+            registered[str(self._thread_key(number))] = entry["at"]
+        for thread in list(stall):
+            if thread not in registered:
+                seqs = index.setdefault("at_stall_seq", {})
+                if isinstance(seqs, dict) and thread in seqs:
+                    seqs[thread] = int(seqs[thread] or 0) + 1
+                stall.pop(thread, None)
+        fired = 0
+        for thread, at_entry in sorted(registered.items()):
+            if self._at_verdict(index, thread) is not None:
+                stall.pop(thread, None)
+                continue
+            entry = stall.get(thread)
+            if not isinstance(entry, dict):
+                entry = {"thread": thread, "rounds": 0, "fired": False,
+                         "since": _now()}
+            entry["rounds"] = int(entry.get("rounds") or 0) + 1
+            stall[thread] = entry
+            if entry.get("fired") or entry["rounds"] < limit:
+                continue
+            issue = at_entry.get("issue")
+            if issue is None:
+                for rec in (index.get("assignments") or {}).values():
+                    if str(rec.get("thread") or "") == thread:
+                        issue = rec.get("issue")
+                        break
+            if issue is None:
+                # The binding records a session, not a number. The thread key
+                # carries it, and ``issue: 0`` would fail the project allowlist
+                # - a watchdog whose notice is always refused looks exactly
+                # like a watchdog that never fired.
+                _repo, parsed = issuekey.split_key(thread)
+                issue = parsed
+            seqs = index.setdefault("at_stall_seq", {})
+            if not isinstance(seqs, dict):
+                seqs = index["at_stall_seq"] = {}
+            seq = int(seqs.get(thread) or 1)
+            seqs[thread] = seq
+            action_key = f"at_stall:{thread}:{seq}"
+            verdict = {"state": "blocked", "matched": "at_stall"}
+            result = self._route_at_frame(
+                index, thread, int(issue or 0), {"id": 0}, verdict,
+                exception=True, kind="at_stall",
+                reason=f"no at verdict in {entry['rounds']} rounds",
+                action_key=action_key,
+                body_text=(f"【AT 停摆】#{int(issue or 0)} "
+                           f"{entry['rounds']} 轮无 AT 结论"))
+            entry["fired"] = True
+            entry["hold_seq"] = seq
+            entry["result"] = str(result.get("reason") or "dispatched")
+            self.store.log_event({
+                "type": "at.stall", "at": _now(), "thread": thread,
+                "rounds": entry["rounds"], "hold_seq": seq,
+                "dispatched": bool(result.get("dispatched")),
+                "reason": result.get("reason") or ""})
+            if not result.get("dispatched"):
+                self._note_undeliverable(
+                    index, thread, 0,
+                    "at stall notice could not be delivered: "
+                    f"{result.get('reason') or 'unknown'}", issue=issue,
+                    once_key=f"atstall:{thread}:{seq}")
+            self._pm_needs_person(
+                index, thread, 0, "at.stall[user]",
+                f"{entry['rounds']} 轮无 AT 结论")
+            fired += 1
+        return fired
+
     # -------------------------------------------------- release-time reminders
     def _release_start(self, index: dict, thread: str, assignment: dict) -> str:
         """The stable start time of a held thread, or ``""`` when there is none.
@@ -1683,6 +2146,75 @@ class Engine:
         except (OSError, ValueError):
             return {}
         return data if isinstance(data, dict) else {}
+
+    def _issue_session_keys(self, thread: str) -> list[str]:
+        """Candidate ``issue_sessions.json`` keys for ``thread``, strongest first.
+
+        **The two sides do not share one key space, and pretending they do is
+        how a binding becomes unreadable.** ``gh_issue.bind`` writes
+        ``<project>#<n>`` - the workbench's short project name from its
+        ``config/gh_projects.json`` - while this engine keys a thread by
+        ``issuekey.thread_key`` -> ``<owner>/<repo>#<n>``. Reading only the
+        qualified key makes every ``at`` binding written by the CLI invisible,
+        which is the "green test, nothing in production" shape this lookup
+        exists to close.
+
+        So the qualified key stays first (it is the canonical form and the one
+        a future writer should use), then the two spellings the workbench
+        actually produces, then - **only for a thread that is itself a bare
+        number** - the legacy numeric key. A qualified thread never falls back
+        to a bare number: two repositories share issue numbers, and a silent
+        bare-number match would hand one repository's answer to the other.
+        """
+        text = str(thread or "").strip()
+        if not text:
+            return []
+        keys = [text]
+        repo, number = issuekey.split_key(text)
+        if number is None:
+            return keys
+
+        def add(candidate: str) -> None:
+            if candidate and candidate not in keys:
+                keys.append(candidate)
+
+        # The project name is only a spelling of **this repo's** binding. Taken
+        # from the issue number alone it would claim whichever project happens
+        # to list that number - and two repositories share numbers, so
+        # ``other/repo#64`` would read ``this_project#64``'s AT.
+        project = self._project_for_repo(repo) if repo else self._project_for(number)
+        if not repo:
+            # Bare-number thread: the numeric key is this thread's own spelling.
+            if project:
+                add(f"{project}#{number}")
+            return keys
+        add(f"{repo.rsplit('/', 1)[-1]}#{number}")
+        if project:
+            add(f"{project}#{number}")
+        return keys
+
+    def _project_for_repo(self, repo: str) -> str | None:
+        """Project name whose ``repo`` is ``repo``; ``None`` when none matches."""
+        wanted = issuekey.repo_full(repo)
+        if not wanted or self.projects is None or self.projects.data is None:
+            return None
+        for name, entry in self.projects.data["projects"].items():
+            if issuekey.repo_full((entry or {}).get("repo")) == wanted:
+                return name
+        return None
+
+    def _issue_session_entry(self, thread: str) -> dict:
+        """The ``issue_sessions.json[thread]`` record, found across key spaces.
+
+        Returns ``{}`` when no spelling matches - never the first record that
+        happens to exist, because a wrong recipient is the failure nobody sees.
+        """
+        ledger = self._load_issue_sessions()
+        for key in self._issue_session_keys(thread):
+            entry = ledger.get(key)
+            if isinstance(entry, dict):
+                return entry
+        return {}
 
     def _sync_assignments(self, index: dict, thread: str, issue: int) -> dict:
         """Create/refresh assignments for ``thread`` from the session stream.
@@ -2575,6 +3107,7 @@ class Engine:
         self._round_closed_threads(index)
         self._remind_release_timeouts(index)
         self._check_pm_stall(index)
+        self._check_at_stall(index)
         needs.merge_into(index, self.store.load_index())
         self.store.save_index(index)
         self.store.log_event({"type": "run.completed", "at": _now(),
@@ -2637,6 +3170,7 @@ class Engine:
             delivery = markers.parse_delivery(str(comment.get("body") or ""))
             review = markers.parse_review(str(comment.get("body") or ""))
             pm_verdict = markers.parse_pm_verdict(str(comment.get("body") or ""))
+            at_verdict = markers.parse_at_verdict(str(comment.get("body") or ""))
             summary["processed"] += 1
             rec["comments_seen"] = int(rec.get("comments_seen") or 0) + 1
             rec["last_comment_id"] = cid
@@ -2665,6 +3199,14 @@ class Engine:
                 state, reason = self._on_pm_verdict(index, key, issue, comment,
                                                     pm_verdict)
                 summary["pm_verdicts"] = int(summary.get("pm_verdicts") or 0) + 1
+                if state != "needs_person":
+                    if rec.get("state") == "idle":
+                        rec["state"] = "tracked"
+                    continue
+            if state == "at_verdict":
+                state, reason = self._on_at_verdict(index, key, issue,
+                                                    comment, at_verdict)
+                summary["at_verdicts"] = int(summary.get("at_verdicts") or 0) + 1
                 if state != "needs_person":
                     if rec.get("state") == "idle":
                         rec["state"] = "tracked"

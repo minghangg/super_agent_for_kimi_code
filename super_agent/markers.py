@@ -295,6 +295,47 @@ _READY_TOKEN = r"ready\s*:\s*(true|false)"
 READY_TOKEN_RE = re.compile(r"<!--\s*" + _READY_TOKEN + r"\s*-->\s*$", re.I)
 READY_TOKEN_ANY_RE = re.compile(r"<!--\s*" + _READY_TOKEN + r"\s*-->", re.I)
 
+
+# ---------------------------------------------------------------- at verdict
+#
+# An ``[AT]`` first line is the fourth marker, and it is **not** a PM verdict
+# with a different name. The contract (issue #57 cid 6828771423) gives the AT
+# three states of its own::
+#
+#     ready      the work can be dispatched
+#     questions  the AT has a question; a person answers it through a local link
+#     blocked    the AT is held
+#
+# ``questions`` exists for no other role, and that is the whole reason the two
+# verdicts keep separate books in the engine. Folding them into one ledger
+# would make a question indistinguishable from a release answer, and the two
+# are read by different gates.
+#
+# The states are **not** equally safe, exactly like the PM's: ``ready`` is the
+# only one that moves work, so it is the only one that demands a structured
+# declaration. Everything unreadable answers ``""``, which the caller treats as
+# blocked (fail-closed).
+AT = "AT"
+AT_PREFIX_RE = re.compile(r"^\s*[\[［]\s*AT\s*[\]］]\s*", re.I)
+
+# Position decides, never table order (see :func:`_first_state_hit`).
+AT_READY_WORDS = ("可派单", "可开工", "ready")
+AT_QUESTION_WORDS = ("有疑问", "待答疑", "提问", "question")
+AT_BLOCKED_WORDS = ("受阻", "阻塞", "返工", "blocked")
+AT_STATE_TABLE = tuple([(w, "ready") for w in AT_READY_WORDS]
+                       + [(w, "questions") for w in AT_QUESTION_WORDS]
+                       + [(w, "blocked") for w in AT_BLOCKED_WORDS])
+
+# Only the trailing token is a declaration; one quoted mid-sentence is a
+# mention. There is no legacy form (no AT comment predates this marker), so
+# ``<!-- ready: true -->`` is **not** read for an AT line: inventing a legacy
+# spelling nobody wrote is how a parser grows a second meaning by accident.
+_AT_VERDICT_TOKEN = r"verdict\s*:\s*(ready|questions|blocked)"
+AT_VERDICT_TOKEN_RE = re.compile(r"<!--\s*" + _AT_VERDICT_TOKEN + r"\s*-->\s*$",
+                                 re.I)
+AT_VERDICT_TOKEN_ANY_RE = re.compile(r"<!--\s*" + _AT_VERDICT_TOKEN + r"\s*-->",
+                                     re.I)
+
 # ``#42`` or ``owner/repo#42``. The look-behind stops ``C#7`` and ``## 42``
 # from being read as a coordinate; the character class stops trailing Chinese
 # punctuation from swallowing the number.
@@ -304,10 +345,12 @@ COORD_RE = re.compile(
 _TRAILING = "，。、,;；:：)）]】\"'`}"
 
 
-def _first_state_hit(text: str) -> tuple[str, str, str]:
+def _first_state_hit(text: str, table: tuple = STATE_TABLE
+                      ) -> tuple[str, str, str]:
     """``(state, word, negated)`` for the earliest usable word.
 
-    Same rule as :func:`_first_hit`, over :data:`STATE_TABLE`. A hit directly
+    Same rule as :func:`_first_hit`, over ``table`` (the PM table by
+    default, the AT table for an ``[AT]`` line). A hit directly
     after a negation character is skipped: ``不可关单`` must not read as
     ``可关单``, and ``未受阻`` must not read as ``受阻``. A tail
     (``可关单项``) is skipped too, for the same reason ``通过项`` is.
@@ -319,7 +362,7 @@ def _first_state_hit(text: str) -> tuple[str, str, str]:
     lower = text.lower()
     best: tuple[int, int, str, str] | None = None
     negated = ""
-    for word, state in STATE_TABLE:
+    for word, state in table:
         needle = word.lower()
         start = lower.find(needle)
         while start != -1:
@@ -586,6 +629,84 @@ def parse_pm_verdict(body: str) -> dict | None:
             "delivery_error": delivery_error,
             "structured": source in ("verdict", "marker"), "source": source}
 
+
+
+def read_at_verdict_token(text: str) -> tuple[str | None, str, str]:
+    """``(state, matched, source)`` from a trailing ``<!-- verdict: ... -->``.
+
+    ``state`` is ``"ready"``, ``"questions"``, ``"blocked"`` or ``None``, and
+    ``source`` is ``"verdict"`` when a declaration was read, ``""`` otherwise.
+
+    Two wrapped tokens that disagree answer ``blocked``: a line that declares
+    two states has not said one thing, and the safe side is the one that moves
+    nothing. Only the **trailing** token is the declaration - the anchor is
+    what lets this protocol be described in a comment about itself.
+    """
+    body = text or ""
+    found = [m.group(1).lower() for m in AT_VERDICT_TOKEN_ANY_RE.finditer(body)]
+    tail = AT_VERDICT_TOKEN_RE.search(body)
+    if tail is None:
+        return None, "", ""
+    if len(set(found)) > 1:
+        return "blocked", " + ".join(sorted(set(found))), "verdict"
+    return tail.group(1).lower(), tail.group(0).strip(), "verdict"
+
+
+def parse_at_verdict(body: str) -> dict | None:
+    """Three-state verdict for an ``[AT]`` first line.
+
+    Returns ``None`` when the body is not an AT comment, and otherwise::
+
+        {"marker": "AT", "state": "ready"|"questions"|"blocked"|"",
+         "matched": <what decided it>, "line": <first line>,
+         "issue": <int|None>, "coords_ok": <bool>, "coords_error": <str>,
+         "structured": <bool>, "source": "verdict"|"prose"|"none"}
+
+    **There is no ``delivery`` field, on purpose.** A PM verdict judges one
+    delivery, so it names one. An AT verdict judges *whether the work can be
+    dispatched at all*, and a rework thread has several deliveries - the AT was
+    never talking about one of them. Copying the field would invite the engine
+    to attribute an AT answer to a delivery by time, which is the guess the
+    ``delivery:`` field exists to prevent on the PM side.
+
+    The coordinate is still mandatory: **no coordinate, no verdict**, for every
+    state. A question about an unnamed issue cannot be answered, and a dispatch
+    decision against an unnamed issue cannot be acted on, so an unusable
+    coordinate answers ``""`` and the caller treats that as blocked.
+
+    ``source`` is ``"verdict"`` for a trailing marker, ``"prose"`` for a state
+    word with no marker (``state`` stays ``""`` and the word is reported so a
+    caller can ask for the marker), and ``"none"`` for nothing readable.
+    """
+    line = first_line(body)
+    if not line or not AT_PREFIX_RE.match(line):
+        return None
+    text = _strip_prefix(line, AT_PREFIX_RE)
+    declared, token, token_source = read_at_verdict_token(text)
+    prose_state, prose_word, negated = _first_state_hit(text, AT_STATE_TABLE)
+    issue, coords_error = _find_coord(text)
+    coords_ok = issue is not None and not coords_error
+    state, source, matched = "", "none", ""
+    if declared is not None:
+        # Two statements that disagree have not said one thing. Unlike the PM
+        # table (which only overrides on ``blocked``), any disagreeing prose
+        # word blocks: ``[AT] 有疑问 ... <!-- verdict: ready -->`` must not
+        # dispatch, and ``[AT] 不可派单 #1 <!-- verdict: ready -->`` is the
+        # negation form of the same failure.
+        if (prose_state and prose_state != declared) or negated == "ready":
+            state = "blocked"
+            matched = " + ".join(x for x in (token, prose_word or "不可派单") if x)
+        else:
+            state, matched = declared, token
+        source = token_source
+    elif prose_state:
+        source, matched = "prose", prose_word
+    if state and not coords_ok:
+        state = ""
+    return {"marker": AT, "state": state, "matched": matched, "line": line,
+            "issue": issue, "coords_ok": coords_ok,
+            "coords_error": coords_error,
+            "structured": source == "verdict", "source": source}
 
 def parse_review(body: str) -> dict | None:
     """``{"marker", "verdict", "matched", "line"}`` for a ``[QA]`` first line.
