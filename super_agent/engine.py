@@ -12,14 +12,32 @@ Routing a ``[QA]`` verdict::
     | first line [WK:name]  -> delivery (matches the worker's assignment)
     | first line [QA]       -> ALWAYS event.agent.project_pm, never a worker
     |                          a pass with no must-fix ALSO goes to the
-    |                          supervisor (``event.agent.supervisor``)
-    | first line [PM]/[supervisor] -> audit only
+    |                          supervisor (``event.agent.supervisor``), but
+    |                          not once a PM verdict exists on this thread
+    | first line [PM]       -> three-state verdict, routed by state:
+    |                          ready   -> event.agent.supervisor (release)
+    |                          blocked -> the same frame, ``exception: true``
+    |                          working -> no frame at all (silence)
+    |                          unreadable / no coordinate -> treated as blocked
     + ordinary comment
        | waiting_review and a qa session is known -> send to qa
-       | waiting_release / close_reconcile       -> audit only
+       | waiting_release / close_reconcile       -> logged, no route
        | a thread held there past ``engine.release_timeout_s`` -> supervisor
        | the thread belongs to a project         -> project_pm (slow path)
        + cross-project or unlisted               -> needs_person
+
+A thread held in ``waiting_release``/``close_reconcile`` past
+``engine.pm_stall_rounds`` rounds without a PM verdict gets one
+``pm_stall`` exception frame **per hold** - the PM is told QA passed, and a
+person is told the PM never answered. The default (15 rounds ≈ 15 min) sits
+inside ``engine.release_timeout_s`` (1800s ≈ 30 rounds), so the two watchdogs
+never fire on the same round. See :meth:`Engine._check_pm_stall`.
+
+A release rings **once**, and the guard asks whether it has rung, not whether
+a PM verdict exists right now: ``index["release_frames"]`` is keyed by the
+delivery the frame judges (``release:<thread>:<delivery_cid>``), so the QA pass
+and the PM answer to it - two comments about one delivery - produce one frame
+across rounds and inside one batch. See :meth:`Engine._release_announced`.
 
 ``_dispatch`` refuses ``origin_role=qa`` with ``target_role=worker`` outright.
 That gate covers **route decisions the engine makes itself**. It does not cover
@@ -29,10 +47,11 @@ decision was made. Guarding the engine's decisions is not the same as
 guarding authority - the boundary is stated here so nobody reads the gate as
 more than it is.
 
-A supervisor notice is a **protocol**, not a wake-up: nothing in this repository
-consumes ``event.agent.*``. Until the workbench subscribes to
-``event.agent.supervisor``, the delivery is recorded and visible in the event
-stream and nowhere else.
+A supervisor notice **is** consumed: ``decide_watch.py`` (ISS-55) subscribes to
+``event.agent.supervisor`` and delivers ``payload.sid`` the text, with an
+at-most-once ledger keyed by event fingerprint. So a frame sent here is a real
+delivery attempt, not a log line - an older version of this docstring said the
+opposite and it was wrong.
 """
 from __future__ import annotations
 
@@ -134,6 +153,15 @@ class Engine:
         # ``route.supervisor_undeliverable`` notices already written, keyed by
         # thread+comment (or thread+assignment on the reminder path).
         self._sup_notice_logged: set[str] = set()
+        # Threads whose PM verdict is in the batch being read right now. Round
+        # scoped: a comment is triaged in id order, so a QA pass is seen before
+        # the PM answer to it, and the double-ring guard has to know that the
+        # answer is already in hand (see ``_pm_verdict_ahead``).
+        self._pm_pending: set[str] = set()
+        # ``release.key_unlinked`` notices already written, keyed by
+        # thread+comment: the miss is a warning to look at, not one line per
+        # round.
+        self._release_key_missed: set[str] = set()
 
     # ------------------------------------------------------------ allowlist
     def allowlist_allows(self, issue: int | None, action: str | None) -> tuple[bool, str]:
@@ -209,13 +237,16 @@ class Engine:
            ignored as role-authored noise;
         2. a ``[QA]`` review is the second marker: its verdict is a transition,
            not discussion, and it must be read before role noise too;
-        3. role-authored noise is ignored;
-        4. escalation markers ask for a person;
-        5. everything else is logged (the historical behaviour, unchanged).
+        3. a ``[PM]`` verdict is the third marker, read before role noise for
+           the same reason - the PM's own role is ``pm``, and a PM verdict from
+           the shared login must not be discarded as author noise;
+        4. role-authored noise is ignored;
+        5. escalation markers ask for a person;
+        6. everything else is logged (the historical behaviour, unchanged).
 
-        ``parse_delivery`` and ``parse_review`` only read the first non-empty
-        line, so a comment that quotes a delivery or a verdict in its body stays
-        ordinary discussion.
+        ``parse_delivery``, ``parse_review`` and ``parse_pm_verdict`` only read
+        the first non-empty line, so a comment that quotes a delivery or a
+        verdict in its body stays ordinary discussion.
         """
         body = str(comment.get("body") or "")
         delivery = markers.parse_delivery(body)
@@ -224,6 +255,10 @@ class Engine:
         review = markers.parse_review(body)
         if review:
             return "review", f"qa verdict {review['verdict'] or 'unreadable'!r}"
+        pm_verdict = markers.parse_pm_verdict(body)
+        if pm_verdict:
+            return "pm_verdict", (f"pm verdict "
+                                  f"{pm_verdict['state'] or 'unreadable'!r}")
         author = str(comment.get("author") or "").strip().lower()
         if self.role and author == self.role.lower():
             return "ignored", "authored by configured role"
@@ -276,6 +311,52 @@ class Engine:
         login allows - and it is logged as unverified when it is false.
         """
         keys = self._qa_session_keys(thread)
+        claimed = str(comment.get("session_key") or "")
+        if claimed:
+            return claimed in keys
+        return bool(keys)
+
+    def _pm_session_keys(self, thread: str) -> set[str]:
+        """Session keys that count as *this thread's* PM.
+
+        The same two sources as :meth:`_qa_session_keys`, so a rotation does not
+        lose the check: the ``pm`` entry of ``issue_sessions.json[thread]``, and
+        every ``pm-*`` key in ``sessions.json``. The author login cannot be used
+        - every role shares one token, so a forgery and a real verdict carry the
+        same login - and that is why this is a weak check treated as one.
+        """
+        keys: set[str] = set()
+        ledger = self._load_issue_sessions().get(thread) or {}
+        if isinstance(ledger, dict):
+            for role, entry in ledger.items():
+                if str(role).lower() != "pm" or not isinstance(entry, dict):
+                    continue
+                for field in ("name", "session"):
+                    value = str(entry.get(field) or "")
+                    if value:
+                        keys.add(value)
+        try:
+            path = self._session_stream()[1]
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        if isinstance(data, dict):
+            keys.update(str(k) for k in data if str(k).startswith("pm"))
+        return keys
+
+    def _pm_verified(self, thread: str, comment: dict) -> bool:
+        """Does this comment come from a PM key of this thread?
+
+        A comment that names its session (``session_key``) is checked against
+        the whitelist exactly. Without that field the answer is "the thread has
+        a PM registered at all" - the strongest statement a shared login allows.
+
+        Unlike the QA side, a miss here **does not let the verdict through**:
+        a QA verdict that cannot be attributed still moves an assignment a
+        person can see, while a PM ``ready`` rings the release bell, which is
+        the one action nobody downstream can take back.
+        """
+        keys = self._pm_session_keys(thread)
         claimed = str(comment.get("session_key") or "")
         if claimed:
             return claimed in keys
@@ -362,9 +443,42 @@ class Engine:
             self._undecidable(thread, cid, sup_key)
         if self._sup_eligible(review, sup_rec) and not (
                 sup_rec is not None and sup_rec.get("ok")):
-            self._route_supervisor(index, thread, issue, comment, review,
-                                   sup_key, action_id(sup_key, "bus_inject",
-                                                      str(cid)))
+            # A release rings **once**, and the question is whether this
+            # release already rang - not whether a PM verdict exists right now.
+            # The QA pass and the PM answer to it are two comments about one
+            # delivery, so both gates read the same ledger and the second one
+            # is silent whether it lands in this batch or a later round.
+            announced = self._release_announced(index, thread, cid)
+            if announced is not None:
+                # Record the decision, not just the log line: the retry pass
+                # reads ``sup_eligible`` from this table, and a record that is
+                # merely absent would be re-sent by it next round.
+                if sup_rec is None:
+                    sup_routes[sup_key] = {
+                        "thread": thread, "comment_id": cid, "at": _now(),
+                        "verdict": str(review.get("verdict") or ""),
+                        "sup_eligible": False, "skipped": "release announced",
+                        "ok": False}
+                self.store.log_event({
+                    "type": "route.supervisor_skipped", "at": _now(),
+                    "thread": thread, "comment_id": cid, "to": "supervisor",
+                    "reason": "this release already rang",
+                    "announced_by": str(announced.get("source") or "")})
+            else:
+                result = self._route_supervisor(
+                    index, thread, issue, comment, review,
+                    sup_key, action_id(sup_key, "bus_inject", str(cid)))
+                # The ledger means "this happened", so it is written only when
+                # the frame landed. A crash between dispatch and this line
+                # costs one duplicate, never a lost release with nothing to
+                # read; an unwritten ledger lets the next round retry.
+                if result.get("dispatched") and result.get("ok"):
+                    self._mark_release(index, thread, cid, source="qa",
+                                       comment_id=cid)
+                # Not delivered: ``_route_supervisor`` already recorded why, in
+                # the ``[user]`` bucket, once per record. Repeating it here
+                # would be a second row for one failure.
+
         if (review.get("fix_structured") is False
                 and str(review.get("verdict") or "") == "pass"):
             # An unmarked *pass* answers the safe side (work is left) and so
@@ -761,6 +875,605 @@ class Engine:
             if result.get("dispatched"):
                 sent += 1
         return sent
+
+    # --------------------------------------------------------- pm verdicts
+    def _pm_verdict(self, index: dict, thread: str) -> dict | None:
+        """The PM verdict recorded for ``thread``, if any."""
+        record = (index.get("pm_verdicts") or {}).get(thread)
+        return record if isinstance(record, dict) else None
+
+    def _pm_verdict_ahead(self, index: dict, thread: str) -> bool:
+        """Is a PM verdict on this thread known, committed *or* in this batch?
+
+        ``pm_verdicts`` is the committed ledger; ``_pm_pending`` is the set of
+        threads whose PM verdict is in the batch being read right now. Both
+        count, because comments are triaged in id order: a QA pass and the PM
+        answer to it usually share a round, and the QA pass is seen first.
+        """
+        return bool(self._pm_verdict(index, thread)
+                    or thread in self._pm_pending)
+
+    # ------------------------------------------------------- release identity
+    def _release_key(self, index: dict, thread: str, cid,
+                     declared: int | None = None) -> str:
+        """Identity of the **release** a frame is about: the delivery it judges.
+
+        A release is "this delivery got a clean verdict", so the delivery
+        comment is its identity - not the round, not the newest delivery on the
+        thread, and not whichever comment happened to arrive first.
+
+        ``cid`` is **the comment being judged** (the QA pass or the PM verdict),
+        and it is used only to find the assignment that comment belongs to.
+        It is not a fallback number: a key derived from it is a different key
+        from the one the other comment about the same release computes.
+
+        A thread with two worker assignments (the rework case) has two
+        deliveries. Picking the newest would give the reworked delivery's key
+        to a comment that judged the first one - the same release would then be
+        counted twice. The assignment that **this** comment belongs to is the
+        only thing that answers "which delivery is this about".
+        """
+        delivery = self._delivery_for(index, thread, cid, declared)
+        return f"release:{thread}:{delivery}"
+
+    def _delivery_for(self, index: dict, thread: str, cid,
+                      declared: int | None = None) -> int:
+        """The delivery comment ``cid`` judges, or ``cid`` itself.
+
+        Five levels, strongest first::
+
+            1. the ``delivery:`` coordinate in the verdict   (exact)
+            2. cid IS a worker assignment's delivery
+            3. cid is that assignment's review (current or last)
+            4. time: the newest delivery not later than cid   (old format only)
+            5. nothing links it - the comment is its own identity
+
+        **Level 4 is a fallback for the old format, nothing else.** A verdict
+        written with ``delivery:`` never reaches it: the coordinate is exactly
+        what the time guess was standing in for, and a guess after an exact
+        statement is how the wrong issue gets closed. Levels 2 and 3 answer for
+        a QA pass, which names no delivery but is linked through its assignment.
+
+        An orphan comment (no assignment, no coordinate) is its own identity -
+        the only thing that can be said about it without guessing - and the miss
+        is recorded once so a loop cannot hide it.
+        """
+        if declared is not None:
+            return int(declared)
+        try:
+            wanted = int(cid)
+        except (TypeError, ValueError):
+            wanted = -1
+        best = None
+        eligible = []
+        for rec in (index.get("assignments") or {}).values():
+            if not isinstance(rec, dict):
+                continue
+            if str(rec.get("thread") or "") != thread:
+                continue
+            if str(rec.get("role") or "") != "worker":
+                continue
+            delivery = rec.get("delivery_comment_id")
+            try:
+                delivery = int(delivery)
+            except (TypeError, ValueError):
+                continue
+            # The comment is either the delivery itself, or a verdict on it.
+            if wanted == delivery:
+                return delivery
+            related = [rec.get("review_comment_id"),
+                       rec.get("last_review_comment_id")]
+            related_ok = any(str(value) == str(wanted) for value in related
+                             if value is not None)
+            if related_ok and (best is None or delivery > best):
+                best = delivery
+            # A PM verdict names no delivery, so it is attributed by time: the
+            # release it is about is the newest delivery that already exists
+            # when the comment was written. A delivery **after** the comment
+            # cannot be what it judged, which is what keeps the rework case
+            # (delivery 9300 judged by a comment at 9200) on the first key.
+            if delivery <= wanted:
+                eligible.append(delivery)
+        if best is not None:
+            return best
+        if eligible:
+            return max(eligible)
+        key = f"{thread}|{wanted}"
+        if key not in self._release_key_missed:
+            self._release_key_missed.add(key)
+            self.store.log_event({
+                "type": "release.key_unlinked", "at": _now(),
+                "thread": thread, "comment_id": wanted,
+                "detail": "no worker assignment links this comment to a "
+                          "delivery; using the comment as its own release key"})
+        return wanted
+
+    def _release_announced(self, index: dict, thread: str, cid,
+                           declared: int | None = None) -> dict | None:
+        """The frame already sent for this release, or ``None``.
+
+        This is an **event** ledger, not a state question: it answers "has this
+        release already rung?" rather than "is there a PM verdict right now".
+        The difference is the whole point - a verdict arrives in a later round
+        than the QA pass, so a state question asked at gate time answers "no"
+        in both rounds and rings twice.
+        """
+        rows = index.get("release_frames")
+        if not isinstance(rows, dict):
+            return None
+        row = rows.get(self._release_key(index, thread, cid, declared))
+        return row if isinstance(row, dict) else None
+
+    def _mark_release(self, index: dict, thread: str, cid, *,
+                      source: str, comment_id, declared: int | None = None) -> dict:
+        """Record that this release has rung - **after** the frame landed.
+
+        The ledger means "this has happened", so it is written only when the
+        dispatch says it happened. Writing it before the dispatch turns a crash
+        in between into a release that is permanently lost with nothing for a
+        person to read: the next round sees "already announced" and the frame
+        was never sent. Left unwritten, the next round simply retries.
+        """
+        rows = index.setdefault("release_frames", {})
+        if not isinstance(rows, dict):
+            rows = index["release_frames"] = {}
+        key = self._release_key(index, thread, cid, declared)
+        row = rows.get(key)
+        row = dict(row) if isinstance(row, dict) else {"key": key, "at": _now()}
+        row.update({"thread": thread, "source": source,
+                    "comment_id": int(comment_id)})
+        rows[key] = row
+        return row
+
+    def _record_pm_verdict(self, index: dict, thread: str, verdict: dict,
+                           cid) -> dict:
+        """Commit the verdict to the thread ledger, newest comment wins."""
+        ledger = index.setdefault("pm_verdicts", {})
+        if not isinstance(ledger, dict):
+            ledger = index["pm_verdicts"] = {}
+        record = {"thread": thread, "comment_id": int(cid),
+                  "state": str(verdict.get("state") or ""),
+                  "matched": str(verdict.get("matched") or ""),
+                  "issue": verdict.get("issue"), "at": _now()}
+        ledger[thread] = record
+        # A verdict is the answer the stall watchdog was waiting for.
+        if isinstance(index.get("pm_stall"), dict):
+            index["pm_stall"].pop(thread, None)
+        return record
+
+    def _on_pm_verdict(self, index: dict, thread: str, issue: int,
+                       comment: dict, verdict: dict) -> tuple[str, str]:
+        """Apply one ``[PM]`` verdict and route it.
+
+        Four answers, and only one of them is quiet:
+
+        * ``working`` - the PM says the work is in hand. No frame: waking the
+          supervisor to say "nothing new" is the noise that teaches a reader to
+          ignore the channel;
+        * ``blocked`` - an exception frame;
+        * ``ready``   - the release frame (wake the supervisor);
+        * unreadable (``""``), or a ``ready`` with no usable coordinate -
+          **treated as blocked**. Silence here would be the one failure nobody
+          can see: a PM answered and the engine dropped it.
+        """
+        cid = int(comment["id"])
+        state = str(verdict.get("state") or "")
+        if not self._pm_verified(thread, comment):
+            # An unverified verdict does not ring. A QA verdict that cannot be
+            # attributed still moves an assignment; a PM ``ready`` wakes a
+            # person to close an issue and cannot be taken back.
+            self.store.log_event({
+                "type": "pm.unverified", "at": _now(), "thread": thread,
+                "comment_id": cid, "consumers": ["doctor"],
+                "detail": "the verdict did not name a pm session key of this "
+                          "thread"})
+            self._pm_needs_person(
+                index, thread, cid, "pm.verdict_unverified[user]",
+                "pm verdict from unverified author", verdict)
+            return "needs_person", "pm verdict from unverified author"
+        delivery_error = str(verdict.get("delivery_error") or "")
+        if delivery_error:
+            # The PM named a delivery and it did not parse. Guessing instead is
+            # the failure the field exists to remove, so this is a look-at.
+            self.store.log_event({
+                "type": "pm.delivery_bad", "at": _now(), "thread": thread,
+                "comment_id": cid, "detail": delivery_error})
+            self._pm_needs_person(
+                index, thread, cid, "pm.verdict[user]", delivery_error, verdict)
+            return "needs_person", f"pm verdict: {delivery_error}"
+        declared_delivery = verdict.get("delivery")
+        if declared_delivery is not None:
+            known = {int(rec.get("delivery_comment_id"))
+                     for rec in (index.get("assignments") or {}).values()
+                     if isinstance(rec, dict)
+                     and str(rec.get("thread") or "") == thread
+                     and str(rec.get("role") or "") == "worker"
+                     and rec.get("delivery_comment_id") is not None}
+            if int(declared_delivery) not in known:
+                detail = (f"delivery #{int(declared_delivery)} is not a delivery "
+                          f"of this thread")
+                self.store.log_event({
+                    "type": "pm.delivery_unknown", "at": _now(),
+                    "thread": thread, "comment_id": cid,
+                    "delivery": int(declared_delivery)})
+                self._pm_needs_person(index, thread, cid, "pm.verdict[user]",
+                                      detail, verdict)
+                return "needs_person", f"pm verdict: {detail}"
+        named = verdict.get("issue")
+        if named is not None and int(named) != int(issue):
+            # The verdict speaks about a different issue. Filing it against
+            # this thread would close the wrong one.
+            self.store.log_event({
+                "type": "pm.verdict_wrong_issue", "at": _now(),
+                "thread": thread, "comment_id": cid, "named_issue": int(named),
+                "thread_issue": int(issue)})
+            self._pm_needs_person(
+                index, thread, cid, "pm.verdict_wrong_issue[user]",
+                f"verdict names issue #{int(named)} but thread is #{int(issue)}",
+                verdict)
+            return "needs_person", (f"verdict names issue #{int(named)} but "
+                                    f"thread is #{int(issue)}")
+        record = self._record_pm_verdict(index, thread, verdict, cid)
+        if state == "working":
+            self.store.log_event({
+                "type": "pm.verdict", "at": _now(), "thread": thread,
+                "comment_id": cid, "state": state,
+                "matched": record["matched"], "frame": "none"})
+            return "pm_verdict", ""
+        exception = state != "ready"
+        reason = ""
+        if not state:
+            reason = (verdict.get("coords_error")
+                      or "no unmarked pm verdict; treated as blocked")
+        elif exception:
+            reason = "pm reports blocked"
+        # A release rings once. ``ready`` is the release frame, so it reads the
+        # same ledger the QA pass reads; an exception frame is about the state
+        # of the work, not about a release, and is keyed by its verdict.
+        if not exception:
+            announced = self._release_announced(index, thread, cid,
+                                                verdict.get("delivery"))
+            if announced is not None:
+                self.store.log_event({
+                    "type": "route.supervisor_skipped", "at": _now(),
+                    "thread": thread, "comment_id": cid, "to": "supervisor",
+                    "reason": "this release already rang",
+                    "announced_by": str(announced.get("source") or "")})
+                return "pm_verdict", ""
+        result = self._route_pm_frame(index, thread, issue, comment, verdict,
+                                      exception=exception, reason=reason)
+        return self._settle_frame(index, thread, issue, cid, result,
+                                  exception=exception, reason=reason,
+                                  verdict=verdict, state=state)
+
+    def _settle_frame(self, index: dict, thread: str, issue, cid,
+                      result: dict, *, exception: bool, reason: str,
+                      verdict: dict | None, state: str,
+                      key: str = "") -> tuple[str, str]:
+        """Close out one dispatch: ledger, or a row a person can read.
+
+        Three outcomes and no fourth::
+
+            dispatched and ok        -> record the release (ready frames only)
+            dispatched, not ok       -> the frame may have landed; a person looks
+            not dispatched           -> nothing happened; the next round retries
+
+        The third outcome needs no row of its own: it is "not yet", and the
+        attempt counter plus the retry pass own it. The first two are the ones
+        that must leave a trace.
+
+        The middle outcome is the reason this exists as one function. It used
+        to fall between two ``if``s on the inline path - ``dispatched`` true,
+        ``ok`` false (the bus raised after the send) - so the frame was sent,
+        the ledger was not written, and nothing was recorded: a release that
+        rang and left no trace, or a notice that vanished. Collecting the three
+        branch here means a new call site cannot re-open the gap by forgetting
+        one of them.
+        """
+        dispatched = bool(result.get("dispatched"))
+        ok = bool(result.get("ok")) if dispatched else False
+        if not dispatched:
+            if exception:
+                # The PM asked for a look and the look could not be sent.
+                self._note_undeliverable(
+                    index, thread, cid,
+                    "pm verdict could not be delivered: "
+                    f"{result.get('reason') or 'unknown'}", issue=issue,
+                    to="supervisor", once_key=f"pm:{thread}:{cid}")
+                self._pm_needs_person(
+                    index, thread, cid, "pm.verdict[user]",
+                    (verdict or {}).get("coords_error") or reason, verdict)
+                return "needs_person", f"pm verdict: {reason or state}"
+            return "pm_verdict", ""
+        if not ok:
+            # Landed but unconfirmed, or the send raised after counting the
+            # attempt: the counter stops a blind repeat, so a person has to
+            # decide - silence here is a lost bell.
+            self._note_undeliverable(
+                index, thread, cid,
+                "frame was dispatched but the send was not confirmed; it may "
+                "or may not have arrived - check before resending",
+                issue=issue, to="supervisor",
+                once_key=f"uncertain:{key or thread + ':' + str(cid)}")
+            return "pm_verdict", ""
+        if not exception:
+            self._mark_release(index, thread, cid, source="pm",
+                               comment_id=cid,
+                               declared=(verdict or {}).get("delivery"))
+        return "pm_verdict", ""
+
+    def _pm_needs_person(self, index: dict, thread: str, cid, reason: str,
+                         detail: str, verdict: dict | None = None) -> None:
+        """One person-facing row per ``(thread, reason)``, never a pile.
+
+        The stall watchdog re-fires across holds and the seam paths can repeat,
+        so an unconditional append would grow a row per round and bury the
+        queue. The row is updated in place; its identity is the reason plus the
+        thread, not the comment id, because the latest comment is only the one
+        that happened to be current when the condition was noticed.
+        """
+        numbers = index.setdefault("issues", {}).setdefault(
+            thread, {"state": "idle", "comments_seen": 0, "needs_person": []})
+        rows = numbers.setdefault("needs_person", [])
+        existing = next((row for row in rows
+                         if str(row.get("reason") or "") == reason), None)
+        if existing is not None:
+            existing["at"] = _now()
+            existing["detail"] = detail
+            existing["comment_id"] = cid
+            return
+        rows.append({"comment_id": cid, "at": _now(), "reason": reason,
+                     "detail": detail})
+
+    def _route_pm_frame(self, index: dict, thread: str, issue: int,
+                        comment: dict, verdict: dict, *, exception: bool,
+                        reason: str = "", action_key: str = "",
+                        body_text: str = "") -> dict:
+        """Send one PM frame on ``event.agent.supervisor``; at most once.
+
+        The record is written **before** the dispatch and carries the decision
+        snapshot (``exception``), the same order and the same reason as
+        :meth:`_route_supervisor`: a crash between the two loses one send,
+        never the decision, and :meth:`_retry_pm_frames` reads the snapshot
+        back instead of re-judging a body it no longer has.
+        """
+        cid = int(comment["id"]) if comment.get("id") is not None else 0
+        key = action_key or f"pm:{thread}:{cid}"
+        base = action_id(key, "bus_inject", str(cid))
+        frames = index.setdefault("pm_frames", {})
+        if not isinstance(frames, dict):
+            frames = index["pm_frames"] = {}
+        record = frames.get(key)
+        record = dict(record) if isinstance(record, dict) else {
+            "thread": thread, "comment_id": cid, "at": _now()}
+        record.update({"exception": bool(exception), "issue": int(issue),
+                       "delivery": verdict.get("delivery"),
+                       "text": body_text or self._pm_frame_text(
+                           issue, cid, verdict, exception=exception),
+                       "action_id": base})
+        frames[key] = record
+        if self.store.action_attempted(base) > 0:
+            return {"dispatched": False, "reason": "already attempted",
+                    "action_id": base}
+        sid = self._supervisor_sid()
+        if not sid:
+            record["ok"] = False
+            record["undeliverable"] = True
+            self._note_undeliverable(
+                index, thread, cid,
+                "no supervisor sid: engine.supervisor_sid is empty and none of "
+                "engine.supervisor_keys resolve", issue=issue, to="supervisor",
+                once_key=f"pmsid:{key}")
+            return {"dispatched": False, "reason": "no supervisor sid",
+                    "action_id": base}
+        record["undeliverable"] = False
+        payload = {"thread": thread, "issue": int(issue),
+                   "review_comment_id": cid,
+                   "kind": "pm_stall" if action_key.startswith("pm_stall:")
+                           else "pm_verdict",
+                   "state": str(verdict.get("state") or ""),
+                   "exception": bool(exception),
+                   "reason": reason,
+                   "sid": sid, "at": _now(), "text": record["text"]}
+        result = self._dispatch(self._route_action(
+            thread, issue, cid, payload, "event.agent.supervisor",
+            target_role="supervisor", origin_role="pm",
+            assignment_id=key))
+        record["ok"] = bool(result.get("ok")) if result.get("dispatched") else False
+        record["refused"] = bool(result.get("refused"))
+        record["action_id"] = result.get("action_id") or base
+        self.store.log_event({
+            "type": "route.decided", "at": _now(), "thread": thread,
+            "comment_id": cid, "to": "supervisor", "origin": "pm",
+            "state": str(verdict.get("state") or ""),
+            "exception": bool(exception),
+            "dispatched": bool(result.get("dispatched")),
+            "refused": bool(result.get("refused")),
+            "reason": result.get("reason") or "",
+        })
+        return result
+
+    @staticmethod
+    def _pm_frame_text(issue, cid, verdict: dict, *, exception: bool) -> str:
+        """The one line a person reads for a PM frame."""
+        state = str(verdict.get("state") or "") or "unreadable"
+        if exception:
+            return (f"【PM 例外】#{int(issue)} PM 结论 {state}"
+                    f"（cid {cid}），需要人看一眼")
+        return (f"【可关单】#{int(issue)}，PM 结论 ready"
+                f"（cid {cid}），可以关单")
+
+    def _retry_pm_frames(self, index: dict) -> int:
+        """Re-send PM frames a refused/suppressed dispatch never sent.
+
+        Same rule as :meth:`_retry_supervisor_routes`: the snapshot is the
+        decision, an attempt that exists is never repeated, and a record with
+        no snapshot is skipped rather than guessed at.
+
+        A successful re-send is a **first** delivery as far as the release
+        ledger is concerned, so it writes the ledger here - the same
+        ``dispatched and ok`` rule as the two inline gates. Leaving it out made
+        the retry path the one place a release could ring twice: the frame went
+        out, the ledger stayed empty, and the next PM verdict rang again. The
+        QA side never had the hole because its retry re-enters
+        :meth:`_route_review`, which writes the ledger itself.
+
+        ``exception`` frames are not releases, so they write nothing - the same
+        distinction the inline path draws.
+        """
+        sent = 0
+        for key, record in sorted((index.get("pm_frames") or {}).items()):
+            if not isinstance(record, dict) or record.get("ok"):
+                continue
+            if "exception" not in record:
+                continue
+            base = str(record.get("action_id") or "")
+            cid = record.get("comment_id")
+            if cid is None or (base and self.store.action_attempted(base) > 0):
+                continue
+            thread = str(record.get("thread") or "")
+            issue = record.get("issue")
+            if issue is None:
+                for rec in (index.get("assignments") or {}).values():
+                    if str(rec.get("thread") or "") == thread:
+                        issue = rec.get("issue")
+                        break
+            if issue is None:
+                continue
+            verdict = {"state": "blocked" if record.get("exception") else "ready",
+                       "matched": ""}
+            declared = record.get("delivery")
+            try:
+                declared = int(declared) if declared is not None else None
+            except (TypeError, ValueError):
+                declared = None
+            result = self._route_pm_frame(
+                index, thread, int(issue), {"id": cid}, verdict,
+                exception=bool(record.get("exception")), action_key=key,
+                body_text=str(record.get("text") or ""))
+            self._settle_frame(index, thread, issue, cid, result,
+                               exception=bool(record.get("exception")),
+                               reason=str(record.get("reason") or ""),
+                               verdict={"delivery": declared}, state="",
+                               key=key)
+            # Write the outcome back **through the table**. ``_route_pm_frame``
+            # stores a fresh ``dict`` under ``key``, so the loop's ``record``
+            # is a stale reference: setting a field on it writes to a copy and
+            # the next round retries a frame that already landed.
+            written = index.get("pm_frames") or {}
+            current = written.get(key) if isinstance(written, dict) else None
+            if isinstance(current, dict):
+                dispatched = bool(result.get("dispatched"))
+                current["ok"] = bool(result.get("ok")) if dispatched else False
+                if dispatched:
+                    sent += 1
+        return sent
+
+    # ------------------------------------------------------- pm stall watchdog
+    def _check_pm_stall(self, index: dict) -> int:
+        """Ask once about a thread where QA passed and the PM never answered.
+
+        A release held in ``waiting_release``/``close_reconcile`` is waiting for
+        a person to close it. The PM verdict is the new gate in front of that
+        person, so a PM that stops answering turns into a **silent** hold - the
+        exact failure mode this engine is built to make visible.
+
+        Counting is by **round**, not by wall clock: a round is the unit the
+        engine actually acts in, and ``pm_stall_rounds`` rounds at the default
+        60s poll interval is roughly that many minutes. The counter is per
+        thread, reset by any PM verdict (see :meth:`_record_pm_verdict`) and by
+        leaving the held states.
+
+        **Each hold is its own notice.** The action id carries a per-thread
+        ``hold_seq`` that only moves when the thread leaves the held states and
+        comes back, so a second stuck release is reported instead of being
+        swallowed by the first one's attempt counter. Inside one hold the
+        ``fired`` flag keeps it to one frame and one ``needs_person`` row.
+
+        The default is **15 rounds** (about 15 minutes at the 60s interval).
+        ``engine.release_timeout_s`` is 1800s = 30 rounds, so 15 sits **inside**
+        it: the PM is asked first, and only a thread that is still held after
+        that gets the release-timeout reminder. Equal defaults would put two
+        frames on the same round for the same thread.
+        """
+        engine_cfg = self.cfg.get("engine") or {}
+        try:
+            limit = int(engine_cfg.get("pm_stall_rounds") or 15)
+        except (TypeError, ValueError):
+            limit = 15
+        if limit <= 0:
+            return 0
+        stall = index.setdefault("pm_stall", {})
+        if not isinstance(stall, dict):
+            stall = index["pm_stall"] = {}
+        held = {}
+        for aid, rec in (index.get("assignments") or {}).items():
+            if not isinstance(rec, dict):
+                continue
+            if str(rec.get("status") or "") not in ("waiting_release",
+                                                    "close_reconcile"):
+                continue
+            thread = str(rec.get("thread") or "")
+            if thread and str(rec.get("qa_verdict") or "") == "pass":
+                held[thread] = (aid, rec)
+        for thread in list(stall):
+            if thread not in held:
+                # Left the hold: the next hold is a new notice, so the seq
+                # moves and the old attempt counter no longer swallows it.
+                seqs = index.setdefault("pm_stall_seq", {})
+                if isinstance(seqs, dict) and thread in seqs:
+                    seqs[thread] = int(seqs[thread] or 0) + 1
+                stall.pop(thread, None)
+        fired = 0
+        for thread, (aid, rec) in sorted(held.items()):
+            if self._pm_verdict_ahead(index, thread):
+                stall.pop(thread, None)
+                continue
+            entry = stall.get(thread)
+            entry = dict(entry) if isinstance(entry, dict) else {
+                "thread": thread, "rounds": 0, "fired": False,
+                "since": _now()}
+            entry["rounds"] = int(entry.get("rounds") or 0) + 1
+            stall[thread] = entry
+            if entry.get("fired") or entry["rounds"] < limit:
+                continue
+            issue = rec.get("issue")
+            comment_id = rec.get("delivery_comment_id")
+            seqs = index.setdefault("pm_stall_seq", {})
+            if not isinstance(seqs, dict):
+                seqs = index["pm_stall_seq"] = {}
+            seq = int(seqs.get(thread) or 1)
+            seqs[thread] = seq
+            action_key = f"pm_stall:{thread}:{seq}"
+            verdict = {"state": "blocked", "matched": "pm_stall"}
+            result = self._route_pm_frame(
+                index, thread, int(issue or 0), {"id": comment_id}, verdict,
+                exception=True, reason=f"no pm verdict in {entry['rounds']} rounds",
+                action_key=action_key,
+                body_text=self._pm_stall_text(thread, issue, entry["rounds"]))
+            entry["fired"] = True
+            entry["hold_seq"] = seq
+            entry["result"] = str(result.get("reason") or "dispatched")
+            self.store.log_event({
+                "type": "pm.stall", "at": _now(), "thread": thread,
+                "assignment": aid, "rounds": entry["rounds"], "hold_seq": seq,
+                "dispatched": bool(result.get("dispatched")),
+                "reason": result.get("reason") or ""})
+            if not result.get("dispatched"):
+                self._note_undeliverable(
+                    index, thread, comment_id,
+                    f"pm stall notice could not be delivered: "
+                    f"{result.get('reason') or 'unknown'}", issue=issue,
+                    assignment=aid, once_key=f"pmstall:{thread}:{seq}")
+            self._pm_needs_person(
+                index, thread, comment_id, "pm.stall[user]",
+                f"QA 通过后 {entry['rounds']} 轮无 PM 结论")
+            fired += 1
+        return fired
+
+    @staticmethod
+    def _pm_stall_text(thread: str, issue, rounds: int) -> str:
+        return f"【PM 停摆】#{int(issue or 0)} QA 已通过，但 {rounds} 轮无 PM 结论"
 
     # -------------------------------------------------- release-time reminders
     def _release_start(self, index: dict, thread: str, assignment: dict) -> str:
@@ -1832,6 +2545,7 @@ class Engine:
         summary["notifications_retried"] = self._retry_waiting_review(index)
         self._retry_routes(index)
         self._retry_supervisor_routes(index)
+        self._retry_pm_frames(index)
         # Archive last: a review that arrived this round is archived this
         # round, and the archived-sid guard applies from the next dispatch on.
         self._archived_cache = None
@@ -1860,6 +2574,7 @@ class Engine:
         # only be advanced by a genuine next round.
         self._round_closed_threads(index)
         self._remind_release_timeouts(index)
+        self._check_pm_stall(index)
         needs.merge_into(index, self.store.load_index())
         self.store.save_index(index)
         self.store.log_event({"type": "run.completed", "at": _now(),
@@ -1902,6 +2617,14 @@ class Engine:
         summary["comments_new"] += len(fresh)
 
         seen_this_round: set[int] = set()
+        # The window the double-ring guard reads: a PM verdict anywhere in this
+        # issue's new comments counts, even when it comes after the QA pass in
+        # id order. Built from the same list the loop walks, so the window is
+        # exactly the batch - never a guess about future comments.
+        self._pm_pending = set()
+        if key and any(markers.parse_pm_verdict(str(c.get("body") or ""))
+                       for c in fresh):
+            self._pm_pending.add(key)
         for comment in fresh:
             event_type = "issue_comment.created"
             if event_type not in self.allowlist:
@@ -1913,6 +2636,7 @@ class Engine:
             state, reason = self._triage(comment)
             delivery = markers.parse_delivery(str(comment.get("body") or ""))
             review = markers.parse_review(str(comment.get("body") or ""))
+            pm_verdict = markers.parse_pm_verdict(str(comment.get("body") or ""))
             summary["processed"] += 1
             rec["comments_seen"] = int(rec.get("comments_seen") or 0) + 1
             rec["last_comment_id"] = cid
@@ -1933,6 +2657,14 @@ class Engine:
                 state, reason = self._on_review(index, key, issue, comment,
                                                 review, summary)
                 summary["reviews"] = int(summary.get("reviews") or 0) + 1
+                if state != "needs_person":
+                    if rec.get("state") == "idle":
+                        rec["state"] = "tracked"
+                    continue
+            if state == "pm_verdict":
+                state, reason = self._on_pm_verdict(index, key, issue, comment,
+                                                    pm_verdict)
+                summary["pm_verdicts"] = int(summary.get("pm_verdicts") or 0) + 1
                 if state != "needs_person":
                     if rec.get("state") == "idle":
                         rec["state"] = "tracked"
@@ -1958,6 +2690,10 @@ class Engine:
             cursor.setdefault("issues", {})[key] = max(int(c["id"]) for c in fresh)
         else:
             cursor.setdefault("issues", {}).setdefault(key, cur)
+        # The window closes here: past this point only the committed ledger
+        # speaks, so the stall watchdog cannot be silenced by a batch that was
+        # already read and answered.
+        self._pm_pending = set()
 
     # ------------------------------------------------------------- status/doctor
     def status(self, *, outbox: bool = False, all: bool = False) -> dict:

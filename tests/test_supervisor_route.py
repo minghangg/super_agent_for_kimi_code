@@ -272,6 +272,10 @@ class DecidedBeforeThePmEarlyReturn(Base):
         # Drop the supervisor record so the block has work to do, keep the PM
         # attempt counter above zero: the PM path returns early here.
         del index["supervisor_routes"][sup_key]
+        # Reconstruct the crash window: since P1-2 the ledger is written after
+        # the send, so a crash between them leaves it **empty** - this pop is
+        # what puts the index back in that state, not what hides it.
+        index.pop("release_frames", None)
         review = markers.parse_review(PASS_BODY)
         pm_base = action_id(f"route:{THREAD}:9100", "bus_inject", "9100")
         self.assertGreater(engine.store.action_attempted(pm_base), 0)
@@ -283,7 +287,28 @@ class DecidedBeforeThePmEarlyReturn(Base):
         self.assertIsNotNone(record, "the supervisor block must still run")
         self.assertTrue(record["sup_eligible"])
         self.assertEqual(len(self.bus.payloads("event.agent.supervisor")), 1,
-                         "an attempted send is not repeated")
+                         "the attempt counter stops a repeat; the ledger is "
+                         "not needed to do that here")
+        self.assertFalse(index.get("release_frames"),
+                         "a frame that never landed is never recorded")
+
+    def test_a_crash_before_the_dispatch_is_retried_next_round(self):
+        # The same window as a whole round: observe mode takes the decision,
+        # sends nothing, and leaves the ledger empty. Round two must send it.
+        engine = self.engine(mode="observe")
+        self.deliver_and_pass(engine)
+        index = self.index(engine)
+        sup_key = f"sup:{THREAD}:9100"
+        self.assertFalse(index["supervisor_routes"][sup_key]["ok"])
+        self.assertEqual(index.get("release_frames") or {}, {},
+                         "nothing landed, so nothing is recorded")
+        engine.dispatch_enabled = True
+        engine.run_once()
+        self.assertEqual(len(self.bus.payloads("event.agent.supervisor")), 1)
+        self.assertTrue(self.index(engine)["release_frames"])
+        engine.run_once()
+        self.assertEqual(len(self.bus.payloads("event.agent.supervisor")), 1,
+                         "and the ledger then stops the repeat")
 
     def test_first_round_supervisor_refusal_is_retried_once(self):
         engine = self.engine(mode="observe")
