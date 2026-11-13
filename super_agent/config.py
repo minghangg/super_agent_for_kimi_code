@@ -65,6 +65,9 @@ DEFAULTS: dict = {
         # Model profile table (ISS-32). "" = not configured: choose_profile then
         # falls back to the built-in default pair and no file is read.
         "model_profiles_path": "",
+        # A-1 (ISS-57): the contract file a new session reads first.
+        # "" = fall back to the inert ping.
+        "contract_path": "",
         # How many held threads one round asks the close reconciliation about.
         # ``waiting_release`` and ``close_reconcile`` are the only states that
         # need it, so the cap bounds a poll loop rather than all assignments.

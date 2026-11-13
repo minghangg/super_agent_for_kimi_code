@@ -34,6 +34,40 @@ ALLOWED_CREATION_MODES = ("pm_created",)
 DEFAULT_MODEL_PROFILE = {"model": "cb-deepseek-v4.1-flash", "effort": "high",
                          "thinking": "high"}
 
+# Inert warm-up ping for a freshly created session (ISS-57). One trivial turn
+# activates the session before the real task; the wording must stay inert so the
+# agent calls no tools and reads no files. Copied verbatim from the workbench
+# dispatcher (``dispatch.py:57-60``) so both sides behave identically.
+WARMUP_PROMPT = ("Reply with exactly: ping. Do not call any tools. "
+                 "Do not read files. Do not run commands.")
+
+
+def contract_warmup_prompt(contract_path: str | Path | None) -> str:
+    """First message for a newly created session, or the inert fallback.
+
+    The workbench routes every new session through its session contract (think in
+    English / precise output / seven-step pre-code check). The message therefore
+    asks the agent to read that file once, then confirm. Wording matches the
+    workbench dispatcher verbatim (``dispatch.py:70-82``); only the path differs,
+    because this side never hardcodes a private workbench root.
+
+    Pure: it tests for existence, reads no content, creates nothing, logs
+    nothing, and never returns ``None`` -- any problem falls back to
+    ``WARMUP_PROMPT``.
+    """
+    if not contract_path:
+        return WARMUP_PROMPT
+    try:
+        path = Path(str(contract_path))
+        if path.is_file():
+            # The message is read by an agent, so hand it a POSIX path.
+            return (f"Read {path.as_posix()} with the Read tool. "
+                    "Reply with exactly: Read done. "
+                    "Do not use any other tool. Do not run any command.")
+    except (OSError, ValueError):
+        pass
+    return WARMUP_PROMPT
+
 
 def _profile_ok(entry) -> bool:
     return isinstance(entry, dict) and all(
@@ -99,13 +133,15 @@ class DispatchAdapter:
     def __init__(self, *, console: str | Path | None = None,
                  creation_mode: str = "pm_created", mode: str = "observe",
                  runner=None, timeout_s: float = 60.0,
-                 model_profiles_path: str | Path | None = None):
+                 model_profiles_path: str | Path | None = None,
+                 contract_path: str | Path | None = None):
         self.console = str(console) if console else ""
         self.creation_mode = str(creation_mode or "pm_created")
         self.mode = str(mode or "observe")
         self.timeout_s = float(timeout_s)
         self.runner = runner or self._subprocess_runner
         self.model_profiles_path = str(model_profiles_path) if model_profiles_path else ""
+        self.contract_path = str(contract_path) if contract_path else ""
 
     # -------------------------------------------------------------- transport
     def _subprocess_runner(self, argv: list[str]) -> tuple[int, str, str]:
@@ -191,6 +227,28 @@ class DispatchAdapter:
         return self._call(["resolve", "--json", "--project", str(project),
                            "--role", str(role)])
 
+    def session_bootstrap(self) -> dict:
+        """First message the engine would send to a newly created session (ISS-57).
+
+        Answers ``{"ok", "code", "text", "source", "contract_path"}``. ``source``
+        is ``contract`` when the configured contract file is readable and
+        ``fallback`` when the inert ping is returned instead.
+
+        It creates nothing: no console spawn, no session, no state write.
+        ``session_id`` is always ``None`` by contract -- this method produces a
+        message, never a session, so the value must not be handed to ``send``.
+        M0 keeps session creation outside the engine, so this method only fixes
+        *what* the first message must be; it never delivers it. The first message
+        of a new session must come from this ``text`` and not from ``send()`` --
+        ``send`` carries follow-up messages for a session that already exists.
+        """
+        text = contract_warmup_prompt(self.contract_path)
+        if text == WARMUP_PROMPT:
+            return _result(True, "ok", source="fallback", text=text,
+                           contract_path="")
+        return _result(True, "ok", source="contract", text=text,
+                       contract_path=Path(self.contract_path).as_posix())
+
     def create_worker(self, assignment: dict) -> dict:
         gate = self._creation_gate("worker", assignment)
         return gate if gate is not None else self._call(
@@ -237,4 +295,5 @@ def build(cfg: dict, *, runner=None) -> DispatchAdapter:
                            runner=runner,
                            timeout_s=float(dispatch_cfg.get("timeout_s") or 60.0),
                            model_profiles_path=str(
-                               engine_cfg.get("model_profiles_path") or ""))
+                               engine_cfg.get("model_profiles_path") or ""),
+                           contract_path=str(engine_cfg.get("contract_path") or ""))
