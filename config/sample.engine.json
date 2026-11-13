@@ -1,0 +1,50 @@
+{
+  "_comment": "super_agent 引擎配置 SAMPLE（注释版。JSON 不支持 // 注释，本文件用 _comment 键说明；真实配置请复制本文件到你的「工作台私有目录」，删 _comment、填真值，用 --config <绝对路径> 指向）。safkc 公开仓内只放 sample，不放任何真实配置。",
+
+  "_comment_角色与模式": "role=会话角色名（仅配置语义）；mode=observe（只读）或 assist（真动作）；state_dir=运行态根（绝对路径，建议放在你的工作台目录而非本仓）；legacy_state_dir=旧版运行态根，''=所选根的同级 state/",
+  "role": "supervisor",
+  "mode": "observe",
+  "state_dir": "/absolute/path/to/your-workbench/state-root",
+  "legacy_state_dir": "",
+
+  "_comment_bus": "事件总线（wss）连接；port 与总线 daemon 一致",
+  "bus": {
+    "host": "127.0.0.1",
+    "port": 58800,
+    "timeout_s": 2.0
+  },
+
+  "_comment_github": "issue 数据源。source=none（空转）/fixture（本地 JSON 夹具）/live（GitHub REST 只读）。repo 必须 owner/name。**token 不在本文件**：用环境变量 GITHUB_TOKEN（export 后启动引擎）。live 轮询频率受 GitHub 限额约束，无 token 时慎用 60s",
+  "github": {
+    "source": "none",
+    "repo": "owner/name",
+    "fixture": "",
+    "poll_interval_s": 60,
+    "max_issues": 20,
+    "max_comments_per_issue": 50
+  },
+
+  "_comment_store": "运行态文件上限与 outbox 滞留判据",
+  "store": {
+    "max_event_lines": 10000,
+    "max_outbox_lines": 5000,
+    "outbox_stale_s": 300
+  },
+
+  "_comment_engine": "引擎行为。allowlist=快路读取的事件类型；cooldown_s=同线程动作冷却；assignments 必须留空（M0 不持有派单态）；session_events_path=工作台会话生命周期流（只读），''=自动解析；project_allowlist=项目策略表路径（见 sample.allowlist.json），''=用本仓 config/allowlist.json；archived_crosscheck=绑定前向会话服务核 archived；model_profiles_path=模型档位表（''=内置默认）；contract_path=A-1 会话契约文件路径（''=退化为裸 ping）；supervisor_sid/supervisor_keys=verdict 帧的收件人（sid 优先，keys 依次查 sessions.json；私有键名只写 untracked overlay 或你的私有配置）；release_timeout_s=关单对账挂起超时提醒",
+  "engine": {
+    "allowlist": ["issue_comment.created"],
+    "cooldown_s": 900,
+    "assignments": {},
+    "session_events_path": "",
+    "project_allowlist": "",
+    "creation_mode": "pm_created",
+    "archived_crosscheck": true,
+    "model_profiles_path": "",
+    "contract_path": "",
+    "max_closed_thread_checks": 10,
+    "supervisor_sid": "",
+    "supervisor_keys": ["supervisor"],
+    "release_timeout_s": 1800
+  }
+}

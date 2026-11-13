@@ -1,0 +1,26 @@
+{
+  "_comment": "项目策略表 SAMPLE。两份文件配合：tracked 的 allowlist.json 是「可公开的默认策略」，allowlist.local.json（untracked，.gitignore 已含）只覆盖白名单字段放「部署事实」（真仓名等）。也可以整体放到你的工作台私有目录、用 --allowlist <绝对路径> 指向——私有部署推荐后者。",
+
+  "_comment_结构": "defaults.mode=observe|assist；defaults.creation_mode 只接受 pm_created（会话创建必须经 PM 显式批准，M0 不自行建会话）；projects 键=项目短名（公开部署用中性名，私有键名不外泄）",
+  "schema_version": 1,
+  "defaults": {
+    "_comment": "新项目缺省只读；creation_mode 只接受 pm_created",
+    "mode": "observe",
+    "creation_mode": "pm_created"
+  },
+  "projects": {
+    "_comment_项目模板": "repo=owner/name（公开占位写假名，真名走 overlay 或私有配置）；cwd=项目工作目录；issues=引擎盯的单号列表；actions=引擎可执行动作集（保守集：collect/reconcile 只读对账，bus_inject 帧投递，bind/archive 会话生命周期）；roles=允许的角色（worker/qa/pm）；max_active_writers=同线程并发写上限",
+    "example-project": {
+      "repo": "placeholder/example-project",
+      "cwd": ".",
+      "mode": "observe",
+      "creation_mode": "pm_created",
+      "issues": [1],
+      "actions": ["collect", "reconcile"],
+      "max_active_writers": 1,
+      "roles": ["worker", "qa"]
+    }
+  },
+
+  "_comment_overlay": "allowlist.local.json（与本文件同目录、同 stem）只许覆盖这些字段：repo/issues/actions/mode/roles/max_active_writers；overlay 不能新增 tracked 未定义的项目。示例：{\"projects\": {\"example-project\": {\"repo\": \"your-real-owner/your-real-repo\", \"issues\": [7, 8]}}}"
+}
