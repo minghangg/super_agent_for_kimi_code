@@ -26,7 +26,7 @@ turns a public repository into a copy of it.
 * the same spelling must also reach the watchdog, or a registered AT has no
   watchdog watching it.
 
-The workbench is located through ``LWA_ROOT`` (default ``../Laike_work_with_agent``
+The workbench is located through ``LWA_ROOT`` (default ``../<private-workbench>``
 beside this repository); when it is absent the producer tests **skip** loudly
 rather than rewrite the binding by hand, because a silent rewrite is the failure
 being tested for.
@@ -58,7 +58,7 @@ def _lwa_root() -> Path | None:
     raw = os.environ.get("LWA_ROOT") or ""
     candidates = [Path(raw)] if raw else []
     candidates.append(Path(__file__).resolve().parent.parent.parent
-                      / "Laike_work_with_agent")
+                      / "<private-workbench>")
     for path in candidates:
         if (path / "tools" / "gh_issue.py").is_file():
             return path
