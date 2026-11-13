@@ -3,11 +3,6 @@
  "projects": {
   "superagent": {"repo": "safkc-bot/super_agent_for_kimi_code",
                  "cwd": ".",
-                 "mode": "assist", "creation_mode": "pm_created",
+                 "mode": "observe", "creation_mode": "pm_created",
                  "issues": [1], "actions": ["bus_inject", "collect", "bind", "archive", "reconcile"],
-                 "max_active_writers": 1, "roles": ["worker", "qa", "pm"]},
-  "workbench": {"repo": "placeholder/workbench",
-                "cwd": ".",
-                "mode": "assist", "creation_mode": "pm_created",
-                "issues": [], "actions": ["bus_inject", "collect", "bind", "archive", "reconcile"],
-                "max_active_writers": 1, "roles": ["worker", "qa", "pm"]}}}
+                 "max_active_writers": 1, "roles": ["worker", "qa"]}}}
