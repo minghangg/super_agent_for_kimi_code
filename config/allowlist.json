@@ -3,6 +3,11 @@
  "projects": {
   "superagent": {"repo": "safkc-bot/super_agent_for_kimi_code",
                  "cwd": ".",
-                 "mode": "observe", "creation_mode": "pm_created",
+                 "mode": "assist", "creation_mode": "pm_created",
                  "issues": [1], "actions": ["bus_inject", "collect", "bind", "archive", "reconcile"],
-                 "max_active_writers": 1, "roles": ["worker", "qa"]}}}
+                 "max_active_writers": 1, "roles": ["worker", "qa", "pm"]},
+  "lwa": {"repo": "minghangg/laike_work_with_agent",
+          "cwd": ".",
+          "mode": "assist", "creation_mode": "pm_created",
+          "issues": [65], "actions": ["bus_inject", "collect", "bind", "archive", "reconcile"],
+          "max_active_writers": 1, "roles": ["worker", "qa", "pm"]}}}
