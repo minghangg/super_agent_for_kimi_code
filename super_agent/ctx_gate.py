@@ -66,7 +66,8 @@ def _joined(*parts: str) -> str:
 # uses it for "close without archiving", this side for long-lived vs one-shot.
 FIXED_KEYS = {"steward", "qa", "scout", "auditor", "planner", "reviewer",
               _joined("re", "ed")}
-FIXED_PREFIXES = ("pm-", _joined("qa-l", "wa-"), _joined("re", "ed"))
+FIXED_PREFIXES = ("pm-", _joined("qa-l", "wa-"), _joined("re", "ed"),
+                  _joined("at", "-"))
 
 THRESHOLD_ONESHOT_REFUSE = 0.35
 THRESHOLD_REFUSE = 0.60
