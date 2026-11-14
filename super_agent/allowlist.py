@@ -27,8 +27,8 @@ is already in flight.
 **Local overlay.** A tracked allowlist must stay publishable, so the real
 repository name cannot live in it. ``<name>.local.json`` next to the tracked
 file (i.e. ``config/allowlist.local.json``) is read *by the same loader* and
-deep-merged over it. Only ``repo``/``issues``/``actions``/``mode``/``roles``/
-``max_active_writers`` may be overridden; everything else is inherited. The
+deep-merged over it. Only ``repo``/``issues``/``actions``/``mode``/``roles``
+may be overridden; everything else is inherited. The
 merged result is validated again, so a broken overlay is refused and the
 tracked copy stays in force - the gate never widens because a local file is
 malformed. Deleting the overlay restores single-file behaviour exactly.
@@ -56,8 +56,7 @@ DEFAULT_ACTIONS = ("collect", "reconcile")
 # Fields a local overlay may override. Everything else is inherited from the
 # tracked file: the overlay adds a deployment fact (the real repository name),
 # it is not a second place to define project policy.
-OVERLAY_FIELDS = ("repo", "issues", "actions", "mode", "roles",
-                  "max_active_writers")
+OVERLAY_FIELDS = ("repo", "issues", "actions", "mode", "roles")
 OVERLAY_SUFFIX = ".local.json"
 
 
@@ -169,10 +168,6 @@ def validate(data) -> dict:
             _require(action in ACTIONS,
                      f"project {name!r}: unknown action {action!r} "
                      f"(known: {sorted(ACTIONS)})")
-        writers = raw.get("max_active_writers", 1)
-        _require(isinstance(writers, int) and not isinstance(writers, bool)
-                 and writers >= 1,
-                 f"project {name!r}: max_active_writers must be an integer >= 1")
         roles = raw.get("roles", ["worker", "qa"])
         clean_roles = _string_list(roles, f"project {name!r}: roles")
         normalized["projects"][name.strip()] = {
@@ -182,7 +177,6 @@ def validate(data) -> dict:
             "creation_mode": creation,
             "issues": sorted(set(clean_issues)),
             "actions": sorted(set(clean_actions)),
-            "max_active_writers": int(writers),
             "roles": clean_roles,
         }
     return normalized
@@ -368,6 +362,54 @@ class ProjectAllowlist:
                     "used": "previous" if (self.using_previous or self.data) else "none",
                     "error": self.load_error}
         return self.reload()
+
+    def sync_issues(self, project: str, issues) -> dict:
+        """Record ``issues`` for ``project`` in the untracked overlay.
+
+        The tracked allowlist is a published file: rewriting it from a running
+        engine would turn configuration into run state and put a private
+        repository's issue numbers into a tracked diff. The overlay
+        (``<name>.local.json``) already has ``issues`` in
+        :data:`OVERLAY_FIELDS` and is never committed, so that is where the
+        engine keeps "which issues are live right now".
+
+        Idempotent: identical content is not rewritten. A write failure is
+        reported, never raised - a read-only checkout must still run.
+        """
+        name = str(project or "").strip()
+        wanted = sorted({int(n) for n in (issues or []) if str(n).strip().lstrip("-").isdigit()})
+        out = {"project": name, "written": False, "changed": False, "error": ""}
+        if not name or self.data is None or name not in self.data["projects"]:
+            out["error"] = f"project {name!r} not in the allowlist"
+            return out
+        current = self.data["projects"][name].get("issues") or []
+        if sorted(current) == wanted:
+            return out
+        raw, error = self._read_overlay()
+        if error:
+            out["error"] = error
+            return out
+        overlay = copy.deepcopy(raw) if raw else {}
+        projects = overlay.setdefault("projects", {})
+        entry = projects.setdefault(name, {})
+        if not isinstance(entry, dict):
+            out["error"] = f"overlay project {name!r} is not an object"
+            return out
+        entry["issues"] = wanted
+        text = json.dumps(overlay, ensure_ascii=False, indent=1, sort_keys=True) + "\n"
+        try:
+            self.overlay_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.overlay_path.with_name(self.overlay_path.name + ".tmp")
+            with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+            os.replace(tmp, self.overlay_path)
+        except OSError as exc:
+            out["error"] = f"{type(exc).__name__}: {exc}"
+            return out
+        out["written"] = True
+        out["changed"] = True
+        self.poll()
+        return out
 
     # ----------------------------------------------------------------- checks
     def project(self, name: str | None) -> dict | None:

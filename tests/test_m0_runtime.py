@@ -116,9 +116,12 @@ class AllowlistGate(Base):
         self.assertIn("engine_preapproved", str(caught.exception))
 
     def test_bad_types_are_rejected(self):
+        # ``max_active_writers`` is gone: it was a dead field (validated, never
+        # read by any scheduler), so a bad value in it is no longer an error -
+        # the key is simply ignored. See allowlist.validate.
         for mutate in (lambda d: d["projects"]["demo"].update(issues="28"),
                        lambda d: d["projects"]["demo"].update(actions=["delete"]),
-                       lambda d: d["projects"]["demo"].update(max_active_writers=0),
+                       lambda d: d["projects"]["demo"].update(roles="worker"),
                        lambda d: d["projects"]["demo"].update(repo="nope")):
             bad = json.loads(json.dumps(GOOD))
             mutate(bad)

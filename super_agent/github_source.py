@@ -47,21 +47,44 @@ def _read_json(path: Path):
 class FixtureSource:
     """Local JSON backend. Deterministic, no network, no writes."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path,
+                 on_hold_labels: list[str] | tuple[str, ...] | None = None):
         self.path = Path(path)
         self.data = _read_json(self.path)
         if not isinstance(self.data, dict):
             raise SourceError("fixture root must be an object")
+        self.on_hold_labels = tuple(
+            str(x) for x in (on_hold_labels or ()) if str(x or "").strip())
 
     def issues(self, limit: int = 20) -> list[int]:
+        """Same contract as ``LiveSource.issues``: held rows are skipped.
+
+        A fixture row may carry ``labels`` as a list of ``{"name": …}`` dicts
+        (the REST shape) or of plain strings; both are accepted so a fixture
+        written by hand stays readable.
+        """
         issues = self.data.get("issues") or {}
+        held = set(self.on_hold_labels)
         out = []
-        for key in issues:
+        for key in sorted(issues, key=lambda k: int(k) if str(k).isdigit() else 0):
             try:
-                out.append(int(key))
+                number = int(key)
             except (TypeError, ValueError):
                 continue
-        return sorted(out)[:limit]
+            if held:
+                rec = issues.get(key) or {}
+                names = set()
+                for item in (rec.get("labels") or []):
+                    if isinstance(item, dict):
+                        names.add(str(item.get("name") or ""))
+                    else:
+                        names.add(str(item or ""))
+                if names & held:
+                    continue
+            out.append(number)
+            if len(out) >= int(limit):
+                break
+        return out
 
     def comments(self, issue: int) -> list[dict]:
         rec = (self.data.get("issues") or {}).get(str(issue)) or {}
@@ -112,12 +135,15 @@ class FixtureSource:
 class LiveSource:
     """Public GitHub REST, GET-only."""
 
-    def __init__(self, repo: str, *, token: str | None = None, timeout_s: float = 15.0):
+    def __init__(self, repo: str, *, token: str | None = None, timeout_s: float = 15.0,
+                 on_hold_labels: list[str] | tuple[str, ...] | None = None):
         if not repo or "/" not in repo:
             raise SourceError("github.repo must be 'owner/name' for source=live")
         self.repo = repo
         self.token = token if token is not None else (os.environ.get("GITHUB_TOKEN") or "")
         self.timeout_s = timeout_s
+        self.on_hold_labels = tuple(
+            str(x) for x in (on_hold_labels or ()) if str(x or "").strip())
 
     def _get(self, path: str, query: dict | None = None):
         url = API + path
@@ -143,15 +169,38 @@ class LiveSource:
             raise SourceError(f"{type(exc).__name__}: {exc}") from None
 
     def issues(self, limit: int = 20) -> list[int]:
+        """Open issues that are not held, newest first, capped at ``limit``.
+
+        The page is asked for at the API maximum (100), not at ``limit``: held
+        issues are filtered out *after* the fetch, so asking for ``limit`` rows
+        could drop a live issue that sat behind 20 held ones. One request
+        either way.
+
+        ``on_hold_labels`` is matched as a **set membership test** on the
+        labels the list endpoint already returns - never by position, never by
+        the ``stage:`` prefix. An empty set means "no filter" (fail open): a
+        missed issue is a frame nobody sees, which is worse than an extra one.
+        """
         rows = self._get(f"/repos/{self.repo}/issues",
-                         {"state": "open", "per_page": min(int(limit), 100)})
+                         {"state": "open", "per_page": 100})
         if not isinstance(rows, list):
             raise SourceError("unexpected issues payload")
+        held = set(self.on_hold_labels)
         out = []
         for row in rows:
-            if isinstance(row, dict) and row.get("number") and not row.get("pull_request"):
-                out.append(int(row["number"]))
-        return out[:limit]
+            if not isinstance(row, dict) or not row.get("number"):
+                continue
+            if row.get("pull_request") is not None:
+                continue
+            if held:
+                names = {str((x or {}).get("name") or "")
+                         for x in (row.get("labels") or []) if isinstance(x, dict)}
+                if names & held:
+                    continue
+            out.append(int(row["number"]))
+            if len(out) >= int(limit):
+                break
+        return out
 
     def comments(self, issue: int) -> list[dict]:
         rows = self._get(f"/repos/{self.repo}/issues/{int(issue)}/comments",
@@ -298,13 +347,14 @@ def comments_from(source, issue: int, *, since_id: int = 0,
 def build(cfg: dict):
     gh = cfg.get("github") or {}
     source = gh.get("source") or "none"
+    held = gh.get("on_hold_labels") or []
     if source == "none":
         return NullSource()
     try:
         if source == "fixture":
-            return FixtureSource(gh.get("fixture") or "")
+            return FixtureSource(gh.get("fixture") or "", on_hold_labels=held)
         if source == "live":
-            return LiveSource(gh.get("repo") or "")
+            return LiveSource(gh.get("repo") or "", on_hold_labels=held)
     except SourceError as exc:
         return BrokenSource(str(exc))
     raise SourceError(f"unknown github.source {source!r}")

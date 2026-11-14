@@ -219,6 +219,35 @@ class Engine:
                 return name
         return None
 
+    def _sync_allowlist_issues(self, issue_numbers, summary: dict) -> dict:
+        """Keep ``allowlist.issues`` equal to the issues the source returned.
+
+        The source has already dropped held and closed issues, so this list is
+        "what is live right now". Only the project that owns the polled
+        repository is touched - a second project's numbers are somebody else's
+        state and this engine cannot see them.
+
+        A write failure is reported into ``summary["warnings"]`` and the round
+        carries on: the allowlist is a guard, and a guard that cannot be
+        refreshed must not stop the work it guards.
+        """
+        repo = str((self.cfg.get("github") or {}).get("repo") or "")
+        project = self._project_for_repo(repo)
+        if self.projects is None or project is None:
+            return {"skipped": "no project owns this repository"}
+        result = self.projects.sync_issues(project, issue_numbers)
+        if result.get("error"):
+            summary.setdefault("warnings", []).append(
+                f"allowlist.sync: {result['error']}")
+            self.store.log_event({"type": "allowlist.sync_failed", "at": _now(),
+                                  "project": project, "error": result["error"],
+                                  "level": "warn", "consumers": ["doctor"]})
+        elif result.get("changed"):
+            self.store.log_event({"type": "allowlist.synced", "at": _now(),
+                                  "project": project,
+                                  "issues": sorted(int(n) for n in (issue_numbers or []))})
+        return result
+
     # ------------------------------------------------------------------ health
     def health_record(self, *, error: str = "", degraded: bool = False,
                       running: bool = True, phase: str = "") -> dict:
@@ -915,16 +944,48 @@ class Engine:
             })
         return cleared
 
+    # A refusal that names the *issue* itself is permanent for that comment: an
+    # issue that is not allowlisted will not become allowlisted because this
+    # comment is retried. A project/action refusal is deliberately NOT in this
+    # set: the allowlist is a file a person edits, so the very next round may
+    # legitimately succeed - the retry is how a fixed allowlist takes effect
+    # (tests/test_qa_route.py::test_refused_allowlist_is_retried_next_round).
+    PERMANENT_REFUSAL_PREFIXES = ("issue #", "creation_mode_forbidden")
+
+    @classmethod
+    def is_permanent_refusal(cls, reason: str) -> bool:
+        """Is this refusal permanent for *this comment*, whatever happens next?
+
+        Only two answers qualify: the issue itself is not allowlisted, and the
+        creation mode forbids session creation. Everything else - a project
+        that is not listed yet, an action that is not listed yet, a network
+        error, ``target session is archived`` - can clear on its own or by a
+        one-line edit, so those keep retrying.
+        """
+        text = str(reason or "").strip()
+        return any(text.startswith(p) for p in cls.PERMANENT_REFUSAL_PREFIXES)
+
     def _retry_routes(self, index: dict) -> int:
         """Re-send verdicts a refused/suppressed dispatch never delivered.
 
         Same rule as the notification retry: an attempt that exists (success or
         ``uncertain``) is never repeated, a refusal writes no attempt so the
         next round may try again.
+
+        Two exceptions, both permanent by nature:
+
+        * a **permanent refusal** (the issue is not allowlisted, or the
+          creation mode forbids it) is recorded once as
+          ``route.refused_permanent`` and never retried again;
+        * a thread whose issue is **closed** is skipped - and only ``closed``,
+          never ``unknown``: a broken probe must not silently stop every
+          delivery in the engine.
         """
         sent = 0
         for key, route in sorted((index.get("routes") or {}).items()):
             if route.get("ok"):
+                continue
+            if route.get("permanent"):
                 continue
             base = str(route.get("action_id") or "")
             if base and self.store.action_attempted(base) > 0:
@@ -938,6 +999,14 @@ class Engine:
                     break
             if issue is None:
                 continue
+            if self._issue_state(issue) == "closed":
+                route["skipped_closed_at"] = _now()
+                self.store.log_event({
+                    "type": "route.skipped_closed_issue", "at": _now(),
+                    "thread": thread, "issue": int(issue), "comment_id": cid,
+                    "level": "info", "consumers": ["doctor"],
+                })
+                continue
             review = {"verdict": str(route.get("verdict") or "")}
             result = self._route_review(index, thread, int(issue),
                                         {"id": cid, "body": "", "author": ""},
@@ -945,6 +1014,21 @@ class Engine:
             if result.get("dispatched"):
                 sent += 1
                 self._supersede_route(index, thread, cid, base)
+            elif self.is_permanent_refusal(str(result.get("reason") or "")):
+                route["permanent"] = True
+                route["permanent_reason"] = str(result.get("reason") or "")
+                route["permanent_at"] = _now()
+                self.store.log_event({
+                    "type": "route.refused_permanent", "at": _now(),
+                    "thread": thread, "issue": int(issue), "comment_id": cid,
+                    "reason": route["permanent_reason"],
+                    "level": "warn", "consumers": ["doctor"],
+                })
+                self._append_needs_person(index, thread, {
+                    "comment_id": cid,
+                    "reason": "route.refused_permanent: "
+                              + route["permanent_reason"],
+                    "at": _now()})
         return sent
 
     def _supersede_route(self, index: dict, thread: str, cid, base: str) -> None:
@@ -3387,6 +3471,11 @@ class Engine:
         except Exception as exc:  # noqa: BLE001  a dead source is a reportable state
             summary["errors"].append(f"issues: {type(exc).__name__}: {exc}")
             issue_numbers = []
+
+        # The issue itself now says whether it is live (open, not on hold), so
+        # the allowlist is kept in step with that instead of being a hand-kept
+        # list. A failed sync is a warning: a read-only checkout must still run.
+        self._sync_allowlist_issues(issue_numbers, summary)
 
         for issue in issue_numbers:
             try:

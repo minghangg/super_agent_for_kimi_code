@@ -21,8 +21,11 @@
     "fixture": "",
     "poll_interval_s": 60,
     "max_issues": 20,
-    "max_comments_per_issue": 50
+    "max_comments_per_issue": 50,
+    "on_hold_labels": ["stage:on-hold"]
   },
+
+  "_comment_on_hold": "github.on_hold_labels=表示「挂起」的 label 名（集合匹配，不是前缀）。挂起＝issue 仍 open 但引擎不看它；一次请求都不发。空数组＝不过滤（fail-open）：漏看一个 issue 会让它的帧静默投不出去，比多看一眼危险。只认这里列出的名字，不许按 stage: 前缀整体过滤（会把 stage:dev 的单也当挂起）。",
 
   "_comment_store": "运行态文件上限与 outbox 滞留判据",
   "store": {

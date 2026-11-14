@@ -41,6 +41,12 @@ DEFAULTS: dict = {
         "poll_interval_s": 60,
         "max_issues": 20,
         "max_comments_per_issue": 50,
+        # Labels that mean "suspend this issue": the issue stays open but the
+        # engine does not look at it. Matched as a set against the labels the
+        # list endpoint already returns, so no extra request. Empty list means
+        # no filter (fail open) - missing an issue silently hides its frames,
+        # which is worse than looking at one too many.
+        "on_hold_labels": ["stage:on-hold"],
     },
     "store": {
         "max_event_lines": 10_000,
@@ -190,6 +196,9 @@ def validate(cfg: dict) -> dict:
     poll = (cfg.get("github") or {}).get("poll_interval_s")
     if not isinstance(poll, (int, float)) or poll <= 0:
         raise ConfigError("github.poll_interval_s must be a positive number")
+    held = (cfg.get("github") or {}).get("on_hold_labels", ["stage:on-hold"])
+    if not isinstance(held, list) or not all(isinstance(x, str) for x in held):
+        raise ConfigError("github.on_hold_labels must be a list of label strings")
     return cfg
 
 
