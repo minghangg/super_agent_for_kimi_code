@@ -245,6 +245,13 @@ def read_fix_token(text: str) -> tuple[bool, str, bool]:
 PM = "PM"
 PM_PREFIX_RE = re.compile(r"^\s*[\[［]\s*(?:PM|supervisor)\s*[\]］]\s*", re.I)
 
+# A bracket-wrapped span on the first line is a **heading**, not a statement:
+# ``[PM] 【返工 · ISS-68 第 2 轮】pm-lwa 第十任`` is a dispatch title, and the
+# ``返工`` inside it describes the work being handed out, not the state of the
+# thread. Removing the span before looking for a conclusion word is what keeps
+# a task book from reading as a verdict (#75).
+PM_HEADING_RE = re.compile(r"[【\[［《][^】\]］》]*[】\]］》]")
+
 # The three-state table. Order carries no precedence (see
 # :func:`_first_state_hit`); it only fixes which state a word belongs to.
 READY_WORDS = ("可关单", "可发布", "可上线", "ready")
@@ -253,6 +260,36 @@ WORKING_WORDS = ("修复中", "处理中", "进行中", "working")
 STATE_TABLE = tuple([(w, "ready") for w in READY_WORDS]
                     + [(w, "blocked") for w in BLOCKED_WORDS]
                     + [(w, "working") for w in WORKING_WORDS])
+
+# Words that make a ``[PM]`` line a **conclusion candidate** (#75). Wider than
+# ``STATE_TABLE`` on purpose: ``通过`` is not one of the three PM states, but
+# ``[PM] 通过 #1`` announces a QA-shaped answer with no marker, and that is the
+# line a caller must ask the PM to fix rather than silently drop. This table
+# decides *candidacy* only - a state still needs the structured marker.
+#
+# The closing table is wider than the state table for the same reason, and for
+# a sharper one: a conclusion word missing from it turns a real answer into
+# silence, which is the failure #75 must not reintroduce (#75 round 2, P0-1).
+# ``关单``/``关闭``/``可以关`` and the three English spellings are the shapes a
+# PM actually writes when the contract says "state it on the first line".
+PM_CONCLUSION_WORDS = tuple([w for w, _ in STATE_TABLE]
+                            + [w for w, _ in WORD_TABLE]
+                            + ["关单", "关闭", "可以关",
+                               "lgtm", "approve", "done"])
+
+# One-character closing words are a **separate table with guards**, because as
+# substrings they appear inside words that say nothing: ``关于``/``关注``/
+# ``相关`` are not conclusions, and neither are ``合计``/``配合``/``综合``.
+# A bare ``关``/``合`` counts only when it ends the clause - the character
+# after it is a verbal ending or the line ends there - and when the character
+# before it is not the first half of one of those compounds. ``[PM] 关单吧 #1``
+# and ``[PM] 没问题，关吧`` are conclusions; ``[PM] 关于 #42 的说明`` is not.
+BARE_CLOSING_WORDS = ("关", "合")
+BARE_CLOSING_AFTER = set("吧了单闭上掉好成")
+BARE_CLOSING_BEFORE = {
+    "关": set("相机关有海城过控门把开报审截攻税卡键"),
+    "合": set("配综结合组符融联场集凑巧契"),
+}
 
 # ``不可关单`` / ``未受阻`` are not verdicts of that state; the negation is part
 # of the statement, so the hit is skipped and the next one is tried.
@@ -590,6 +627,26 @@ def parse_pm_verdict(body: str) -> dict | None:
     The coordinate comes from the **first line only**. A ``#99`` mentioned in
     the body is a reference, not this verdict's subject; judging it as the
     coordinate files a release against an issue the PM never spoke about.
+
+    ``candidate`` says whether this line is a **conclusion at all** (#75). A
+    PM writes three different things under ``[PM]``: a conclusion, a dispatch,
+    and a note. Only the first is this function's business, and telling them
+    apart is what stops every task book from filing an exception:
+
+    * True when a structured marker is present - a declaration is a conclusion
+      by definition, and it is read even when the words around it disagree;
+    * True when a conclusion word sits on the first line **outside** a bracketed
+      heading; a heading is a title, and ``【返工 · ISS-68 第 2 轮】`` hands out
+      work rather than reporting on it. A one-character ``关``/``合`` counts
+      here only when it ends its clause - see :func:`is_pm_conclusion`;
+    * False otherwise. A coordinate alone is not a conclusion
+      (``[PM] #61 收单：scout 对标报告``), and neither is a bare note
+      (``[PM] [PM] 知悉并落执行``). A caller that logged them would file 57
+      false exceptions from one morning of dispatch traffic.
+
+    ``state`` stays ``""`` for every non-candidate: "not my business" and "I
+    could not read it" must not be the same answer, because only the second one
+    asks a person to look.
     """
     line = first_line(body)
     if not line or not PM_PREFIX_RE.match(line):
@@ -627,7 +684,86 @@ def parse_pm_verdict(body: str) -> dict | None:
             "issue": issue, "coords_ok": coords_ok,
             "coords_error": coords_error, "delivery": delivery,
             "delivery_error": delivery_error,
-            "structured": source in ("verdict", "marker"), "source": source}
+            "structured": source in ("verdict", "marker"), "source": source,
+            "candidate": is_pm_conclusion(text,
+                                          structured=source in ("verdict",
+                                                                "marker"))}
+
+
+def is_pm_conclusion(text: str, *, structured: bool = False) -> bool:
+    """Is a ``[PM]`` first line a conclusion rather than a dispatch or a note?
+
+    Two inputs, and neither of them is "the body happens to contain the word
+    ``verdict``":
+
+    * a structured marker - the verdict itself;
+    * a conclusion word outside a bracketed heading - ``[PM] 可关单 #42``.
+
+    A coordinate on its own is not a conclusion: ``[PM] #61 收单：scout 对标报告``
+    names an issue and reports work, it does not answer for it.
+
+    Headings are removed first. ``【返工 · ISS-68 第 2 轮】`` is a dispatch
+    title, and reading its ``返工`` as the thread's state is the false blocked
+    this exists to remove.
+
+    A **bare** ``关``/``合`` is guarded rather than matched as a substring:
+    ``关于``/``相关``/``合計`` are ordinary words, and reading them as "close
+    it" would file an exception on every note that mentions one. The guard
+    asks two questions of each occurrence - is the character before it part of
+    such a compound, and does the character after it end the clause (a verbal
+    ending, whitespace, punctuation, or the end of the line).
+    """
+    if structured:
+        return True
+    body = PM_HEADING_RE.sub(" ", text or "")
+    lowered = body.lower()
+    for word in PM_CONCLUSION_WORDS:
+        needle = word.lower()
+        start = lowered.find(needle)
+        while start != -1:
+            before = lowered[start - 1: start] if start else ""
+            after = lowered[start + len(needle): start + len(needle) + 1]
+            if not _negated_at(lowered, start) and \
+                    not (after and after in TAILS):
+                return True
+            start = lowered.find(needle, start + 1)
+    for word in BARE_CLOSING_WORDS:
+        start = lowered.find(word)
+        while start != -1:
+            before = lowered[start - 1: start] if start else ""
+            after = lowered[start + 1: start + 2]
+            if before not in BARE_CLOSING_BEFORE[word] and \
+                    not _negated_at(lowered, start) and \
+                    (not after or after in BARE_CLOSING_AFTER
+                     or after in " \t，。、,;；:：!！?？#-—()（）"):
+                return True
+            start = lowered.find(word, start + 1)
+    return False
+
+
+def _negated_at(text: str, index: int) -> bool:
+    """Is the hit at ``index`` denied by a negation just before it?
+
+    ``不可关单`` denies the release, but the word ``可关单`` starts one
+    character after the ``不``, and the bare ``关`` starts two. Checking only
+    the immediately preceding character reads both as the opposite answer, so
+    the modifier characters a negation travels through (``可``/``能``/``该``…)
+    are stepped over first. ``[PM] 未可关单`` and ``[PM] 不可关单`` must answer
+    the same way as ``[PM] 未关``.
+    """
+    i = index - 1
+    steps = 0
+    while i >= 0 and steps < 3:
+        ch = text[i]
+        if ch in NEGATIONS:
+            return True
+        if ch in "可能该会好就都也":
+            i -= 1
+            steps += 1
+            continue
+        return False
+    return False
+
 
 
 

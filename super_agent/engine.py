@@ -268,7 +268,12 @@ class Engine:
            not discussion, and it must be read before role noise too;
         3. a ``[PM]`` verdict is the third marker, read before role noise for
            the same reason - the PM's own role is ``pm``, and a PM verdict from
-           the shared login must not be discarded as author noise;
+           the shared login must not be discarded as author noise. A ``[PM]``
+           line that is **not** a conclusion - a task book, a dispatch, a note
+           - is discussion and is ignored here; reading it as an unreadable
+           verdict is what filed 57 false exceptions (#75). Escalation markers
+           are still honoured on that path: a note that asks for a person is
+           not noise;
         4. role-authored noise is ignored;
         5. escalation markers ask for a person;
         6. everything else is logged (the historical behaviour, unchanged).
@@ -285,9 +290,31 @@ class Engine:
         if review:
             return "review", f"qa verdict {review['verdict'] or 'unreadable'!r}"
         pm_verdict = markers.parse_pm_verdict(body)
-        if pm_verdict:
+        if pm_verdict and pm_verdict.get("candidate"):
             return "pm_verdict", (f"pm verdict "
                                   f"{pm_verdict['state'] or 'unreadable'!r}")
+        if pm_verdict:
+            # A ``[PM]`` line that is not a conclusion: a dispatch, a task
+            # book, a note. It used to fall through to ``pm_verdict`` with
+            # ``state == ""``, which the router reads as "the PM answered and
+            # the answer was unreadable" - 57 task books and 1251 frames later
+            # (#75). The answer is not "unreadable", it is "not an answer".
+            #
+            # The escalation markers are checked **first**. A note is quiet by
+            # default, but a note that says ``[blocked]`` or ``[decision]`` is
+            # asking for a person, and returning ``ignored`` here would answer
+            # that request with silence - the round-2 P0: a human-intervention
+            # signal downgraded to nothing visible at all.
+            #
+            # The escalation goes down the PM frame path (``state == ""``
+            # answers ``exception``), not the plain ``needs_person`` one: the
+            # bell the supervisor already listens to is the frame, and routing
+            # a request for a decision past it would leave the reading half
+            # unchanged from before this issue.
+            escalated = self._escalation_marker(body)
+            if escalated:
+                return "pm_verdict", f"escalation marker {escalated!r}"
+            return "ignored", "pm comment is not a verdict"
         at_verdict = markers.parse_at_verdict(body)
         if at_verdict:
             return "at_verdict", (f"at verdict "
@@ -295,11 +322,25 @@ class Engine:
         author = str(comment.get("author") or "").strip().lower()
         if self.role and author == self.role.lower():
             return "ignored", "authored by configured role"
-        lowered = body.lower()
+        escalated = self._escalation_marker(body)
+        if escalated:
+            return "needs_person", f"marker {escalated!r}"
+        return "logged", ""
+
+    def _escalation_marker(self, body: str) -> str:
+        """The first configured escalation marker in ``body``, or ``""``.
+
+        One place, so the two paths that must honour a marker cannot drift:
+        the ordinary fallthrough, and the ``[PM]`` branch that otherwise
+        returns ``ignored``. The branch that answered a note with silence is
+        what turned ``[PM] [blocked] 卡在 allowlist`` into zero visible output
+        (#75 round 2, P0-2).
+        """
+        lowered = str(body or "").lower()
         for marker in self.markers:
             if marker and marker in lowered:
-                return "needs_person", f"marker {marker!r}"
-        return "logged", ""
+                return marker
+        return ""
 
     # ------------------------------------------------------------ qa routing
     def _qa_session_keys(self, thread: str) -> set[str]:
@@ -648,9 +689,7 @@ class Engine:
             "reason": result.get("reason") or "",
         })
         if not result.get("dispatched"):
-            numbers = index.setdefault("issues", {}).setdefault(
-                thread, {"state": "idle", "comments_seen": 0, "needs_person": []})
-            numbers.setdefault("needs_person", []).append({
+            self._append_needs_person(index, thread, {
                 "comment_id": cid, "reason": "route.undeliverable", "at": _now()})
             self.store.log_event({
                 "type": "route.undeliverable", "at": _now(), "thread": thread,
@@ -1626,6 +1665,17 @@ class Engine:
         """
         cid = int(comment["id"])
         state = str(verdict.get("state") or "")
+        escalated = self._escalation_marker(str(comment.get("body") or ""))
+        if escalated and not state:
+            # A ``[PM]`` note that asks for a decision. It rings the exception
+            # frame below and it also leaves a row: the frame is delivered to a
+            # session, and a session that is not listening would otherwise be
+            # the only copy of a request for a person (#75 round 2, P0-2).
+            self.store.log_event({
+                "type": "pm.escalation", "at": _now(), "thread": thread,
+                "comment_id": cid, "marker": escalated})
+            self._pm_needs_person(index, thread, cid, "pm.escalation[user]",
+                                  f"escalation marker {escalated!r}", verdict)
         if not self._pm_verified(thread, comment):
             # An unverified verdict does not ring. A QA verdict that cannot be
             # attributed still moves an assignment; a PM ``ready`` wakes a
@@ -1770,6 +1820,51 @@ class Engine:
                                declared=(verdict or {}).get("delivery"))
         return "pm_verdict", ""
 
+    def _append_needs_person(self, index: dict, thread: str, row: dict) -> bool:
+        """Append one person-facing row unless ``(thread, cid, reason)`` exists.
+
+        The scan runs every round and the same comment is re-judged whenever a
+        dispatch stays refused, so an unconditional ``append`` grew a row per
+        round: ``#69`` held 138 copies of one ``route.undeliverable`` (#75 B).
+        A repeat updates the row it repeats instead - the failure is still
+        current, the queue is not.
+
+        The identity is the triple the issue names. Rows that carry an
+        ``assignment`` or a ``detail`` are **not** folded by this rule; those
+        live in :meth:`_note_undeliverable`, where two assignments sharing one
+        comment id are two distinct failures and collapsing them loses one.
+        """
+        numbers = index.setdefault("issues", {}).setdefault(
+            thread, {"state": "idle", "comments_seen": 0, "needs_person": []})
+        rows = numbers.setdefault("needs_person", [])
+        reason = str(row.get("reason") or "")
+        cid = needs.cid_of(row)
+        existing = next((entry for entry in rows
+                         if cid is not None and needs.cid_of(entry) == cid
+                         and str(entry.get("reason") or "") == reason), None)
+        if existing is not None:
+            existing["at"] = row.get("at") or _now()
+            if row.get("detail") is not None:
+                existing["detail"] = row["detail"]
+            return False
+        rows.append(row)
+        return True
+
+    def _pm_row_exists(self, index: dict, thread: str, cid) -> bool:
+        """Is there already a row for this comment under this thread?
+
+        The loop's fallback path asks this before appending. Its ``reason`` is
+        the prose the router produced, so the same comment can arrive here
+        after the router has already filed a row with a name a reader can act
+        on - two rows for one failure, and one of them a duplicate of the
+        other's detail.
+        """
+        rows = ((index.get("issues") or {}).get(thread) or {}).get(
+            "needs_person") or []
+        want = needs.cid_of(cid)
+        return want is not None and any(needs.cid_of(entry) == want
+                                        for entry in rows)
+
     def _pm_needs_person(self, index: dict, thread: str, cid, reason: str,
                          detail: str, verdict: dict | None = None) -> None:
         """One person-facing row per ``(thread, reason)``, never a pile.
@@ -1894,6 +1989,16 @@ class Engine:
             if not isinstance(record, dict) or record.get("ok"):
                 continue
             if "exception" not in record:
+                continue
+            if record.get("refused"):
+                # A refused frame is a **decision**, not an unfinished send.
+                # The allowlist said no before the action was even begun, so no
+                # attempt counter was written and the old skip rule let every
+                # round retry it: 56 frames regenerating 56 ``route.decided``
+                # lines a minute, forever (#75 round 2, P1-2). Re-asking an
+                # allowlist would produce the same no, and a different answer
+                # needs a configuration change and a new verdict, not this
+                # loop.
                 continue
             base = str(record.get("action_id") or "")
             cid = record.get("comment_id")
@@ -3432,9 +3537,17 @@ class Engine:
                     continue
             if state == "needs_person":
                 rec["state"] = "needs_person"
-                rec.setdefault("needs_person", []).append({
-                    "comment_id": cid, "reason": reason, "at": _now(),
-                })
+                if self._pm_row_exists(index, key, cid):
+                    # The router already filed this comment, with a reason a
+                    # reader can act on. The loop's own ``reason`` is the prose
+                    # the router derived, so appending it would be a second row
+                    # for one failure - the shape that put 179 rows under one
+                    # comment in #68 (#75 B).
+                    continue
+                added = self._append_needs_person(index, key, {
+                    "comment_id": cid, "reason": reason, "at": _now()})
+                if not added:
+                    continue
                 summary["needs_person"] += 1
                 now = self.clock()
                 if self._cooldown_ok(rec, "needs_person", now):
