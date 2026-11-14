@@ -71,6 +71,11 @@ FIXED_PREFIXES = ("pm-", _joined("qa-l", "wa-"), _joined("re", "ed"),
 
 THRESHOLD_ONESHOT_REFUSE = 0.35
 THRESHOLD_REFUSE = 0.60
+
+# PM 系差别化（用户 2026-11-14 令：60% 交接线降到 50%；预警 40 由 Reed 定）。
+# 仅对「sessions.json 键名以 pm- 开头的长命会话」生效；--role 参数只作留痕，
+# 分线依据是会话自身的键名，调用方传错 role 不会错套 tiers。
+PM_TIERS = {"warn": 0.40, "refuse": 0.50}
 THRESHOLD_HANDOFF = 0.75
 THRESHOLD_FORCE_HARD = 0.90
 
@@ -160,15 +165,32 @@ def usage_of(st: dict | None) -> float | None:
     return None
 
 
-def verdict(usage: float | None, kind: str, force: bool = False) -> tuple[str, int, str]:
+def _pm_tiers_apply(sid: str, kind: str, sessions_path) -> bool:
+    """PM 系分线：仅长命（非 one-shot）且 sessions.json 里有 pm- 键指向该 sid。"""
+    if kind == "one-shot" or not sessions_path:
+        return False
+    try:
+        data = json.loads(Path(sessions_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    for key, rec in (data or {}).items():
+        if isinstance(key, str) and key.startswith("pm-") \
+                and isinstance(rec, dict) and rec.get("id") == sid:
+            return True
+    return False
+
+
+def verdict(usage: float | None, kind: str, force: bool = False,
+            sid: str = "", sessions_path=None) -> tuple[str, int, str]:
     """Pure decision: return `(verdict, exit_code, explanation)`.
 
-    verdict is one of "allow", "allow-unknown", "refuse-60", "refuse-75",
+    verdict is one of "allow", "allow-unknown", "warn", "refuse-60", "refuse-75",
     "hard-cap", "force-allow".
     """
     if usage is None:
         return "allow-unknown", EXIT_OK, "ctx 未知（bus 与直连都取不到）——放行但请留意"
     pct = usage * 100
+    pm_tiered = _pm_tiers_apply(sid, kind, sessions_path)
     if usage >= THRESHOLD_FORCE_HARD:
         return "hard-cap", EXIT_HARD_CAP, (
             f"ctx ≈{pct:.1f}% ≥ {THRESHOLD_FORCE_HARD * 100:.0f}% 硬顶：连 --force 也不放行，"
@@ -189,6 +211,11 @@ def verdict(usage: float | None, kind: str, force: bool = False) -> tuple[str, i
         return "refuse-35", EXIT_REFUSE_35, (
             f"ctx ≈{pct:.1f}% ≥ {THRESHOLD_ONESHOT_REFUSE * 100:.0f}%："
             f"一次性 worker/QA 不再派新活，请另起新会话")
+    if pm_tiered and usage >= PM_TIERS["refuse"]:
+        return "refuse-60", (EXIT_REFUSE_60 if not force else EXIT_OK), (
+            f"ctx ≈{pct:.1f}% ≥ 50%：PM 系应交接后再派（用户 2026-11-14 令，原 60%）"
+            if not force else
+            f"ctx ≈{pct:.1f}% ≥ 50%（已 --force 放行；PM 系仍应交接后再派）")
     if usage >= THRESHOLD_REFUSE:
         if kind == "one-shot":
             return "allow", EXIT_OK, (
@@ -197,6 +224,9 @@ def verdict(usage: float | None, kind: str, force: bool = False) -> tuple[str, i
             f"ctx ≈{pct:.1f}% ≥ 60%：应交接后再派（长命助手）"
             if not force else
             f"ctx ≈{pct:.1f}% ≥ 60%（已 --force 放行；长命助手应交接后再派）")
+    if pm_tiered and usage >= PM_TIERS["warn"]:
+        return "warn", EXIT_OK, (
+            f"ctx ≈{pct:.1f}% ≥ 40%：PM 系预警——开始准备交接档，50% 即拒派（Reed 2026-11-14 定）")
     return "allow", EXIT_OK, f"ctx ≈{pct:.1f}% < 60%：放行"
 
 
@@ -241,7 +271,8 @@ def gate(sid: str, *, force: bool = False, operator: str = "",
             print(f"[ctx-gate] 取状态失败（{type(exc).__name__}: {exc}）", file=sys.stderr)
     u = usage_of(st)
     kind, key = session_kind(sid, cfg.sessions_path)
-    v, code, msg = verdict(u, kind, force)
+    v, code, msg = verdict(u, kind, force, sid=sid,
+                           sessions_path=(cfg.sessions_path if cfg else None))
 
     pct = "?" if u is None else f"{u * 100:.1f}"
     note = f"ctx={pct}% verdict={v} kind={kind}"
@@ -308,6 +339,28 @@ def self_test() -> int:
     check("0.751 落在 refuse-75（一次性）",
           verdict(0.751, "one-shot")[:2] == ("refuse-75", EXIT_REFUSE_75),
           str(verdict(0.751, "one-shot")))
+    # PM 系差别化（用户 2026-11-14）：按 sessions.json 键名 pm-* 识别会话。
+    import tempfile
+    with tempfile.TemporaryDirectory() as _td:
+        _sp = Path(_td) / "sessions.json"
+        _sp.write_text(json.dumps({"pm-laike_work_with_agent": {"id": "s_pm"},
+                                   "scout": {"id": "s_sc"}}), encoding="utf-8")
+        check("PM 52% 拒派-60（用户令 50 线）",
+              verdict(0.52, "long-lived", sid="s_pm", sessions_path=_sp)[:2]
+              == ("refuse-60", EXIT_REFUSE_60),
+              str(verdict(0.52, "long-lived", sid="s_pm", sessions_path=_sp)))
+        check("PM 42% 预警放行",
+              verdict(0.42, "long-lived", sid="s_pm", sessions_path=_sp)[:2]
+              == ("warn", EXIT_OK))
+        check("PM 38% 普通放行",
+              verdict(0.38, "long-lived", sid="s_pm", sessions_path=_sp)[:2]
+              == ("allow", EXIT_OK))
+        check("非 PM 会话 52% 仍放行（60 线不变）",
+              verdict(0.52, "long-lived", sid="s_sc", sessions_path=_sp)[:2]
+              == ("allow", EXIT_OK))
+        check("一次性 worker 不套 PM 线",
+              verdict(0.52, "one-shot", sid="s_pm", sessions_path=_sp)[:2]
+              == ("refuse-35", EXIT_REFUSE_35))
     check("THRESHOLD_HANDOFF 恰为 0.75",
           THRESHOLD_HANDOFF == 0.75, str(THRESHOLD_HANDOFF))
     check("固定键白名单命中", _is_fixed_key("steward") and _is_fixed_key("pm-<项目>")
