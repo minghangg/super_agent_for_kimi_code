@@ -158,6 +158,17 @@ class Base(unittest.TestCase):
         return rec.get("needs_person") or []
 
 
+class _Case(Base):
+    """One isolated engine, without the test runner's fixture protocol.
+
+    Several cases walk a list of bodies and need a fresh store per body; going
+    through ``subTest`` and ``setUp`` reads worse than a small helper.
+    """
+
+    def runTest(self):
+        pass
+
+
 class Candidate(unittest.TestCase):
     """The parse-level rule: candidacy is decided on the first line only."""
 
@@ -381,6 +392,89 @@ class ClosingWordGuard(unittest.TestCase):
                         self.assertEqual(rows, [], body)
                 finally:
                     case.tearDown()
+
+
+class QuotedConclusionStillCounts(unittest.TestCase):
+    """P0-B: a quoted conclusion is a conclusion.
+
+    Round 3 removed every quoted span before looking for a conclusion word, so
+    a PM who wrote ``「可关单 #42」`` - a common way to state an answer - went
+    silent. The removal now applies to the **guards only**: the main table
+    reads the line as written.
+    """
+
+    QUOTED = ("[PM] 「可关单 #42」", "[PM] “可关单 #42”",
+              "[PM] 我说「可关单 #42」了", "[PM] 马上 `可关单 #42`")
+
+    def test_a_quoted_answer_is_a_candidate(self):
+        for body in self.QUOTED:
+            self.assertTrue(markers.parse_pm_verdict(body)["candidate"], body)
+
+    def test_a_quoted_answer_rings(self):
+        for body in self.QUOTED:
+            with self.subTest(body=body):
+                case = _Case()
+                case.setUp()
+                try:
+                    engine = case.engine()
+                    case.source.add(9100, body)
+                    engine.run_once()
+                    # A frame, or a row naming the mismatch: ``#42`` in a body
+                    # on the ``#1`` thread is audible either way, and either
+                    # way the answer was not swallowed.
+                    self.assertTrue(
+                        case.bus.payloads("event.agent.supervisor")
+                        or case.rows(engine), body)
+                finally:
+                    case.tearDown()
+
+    def test_a_quoted_verb_stays_quiet(self):
+        # The guard still reads the de-quoted text, or every explanation of
+        # ``关闭窗口`` would file an exception.
+        for body in ("[PM] 关于「关闭窗口」的说明", "[PM] 关闭窗口已开"):
+            self.assertFalse(markers.parse_pm_verdict(body)["candidate"], body)
+
+
+class ClosingIssueAsAnObject(unittest.TestCase):
+    """P0-C: ``挡关单`` is about blocking a close, not announcing one."""
+
+    OBJECTS = ("[PM] 挡关单", "[PM] 拒绝关单", "[PM] 阻止关单",
+               "[PM] 防止关单", "[PM] 避免关单", "[PM] 停止关单")
+    ANSWERS = ("[PM] 关单吧 #1", "[PM] 可关单 #42",
+               "[PM] 同意关单 #42", "[PM] 可以关单了 #42")
+
+    def test_the_object_reading_is_not_a_candidate(self):
+        for body in self.OBJECTS:
+            self.assertFalse(markers.parse_pm_verdict(body)["candidate"], body)
+
+    def test_the_answers_are_still_candidates(self):
+        for body in self.ANSWERS:
+            self.assertTrue(markers.parse_pm_verdict(body)["candidate"], body)
+
+    def test_the_negation_chain_still_wins(self):
+        # ``不可关单`` must answer the same way as ``挡关单``: the negation and
+        # the object verb are two guards on one word, not rivals.
+        for body in ("[PM] 不可关单 #42", "[PM] 未可关单 #42"):
+            self.assertFalse(markers.parse_pm_verdict(body)["candidate"], body)
+
+    def test_a_task_book_that_mentions_blocking_is_silent(self):
+        # The real first line of cid 6881482959.
+        body = ("[PM] ISS-75 第三轮 fix 轮独立复核（qa-lwa-ISS-75 复用，同 issue "
+                "多轮合法；本轮只 P0 挡关单，P1 记 backlog）\n\n"
+                "5. P0-C：escalation_markers（默认 [decision]／[blocked]）\n")
+        engine_case = _Case()
+        engine_case.setUp()
+        try:
+            self.assertFalse(markers.parse_pm_verdict(body)["candidate"])
+            engine = engine_case.engine()
+            engine_case.source.add(6881482959, body)
+            for _ in range(3):
+                engine.run_once()
+            self.assertEqual(
+                engine_case.bus.payloads("event.agent.supervisor"), [])
+            self.assertEqual(engine_case.rows(engine), [])
+        finally:
+            engine_case.tearDown()
 
 
 class EngineQuiet(Base):

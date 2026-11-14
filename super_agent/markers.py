@@ -281,7 +281,15 @@ STATE_TABLE = tuple([(w, "ready") for w in READY_WORDS]
 # actually writes when the contract says "state it on the first line".
 PM_CONCLUSION_WORDS = tuple([w for w, _ in STATE_TABLE]
                             + [w for w, _ in WORD_TABLE]
-                            + ["关单", "可以关", "lgtm", "approve", "done"])
+                            + ["可以关", "lgtm", "approve", "done"])
+
+# ``关单`` is a conclusion **unless it is somebody's object**. ``挡关单``,
+# ``拒绝关单``, ``防止关单`` are about blocking a close, not announcing one, and
+# the third-round task book that said ``本轮只 P0 挡关单`` rang every round
+# (#75 round 4, P0-C). The test is the character before the word: an
+# object-taking verb turns the phrase into "block/stop/refuse the closing".
+CLOSING_ISSUE_WORD = "关单"
+CLOSING_ISSUE_OBJECT_VERB = set("挡住止绝停拒免防阻抗压控护延拖劝禁")
 
 # ``关闭`` is **not** in the table above. It is an ordinary verb as often as it
 # is a conclusion - ``关闭窗口``/``门禁已关闭``/``会话关闭后归档`` - so it gets
@@ -736,19 +744,33 @@ def is_pm_conclusion(text: str, *, structured: bool = False) -> bool:
     """
     if structured:
         return True
-    body = PM_QUOTE_RE.sub(" ", text or "")
-    body = PM_HEADING_RE.sub(" ", body)
-    lowered = body.lower()
+    raw = PM_HEADING_RE.sub(" ", text or "")
+    lowered = raw.lower()
     for word in PM_CONCLUSION_WORDS:
         needle = word.lower()
         start = lowered.find(needle)
         while start != -1:
-            before = lowered[start - 1: start] if start else ""
             after = lowered[start + len(needle): start + len(needle) + 1]
             if not _negated_at(lowered, start) and \
+                    not _closing_is_object(lowered, start) and \
                     not (after and after in TAILS):
                 return True
             start = lowered.find(needle, start + 1)
+    # The guards below read the text **with quoted spans removed**. That is the
+    # opposite of the table above, and deliberately so: a quoted ``可关单`` is
+    # still a conclusion (it is what a PM writes when quoting their own
+    # answer), but a quoted ``关闭窗口`` is a mention of a verb, and letting
+    # the guard read it would file an exception on every explanation (#75
+    # round 4, P0-B).
+    body = PM_QUOTE_RE.sub(" ", raw)
+    lowered = body.lower()
+    start = lowered.find(CLOSING_ISSUE_WORD)
+    while start != -1:
+        before = lowered[start - 1: start] if start else ""
+        if before not in CLOSING_ISSUE_OBJECT_VERB and \
+                not _negated_at(lowered, start):
+            return True
+        start = lowered.find(CLOSING_ISSUE_WORD, start + 1)
     for word in BARE_CLOSING_WORDS:
         start = lowered.find(word)
         while start != -1:
@@ -756,6 +778,7 @@ def is_pm_conclusion(text: str, *, structured: bool = False) -> bool:
             after = lowered[start + 1: start + 2]
             if before not in BARE_CLOSING_BEFORE[word] and \
                     not _negated_at(lowered, start) and \
+                    not _closing_is_object(lowered, start) and \
                     (not after or after in BARE_CLOSING_AFTER
                      or after in " \t，。、,;；:：!！?？#-—()（）"):
                 return True
@@ -773,6 +796,33 @@ def is_pm_conclusion(text: str, *, structured: bool = False) -> bool:
                         after and after in CLOSING_VERB_TAIL):
             return True
         start = lowered.find(CLOSING_WORD, start + 1)
+    return False
+
+
+def _closing_is_object(text: str, index: int) -> bool:
+    """Does the hit at ``index`` sit inside an "object of a verb" phrase?
+
+    ``挡关单``/``拒绝关单``/``防止关单`` are about blocking a close. The wider
+    table reaches the same place through ``可关单`` (which contains ``关单``),
+    and the single-character pass reaches it through the bare ``关``, so the
+    question is asked of every closing hit: does a ``关单`` start here or one
+    character later, and is an object-taking verb just before it?
+    """
+    for offset in (0, 1):
+        at = index + offset
+        if text[at:at + len(CLOSING_ISSUE_WORD)] != CLOSING_ISSUE_WORD:
+            continue
+        i = at - 1
+        steps = 0
+        while i >= 0 and steps < 2:
+            ch = text[i]
+            if ch in CLOSING_ISSUE_OBJECT_VERB:
+                return True
+            if ch in "可将以要会能":
+                i -= 1
+                steps += 1
+                continue
+            return False
     return False
 
 
