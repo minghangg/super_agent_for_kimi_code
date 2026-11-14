@@ -351,21 +351,30 @@ class Engine:
         author = str(comment.get("author") or "").strip().lower()
         if self.role and author == self.role.lower():
             return "ignored", "authored by configured role"
-        escalated = self._escalation_marker(body)
+        escalated = self._escalation_marker(body, first_line_only=False)
         if escalated:
             return "needs_person", f"marker {escalated!r}"
         return "logged", ""
 
-    def _escalation_marker(self, body: str) -> str:
-        """The first configured escalation marker in ``body``, or ``""``.
+    def _escalation_marker(self, body: str, *, first_line_only: bool = True) -> str:
+        """The first configured escalation marker, or ``""``.
 
-        One place, so the two paths that must honour a marker cannot drift:
-        the ordinary fallthrough, and the ``[PM]`` branch that otherwise
-        returns ``ignored``. The branch that answered a note with silence is
-        what turned ``[PM] [blocked] 卡在 allowlist`` into zero visible output
-        (#75 round 2, P0-2).
+        ``first_line_only`` defaults to True and is what the ``[PM]`` branch
+        uses: the marker must open the comment, the same contract
+        ``parse_delivery``, ``parse_review`` and ``parse_pm_verdict`` follow.
+        Scanning the whole body was the round-3 P0 - a task book that
+        *explains* the markers rang the exception bell every round for 29
+        rounds, the exact shape this issue exists to remove. A comment that
+        quotes a marker is discussion; one that opens with it is a request.
+
+        The legacy fallthrough passes ``False``: there the whole-body scan is
+        the behaviour every other author already had, and narrowing it would
+        trade one silence for a different one outside this issue.
         """
-        lowered = str(body or "").lower()
+        text = str(body or "")
+        if first_line_only:
+            text = markers.first_line(text)
+        lowered = text.lower()
         for marker in self.markers:
             if marker and marker in lowered:
                 return marker

@@ -252,6 +252,13 @@ PM_PREFIX_RE = re.compile(r"^\s*[\[［]\s*(?:PM|supervisor)\s*[\]］]\s*", re.I)
 # a task book from reading as a verdict (#75).
 PM_HEADING_RE = re.compile(r"[【\[［《][^】\]］》]*[】\]］》]")
 
+# A **quoted** span is a mention, not a statement. The round-3 task book for
+# this very issue is the example: ``…同批收口「关闭」误报`` quotes the word it
+# is about, and reading that quotation as a closing verdict is the same failure
+# as reading a task book's explanation of ``[blocked]`` as a request. Code
+# spans go too - a marker shown in backticks is documentation.
+PM_QUOTE_RE = re.compile(r"[「『“][^」』”]*[」』”]|`[^`\n]*`")
+
 # The three-state table. Order carries no precedence (see
 # :func:`_first_state_hit`); it only fixes which state a word belongs to.
 READY_WORDS = ("可关单", "可发布", "可上线", "ready")
@@ -270,13 +277,16 @@ STATE_TABLE = tuple([(w, "ready") for w in READY_WORDS]
 # The closing table is wider than the state table for the same reason, and for
 # a sharper one: a conclusion word missing from it turns a real answer into
 # silence, which is the failure #75 must not reintroduce (#75 round 2, P0-1).
-# ``关单``/``关闭``/``可以关`` and the three English spellings are the shapes a
-# PM actually writes when the contract says "state it on the first line".
+# ``关单``/``可以关`` and the three English spellings are the shapes a PM
+# actually writes when the contract says "state it on the first line".
 PM_CONCLUSION_WORDS = tuple([w for w, _ in STATE_TABLE]
                             + [w for w, _ in WORD_TABLE]
-                            + ["关单", "关闭", "可以关",
-                               "lgtm", "approve", "done"])
+                            + ["关单", "可以关", "lgtm", "approve", "done"])
 
+# ``关闭`` is **not** in the table above. It is an ordinary verb as often as it
+# is a conclusion - ``关闭窗口``/``门禁已关闭``/``会话关闭后归档`` - so it gets
+# the same treatment as the one-character words: matched, then guarded.
+#
 # One-character closing words are a **separate table with guards**, because as
 # substrings they appear inside words that say nothing: ``关于``/``关注``/
 # ``相关`` are not conclusions, and neither are ``合计``/``配合``/``综合``.
@@ -285,11 +295,22 @@ PM_CONCLUSION_WORDS = tuple([w for w, _ in STATE_TABLE]
 # before it is not the first half of one of those compounds. ``[PM] 关单吧 #1``
 # and ``[PM] 没问题，关吧`` are conclusions; ``[PM] 关于 #42 的说明`` is not.
 BARE_CLOSING_WORDS = ("关", "合")
-BARE_CLOSING_AFTER = set("吧了单闭上掉好成")
+BARE_CLOSING_AFTER = set("吧了单上掉好成")
 BARE_CLOSING_BEFORE = {
     "关": set("相机关有海城过控门把开报审截攻税卡键"),
     "合": set("配综结合组符融联场集凑巧契"),
 }
+
+# ``关闭`` needs a guard of its own, and it is a different question from the
+# one the single characters ask. The verb sense is told apart by what follows:
+# ``关闭窗口``/``关闭后``/``关闭前`` name a thing or a moment, while a closing
+# answer ends its clause or names the issue (``关闭 #42``, ``同意关闭``).
+# ``已关闭``/``尚未关闭`` are the state of something, not a decision about it.
+CLOSING_WORD = "关闭"
+CLOSING_VERB_TAIL = set("窗门口端道闭掉后前时中过完再又了着")
+# ``已关闭``/``刚关闭``/``被关闭`` are the state of something. The negation
+# characters are already handled by :func:`_negated_at`.
+CLOSING_STATE_HEAD = set("已刚被正将曾")
 
 # ``不可关单`` / ``未受阻`` are not verdicts of that state; the negation is part
 # of the statement, so the hit is skipped and the next one is tried.
@@ -715,7 +736,8 @@ def is_pm_conclusion(text: str, *, structured: bool = False) -> bool:
     """
     if structured:
         return True
-    body = PM_HEADING_RE.sub(" ", text or "")
+    body = PM_QUOTE_RE.sub(" ", text or "")
+    body = PM_HEADING_RE.sub(" ", body)
     lowered = body.lower()
     for word in PM_CONCLUSION_WORDS:
         needle = word.lower()
@@ -738,6 +760,19 @@ def is_pm_conclusion(text: str, *, structured: bool = False) -> bool:
                      or after in " \t，。、,;；:：!！?？#-—()（）"):
                 return True
             start = lowered.find(word, start + 1)
+    start = lowered.find(CLOSING_WORD)
+    while start != -1:
+        before = lowered[start - 1: start] if start else ""
+        after = lowered[start + len(CLOSING_WORD):
+                        start + len(CLOSING_WORD) + 1]
+        # ``关闭窗口``/``关闭后``/``已关闭`` describe a thing or a moment; a
+        # closing answer ends its clause or names the issue. The verb tail and
+        # the state head are the tests, because the answer forms carry neither.
+        if before not in CLOSING_STATE_HEAD and \
+                not _negated_at(lowered, start) and not (
+                        after and after in CLOSING_VERB_TAIL):
+            return True
+        start = lowered.find(CLOSING_WORD, start + 1)
     return False
 
 

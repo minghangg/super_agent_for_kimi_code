@@ -268,6 +268,121 @@ class EscalationMarkers(Base):
         self.assertEqual(self.rows(engine), [])
 
 
+class EscalationIsReadFromTheFirstLineOnly(Base):
+    """P0-3: a comment that *quotes* a marker is discussion, not a request.
+
+    The round-2 fix scanned the whole body, so a task book that explains
+    ``[blocked]``／``[decision]`` rang the exception bell every round - the
+    shape this issue exists to remove, reintroduced through a different word.
+    """
+
+    # The real task book that reproduced it (cid 6877947836): first line is an
+    # ordinary title, and the body quotes both markers. Abbreviated to the
+    # lines that matter, so the test says why it exists.
+    BODIES = ("[PM] [blocked] 卡在 allowlist", "[PM] [decision] 需要人拍板")
+
+    QUOTING_BOOK = (
+        "[PM] ISS-75 第二轮：修 QA 判定的两条 P0（降噪过头）＋两条 P1\n"
+        "\n"
+        "4. P0-2：escalation_markers（默认 [decision]／[blocked]）之前返回，于是：\n"
+        "   [PM] [blocked] 卡在 allowlist      改前 frames=1 exc=[True]\n"
+        "   [PM] [decision] 需要人拍板         改前 frames=1 exc=[True]\n"
+    )
+
+    def test_a_task_book_quoting_both_markers_is_silent(self):
+        engine = self.engine()
+        self.source.add(6877947836, self.QUOTING_BOOK)
+        for _ in range(3):
+            engine.run_once()
+        self.assertEqual(self.bus.payloads("event.agent.supervisor"), [])
+        self.assertEqual(self.rows(engine), [])
+
+    def test_a_marker_inside_a_fenced_block_is_silent(self):
+        engine = self.engine()
+        self.source.add(9100, "[PM] 三点说明\n\n```\n[decision] 需要人拍板\n```\n")
+        engine.run_once()
+        self.assertEqual(self.bus.payloads("event.agent.supervisor"), [])
+        self.assertEqual(self.rows(engine), [])
+
+    def test_a_marker_on_the_first_line_still_rings(self):
+        # The other half: narrowing the detection must not silence a real one.
+        for body in self.BODIES:
+            with self.subTest(body=body):
+                self.setUp()
+                try:
+                    engine = self.engine()
+                    self.source.add(9100, body)
+                    engine.run_once()
+                    frames = self.bus.payloads("event.agent.supervisor")
+                    self.assertEqual(len(frames), 1)
+                    self.assertTrue(frames[0]["exception"])
+                    self.assertIn("pm.escalation[user]",
+                                  [r.get("reason") for r in self.rows(engine)])
+                finally:
+                    self.tearDown()
+
+    def test_case_insensitive_on_the_first_line(self):
+        for body in ("[PM] [BLOCKED] 卡在 allowlist",
+                     "[PM] [Decision] 需要人拍板"):
+            with self.subTest(body=body):
+                self.setUp()
+                try:
+                    engine = self.engine()
+                    self.source.add(9100, body)
+                    engine.run_once()
+                    self.assertEqual(
+                        len(self.bus.payloads("event.agent.supervisor")), 1)
+                finally:
+                    self.tearDown()
+
+
+class ClosingWordGuard(unittest.TestCase):
+    """``关闭`` is a verb as often as a conclusion (#75 round 3).
+
+    It cannot sit in ``PM_CONCLUSION_WORDS`` unguarded: ``关闭窗口`` and
+    ``门禁已关闭`` describe things, and reading them as "close the issue" files
+    a false exception. The guard is the verb tail and the state head, so the
+    answer forms - which carry neither - still count.
+    """
+
+    ANSWERS = ("[PM] 关单吧 #1", "[PM] 关闭 #42", "[PM] 可以关 #42",
+               "[PM] 同意关闭 #42")
+    VERBS = ("[PM] 关闭窗口已开", "[PM] 门禁已关闭",
+             "[PM] 会话关闭后归档", "[PM] 关闭前先报清单",
+             "[PM] 综合评估见下", "[PM] 合并分支说明")
+
+    def test_a_closing_answer_is_a_candidate(self):
+        for body in self.ANSWERS:
+            self.assertTrue(markers.parse_pm_verdict(body)["candidate"], body)
+
+    def test_the_verb_reading_is_not_a_candidate(self):
+        for body in self.VERBS:
+            self.assertFalse(markers.parse_pm_verdict(body)["candidate"], body)
+
+    def test_the_answers_ring_and_the_verbs_do_not(self):
+        class Case(Base):
+            def runTest(self):
+                pass
+
+        for body in self.ANSWERS + self.VERBS:
+            with self.subTest(body=body):
+                case = Case()
+                case.setUp()
+                try:
+                    engine = case.engine()
+                    case.source.add(9100, body)
+                    engine.run_once()
+                    frames = case.bus.payloads("event.agent.supervisor")
+                    rows = case.rows(engine)
+                    if body in self.ANSWERS:
+                        self.assertTrue(frames or rows, body)
+                    else:
+                        self.assertEqual(frames, [], body)
+                        self.assertEqual(rows, [], body)
+                finally:
+                    case.tearDown()
+
+
 class EngineQuiet(Base):
     """The router: a non-candidate is discussion, and discussion is silent."""
 
