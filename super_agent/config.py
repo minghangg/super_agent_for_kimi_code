@@ -81,6 +81,15 @@ DEFAULTS: dict = {
         # A thread held by close reconciliation for longer than this reminds
         # the supervisor once (at most once per start time).
         "release_timeout_s": 1800,
+        # Worker/QA liveness watch (ISS-69). A bound worker or QA session that
+        # is not busy for this many consecutive probes, with no new comment or
+        # verdict on its thread in between, gets one exception frame to the
+        # supervisor. Off by default: nobody configured it means nobody runs it.
+        # busy only answers "alive or dead", never "finished" - completion stays
+        # with the verdict contract.
+        "worker_liveness_enabled": False,
+        "worker_liveness_rounds": 2,
+        "worker_liveness_interval_s": 60,
     },
 }
 
@@ -167,6 +176,17 @@ def validate(cfg: dict) -> dict:
     if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) \
             or timeout <= 0:
         raise ConfigError("engine.release_timeout_s must be a positive number")
+    liveness_on = (cfg.get("engine") or {}).get("worker_liveness_enabled", False)
+    if not isinstance(liveness_on, bool):
+        raise ConfigError("engine.worker_liveness_enabled must be a boolean")
+    liveness_rounds = (cfg.get("engine") or {}).get("worker_liveness_rounds", 2)
+    if not isinstance(liveness_rounds, int) or isinstance(liveness_rounds, bool) \
+            or liveness_rounds < 1:
+        raise ConfigError("engine.worker_liveness_rounds must be an integer >= 1")
+    liveness_interval = (cfg.get("engine") or {}).get("worker_liveness_interval_s", 60)
+    if not isinstance(liveness_interval, (int, float)) \
+            or isinstance(liveness_interval, bool) or liveness_interval <= 0:
+        raise ConfigError("engine.worker_liveness_interval_s must be a positive number")
     poll = (cfg.get("github") or {}).get("poll_interval_s")
     if not isinstance(poll, (int, float)) or poll <= 0:
         raise ConfigError("github.poll_interval_s must be a positive number")

@@ -31,7 +31,7 @@
     "outbox_stale_s": 300
   },
 
-  "_comment_engine": "引擎行为。allowlist=快路读取的事件类型；cooldown_s=同线程动作冷却；assignments 必须留空（M0 不持有派单态）；session_events_path=工作台会话生命周期流（只读），''=自动解析；project_allowlist=项目策略表路径（见 sample.allowlist.json），''=用本仓 config/allowlist.json；archived_crosscheck=绑定前向会话服务核 archived；model_profiles_path=模型档位表（''=内置默认）；contract_path=A-1 会话契约文件路径（''=退化为裸 ping）；supervisor_sid/supervisor_keys=verdict 帧的收件人（sid 优先，keys 依次查 sessions.json；私有键名只写 untracked overlay 或你的私有配置）；release_timeout_s=关单对账挂起超时提醒",
+  "_comment_engine": "引擎行为。allowlist=快路读取的事件类型；cooldown_s=同线程动作冷却；assignments 必须留空（M0 不持有派单态）；session_events_path=工作台会话生命周期流（只读），''=自动解析；project_allowlist=项目策略表路径（见 sample.allowlist.json），''=用本仓 config/allowlist.json；archived_crosscheck=绑定前向会话服务核 archived；model_profiles_path=模型档位表（''=内置默认）；contract_path=A-1 会话契约文件路径（''=退化为裸 ping）；supervisor_sid/supervisor_keys=verdict 帧的收件人（sid 优先，keys 依次查 sessions.json；私有键名只写 untracked overlay 或你的私有配置）；release_timeout_s=关单对账挂起超时提醒；worker_liveness_enabled/rounds/interval_s=worker/QA 活性看护（ISS-69）：bound 会话连续 N 轮不忙且期间无新评论或 verdict ⇒ 投一次例外帧给 supervisor，默认关",
   "engine": {
     "allowlist": ["issue_comment.created"],
     "cooldown_s": 900,
@@ -45,6 +45,9 @@
     "max_closed_thread_checks": 10,
     "supervisor_sid": "",
     "supervisor_keys": ["supervisor"],
-    "release_timeout_s": 1800
+    "release_timeout_s": 1800,
+    "worker_liveness_enabled": false,
+    "worker_liveness_rounds": 2,
+    "worker_liveness_interval_s": 60
   }
 }
