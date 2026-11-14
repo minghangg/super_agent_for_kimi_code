@@ -42,6 +42,9 @@ The transitions, in full (a row is a test)::
     14  blocked                           [WK:] newer than tombstone  waiting_review
     15  completed                         any late event              unchanged (audit)
     16  blocked                           cli unblock                 working
+    17  waiting_release                   [QA] pass                   unchanged (verdict
+                                                                      recorded; E58)
+    18  waiting_release                   [QA] reject / no verdict     unchanged (refused)
 
 
 Rules this module enforces (each one is a test):
@@ -359,16 +362,67 @@ def on_review(assignment: dict, review: dict, *, review_cid, verified: bool = Tr
     warning and the verdict **still applies**: the author login is shared by
     every role, so a key mismatch cannot be proof of a forgery, and refusing to
     move would leave every rotated QA unable to reject anything.
+
+    Two states are handled as **exits**, not as fresh verdicts, because work has
+    already stopped there:
+
+    * ``waiting_person`` is where an unreadable conclusion parks a delivery.
+      It is re-enterable, and only by a **newer, readable** verdict: the
+      watermark ``last_review_comment_id`` records which comment was already
+      answered, so a replay cannot promote the thread and an older comment
+      cannot arrive late to decide it. An unreadable comment here changes
+      nothing at all - the state exists precisely because wording was not
+      enough, and "it is in the candidate set now" is not an answer.
+    * ``waiting_release`` takes only a ``pass``: the archive pass may run before
+      the verdict exists (E58), so the delivery is already on record and this
+      function is the only writer of ``qa_verdict``. A reject there would
+      contradict a hold that has a pass on record, and re-deciding that is what
+      :func:`reopen` exists for - it demands a newer review, a newer delivery
+      and one live session, none of which a bare comment supplies.
+
+    ``close_reconcile`` and ``completed`` take nothing.
+
+    Every refusal above returns ``refused: True``. The caller turns that into an
+    event: a verdict that lands and is not applied is exactly the shape that
+    used to be silent, and silence here is indistinguishable from a lost
+    comment.
     """
     status = str(assignment.get("status") or "")
-    if status in TERMINAL_STATES or status in HOLD_STATES:
-        return {"changed": False, "reason": "review after the hold state"}
-    if assignment.get("last_review_comment_id") == review_cid:
-        return {"changed": False, "reason": "same review already recorded"}
+    if status in TERMINAL_STATES or status == "close_reconcile":
+        return {"changed": False, "refused": True,
+                "reason": "review after the hold state"}
     verdict = str(review.get("verdict") or "")
+    edited = _is_edited(assignment, review_cid, verdict)
+    # A comment that has already been read and has **not** changed is a replay,
+    # whatever the current state is. It is not news, so it must not be
+    # reported - the short-circuit below is about "we have seen this exact
+    # line before", which is a different question from "where does this id sit".
+    #
+    # This is what keeps a re-read of already-answered comments from growing a
+    # refusal row every round: with the state check below they used to re-enter
+    # as "a hold took nothing from me".
+    if _reading_of(assignment, review_cid) is not None and not edited:
+        return {"changed": False, "reason": "same review already recorded"}
+    same_cid = _cid_eq(assignment.get("last_review_comment_id"), review_cid)
+    if same_cid and not edited:
+        return {"changed": False, "reason": "same review already recorded"}
+    delivery = assignment.get("delivery_comment_id")
+    if delivery_cid is not None:
+        delivery = delivery_cid
+    try:
+        delivery = int(delivery)
+    except (TypeError, ValueError):
+        delivery = None
+    if status == "waiting_release":
+        return _pass_after_hold(assignment, verdict, review_cid, verified,
+                                delivery, edited=edited)
+    if status == "waiting_person":
+        return _verdict_after_person(assignment, verdict, review_cid, verified,
+                                     delivery, edited=edited)
     assignment["last_review_comment_id"] = review_cid
     assignment["review_verified"] = bool(verified)
     assignment["updated_at"] = now()
+    _remember_reading(assignment, review_cid, verdict)
     if not verdict:
         assignment["status"] = "waiting_person"
         return {"changed": True, "status": "waiting_person",
@@ -376,12 +430,6 @@ def on_review(assignment: dict, review: dict, *, review_cid, verified: bool = Tr
     if verdict == "pass":
         # A pass re-read after a newer delivery is stale: the worker delivered
         # again, so the review no longer describes the code on the table.
-        delivery = (assignment.get("delivery_comment_id") if delivery_cid is None
-                    else delivery_cid)
-        try:
-            delivery = int(delivery)
-        except (TypeError, ValueError):
-            delivery = None
         if delivery is not None and delivery > int(review_cid):
             return {"changed": False, "reason": "review.stale"}
         assignment["status"] = "waiting_release"
@@ -392,6 +440,188 @@ def on_review(assignment: dict, review: dict, *, review_cid, verified: bool = Tr
     assignment["qa_verdict"] = "reject"
     assignment["review_comment_id"] = review_cid
     return {"changed": True, "status": "working", "reason": "qa reject"}
+
+
+def _cid_eq(left, right) -> bool:
+    """``True`` when both sides are the same comment id (int-normalised).
+
+    Deliberately an equality helper, not a comparison: "is this the comment we
+    last read" and "is this comment older than that one" are different
+    questions, and the first one must not be answered by the second.
+    """
+    if left is None or right is None:
+        return False
+    try:
+        return int(left) == int(right)
+    except (TypeError, ValueError):
+        return False
+
+
+# Where the *reading* of each review comment is kept: ``{cid: verdict}``. It is
+# the only way to tell an in-place edit from a replay, because the comment id
+# does not move when a QA fixes the wording. Without it, "did this comment
+# change" can only be guessed from the assignment's current state, which is a
+# different question - and the wrong one: #65's QA fixed a comment that was
+# **older** than the watermark, so any "newer than the watermark" rule refuses
+# exactly the case the issue is about.
+READINGS = "review_readings"
+
+
+def _readings(assignment: dict) -> dict:
+    table = assignment.get(READINGS)
+    if not isinstance(table, dict):
+        table = assignment[READINGS] = {}
+    return table
+
+
+def _reading_of(assignment: dict, review_cid) -> str | None:
+    """The verdict this comment read last time, or ``None`` if never read."""
+    table = assignment.get(READINGS)
+    if not isinstance(table, dict):
+        return None
+    try:
+        key = str(int(review_cid))
+    except (TypeError, ValueError):
+        return None
+    value = table.get(key)
+    return None if value is None else str(value)
+
+
+def _remember_reading(assignment: dict, review_cid, verdict: str) -> None:
+    try:
+        key = str(int(review_cid))
+    except (TypeError, ValueError):
+        return
+    _readings(assignment)[key] = str(verdict or "")
+
+
+def _is_edited(assignment: dict, review_cid, verdict: str) -> bool:
+    """Is this the same comment, read differently than last time?
+
+    An edit is **the same comment id with a different reading**. Anything else
+    - a new id, an unreadable line both times, a byte-identical replay - is not
+    an edit, so the replay guard still short-circuits it.
+    """
+    previous = _reading_of(assignment, review_cid)
+    return previous is not None and previous != str(verdict or "")
+
+
+def _verdict_after_person(assignment: dict, verdict: str, review_cid,
+                          verified: bool, delivery: int | None,
+                          *, edited: bool = False) -> dict:
+    """Apply a verdict that arrives while the delivery waits for a person.
+
+    Only a **newer, readable** conclusion may leave ``waiting_person`` - and,
+    since the same comment may be **edited in place**, a readable conclusion
+    that differs from the one already recorded at that same id counts as newer
+    (``edited``, decided by the caller; the id itself cannot express an edit):
+
+    * unreadable - stay put. The state is the answer to "the wording was not
+      enough", so more wording of the same kind cannot answer it. The
+      watermark does move: the comment *was* read and answered by the state it
+      left behind, and moving it keeps a replay from looking newer later.
+    * readable but not newer than ``last_review_comment_id`` - stay put. The
+      watermark is the record of what this thread has already decided; a
+      comment below it is history, and history must not reopen a stop. An
+      in-place edit is the one exception: the id ties with the watermark, but
+      the reading changed, which is what a person was waiting for.
+    * readable and newer (or a differing in-place edit) - the normal
+      transitions, unchanged: ``pass`` to ``waiting_release`` (unless a newer
+      delivery already exists), ``reject`` to ``working``.
+
+    Comparing comment ids rather than timestamps is deliberate: ids are
+    monotonic per repository and already used as the delivery ordering
+    everywhere else in this module (:func:`on_delivery`, the stale check), so
+    one clock cannot disagree with another.
+
+    Who may answer is decided by **identity, not by ordering**: this comment is
+    the one we are answering if it is the comment on record
+    (``review_comment_id`` or ``last_review_comment_id``) or if its reading
+    changed (``edited``). A comment *older* than the watermark is refused only
+    when it is neither of those - #65's fix was an edit of a comment that sat
+    **below** the watermark, and a "must be newer" rule refuses exactly that.
+    """
+    last = assignment.get("last_review_comment_id")
+    try:
+        last = int(last) if last is not None else None
+    except (TypeError, ValueError):
+        last = None
+    try:
+        cid = int(review_cid)
+    except (TypeError, ValueError):
+        cid = None
+    if not verdict:
+        assignment["last_review_comment_id"] = (
+            cid if cid is not None and (last is None or cid > last) else last)
+        assignment["review_verified"] = bool(verified)
+        assignment["updated_at"] = now()
+        _remember_reading(assignment, review_cid, "")
+        return {"changed": False, "refused": True,
+                "reason": "no readable verdict after waiting_person"}
+    on_record = (_cid_eq(cid, last)
+                 or _cid_eq(cid, assignment.get("review_comment_id")))
+    if cid is None or (not on_record and not edited
+                       and last is not None and cid < last):
+        return {"changed": False, "refused": True,
+                "reason": "review is not newer than the recorded one"}
+    if verdict == "pass":
+        if delivery is not None and delivery > cid:
+            return {"changed": False, "refused": True, "reason": "review.stale"}
+        assignment["last_review_comment_id"] = cid
+        assignment["review_verified"] = bool(verified)
+        assignment["status"] = "waiting_release"
+        assignment["qa_verdict"] = "pass"
+        assignment["review_comment_id"] = cid
+        assignment["updated_at"] = now()
+        _remember_reading(assignment, review_cid, verdict)
+        return {"changed": True, "status": "waiting_release", "reason": "qa pass"}
+    assignment["last_review_comment_id"] = cid
+    assignment["review_verified"] = bool(verified)
+    assignment["status"] = "working"
+    assignment["qa_verdict"] = "reject"
+    assignment["review_comment_id"] = cid
+    assignment["updated_at"] = now()
+    _remember_reading(assignment, review_cid, verdict)
+    return {"changed": True, "status": "working", "reason": "qa reject"}
+
+
+def _pass_after_hold(assignment: dict, verdict: str, review_cid, verified: bool,
+                     delivery: int | None, *, edited: bool = False) -> dict:
+    """Apply a verdict that arrives when the assignment is already archived.
+
+    The status does not move - the hold is what the archive established, and
+    nothing a comment says can undo an archive. What is written is the QA's
+    answer: the comment is on record, the pass is on record, and a second read
+    of the same comment changes nothing.
+
+    An **edit** counts here too, and that is not a detail: without it a QA that
+    corrected the line of the comment already on record got ``sup=1`` and
+    ``release_frames`` written while ``qa_gate`` still said "no qa pass
+    recorded" - the original E1 shape, unchanged, one state over.
+
+    ``refused: True`` marks the answers that are **not** applied here (reject,
+    unreadable, stale). The caller writes an event for them; a hold state that
+    swallows a verdict is how the verdict gets lost.
+    """
+    _remember_reading(assignment, review_cid, verdict)
+    if verdict != "pass":
+        return {"changed": False, "refused": True,
+                "reason": "review after the hold state"}
+    if delivery is not None and delivery > int(review_cid):
+        return {"changed": False, "refused": True, "reason": "review.stale"}
+    if (not edited and str(assignment.get("qa_verdict") or "") == "pass"
+            and assignment.get("review_comment_id") is not None):
+        # An **edit** is the exception: the QA corrected this comment, so its
+        # new reading is the answer - "a pass is already recorded" would keep
+        # the refusal row alive for a comment that has since said the opposite.
+        assignment["last_review_comment_id"] = review_cid
+        return {"changed": False, "reason": "pass already recorded"}
+    assignment["last_review_comment_id"] = review_cid
+    assignment["review_verified"] = bool(verified)
+    assignment["qa_verdict"] = "pass"
+    assignment["review_comment_id"] = review_cid
+    assignment["updated_at"] = now()
+    return {"changed": True, "status": "waiting_release", "reason": "qa pass"}
 
 
 def enter_close_reconcile(assignment: dict, reason: str = "") -> dict:

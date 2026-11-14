@@ -77,6 +77,26 @@ from .store import Store, action_id
 
 OBSERVE = "observe"
 
+# Where a ``[QA]`` verdict may find the assignment it judges. Each extra state
+# is an **exit** the verdict has to be able to reach, not a looser reading of
+# one:
+#
+# * ``waiting_release`` - the archive pass may run before the verdict exists, so
+#   a delivery fully on record can already sit there when its verdict arrives.
+# * ``waiting_person`` - an unreadable conclusion (``可过``) parks the delivery
+#   here. Without this state the later, correct ``通过`` found no candidate and
+#   became ``review.unmatched``: E59 caused the state, E58 made it terminal.
+#   Only a newer, readable verdict leaves it (see
+#   ``assignments._verdict_after_person``), so an unreadable replay still
+#   parks.
+#
+# ``close_reconcile`` stays out: that state means the close-out was already
+# judged unproven, so a pass arriving there would contradict the evidence chain
+# and has to be a person's call. ``completed`` stays out for the same reason,
+# with the state machine's "late event is audited, never a restart" on top.
+REVIEW_TARGET_STATES = ("working", "waiting_review", "blocked",
+                        "waiting_release", "waiting_person")
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -468,13 +488,20 @@ class Engine:
         one is not a candidate: without a delivery there is nothing to accept or
         send back, and moving it would invent state out of a stray comment. The
         newest delivery wins - an older assignment on the same thread is stale.
+
+        The state filter is ``REVIEW_TARGET_STATES``: every state a verdict has
+        to be able to reach is listed there, including ``waiting_release`` (the
+        archive ran first) and ``waiting_person`` (an earlier unreadable
+        conclusion). Requiring only the three "before the archive" states made
+        those verdicts ``review.unmatched`` and dropped the QA comment (E58/E59).
+        ``on_review`` keeps its own guards, so this widens **who may answer**,
+        not what an answer is allowed to change.
         """
         candidates = [rec for rec in (index.get("assignments") or {}).values()
                       if str(rec.get("thread") or "") == thread
                       and str(rec.get("role") or "") == "worker"
                       and rec.get("delivery_comment_id") is not None
-                      and str(rec.get("status") or "") in
-                      ("working", "waiting_review", "blocked")]
+                      and str(rec.get("status") or "") in REVIEW_TARGET_STATES]
         if not candidates:
             return None
         return max(candidates, key=lambda r: int(r.get("delivery_comment_id") or 0))
@@ -652,12 +679,202 @@ class Engine:
                 "verdict": str(review.get("verdict") or ""),
                 "verified": verified,
             })
-        elif moved.get("reason") == "review.stale":
-            self.store.log_event({"type": "review.stale", "at": _now(),
-                                  "assignment": assignment["id"],
-                                  "thread": thread, "comment_id": cid})
-        self._route_review(index, thread, issue, comment, review)
+            # A verdict that was refused earlier and is applied now settles its
+            # own refusal. Leaving the row in place would keep telling a person
+            # to decide something the engine has just decided - and #65's
+            # repaired comment is exactly that case.
+            self._clear_refused(index, thread, comment_id=cid)
+        elif moved.get("refused"):
+            # A verdict that landed and was **not** applied. Three things are
+            # needed here, and none existed before this issue:
+            #
+            # * the ``review.stale`` reason keeps its own event (doctor reads
+            #   it) *and* lands in the refused bucket. Making it an either/or
+            #   was how a stale pass stayed half-invisible: a doctor row is not
+            #   a person's queue.
+            # * the refusal becomes a ``needs_person`` row. A ``consumers`` key
+            #   is a routing hint, not a queue - ``brief``/``status`` read
+            #   ``index.needs_person``, so a ``[user]`` event with no row was
+            #   readable only in the raw log.
+            # * the PM hears about it, as a **refusal**. The supervisor does
+            #   not: the bell stays silent, which is the part that must not
+            #   regress.
+            #
+            # The row and the event are deduped per ``(thread, cid, reason)``:
+            # a refused verdict is re-read every round while the comment stays
+            # in the window, and N identical rows is noise, not N problems -
+            # but two *different* reasons are two problems.
+            reason = str(moved.get("reason") or "")
+            if reason == "review.stale":
+                self.store.log_event({"type": "review.stale", "at": _now(),
+                                      "assignment": assignment["id"],
+                                      "thread": thread, "comment_id": cid})
+            self._note_refused_after_hold(index, assignment, thread, cid,
+                                          review, moved)
+        if not moved.get("refused"):
+            # Routing a refused verdict is what made the deadlock complete:
+            # the frame said "ready to release" while ``qa_gate`` still had no
+            # pass, so the bell rang for a thread that could never complete.
+            # Only an **applied** verdict speaks for the thread.
+            #
+            # A replay speaks for nothing either: same comment, same reading,
+            # already answered. Routing it again would ring the PM once per
+            # round for a batch that was read before.
+            if moved.get("reason") == "same review already recorded":
+                return "review", ""
+            self._route_review(index, thread, issue, comment, review)
         return "review", ""
+
+    def _route_refused_review(self, index: dict, thread: str, issue: int,
+                              assignment: dict, cid: int, review: dict,
+                              reason: str) -> dict:
+        """Tell the project PM that a verdict landed and was not applied.
+
+        Goes to ``event.agent.project_pm`` with ``refused: true`` under its own
+        action key, so it can never be mistaken for - or suppress - the release
+        route of the same comment. ``release_frames`` is untouched by design:
+        that ledger answers "has this release rung", and a refusal is the
+        opposite answer.
+        """
+        key = f"refused_route:{thread}:{cid}"
+        routes = index.setdefault("refused_routes", {})
+        if not isinstance(routes, dict):
+            routes = index["refused_routes"] = {}
+        route = routes.get(key)
+        if isinstance(route, dict) and route.get("ok"):
+            return {"dispatched": False, "reason": "already sent"}
+        base = action_id(key, "bus_inject", str(cid))
+        if self.store.action_attempted(base) > 0:
+            return {"dispatched": False, "reason": "already attempted",
+                    "action_id": base}
+        target = self._pm_target(thread, issue)
+        payload = {"thread": thread, "issue": int(issue),
+                   "review_comment_id": int(cid),
+                   "project": target["project"],
+                   "verdict": str(review.get("verdict") or ""),
+                   "refused": True, "reason": reason,
+                   "assignment": str(assignment.get("id") or ""),
+                   "status": str(assignment.get("status") or ""),
+                   "at": _now()}
+        result = self._dispatch(self._route_action(
+            thread, issue, cid, payload, "event.agent.project_pm",
+            target_role=target["target_role"], origin_role=markers.QA.lower(),
+            assignment_id=key))
+        routes[key] = {"thread": thread, "comment_id": int(cid), "at": _now(),
+                       "verdict": payload["verdict"], "reason": reason,
+                       "ok": (bool(result.get("ok"))
+                              if result.get("dispatched") else False),
+                       "action_id": result.get("action_id") or base}
+        self.store.log_event({
+            "type": "route.refused_decided", "at": _now(), "thread": thread,
+            "comment_id": int(cid), "to": "project_pm",
+            "project": target["project"], "verdict": payload["verdict"],
+            "reason": reason,
+            "dispatched": bool(result.get("dispatched")),
+            "refused": bool(result.get("refused")),
+        })
+        return result
+
+    def _note_refused_after_hold(self, index: dict, assignment: dict,
+                                 thread: str, cid: int, review: dict,
+                                 moved: dict) -> None:
+        """Record one refused verdict: log, queue row, PM frame, dedupe.
+
+        The identity is ``(thread, cid, reason)``. Reason is part of it on
+        purpose: one comment can be refused for two different reasons on
+        different rounds ("not newer", then "stale"), and swallowing the second
+        is how a real problem stays invisible. The ``needs`` dismissal key
+        stays ``(thread, cid)`` - that is how a person dismisses a *comment*,
+        not a diagnosis - so a dismissal still suppresses every row for it.
+        """
+        cid = int(cid)
+        reason = str(moved.get("reason") or "")
+        key = f"refused:{thread}:{cid}:{reason}"
+        seen = index.setdefault("review_refused", {})
+        if not isinstance(seen, dict):
+            seen = index["review_refused"] = {}
+        if seen.get(key):
+            return
+        seen[key] = {"thread": thread, "comment_id": cid,
+                     "assignment": str(assignment.get("id") or ""),
+                     "status": str(assignment.get("status") or ""),
+                     "verdict": str(review.get("verdict") or ""),
+                     "reason": reason, "at": _now()}
+        self.store.log_event({
+            "type": "assignment.qa_refused_after_hold", "at": _now(),
+            "assignment": assignment.get("id"), "thread": thread,
+            "comment_id": cid, "status": str(assignment.get("status") or ""),
+            "verdict": str(review.get("verdict") or ""),
+            "reason": reason, "level": "warn", "consumers": ["user"],
+        })
+        numbers = index.setdefault("issues", {}).setdefault(
+            thread, {"state": "idle", "comments_seen": 0, "needs_person": []})
+        numbers.setdefault("needs_person", []).append({
+            "comment_id": cid,
+            # ``brief`` files an entry under "4. 等用户的事项" only when the
+            # reason matches its ``[user]`` markers. The old row carried no
+            # marker, so it landed in "3. 等 supervisor 裁决" - the opposite of
+            # what the code comment claimed.
+            "reason": "review.refused_after_hold [user]",
+            "detail": reason, "at": _now()})
+        issue = assignment.get("issue")
+        if issue is not None:
+            self._route_refused_review(index, thread, int(issue), assignment,
+                                       cid, review, reason)
+
+    def _clear_refused(self, index: dict, thread: str,
+                       *, comment_id=None) -> int:
+        """Drop refused-verdict bookkeeping for a thread, or for one comment.
+
+        ``review_refused`` and its ``needs_person`` rows describe work still
+        waiting on a person. Two things end that wait, and both used to leave
+        the rows behind:
+
+        * the **comment itself** is applied later (``comment_id`` given) - the
+          refusal was about a reading that has since been corrected, so the row
+          now asks a person to decide something the engine already decided;
+        * the **thread completes** (no ``comment_id``) - nothing on it waits for
+          a person any more.
+
+        The event log keeps the audit trail; this only stops the queue from
+        lying. Returns how many ``review_refused`` entries were cleared.
+        """
+        def wanted(rec) -> bool:
+            if not isinstance(rec, dict):
+                return False
+            if str(rec.get("thread") or "") != thread:
+                return False
+            if comment_id is None:
+                return True
+            try:
+                return int(rec.get("comment_id")) == int(comment_id)
+            except (TypeError, ValueError):
+                return False
+
+        seen = index.get("review_refused")
+        cleared = 0
+        if isinstance(seen, dict):
+            for key in [k for k, rec in seen.items() if wanted(rec)]:
+                del seen[key]
+                cleared += 1
+        numbers = (index.get("issues") or {}).get(thread)
+        if isinstance(numbers, dict):
+            rows = numbers.get("needs_person")
+            if isinstance(rows, list):
+                numbers["needs_person"] = [
+                    r for r in rows
+                    if not (isinstance(r, dict)
+                            and str(r.get("reason") or "").startswith(
+                                "review.refused_after_hold")
+                            and (comment_id is None
+                                 or str(r.get("comment_id")) == str(comment_id)))]
+        if cleared:
+            self.store.log_event({
+                "type": "review.refused_cleared", "at": _now(),
+                "thread": thread, "entries": cleared,
+                "comment_id": comment_id,
+            })
+        return cleared
 
     def _retry_routes(self, index: dict) -> int:
         """Re-send verdicts a refused/suppressed dispatch never delivered.
@@ -2817,9 +3034,11 @@ class Engine:
             if completed and not refused:
                 record["status"] = "completed"
                 records[thread] = record
+                cleared = self._clear_refused(index, thread)
                 self.store.log_event({"type": "thread.completed", "at": _now(),
                                       "thread": thread, "assignments": completed,
-                                      "conditions": snap["conditions"]})
+                                      "conditions": snap["conditions"],
+                                      "refused_cleared": cleared})
                 return {"thread": thread, "status": "completed",
                         "completed": completed, "reason": "",
                         "conditions": snap["conditions"], "consecutive_ok": streak}
