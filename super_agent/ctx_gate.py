@@ -226,7 +226,7 @@ def verdict(usage: float | None, kind: str, force: bool = False,
             f"ctx ≈{pct:.1f}% ≥ 60%（已 --force 放行；长命助手应交接后再派）")
     if pm_tiered and usage >= PM_TIERS["warn"]:
         return "warn", EXIT_OK, (
-            f"ctx ≈{pct:.1f}% ≥ 40%：PM 系预警——开始准备交接档，50% 即拒派（Reed 2026-11-14 定）")
+            f"ctx ≈{pct:.1f}% ≥ 40%：PM 系预警——开始准备交接档，50% 即拒派（制度 2026-11-14）")
     return "allow", EXIT_OK, f"ctx ≈{pct:.1f}% < 60%：放行"
 
 
