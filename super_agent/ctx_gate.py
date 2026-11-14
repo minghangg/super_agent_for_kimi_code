@@ -343,7 +343,7 @@ def self_test() -> int:
     import tempfile
     with tempfile.TemporaryDirectory() as _td:
         _sp = Path(_td) / "sessions.json"
-        _sp.write_text(json.dumps({"pm-laike_work_with_agent": {"id": "s_pm"},
+        _sp.write_text(json.dumps({"pm-demo": {"id": "s_pm"},
                                    "scout": {"id": "s_sc"}}), encoding="utf-8")
         check("PM 52% 拒派-60（用户令 50 线）",
               verdict(0.52, "long-lived", sid="s_pm", sessions_path=_sp)[:2]
