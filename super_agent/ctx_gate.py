@@ -72,7 +72,7 @@ FIXED_PREFIXES = ("pm-", _joined("qa-l", "wa-"), _joined("re", "ed"),
 THRESHOLD_ONESHOT_REFUSE = 0.35
 THRESHOLD_REFUSE = 0.60
 
-# PM 系差别化（用户 2026-11-14 令：60% 交接线降到 50%；预警 40 由 Reed 定）。
+# PM 系差别化（用户 2026-11-14 令：60% 交接线降到 50%；预警 40 由 supervisor 定）。
 # 仅对「sessions.json 键名以 pm- 开头的长命会话」生效；--role 参数只作留痕，
 # 分线依据是会话自身的键名，调用方传错 role 不会错套 tiers。
 PM_TIERS = {"warn": 0.40, "refuse": 0.50}
