@@ -170,6 +170,10 @@ class Engine:
         self._assignments_error = ""
         self._archived_cache: dict | None = None
         self._archived_unreadable = False
+        # Archive refusals already written to ``events.jsonl``, read once on
+        # first use (see ``_note_archived_sid``). Round-scoped state would be
+        # the bug: the whole point is that round 2 adds no second line.
+        self._archived_noted: set | None = None
         # sid -> archived, asked from the server once per round (see
         # ``_live_archived``); reset at the start of every round.
         self._live_check: dict[str, bool] = {}
@@ -1074,7 +1078,9 @@ class Engine:
           without the retry ever giving up on it;
         * a thread whose issue is **closed** is skipped - and only ``closed``,
           never ``unknown``: a broken probe must not silently stop every
-          delivery in the engine.
+          delivery in the engine. Closed is an end state, so the route is
+          marked ``permanent`` on the first sighting and stops being a
+          candidate; see the note at that branch for what a reopen costs.
         """
         sent = 0
         for key, route in sorted((index.get("routes") or {}).items()):
@@ -1108,6 +1114,19 @@ class Engine:
                     "thread": thread, "issue": int(issue), "comment_id": cid,
                     "level": "info", "consumers": ["doctor"],
                 })
+                # Closed is a business end state, not a transient refusal, so the
+                # route stops being a candidate: without this mark the same dead
+                # route is re-probed and re-logged every round forever (#84: 229
+                # identical events for one issue). Marking it here also means no
+                # cid or sid has to be named anywhere.
+                #
+                # **A reopened issue needs a person to clear these three keys.**
+                # The engine never clears them by itself: ``permanent`` keeps the
+                # route out of this loop before ``_issue_state`` is ever asked
+                # again, so a reopen cannot be noticed from inside the retry pass.
+                route["permanent"] = True
+                route["permanent_reason"] = "issue closed"
+                route["permanent_at"] = _now()
                 continue
             review = {"verdict": str(route.get("verdict") or "")}
             result = self._route_review(index, thread, int(issue),
@@ -2582,10 +2601,12 @@ class Engine:
         # an external action and leaves no attempt behind.
         payload_sid = str((action.get("payload") or {}).get("sid") or "")
         if payload_sid and self._sid_archived(payload_sid):
-            self.store.log_event({"type": "dispatch.archived_sid", "at": _now(),
-                                  "sid": payload_sid,
-                                  "action": action.get("kind"),
-                                  "assignment": action.get("assignment_id")})
+            # Refused every round, but **logged once**. Archive is a reversible
+            # operational act (RULES §33: restore first, then deliver), so this
+            # is not a permanent refusal: marking the record would kill a route
+            # that a restore makes deliverable again. The growth was never the
+            # check - it was one identical event per round (#84: 229).
+            self._note_archived_sid(payload_sid, action)
             return {"dispatched": False, "refused": True,
                     "reason": "target session is archived"}
 
@@ -2908,6 +2929,69 @@ class Engine:
         # ``False`` only means "no archive event was written", which is the
         # normal state after an API-side archive. Ask the server.
         return self._live_archived(sid)
+
+    def _archived_noted_key(self, sid: str, action: dict) -> tuple:
+        """Identity of one archive refusal: sid, action kind and assignment.
+
+        Two different actions aimed at the same archived session are two facts,
+        so they are two rows; the same action refused again is one fact, so it
+        is not a second row.
+        """
+        return (str(sid), str(action.get("kind") or ""),
+                str(action.get("assignment_id") or ""))
+
+    def _note_archived_sid(self, sid: str, action: dict) -> None:
+        """Write ``dispatch.archived_sid`` at most once per refusal identity.
+
+        The refusal itself is unchanged and still happens every round: a route
+        that comes back from ``restore`` must be able to deliver, so nothing is
+        marked permanent here (RULES §33 - archive is reversible, unlike a
+        closed issue). What is bounded is the *event*: the check is cheap, the
+        identical log line every round was not (#84: 229 rows for one sid).
+
+        The memory of "already written" is the event stream itself, read once
+        per process and then kept in :attr:`_archived_noted`. No new state file
+        and no new config key: the log already holds the answer, and a rotated
+        segment costs at most one repeated line, never a wrong decision.
+        """
+        key = self._archived_noted_key(sid, action)
+        if self._archived_noted is None:
+            self._archived_noted = self._load_archived_noted()
+        if key in self._archived_noted:
+            return
+        self._archived_noted.add(key)
+        self.store.log_event({"type": "dispatch.archived_sid", "at": _now(),
+                              "sid": sid,
+                              "action": action.get("kind"),
+                              "assignment": action.get("assignment_id")})
+
+    def _load_archived_noted(self) -> set:
+        """Every archive refusal the current ``events.jsonl`` already records.
+
+        Unreadable or absent log means "nothing written yet", which costs one
+        duplicate event and never a delivered frame - the fail-open side here is
+        the log, not the dispatch.
+        """
+        found: set = set()
+        try:
+            lines = self.store.events_path.read_text(encoding="utf-8").splitlines()
+        except (OSError, ValueError):
+            return found
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(row, dict) or row.get("type") != "dispatch.archived_sid":
+                continue
+            found.add(self._archived_noted_key(
+                str(row.get("sid") or ""),
+                {"kind": row.get("action"),
+                 "assignment_id": row.get("assignment")}))
+        return found
 
     def _live_archived(self, sid: str) -> bool:
         """Ask the server about one sid; cached for the round, fail-closed.
