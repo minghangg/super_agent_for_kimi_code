@@ -14,6 +14,10 @@ Routing a ``[QA]`` verdict::
     |                          a pass with no must-fix ALSO goes to the
     |                          supervisor (``event.agent.supervisor``), but
     |                          not once a PM verdict exists on this thread
+    | first line [PM:TASK]  -> never a verdict: ignored, and one ``warn``
+    |                          (``pm.task_book_conclusion``) when its own line
+    |                          reads as a conclusion - a dispatch must not be
+    |                          filed as an unreadable answer (ISS-85)
     | first line [PM]       -> three-state verdict, routed by state:
     |                          ready   -> event.agent.supervisor (release)
     |                          blocked -> the same frame, ``exception: true``
@@ -65,6 +69,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -96,6 +101,19 @@ OBSERVE = "observe"
 # with the state machine's "late event is audited, never a restart" on top.
 REVIEW_TARGET_STATES = ("working", "waiting_review", "blocked",
                         "waiting_release", "waiting_person")
+
+# A PM task book, dispatch or receipt says so on its first line: ``[PM:TASK]``.
+# It is the same bracket and the same author as a verdict, and ``PM_PREFIX_RE``
+# deliberately does **not** match it - there the character after ``PM`` is a
+# colon, not a closing bracket. That is the whole point: the prefix states
+# "this is a dispatch, not a state", so the engine never has to guess from the
+# wording (#ISS-85).
+#
+# The spelling is matched generously - case, half- and full-width brackets, and
+# both colons - because it is written by hand, and a prefix that only one
+# spelling can use is a prefix half the dispatches will miss.
+TASK_PREFIX_RE = re.compile(
+    r"^\s*[\[［]\s*(?:PM|supervisor)\s*[:：]\s*TASK\s*[\]］]\s*", re.I)
 
 
 def _now() -> str:
@@ -299,7 +317,13 @@ class Engine:
            ignored as role-authored noise;
         2. a ``[QA]`` review is the second marker: its verdict is a transition,
            not discussion, and it must be read before role noise too;
-        3. a ``[PM]`` verdict is the third marker, read before role noise for
+        3. a ``[PM:TASK]`` line is a dispatch by its own declaration, so it is
+           settled before the verdict branch is ever asked. It is always
+           ``ignored`` - not an unreadable verdict - and one ``warn`` event is
+           logged when its own first line reads like a conclusion, because a
+           reply that answers a task book is the reply somebody forgot to send
+           as a ``[PM]`` verdict (#ISS-85);
+        4. a ``[PM]`` verdict is the fourth marker, read before role noise for
            the same reason - the PM's own role is ``pm``, and a PM verdict from
            the shared login must not be discarded as author noise. A ``[PM]``
            line that is **not** a conclusion - a task book, a dispatch, a note
@@ -307,9 +331,9 @@ class Engine:
            verdict is what filed 57 false exceptions (#75). Escalation markers
            are still honoured on that path: a note that asks for a person is
            not noise;
-        4. role-authored noise is ignored;
-        5. escalation markers ask for a person;
-        6. everything else is logged (the historical behaviour, unchanged).
+        5. role-authored noise is ignored;
+        6. escalation markers ask for a person;
+        7. everything else is logged (the historical behaviour, unchanged).
 
         ``parse_delivery``, ``parse_review`` and ``parse_pm_verdict`` only read
         the first non-empty line, so a comment that quotes a delivery or a
@@ -322,6 +346,34 @@ class Engine:
         review = markers.parse_review(body)
         if review:
             return "review", f"qa verdict {review['verdict'] or 'unreadable'!r}"
+        line = markers.first_line(body)
+        task_book = TASK_PREFIX_RE.match(line)
+        if task_book:
+            # The prefix declares it: a task book, a dispatch, a receipt. It is
+            # never a verdict, whatever the rest of the line says, so it is
+            # settled here - before ``parse_pm_verdict`` is asked - and it never
+            # reaches the "unreadable verdict" branch (#ISS-85).
+            #
+            # The guard below is the other half. A task book that *answers* -
+            # ``[PM:TASK] 可关单 #42`` - is a verdict written with the wrong
+            # prefix, and silence would lose it. The answer is still silence
+            # here (a task book must not change state), but it is **logged**:
+            # one ``warn`` to the doctor, no frame, no row. Logging it as an
+            # exception would be the noise #75 removed, under a new name.
+            #
+            # Only the rest of the first line is read. A body that explains
+            # ``可关单`` is documentation, and the same first-line rule the
+            # other parsers follow applies here.
+            rest = markers.first_line(body[task_book.end():])
+            if markers.is_pm_conclusion(rest):
+                self.store.log_event({
+                    "type": "pm.task_book_conclusion", "at": _now(),
+                    "comment_id": comment.get("id"), "level": "warn",
+                    "consumers": ["doctor"],
+                    "reason": "a [PM:TASK] line reads as a conclusion; "
+                              "use [PM] + verdict marker",
+                })
+            return "ignored", "pm task book"
         pm_verdict = markers.parse_pm_verdict(body)
         if pm_verdict and pm_verdict.get("candidate"):
             return "pm_verdict", (f"pm verdict "
