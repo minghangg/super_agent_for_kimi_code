@@ -18,6 +18,9 @@ Routing a ``[QA]`` verdict::
     |                          (``pm.task_book_conclusion``) when its own line
     |                          reads as a conclusion - a dispatch must not be
     |                          filed as an unreadable answer (ISS-85)
+    |                          an escalation marker is the exception: it takes
+    |                          the ``[PM]`` frame path, because a request for a
+    |                          person must ring under either prefix (ISS-85 P1-2)
     | first line [PM]       -> three-state verdict, routed by state:
     |                          ready   -> event.agent.supervisor (release)
     |                          blocked -> the same frame, ``exception: true``
@@ -122,6 +125,42 @@ def _now() -> str:
 
 def _now_ts() -> float:
     return time.time()
+
+
+def _tail_events(path: Path, *, limit: int, max_bytes: int = 512 * 1024) -> list:
+    """The last ``limit`` JSON rows of an append-only JSONL file.
+
+    ``events.jsonl`` is unbounded in practice (the live file passed 9000 rows
+    and grows every round), so the doctor must not read it whole. Two bounds
+    and no third: at most ``limit`` rows, and at most ``max_bytes`` read from
+    the end. A row that does not parse is skipped - the file is a log, and a
+    torn last line is not a fault of its own.
+    """
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            start = max(0, size - max_bytes)
+            fh.seek(start)
+            chunk = fh.read()
+    except OSError:
+        return []
+    text = chunk.decode("utf-8", "replace")
+    if start > 0:
+        # The first line of a mid-file read is almost certainly a fragment.
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+    rows = []
+    for raw in text.splitlines()[-limit:]:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            row = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
 
 
 def _parse_ts(value: str) -> datetime | None:
@@ -322,7 +361,10 @@ class Engine:
            ``ignored`` - not an unreadable verdict - and one ``warn`` event is
            logged when its own first line reads like a conclusion, because a
            reply that answers a task book is the reply somebody forgot to send
-           as a ``[PM]`` verdict (#ISS-85);
+           as a ``[PM]`` verdict (#ISS-85). The one exception is an escalation
+           marker: a task book that says ``[blocked]`` or ``[decision]`` is
+           asking for a person, and it goes down the ``[PM]`` frame path below
+           - the same prefix change must not turn a bell into silence;
         4. a ``[PM]`` verdict is the fourth marker, read before role noise for
            the same reason - the PM's own role is ``pm``, and a PM verdict from
            the shared login must not be discarded as author noise. A ``[PM]``
@@ -361,10 +403,20 @@ class Engine:
             # one ``warn`` to the doctor, no frame, no row. Logging it as an
             # exception would be the noise #75 removed, under a new name.
             #
-            # Only the rest of the first line is read. A body that explains
+            # Only the prefix line's remainder is read, plus the next non-empty
+            # line when the prefix stands alone. A body that *explains*
             # ``可关单`` is documentation, and the same first-line rule the
-            # other parsers follow applies here.
-            rest = markers.first_line(body[task_book.end():])
+            # other parsers follow applies here. The slice starts from ``line``
+            # and not from ``body``: ``TASK_PREFIX_RE`` matched the stripped
+            # first line, so ``body[end:]`` is off by the leading whitespace it
+            # no longer saw (#ISS-85 P2-3).
+            lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+            rest = line[task_book.end():].strip()
+            if not rest and len(lines) > 1:
+                # A real task book writes the prefix alone and the title below
+                # it. Reading only the prefix line would make the guard blind
+                # to exactly the shape it exists for.
+                rest = lines[1]
             if markers.is_pm_conclusion(rest):
                 self.store.log_event({
                     "type": "pm.task_book_conclusion", "at": _now(),
@@ -373,6 +425,15 @@ class Engine:
                     "reason": "a [PM:TASK] line reads as a conclusion; "
                               "use [PM] + verdict marker",
                 })
+            # A task book that *asks for a person* is not discussion. Returning
+            # ``ignored`` here answered ``[PM:TASK] 任务书 [blocked] 需要决策``
+            # with silence while the same words under ``[PM]`` rang the bell -
+            # a human-intervention signal downgraded by a prefix change
+            # (#ISS-85 P1-2). It goes down the same PM frame path as the
+            # ``[PM]`` branch below, with no new frame type.
+            escalated = self._escalation_marker(body)
+            if escalated:
+                return "pm_verdict", f"escalation marker {escalated!r}"
             return "ignored", "pm task book"
         pm_verdict = markers.parse_pm_verdict(body)
         if pm_verdict and pm_verdict.get("candidate"):
@@ -3847,8 +3908,14 @@ class Engine:
                         rec["state"] = "tracked"
                     continue
             if state == "pm_verdict":
+                # A ``[PM:TASK]`` escalation never reaches ``parse_pm_verdict``
+                # - the prefix is deliberate - so the router is handed the empty
+                # verdict, the same shape an unmarked ``[PM]`` note produces:
+                # no state, fail-closed, one exception frame (#ISS-85 P1-2).
+                verdict = pm_verdict or {"state": "", "matched": "",
+                                         "issue": None, "candidate": False}
                 state, reason = self._on_pm_verdict(index, key, issue, comment,
-                                                    pm_verdict)
+                                                    verdict)
                 summary["pm_verdicts"] = int(summary.get("pm_verdicts") or 0) + 1
                 if state != "needs_person":
                     if rec.get("state") == "idle":
@@ -4022,6 +4089,28 @@ class Engine:
                       or issuekey.issue_number(k) is None]
         add("cursor", not bad_cursor,
             "cursor ok" if not bad_cursor else f"invalid cursors: {bad_cursor}")
+
+        # The ``[PM:TASK]`` guard writes ``pm.task_book_conclusion`` and nothing
+        # else reads it, so a conclusion written under the wrong prefix stayed
+        # as invisible as the silence it was meant to break (#ISS-85 P1-1).
+        # The doctor is the reader: it is already the queue of "a person should
+        # look", and the event is a one-line fact, not a new mechanism.
+        #
+        # Bounded on purpose - the tail, not the file. The live log passed 9000
+        # rows and grows every round; reading it whole in a health check would
+        # turn the check itself into the load.
+        warn_rows = [r for r in _tail_events(self.store.events_path, limit=500)
+                     if r.get("type") == "pm.task_book_conclusion"]
+        if warn_rows:
+            last = warn_rows[-1]
+            add("pm-task-book", False,
+                f"{len(warn_rows)} conclusion(s) written under [PM:TASK] in the "
+                f"last 500 events; latest comment_id={last.get('comment_id')} "
+                f"at={last.get('at')} - use [PM] + verdict marker instead",
+                level="warn", label="pm-task-book")
+        else:
+            add("pm-task-book", True,
+                "no conclusion under [PM:TASK] in the last 500 events")
 
         index = self.store.load_index()
         residual = asg_mod.active_assignments(index)

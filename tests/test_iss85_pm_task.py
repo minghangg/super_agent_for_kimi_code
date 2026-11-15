@@ -316,5 +316,138 @@ class VerdictStillWorks(Base):
         self.assertEqual(self.logged("pm.task_book_conclusion"), [])
 
 
+class EscalationIsNotSwallowed(Base):
+    """P1-2: the same words must ring the same bell under either prefix.
+
+    Round 1 returned ``ignored`` for every ``[PM:TASK]`` line before the
+    escalation markers were read, so ``[PM:TASK] 任务书 [blocked] 需要决策``
+    was silent while the identical ``[PM]`` line rang. The parent commit rang
+    both. A prefix that only says "do not change state" must not also say
+    "do not ask for a person".
+    """
+
+    def test_a_blocked_task_book_rings_like_the_pm_prefix(self):
+        for body in ("[PM:TASK] 任务书 [blocked] 需要人决策",
+                     "[PM] 任务书 [blocked] 需要人决策"):
+            with self.subTest(body=body):
+                self.setUp()
+                try:
+                    engine = self.engine()
+                    self.source.add(9100, body)
+                    engine.run_once()
+                    state, reason = engine._triage(
+                        {"id": 9100, "author": "pm", "body": body})
+                    self.assertEqual(state, "pm_verdict", body)
+                    self.assertIn("escalation marker", reason, body)
+                    self.assertGreaterEqual(len(self.frames()), 1, body)
+                finally:
+                    self.tearDown()
+
+    def test_a_decision_task_book_rings_too(self):
+        engine = self.engine()
+        body = "[PM:TASK] 任务书 [decision] 需要选一个方案"
+        self.source.add(9100, body)
+        engine.run_once()
+        state, reason = engine._triage(
+            {"id": 9100, "author": "pm", "body": body})
+        self.assertEqual(state, "pm_verdict")
+        self.assertEqual(reason, "escalation marker '[decision]'")
+        payloads = self.frames()
+        self.assertGreaterEqual(len(payloads), 1)
+        self.assertTrue(any(p.get("exception") for p in payloads))
+
+    def test_the_escalation_does_not_become_a_state(self):
+        # The frame is an exception, not a verdict: the ledger record carries an
+        # empty state, exactly as the ``[PM]`` note path does, so the stall
+        # watchdog still sees the thread as unanswered (#75 round 2 behaviour).
+        engine = self.engine()
+        self.source.add(9100, "[PM:TASK] 任务书 [blocked] 需要人决策")
+        engine.run_once()
+        record = (engine.store.load_index().get("pm_verdicts") or {}).get(THREAD)
+        self.assertIsInstance(record, dict)
+        self.assertEqual(record.get("state"), "")
+
+    def test_a_quiet_task_book_still_leaves_no_frame(self):
+        # The regression the fix must not cause: recognising escalation markers
+        # must not wake anything for a task book that does not ask.
+        engine = self.engine()
+        self.source.add(9100, QUIET_BOOK)
+        engine.run_once()
+        self.assertEqual(self.frames(), [])
+        self.assertEqual(self.rows(engine), [])
+
+
+class PrefixRemainder(Base):
+    """P2-1/P2-4: ``rest`` comes from the line the regex actually matched."""
+
+    def test_the_remainder_ignores_leading_whitespace(self):
+        # The old slice was ``body[end:]``, but the match ran on the *stripped*
+        # line, so leading spaces shifted the index into the middle of the
+        # prefix (``SK] 可关单 #42``). The outcome never flipped; the text did.
+        engine = self.engine()
+        for body in ("    [PM:TASK] 可关单 #42", "  [PM:TASK] 可关单 #42",
+                     "[PM:TASK] 可关单 #42"):
+            with self.subTest(body=body):
+                self.setUp()
+                try:
+                    engine = self.engine()
+                    self.source.add(9100, body)
+                    engine.run_once()
+                    events = self.logged("pm.task_book_conclusion")
+                    self.assertEqual(len(events), 1, body)
+                finally:
+                    self.tearDown()
+
+    def test_a_prefix_alone_on_its_line_reads_the_title_below(self):
+        # The shape a real task book takes: the prefix on its own line, the
+        # title under it. Reading only the prefix line would make the guard
+        # blind to the very dispatch it exists to catch.
+        engine = self.engine()
+        self.source.add(9100, "[PM:TASK]\nISS-84 实现单：已关单的 route 必须终止重试")
+        engine.run_once()
+        self.assertEqual(len(self.logged("pm.task_book_conclusion")), 1)
+
+
+class DoctorSeesTheWarn(Base):
+    """P1-1: the event has a reader, and the reader is ``doctor``."""
+
+    def check(self, engine):
+        return next(c for c in engine.doctor()["checks"]
+                    if c["name"] == "pm-task-book")
+
+    def test_clean_when_no_event_exists(self):
+        engine = self.engine()
+        item = self.check(engine)
+        self.assertTrue(item["ok"], item)
+        self.assertEqual(item["level"], "ok")
+        self.assertEqual(item["label"], "ok")
+
+    def test_a_warn_event_shows_up(self):
+        engine = self.engine()
+        self.source.add(9100, "[PM:TASK] 可关单 #42")
+        engine.run_once()
+        item = self.check(engine)
+        self.assertFalse(item["ok"], item)
+        self.assertEqual(item["level"], "warn")
+        self.assertEqual(item["label"], "pm-task-book")
+        self.assertIn("9100", item["detail"])
+        self.assertIn("1 conclusion", item["detail"])
+
+    def test_old_events_outside_the_tail_window_do_not_leak(self):
+        # The check is a tail, not a full read: an event older than the window
+        # is out of scope by design, so the check reports ok rather than
+        # scanning the whole log.
+        engine = self.engine()
+        path = engine.store.events_path
+        lines = [json.dumps({"type": "pm.task_book_conclusion",
+                             "level": "warn", "comment_id": 1})]
+        lines += [json.dumps({"type": "comment.processed",
+                              "comment_id": 100000 + i}) for i in range(600)]
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        item = self.check(engine)
+        self.assertTrue(item["ok"], item)
+
+
 if __name__ == "__main__":
     unittest.main()
