@@ -22,10 +22,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from super_agent import config, github_source
+from super_agent import config, github_source, needs
 from super_agent.allowlist import ProjectAllowlist
 from super_agent.engine import Engine
-from super_agent.store import Store
+from super_agent.store import Store, action_id
 
 HOLD = "stage:on-hold"
 
@@ -199,13 +199,20 @@ class RouteRetry(unittest.TestCase):
                       project_allowlist=ProjectAllowlist(self.allow))
 
     def test_permanent_refusal_is_classified(self):
-        for reason in ("issue #9 not allowlisted (observe only; ...)",
-                       "creation_mode_forbidden: pm_created does not create sessions"):
-            self.assertTrue(Engine.is_permanent_refusal(reason), reason)
+        # Only the creation mode is permanent. The refusal *text* is never a
+        # criterion: the wording belongs to ``allowlist.check``, and the
+        # "issue #N" form is unreachable through ``_dispatch`` anyway
+        # (``_project_for`` answers None before ``check`` is asked), so the old
+        # prefix matched dead code and pinned a reader to a false belief.
+        self.assertEqual(Engine.PERMANENT_REFUSAL_PREFIXES,
+                         ("creation_mode_forbidden",))
+        self.assertTrue(Engine.is_permanent_refusal(
+            "creation_mode_forbidden: pm_created does not create sessions"))
         # A project/action refusal is *not* permanent: the allowlist is a file a
         # person edits, and the next round must be able to succeed once fixed
         # (tests/test_qa_route.py::test_refused_allowlist_is_retried_next_round).
-        for reason in ("project None not allowlisted (repository unlisted)",
+        for reason in ("issue #9 not allowlisted (observe only; ...)",
+                       "project None not allowlisted (repository unlisted)",
                        "action 'bind' not allowlisted",
                        "target session is archived",
                        "no supervisor sid: engine.supervisor_sid is empty",
@@ -243,12 +250,20 @@ class RouteRetry(unittest.TestCase):
         engine = self.engine(src)
         calls = {"n": 0}
 
-        def route(*args, **kwargs):
+        # ``_dispatch`` is stubbed, not ``_route_review``: the recording point
+        # under test lives in ``_route_review``, so replacing it would answer
+        # the question by not asking it. A permanent refusal still counts one
+        # round (``refusal_streak.rounds == 1``) - what stops the climb is
+        # ``permanent`` being set and the loop skipping it from then on, not an
+        # absent streak. The old ``assertNotIn("refusal_streak")`` was true
+        # only because the stub had removed the code that writes it.
+        def dispatch(*args, **kwargs):
             calls["n"] += 1
-            return {"dispatched": False,
-                    "reason": "issue #7 not allowlisted (observe only; ...)"}
+            return {"dispatched": False, "refused": True,
+                    "reason": "creation_mode_forbidden: pm_created does not "
+                              "create sessions"}
 
-        engine._route_review = route
+        engine._dispatch = dispatch
         engine._issue_state = lambda issue: "open"
         index = {"routes": {"route:owner/demo#7:3": {
                      "thread": "owner/demo#7", "comment_id": 3,
@@ -258,15 +273,34 @@ class RouteRetry(unittest.TestCase):
                      "role": "worker", "status": "working"}},
                  "issues": {}}
         engine._retry_routes(index)
-        self.assertTrue(index["routes"]["route:owner/demo#7:3"]["permanent"])
+        route_rec = index["routes"]["route:owner/demo#7:3"]
+        self.assertTrue(route_rec["permanent"])
         self.assertEqual(calls["n"], 1)
         rows_after = (index["issues"]["owner/demo#7"]["needs_person"])
-        self.assertEqual(len(rows_after), 1)
-        self.assertIn("route.refused_permanent", rows_after[0]["reason"])
+        # Two rows, both true and both about this comment: ``_route_review``
+        # records the failed send as ``route.undeliverable`` when it returns,
+        # and the retry pass adds ``route.refused_permanent`` for the reason
+        # that will not change. Collapsing them would lose the difference
+        # between "could not send" and "will never send".
+        permanent_rows = [r for r in rows_after
+                          if str(r.get("reason") or "").startswith(
+                              "route.refused_permanent")]
+        self.assertEqual(len(permanent_rows), 1)
+        self.assertIn("creation_mode_forbidden", permanent_rows[0]["reason"])
         # Second round: the permanent flag keeps it out of the loop entirely.
         engine._retry_routes(index)
         self.assertEqual(calls["n"], 1)
-        self.assertEqual(len(index["issues"]["owner/demo#7"]["needs_person"]), 1)
+        self.assertEqual(len(index["issues"]["owner/demo#7"]["needs_person"]), 2)
+        # Three fail-closed assertions: the permanent path is a refusal, so it
+        # leaves the route failed, writes no attempt, and injects no frame.
+        self.assertFalse(route_rec["ok"])
+        self.assertEqual(engine.store.action_attempted(
+            action_id("route:owner/demo#7:3", "bus_inject", "3")), 0)
+        self.assertIsNone(engine.bus, "the refusal must not become a frame")
+        # A permanent refusal counts one round and stops there: the loop never
+        # reaches it again, so the alert threshold is out of reach.
+        self.assertLess(route_rec["refusal_streak"]["rounds"], 3,
+                        "a permanent refusal never climbs to the alert")
 
 
 class ConfigKey(unittest.TestCase):
@@ -286,3 +320,349 @@ class ConfigKey(unittest.TestCase):
         data = json.loads(sample.read_text(encoding="utf-8"))
         self.assertEqual(data["github"]["on_hold_labels"],
                          config.DEFAULTS["github"]["on_hold_labels"])
+
+
+class Source:
+    """Enough of a source for ``run_round``; ``page`` is the live list."""
+
+    def __init__(self, page):
+        self.page = list(page)
+
+    def issues(self, limit=20):
+        return list(self.page)
+
+    def title(self, issue):
+        return "probe"
+
+    def comments(self, issue):
+        return []
+
+    def paged(self, issue, *, since_id=0, max_pages=10):
+        return []
+
+    def issue_state(self, issue):
+        return "open"
+
+
+class RefusedRetryAlert(unittest.TestCase):
+    """必修 A/B: a refusal that will not clear becomes visible, once."""
+
+    THREAD = "owner/demo#7"
+    KEY = "route:owner/demo#7:3"
+
+    class Bus:
+        def __init__(self):
+            self.injected = []
+
+        def healthz(self):
+            return {"ok": True, "ready": True, "connected": True, "seq": 1}
+
+        def inject(self, event_type, payload):
+            self.injected.append((event_type, payload))
+            return {"ok": True, "seq": len(self.injected)}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = self.root / "state"
+        self.allow = self.root / "allowlist.json"
+        self.allow.write_text(json.dumps(GOOD), encoding="utf-8")
+        self.events = self.root / "sessions" / "events.jsonl"
+        self.events.parent.mkdir(parents=True, exist_ok=True)
+        self.events.write_text("", encoding="utf-8")
+        self.bus = self.Bus()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def engine(self):
+        cfg = config.load(None, {"mode": "assist",
+                                 "github": {"source": "none", "repo": "owner/demo"},
+                                 "engine": {"archived_crosscheck": False,
+                                            "session_events_path": str(self.events)}})
+        engine = Engine(cfg, Store(self.state), github_source.NullSource(),
+                        self.bus, project_allowlist=ProjectAllowlist(self.allow))
+        engine._issue_state = lambda issue: "open"
+        return engine
+
+    def seed(self, engine):
+        index = engine.store.load_index()
+        index.setdefault("routes", {})[self.KEY] = {
+            "thread": self.THREAD, "comment_id": 3, "verdict": "pass",
+            "action_id": "seed", "ok": False}
+        index.setdefault("assignments", {})["asg_7_worker_1"] = {
+            "thread": self.THREAD, "issue": 7, "role": "worker",
+            "status": "working", "sid": "session_w1"}
+        engine.store.save_index(index)
+
+    def alerts(self, engine):
+        rec = (engine.store.load_index().get("issues") or {}).get(self.THREAD) or {}
+        return [r for r in rec.get("needs_person") or []
+                if str(r.get("reason") or "").startswith("route.refused_retryable")]
+
+    def warned(self, engine):
+        path = self.state / "events.jsonl"
+        if not path.is_file():
+            return []
+        rows = [json.loads(x) for x in
+                path.read_text("utf-8").splitlines() if x.strip()]
+        return [r for r in rows if r["type"] == "route.refused_retryable"]
+
+    def test_the_real_refusal_text_counts_three_rounds_and_alerts_once(self):
+        engine = self.engine()
+        engine.source = Source([])
+        self.seed(engine)
+        seen = []
+        original = engine._route_review
+
+        def spy(*args, **kwargs):
+            out = original(*args, **kwargs)
+            seen.append(str(out.get("reason") or ""))
+            return out
+
+        engine._route_review = spy
+        for _ in range(3):
+            engine.run_once()
+        # Real refusal: no stub, no hand-written text. Issue 7 is in no
+        # project's list, so ``_project_for`` answers None and the wording is
+        # the production one.
+        self.assertEqual(len(seen), 3, seen)
+        self.assertTrue(all("not allowlisted" in r for r in seen), seen)
+        self.assertEqual(self.bus.injected, [], "the alert is not a frame")
+        alerts = self.alerts(engine)
+        self.assertEqual(len(alerts), 1, alerts)
+        self.assertTrue(alerts[0]["reason"].startswith(
+            "route.refused_retryable[user]:"))
+        # The row names what was observed, not a guessed cause: three of the
+        # four refusal shapes have nothing to do with the allowlist.
+        self.assertNotIn("allowlist", alerts[0]["reason"])
+        self.assertIn("cid 3", alerts[0]["reason"])
+        self.assertIn("route.decided", alerts[0]["reason"])
+        warned = self.warned(engine)
+        self.assertEqual(len(warned), 1)
+        # The refusal's own text rides on the event, so a reader can tell the
+        # four shapes apart without opening ``route.decided``.
+        self.assertIn("not allowlisted", warned[0]["reason"])
+        route = engine.store.load_index()["routes"][self.KEY]
+        self.assertEqual(route["refusal_streak"]["rounds"], 3)
+        # A fourth refused round adds one count, not a second alert.
+        engine.run_once()
+        self.assertEqual(len(self.alerts(engine)), 1)
+        self.assertEqual(len(self.warned(engine)), 1)
+        self.assertEqual(
+            engine.store.load_index()["routes"][self.KEY]
+            ["refusal_streak"]["rounds"], 4)
+
+    def test_the_issue_going_live_in_github_delivers_and_quiets_the_streak(self):
+        # The healthy path is not "edit the overlay": ``_sync_allowlist_issues``
+        # rewrites ``issues`` from the source every round, so a hand edit is
+        # undone before the retry reads it. What heals a refusal is the issue
+        # becoming live again (the on-hold label removed), which the sync then
+        # writes - the shape #75 hit.
+        engine = self.engine()
+        engine.source = Source([])
+        self.seed(engine)
+        for _ in range(3):
+            engine.run_once()
+        self.assertEqual(self.bus.injected, [])
+        self.assertEqual(len(self.alerts(engine)), 1)
+        engine.source.page = [7]
+        calls = {"n": 0}
+        original = engine._route_review
+
+        def spy(*args, **kwargs):
+            calls["n"] += 1
+            return original(*args, **kwargs)
+
+        engine._route_review = spy
+        engine.run_once()
+        self.assertEqual([e for e, _ in self.bus.injected],
+                         ["event.agent.project_pm"])
+        self.assertEqual(calls["n"], 1)
+        route = engine.store.load_index()["routes"][self.KEY]
+        self.assertTrue(route["ok"])
+        self.assertEqual(route["refusal_streak"]["rounds"], 0)
+        stamp = route["refusal_streak"]["alerted_at"]
+        self.assertEqual(len(self.alerts(engine)), 1, "one alert, ever")
+        # Ten more rounds: ok=True keeps the retry pass out, so no call and no
+        # second alert, and the alert moment does not move.
+        for _ in range(10):
+            engine.run_once()
+        self.assertEqual(calls["n"], 1, "a delivered route is never retried")
+        self.assertEqual(len(self.bus.injected), 1)
+        self.assertEqual(len(self.alerts(engine)), 1)
+        self.assertEqual(
+            engine.store.load_index()["routes"][self.KEY]
+            ["refusal_streak"]["alerted_at"], stamp)
+
+    def test_a_restart_does_not_re_alert(self):
+        engine = self.engine()
+        engine.source = Source([])
+        self.seed(engine)
+        for _ in range(10):
+            engine.run_once()
+        self.assertEqual(len(self.alerts(engine)), 1)
+        self.assertEqual(len(self.warned(engine)), 1)
+        engine2 = self.engine()
+        engine2.source = Source([])
+        for _ in range(3):
+            engine2.run_once()
+        self.assertEqual(len(self.alerts(engine2)), 1, "the streak survives")
+        self.assertEqual(len(self.warned(engine2)), 1, "and so does the alert")
+        rows = engine2.store.load_index()["issues"][self.THREAD]["needs_person"]
+        mine = [r for r in rows if needs.cid_of(r) == 3]
+        self.assertEqual(
+            len([r for r in mine
+                 if str(r.get("reason") or "").startswith("route.refused_retryable")]),
+            1, "two alert rows for one verdict is the shape this forbids")
+        self.assertEqual(
+            [r for r in mine
+             if str(r.get("reason") or "").startswith("dispatch.refused")], [])
+
+    def test_a_suppressed_dispatch_is_not_a_refusal(self):
+        engine = self.engine()
+        engine.source = Source([])
+        self.seed(engine)
+        engine.dispatch_enabled = False
+        for _ in range(5):
+            engine.run_once()
+        self.assertEqual(self.alerts(engine), [])
+        self.assertEqual(self.bus.injected, [])
+        route = engine.store.load_index()["routes"][self.KEY]
+        self.assertNotIn("refusal_streak", route,
+                         "dispatch disabled is not a refusal")
+        # The other shape without ``refused``: the record never reaches
+        # ``_route_review``'s dispatch at all, because an attempt already
+        # exists. Neither counts nor clears - the second half matters, since a
+        # suppress-and-reset pair would let a stuck verdict alert forever.
+        engine.dispatch_enabled = True
+        engine._dispatch = lambda *a, **k: {
+            "dispatched": False, "refused": True,
+            "reason": "project None not allowlisted (repository unlisted)"}
+        index = engine.store.load_index()
+        seed_route = index["routes"][self.KEY]
+        index["meta"]["run_count"] = 50
+        engine._route_review(index, self.THREAD, 7, {"id": 3, "body": "",
+                                                     "author": ""},
+                             {"verdict": "pass"}, log_unverified=False)
+        self.assertEqual(seed_route["refusal_streak"]["rounds"], 1)
+        index["meta"]["run_count"] = 51
+        engine.store.begin_action(
+            action_id(self.KEY, "bus_inject", "3"), verb="bus_inject",
+            kind="bus_inject", assignment_id=self.KEY, input_ref="3")
+        engine._route_review(index, self.THREAD, 7, {"id": 3, "body": "",
+                                                     "author": ""},
+                             {"verdict": "pass"}, log_unverified=False)
+        self.assertEqual(seed_route["refusal_streak"]["rounds"], 1,
+                         "an already-attempted record neither counts nor clears")
+
+    def test_a_closed_issue_stays_silent_and_keeps_the_streak(self):
+        engine = self.engine()
+        engine.source = Source([])
+        self.seed(engine)
+        engine._issue_state = lambda issue: "closed"
+        for _ in range(5):
+            engine.run_once()
+        route = engine.store.load_index()["routes"][self.KEY]
+        self.assertIn("skipped_closed_at", route)
+        self.assertNotIn("refusal_streak", route)
+        self.assertEqual(self.bus.injected, [])
+        self.assertEqual(self.alerts(engine), [])
+
+    def test_two_entries_in_one_round_count_once(self):
+        # ``_route_review`` is reachable twice per round: inline from
+        # ``_on_review`` and again from the retry pass at the round's tail. The
+        # round token makes the second entry a no-op.
+        engine = self.engine()
+        index = engine.store.load_index()
+        route = {"thread": self.THREAD, "comment_id": 3, "verdict": "pass",
+                 "action_id": "seed", "ok": False}
+        index["routes"] = {self.KEY: route}
+        index["meta"]["run_count"] = 41
+        engine._dispatch = lambda *a, **k: {
+            "dispatched": False, "refused": True,
+            "reason": "project None not allowlisted (repository unlisted)"}
+        comment = {"id": 3, "body": "", "author": ""}
+        for _ in range(2):
+            engine._route_review(index, self.THREAD, 7, comment,
+                                 {"verdict": "pass"}, log_unverified=False)
+        self.assertEqual(route["refusal_streak"]["rounds"], 1,
+                         "one round is one count, not one per call")
+        index["meta"]["run_count"] = 42
+        engine._route_review(index, self.THREAD, 7, comment,
+                             {"verdict": "pass"}, log_unverified=False)
+        self.assertEqual(route["refusal_streak"]["rounds"], 2,
+                         "the next round counts again")
+
+
+class PermanentStillPermanent(unittest.TestCase):
+    """反例 3: the creation mode stays permanent and never climbs to an alert."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = self.root / "state"
+        self.allow = self.root / "allowlist.json"
+        self.allow.write_text(json.dumps(GOOD), encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def engine(self):
+        cfg = config.load(None, {"mode": "assist",
+                                 "github": {"source": "none", "repo": "owner/demo"},
+                                 "engine": {"archived_crosscheck": False}})
+        engine = Engine(cfg, Store(self.state), github_source.NullSource(), None,
+                        project_allowlist=ProjectAllowlist(self.allow))
+        engine._issue_state = lambda issue: "open"
+        return engine
+
+    def test_permanent_refusal_is_recorded_once_and_not_retried(self):
+        engine = self.engine()
+        calls = {"n": 0}
+
+        def dispatch(*args, **kwargs):
+            calls["n"] += 1
+            return {"dispatched": False, "refused": True,
+                    "reason": "creation_mode_forbidden: pm_created does not "
+                              "create sessions"}
+
+        engine._dispatch = dispatch
+        index = {"routes": {"route:owner/demo#7:3": {
+                     "thread": "owner/demo#7", "comment_id": 3,
+                     "verdict": "pass", "action_id": "z", "ok": False}},
+                 "assignments": {"asg_7_worker_1": {
+                     "thread": "owner/demo#7", "issue": 7,
+                     "role": "worker", "status": "working"}},
+                 "issues": {}}
+        engine._retry_routes(index)
+        route_rec = index["routes"]["route:owner/demo#7:3"]
+        self.assertTrue(route_rec["permanent"])
+        self.assertEqual(calls["n"], 1)
+        rows_after = (index["issues"]["owner/demo#7"]["needs_person"])
+        permanent_rows = [r for r in rows_after
+                          if str(r.get("reason") or "").startswith(
+                              "route.refused_permanent")]
+        self.assertEqual(len(permanent_rows), 1)
+        engine._retry_routes(index)
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(len(index["issues"]["owner/demo#7"]["needs_person"]), 2)
+        self.assertFalse(route_rec["ok"])
+        self.assertEqual(engine.store.action_attempted(
+            action_id("route:owner/demo#7:3", "bus_inject", "3")), 0)
+        self.assertIsNone(engine.bus, "the refusal must not become a frame")
+        self.assertLess(route_rec["refusal_streak"]["rounds"], 3,
+                        "a permanent refusal never climbs to the alert")
+
+    def test_permanent_refusal_is_classified(self):
+        self.assertEqual(Engine.PERMANENT_REFUSAL_PREFIXES,
+                         ("creation_mode_forbidden",))
+        self.assertTrue(Engine.is_permanent_refusal(
+            "creation_mode_forbidden: pm_created does not create sessions"))
+        for reason in ("issue #9 not allowlisted (observe only; ...)",
+                       "project None not allowlisted (repository unlisted)",
+                       "action 'bind' not allowlisted",
+                       "target session is archived",
+                       "no supervisor sid: engine.supervisor_sid is empty",
+                       ""):
+            self.assertFalse(Engine.is_permanent_refusal(reason), reason)

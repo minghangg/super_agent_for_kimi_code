@@ -718,6 +718,13 @@ class Engine:
         route["ok"] = bool(result.get("ok")) if result.get("dispatched") else False
         route["refused"] = bool(result.get("refused"))
         route["action_id"] = result.get("action_id") or base
+        # The one place a round learns whether this route was refused. Reading
+        # the returned flag, never the wording, keeps the count honest when the
+        # refusal text changes; a delivered dispatch ends the run.
+        if result.get("dispatched"):
+            self._clear_route_refusal(route)
+        elif result.get("refused") is True:
+            self._count_route_refusal(index, route, thread, cid, result)
         self.store.log_event({
             "type": "route.decided", "at": _now(), "thread": thread,
             "comment_id": cid, "to": "project_pm", "project": target["project"],
@@ -953,26 +960,103 @@ class Engine:
             })
         return cleared
 
-    # A refusal that names the *issue* itself is permanent for that comment: an
-    # issue that is not allowlisted will not become allowlisted because this
-    # comment is retried. A project/action refusal is deliberately NOT in this
-    # set: the allowlist is a file a person edits, so the very next round may
-    # legitimately succeed - the retry is how a fixed allowlist takes effect
-    # (tests/test_qa_route.py::test_refused_allowlist_is_retried_next_round).
-    PERMANENT_REFUSAL_PREFIXES = ("issue #", "creation_mode_forbidden")
+    # A refusal is permanent only when no retry can ever succeed: the creation
+    # mode forbids the session, so asking again is asking the same question.
+    # Every other refusal is transient and the next round must be able to win -
+    # an issue that is not listed yet becomes listed on its next sync, a
+    # project that is not listed yet becomes listed on a one-line edit, a
+    # ``target session is archived`` record can be replaced.
+    #
+    # The wording is not the criterion. ``allowlist.check`` owns it and may
+    # rephrase without changing what happened, and ``issue #N not allowlisted``
+    # is unreachable through ``_dispatch`` anyway: ``_project_for`` answers
+    # ``None`` before ``check`` is asked, so that prefix only ever matched dead
+    # code. "Not in this table" therefore means "transient", not "unknown".
+    PERMANENT_REFUSAL_PREFIXES = ("creation_mode_forbidden",)
+
+    # How many refused rounds in a row earn one visible alert, and the event
+    # type that alert carries. Three matches the E61 liveness window, so a
+    # person hears about a stuck verdict on the same rhythm they hear about a
+    # stuck session.
+    REFUSED_RETRY_ROUNDS = 3
+    REFUSED_RETRY_ROW = "route.refused_retryable"
 
     @classmethod
     def is_permanent_refusal(cls, reason: str) -> bool:
         """Is this refusal permanent for *this comment*, whatever happens next?
 
-        Only two answers qualify: the issue itself is not allowlisted, and the
-        creation mode forbids session creation. Everything else - a project
-        that is not listed yet, an action that is not listed yet, a network
-        error, ``target session is archived`` - can clear on its own or by a
-        one-line edit, so those keep retrying.
+        Only one answer qualifies: the creation mode forbids session creation.
+        Everything else - an issue or a project that is not listed yet, an
+        action that is not listed yet, a network error, ``target session is
+        archived`` - can clear on its own or by a one-line edit, so those keep
+        retrying. The text is read as a prefix only because that is the shape
+        the engine itself emits for the creation mode; no other wording is
+        load-bearing.
         """
         text = str(reason or "").strip()
         return any(text.startswith(p) for p in cls.PERMANENT_REFUSAL_PREFIXES)
+
+    @staticmethod
+    def _round_token(index: dict) -> int:
+        """The round a write belongs to.
+
+        ``run_count`` is bumped at the end of the round, after the retry pass,
+        so every write inside one round (the inline triage call and the retry
+        call) reads the same value. A crash before ``save_index`` leaves the
+        token unchanged, which merges that refusal into the next round instead
+        of counting it twice - late, never early.
+        """
+        return int((index.get("meta") or {}).get("run_count") or 0)
+
+    def _count_route_refusal(self, index: dict, route: dict, thread: str,
+                             cid, result: dict | None = None) -> None:
+        """One increment per round for a route whose dispatch was refused.
+
+        The criterion is the returned ``refused`` flag, never the reason text:
+        the wording belongs to ``allowlist.check`` and may change without
+        changing what happened. Nothing here is kept in memory - the streak
+        lives in the route record so a restart resumes it.
+
+        The alert says what was observed (a run of refusals, this comment) and
+        carries the refusal's own reason for evidence. It deliberately does not
+        guess a cause: three of the four refusal shapes are unrelated to the
+        allowlist, and an alert that names the wrong file is worse than none.
+        """
+        streak = route.get("refusal_streak")
+        if not isinstance(streak, dict):
+            streak = route["refusal_streak"] = {"rounds": 0, "last_round": None}
+        token = self._round_token(index)
+        if streak.get("last_round") == token:
+            return
+        streak["last_round"] = token
+        streak["rounds"] = int(streak.get("rounds") or 0) + 1
+        if streak["rounds"] < self.REFUSED_RETRY_ROUNDS:
+            return
+        if streak.get("alerted_at"):
+            return
+        streak["alerted_at"] = _now()
+        reason = (f"{self.REFUSED_RETRY_ROW}[user]: verdict on cid {cid} of "
+                  f"{thread} was refused {streak['rounds']} rounds in a row; "
+                  "see route.decided for what each round answered")
+        self._append_needs_person(index, thread, {
+            "comment_id": cid, "reason": reason, "at": _now()})
+        self.store.log_event({
+            "type": self.REFUSED_RETRY_ROW, "at": _now(), "thread": thread,
+            "comment_id": cid, "rounds": streak["rounds"],
+            "reason": str((result or {}).get("reason") or ""),
+            "level": "warn", "consumers": ["doctor"],
+        })
+
+    @staticmethod
+    def _clear_route_refusal(route: dict) -> None:
+        """A landed dispatch ends the streak.
+
+        ``alerted_at`` stays as the one-shot proof, so the same comment can
+        never alert twice even if it is refused again afterwards.
+        """
+        streak = route.get("refusal_streak")
+        if isinstance(streak, dict):
+            streak["rounds"] = 0
 
     def _retry_routes(self, index: dict) -> int:
         """Re-send verdicts a refused/suppressed dispatch never delivered.
@@ -983,15 +1067,24 @@ class Engine:
 
         Two exceptions, both permanent by nature:
 
-        * a **permanent refusal** (the issue is not allowlisted, or the
-          creation mode forbids it) is recorded once as
-          ``route.refused_permanent`` and never retried again;
+        * a **permanent refusal** (the creation mode forbids the session) is
+          recorded once as ``route.refused_permanent`` and never retried again;
+          every other refusal keeps retrying and is counted per round
+          (:meth:`_count_route_refusal`), so a stuck verdict becomes visible
+          without the retry ever giving up on it;
         * a thread whose issue is **closed** is skipped - and only ``closed``,
           never ``unknown``: a broken probe must not silently stop every
           delivery in the engine.
         """
         sent = 0
         for key, route in sorted((index.get("routes") or {}).items()):
+            # ``routes`` is a plain dict in the index, and the index is a file a
+            # person may edit, an older version may have written, or a crash may
+            # have truncated. ``run_round`` calls this outside any try, so one
+            # malformed record would take down the retry passes, the archiving
+            # and both saves of the round. Skipping it keeps the round alive.
+            if not isinstance(route, dict):
+                continue
             if route.get("ok"):
                 continue
             if route.get("permanent"):
