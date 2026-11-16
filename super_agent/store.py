@@ -148,7 +148,18 @@ class CursorRefused(RuntimeError):
     """
 
 
-def check_migration(root: Path) -> None:
+class IndexRefused(RuntimeError):
+    """index.json cannot be read, so no write-back may happen this process.
+
+    Raised by :meth:`Store.save_index` on every write path - the round's two
+    saves, ``replay``, ``unblock``, ``resolve`` and the exit flush - so a
+    single gate covers all of them. Writing an empty index over the file that
+    could not be read loses ``assignments`` and ``release_frames``, neither of
+    which the event log can rebuild.
+    """
+
+
+def check_migration(root: Path, *, accept_empty_index: bool = False) -> None:
     """Refuse to start on a half-finished migration.
 
     Two criteria, neither of which counts files:
@@ -159,6 +170,11 @@ def check_migration(root: Path) -> None:
     ``events.jsonl``/``outbox.jsonl`` are deliberately absent: they are
     append-only JSONL, a torn last line is tolerated by the readers, and
     refusing them would reject a normal round.
+
+    ``accept_empty_index`` exempts ``index.json`` alone, and only for the
+    explicit ``--accept-empty-index``: a corrupt index refuses the start, so the
+    flag that says "rebuild from empty" could never be reached on the restart
+    that needs it. Every other strict file is checked either way.
     """
     marker = root / MIGRATION_MARKER
     if marker.is_file():
@@ -166,6 +182,8 @@ def check_migration(root: Path) -> None:
             f"迁移未完成：{marker} 存在。先跑 tools/migrate_state_to_data.py，"
             "或确认无需迁移后手工删除该标记。")
     for name in STRICT_JSON:
+        if accept_empty_index and name == "index.json":
+            continue
         path = root / name
         if not path.is_file():
             continue
@@ -199,7 +217,8 @@ def choose_root(data: str | Path, legacy: str | Path = "state") -> tuple[Path, s
 
 class Store:
     def __init__(self, root: str | Path, *, max_event_lines: int = 10_000,
-                 max_outbox_lines: int = 5_000, outbox_stale_s: float = 300):
+                 max_outbox_lines: int = 5_000, outbox_stale_s: float = 300,
+                 accept_empty_index: bool = False):
         self.root = Path(root)
         self.max_event_lines = max_event_lines
         self.max_outbox_lines = max_outbox_lines
@@ -213,21 +232,64 @@ class Store:
         self.heartbeat_path = self.root / "run_heartbeat.json"
         self.health_path = self.root / "health.json"
         self.pid_path = self.root / "engine.pid"
-        check_migration(self.root)
+        check_migration(self.root, accept_empty_index=accept_empty_index)
         self.root.mkdir(parents=True, exist_ok=True)
         self._lines = {
             self.events_path: _count_lines(self.events_path),
             self.outbox_path: _count_lines(self.outbox_path),
         }
+        # Set by ``load_index`` when the file exists but cannot be trusted. Every
+        # write-back path checks it through ``save_index``, so the unreadable
+        # file is never replaced by the empty skeleton the reader fell back to.
+        self._index_error = ""
+        self._index_quarantined = ""
+        # ``--accept-empty-index``: a person declared the loss acceptable, so the
+        # gate below reopens. Never a default (see ``cli._index_options``).
+        self._accept_empty = bool(accept_empty_index)
 
     # ------------------------------------------------------------------ index
+    def accept_empty_index(self) -> None:
+        """Allow the write-back even though ``index.json`` cannot be read.
+
+        Only ``--accept-empty-index`` calls this. It does not hide the fault:
+        the unreadable file is still moved aside, and the round still logs
+        ``index.accepted_empty``. It only reopens ``save_index``, because a
+        person declared the loss acceptable and the rebuild has to start
+        somewhere. See ``cli._index_options`` for what is lost.
+        """
+        self._accept_empty = True
+
     def load_index(self) -> dict:
+        """The index, or the empty skeleton when it cannot be read.
+
+        Tolerant on purpose, like ``load_cursor``: ``status``, ``doctor`` and
+        ``brief`` must be able to *report* a fault instead of dying on it. What
+        changes is that "could not read" is no longer indistinguishable from
+        "empty" - the instance remembers it in ``_index_error`` and
+        :meth:`save_index` refuses every write-back while it is set.
+
+        A missing file is a fresh root, an object is fine, and anything else is
+        a fault whose bytes are moved aside (see :meth:`_quarantine_index`).
+        """
         try:
             data = json.loads(self.index_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except FileNotFoundError:
+            # A fresh root, and also the state every load after a quarantine:
+            # the marker is left exactly as it was, so the write-back stays
+            # refused until a real file is read successfully.
+            if not self._index_error:
+                self._index_error = self._kept_copy_problem()
+            return {"version": 1, "meta": {}, "issues": {}, "assignments": {}}
+        except (OSError, ValueError) as exc:
+            self._index_error = f"{type(exc).__name__}: {exc}"
+            self._quarantine_index(self._index_error)
             return {"version": 1, "meta": {}, "issues": {}, "assignments": {}}
         if not isinstance(data, dict):
+            self._index_error = (f"top-level is {type(data).__name__}, "
+                                 "not an object")
+            self._quarantine_index(self._index_error)
             return {"version": 1, "meta": {}, "issues": {}, "assignments": {}}
+        self._index_error = ""
         data.setdefault("version", 1)
         data.setdefault("meta", {})
         data.setdefault("issues", {})
@@ -235,8 +297,99 @@ class Store:
         return data
 
     def save_index(self, data: dict) -> None:
+        """Write the index back, unless it could not be read this process.
+
+        The gate is here, not in each caller: six paths write this file, and
+        one missed path would overwrite the unreadable file with the empty
+        value the reader fell back to.
+        """
+        if self._index_error and self._accept_empty:
+            # The loss was declared acceptable: record it, then let this one
+            # write through. What lands is a fresh skeleton, not the old bytes.
+            self._accept_empty = False
+            self.log_event({"type": "index.accepted_empty", "at": _iso(time.time()),
+                            "error": self._index_error,
+                            "quarantined": self._index_quarantined})
+            self._index_error = ""
+        if self._index_error:
+            raise IndexRefused(
+                f"refusing to write {self.index_path}: it was unreadable this "
+                f"process ({self._index_error}); kept copy: "
+                f"{self._index_quarantined or 'none'}")
         atomic_write_text(self.index_path,
                           json.dumps(data, ensure_ascii=False, indent=1, sort_keys=True) + "\n")
+
+    @property
+    def index_quarantined(self) -> str:
+        """Name of the file the unreadable index was moved to, or ``""``."""
+        return self._index_quarantined
+
+    @property
+    def index_unreadable(self) -> str:
+        """Why this process must not write ``index.json`` back, or ``""``.
+
+        Unlike :meth:`index_problem` this reads the stored marker: after a
+        quarantine the path is empty, so a fresh probe says "fresh root".
+        """
+        return self._index_error
+
+    @property
+    def index_writable(self) -> bool:
+        """True when a write-back may happen now (live flag, not a cached one)."""
+        return not self._index_error or self._accept_empty
+
+    def _kept_copy_problem(self) -> str:
+        """Why a missing ``index.json`` is still a fault, or ``""``.
+
+        Quarantine *moves* the file, so the next process sees the fresh-root
+        case and would write an empty index over what the kept copy holds.
+        """
+        kept = sorted(self.index_path.parent.glob(self.index_path.name + ".corrupt.*"))
+        if not kept:
+            return ""
+        return (f"index.json is missing but {kept[-1].name} is kept beside it: "
+                "a previous process moved an unreadable index aside. Restore "
+                "that copy (or a backup) as index.json, or accept the empty "
+                "index explicitly")
+
+    def index_problem(self) -> str:
+        """Why ``index.json`` cannot be trusted right now, or ``""`` when it can.
+
+        Pure read: parses once, never writes, never quarantines. Mirrors
+        ``cursor_problem`` so the two faults are reported the same way.
+        """
+        path = self.index_path
+        if not path.is_file():
+            return self._kept_copy_problem()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return f"{type(exc).__name__}: {exc}"
+        if not isinstance(data, dict):
+            return f"top-level is {type(data).__name__}, not an object"
+        return ""
+
+    def _quarantine_index(self, why: str) -> str:
+        """Move the unreadable ``index.json`` aside; return the kept name.
+
+        Not the ``decide_watch`` behaviour: that file is advisory, this one
+        holds the assignments and the release ledger. A rename that fails is
+        therefore a hard refusal - the error grows and every write stays
+        refused - never "continue with an empty state".
+
+        Once per process, so one fault leaves one ``.corrupt.*`` file.
+        """
+        if self._index_quarantined:
+            return self._index_quarantined
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        target = self.index_path.with_name(f"{self.index_path.name}.corrupt.{stamp}")
+        try:
+            os.replace(self.index_path, target)
+        except OSError as exc:
+            self._index_error = f"{why}; quarantine failed: {exc}"
+            return ""
+        self._index_quarantined = target.name
+        return target.name
 
     # ----------------------------------------------------------------- events
     def _rotate(self, path: Path) -> None:

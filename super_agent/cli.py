@@ -121,7 +121,9 @@ def _build(args) -> tuple[dict, Store]:
     store = Store(root,
                   max_event_lines=int(store_cfg.get("max_event_lines") or 10_000),
                   max_outbox_lines=int(store_cfg.get("max_outbox_lines") or 5_000),
-                  outbox_stale_s=float(store_cfg.get("outbox_stale_s") or 300))
+                  outbox_stale_s=float(store_cfg.get("outbox_stale_s") or 300),
+                  accept_empty_index=bool(getattr(args, "accept_empty_index", False)))
+    _apply_index_options(args, store)
     return cfg, store
 
 
@@ -204,6 +206,34 @@ def _cursor_refusal(exc, store) -> int:
     return 4
 
 
+def _index_options(parser: argparse.ArgumentParser, *, suppress: bool = False) -> None:
+    """``--accept-empty-index``: the explicit answer to :class:`IndexRefused`.
+
+    置位此开关表示接受索引为空并继续。注意：release_frames 在事件日志里没有任何证据可重建，走到这一步它永久丢失；人工恢复后，此前已发的 release 会重投一次。
+
+    A flag, never a setting, for the same reason as ``--allow-empty-cursor``:
+    a default would quietly re-enable the silent empty write-back. ``suppress``
+    stops a subparser's default from clobbering a value given before it.
+    """
+    parser.add_argument(
+        "--accept-empty-index", action="store_true",
+        default=argparse.SUPPRESS if suppress else False,
+        help="write the index back anyway when index.json cannot be read. "
+             "置位此开关表示接受索引为空并继续。注意：release_frames 在事件日志里"
+             "没有任何证据可重建，走到这一步它永久丢失；人工恢复后，此前已发的 "
+             "release 会重投一次。")
+
+
+def _apply_index_options(args, store: Store) -> None:
+    """Open the write-back gate when the flag was given, and say so."""
+    if not getattr(args, "accept_empty_index", False):
+        return
+    if store.index_unreadable:
+        print(f"accepted empty index: {store.index_unreadable} "
+              f"(kept copy: {store.index_quarantined or 'none'})", file=sys.stderr)
+    store.accept_empty_index()
+
+
 def _common_options(parser: argparse.ArgumentParser) -> None:
     """Flags shared by the commands that can start a round.
 
@@ -215,6 +245,7 @@ def _common_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow-empty-cursor", action="store_true",
                         help="run even when cursor.json cannot be trusted, "
                              "accepting a full re-scan of every comment")
+    _index_options(parser)
 
 
 def _refuse_bad_cursor(args, cfg: dict, store) -> int | None:
@@ -294,10 +325,18 @@ def _restore_handlers(previous: dict) -> None:
 
 
 def _flush_state(store: Store) -> None:
-    """Re-persist cursor and index so stopping between rounds leaves valid files."""
+    """Re-persist cursor and index so stopping between rounds leaves valid files.
+
+    ``IndexRefused`` is the point of this guard: ``save_index(load_index())``
+    is the second path that writes an empty index over a file that could not be
+    read. A Ctrl-C during the fault must leave the bytes alone, so the refusal
+    is reported and the stop continues.
+    """
     try:
         store.save_cursor(store.load_cursor())
         store.save_index(store.load_index())
+    except store_mod.IndexRefused as exc:
+        print(f"warning: index not flushed on exit: {exc}", file=sys.stderr)
     except OSError as exc:
         print(f"warning: could not persist state on exit: {exc}", file=sys.stderr)
 
@@ -985,6 +1024,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_unblock = sub.add_parser("unblock", help="move one blocked assignment back to working")
     _add_common(p_unblock, suppress=True)
+    _index_options(p_unblock, suppress=True)
     p_unblock.add_argument("--id", required=True,
                            help="assignment id (asg_<issue>_<role>_<n>)")
     p_unblock.add_argument("--reason", default="",
@@ -994,6 +1034,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_resolve = sub.add_parser(
         "resolve", help="dismiss one needs_person entry (exit 2 = some keys not written)")
     _add_common(p_resolve, suppress=True)
+    _index_options(p_resolve, suppress=True)
     p_resolve.add_argument("--issue", required=True,
                            help="owner/name#12, #12, or 12 (every key form is "
                                 "resolved, legacy and qualified alike)")
@@ -1013,6 +1054,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_replay = sub.add_parser("replay", help="rebuild one issue's index entry")
     _add_common(p_replay, suppress=True)
+    _index_options(p_replay, suppress=True)
     p_replay.add_argument("--issue", type=int, default=None,
                           help="issue number to rebuild (omit with --at/--sessions)")
     p_replay.add_argument("--at", default=None,
@@ -1082,7 +1124,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _ensure_common_defaults(args) -> None:
     for name in ("config", "state_dir", "mode", "role", "source", "allowlist",
-                 "session_api"):
+                 "session_api", "accept_empty_index"):
         if not hasattr(args, name):
             setattr(args, name, None)
 
@@ -1092,6 +1134,15 @@ def main(argv=None) -> int:
     _ensure_common_defaults(args)
     try:
         return args.func(args)
+    except store_mod.IndexRefused as exc:
+        # A command that only writes the index (``unblock``, ``resolve``,
+        # ``replay``) gets here instead of a traceback: the fault is the file,
+        # not the command, and the message names the kept copy.
+        print(f"index refused: {exc}", file=sys.stderr)
+        print("  repair index.json from the kept copy (or a backup), then run "
+              "again. To rebuild from empty instead, rerun with "
+              "--accept-empty-index.", file=sys.stderr)
+        return 5
     except config_mod.ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2

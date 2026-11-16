@@ -225,6 +225,14 @@ class Engine:
         # and health reports degraded (fail closed, never an empty loop).
         self.degraded = False
         self._assignments_error = ""
+        # Set when index.json cannot be read (see ``_note_index_state``): the
+        # round keeps running so the fault reaches health and the event log.
+        self._index_error = ""
+        # Last count from a trustworthy index: an unreadable one reads 0, and
+        # 0 reported as truth says "nothing in flight".
+        self._active_assignments_last = 0
+        # One skipped-write event per round, not one per save site.
+        self._index_skip_logged = False
         self._archived_cache: dict | None = None
         self._archived_unreadable = False
         # Archive refusals already written to ``events.jsonl``, read once on
@@ -314,14 +322,46 @@ class Engine:
         return result
 
     # ------------------------------------------------------------------ health
+    def _note_index_state(self) -> str:
+        """Read once, and mark degraded when ``index.json`` cannot be trusted.
+
+        Same shape as ``_sync_assignments``: a reportable state, not a crash,
+        so health and the event both get written. ``load_index`` records the
+        fault and moves the file aside at most once per process, so the store's
+        marker - not a second ``index_problem`` probe - keeps the reason after
+        the path is empty.
+        """
+        self.store.load_index()
+        problem = self.store.index_unreadable
+        self._index_error = problem
+        if not problem:
+            return ""
+        self.degraded = True
+        self.store.log_event({"type": "index.unreadable", "at": _now(),
+                              "error": problem,
+                              "path": str(self.store.index_path),
+                              "quarantined": self.store.index_quarantined,
+                              "level": "warn",
+                              "consumers": ["doctor", "brief", "health"]})
+        return problem
+
     def health_record(self, *, error: str = "", degraded: bool = False,
                       running: bool = True, phase: str = "") -> dict:
         index = self.store.load_index()
+        active = len(asg_mod.active_assignments(index))
+        if not self._index_error:
+            # Only a trustworthy index may move this baseline: an unreadable
+            # one reads 0, and 0 reported as truth is "nothing in flight".
+            self._active_assignments_last = active
+        else:
+            active = self._active_assignments_last
+        last_error = "; ".join(x for x in (error, self._index_error) if x)
         record = {"pid": os.getpid(), "mode": self.mode,
                   "last_loop_at": _now(),
                   "last_successful_action_at": self.last_successful_action_at,
-                  "active_assignments": len(asg_mod.active_assignments(index)),
-                  "degraded": bool(degraded or error), "last_error": error,
+                  "active_assignments": active,
+                  "degraded": bool(degraded or error or self._index_error),
+                  "last_error": last_error,
                   "running": bool(running)}
         if phase:
             record["phase"] = phase
@@ -332,6 +372,21 @@ class Engine:
         return health.write(self.store.health_path,
                             self.health_record(error=error, degraded=degraded,
                                                running=running, phase=phase))
+
+    def _skip_write_back(self) -> None:
+        """Record that this round wrote no index, once per round.
+
+        The only trace a skipped write leaves: the mtime stops moving, which
+        looks the same as a round that changed nothing.
+        """
+        if self._index_skip_logged:
+            return
+        self._index_skip_logged = True
+        self.store.log_event({"type": "index.write_back_skipped", "at": _now(),
+                              "error": self._index_error,
+                              "quarantined": self.store.index_quarantined,
+                              "level": "warn",
+                              "consumers": ["doctor", "health"]})
 
     # ------------------------------------------------------------------ state
     def _cooldown_ok(self, issue_state: dict, kind: str, now: float) -> bool:
@@ -3849,6 +3904,11 @@ class Engine:
 
     def run_round(self) -> dict:
         index = self.store.load_index()
+        # Checked before anything else so the health snapshot and the
+        # ``index.unreadable`` event exist even when the write-back is refused
+        # at the end of the round (see the two save sites below).
+        self._index_skip_logged = False
+        self._note_index_state()
         # A cursor that cannot be trusted is refused **before** anything is
         # read: with a verdict requiring a session key (issue #87), re-reading
         # an issue's whole history turns every older verdict into an
@@ -3933,14 +3993,21 @@ class Engine:
         # Index is written once per round, atomically: a crash leaves the old one.
         # The dismissal side table is monotonic, so unioning whatever is on disk
         # now keeps a ``resolve`` run during this round from being overwritten.
-        needs.merge_into(index, self.store.load_index())
-        index["meta"].update({
-            "updated_at": _now(), "mode": self.mode, "role": self.role,
-            "dispatch_enabled": self.dispatch_enabled,
-            "run_count": int(index["meta"].get("run_count") or 0) + 1,
-        })
-        self.store.save_index(index)
-        self.store.save_cursor(cursor)
+        #
+        # Skipped, not merely refused, when the index could not be read: the
+        # raise would skip ``write_health`` below - the one snapshot an operator
+        # reads during this exact fault.
+        if not self.store.index_writable:
+            self._skip_write_back()
+        else:
+            needs.merge_into(index, self.store.load_index())
+            index["meta"].update({
+                "updated_at": _now(), "mode": self.mode, "role": self.role,
+                "dispatch_enabled": self.dispatch_enabled,
+                "run_count": int(index["meta"].get("run_count") or 0) + 1,
+            })
+            self.store.save_index(index)
+            self.store.save_cursor(cursor)
         # Close reconciliation last: the round's own archives are visible to it,
         # and ``run_count`` is already incremented, so the two-round streak can
         # only be advanced by a genuine next round.
@@ -3948,8 +4015,9 @@ class Engine:
         self._remind_release_timeouts(index)
         self._check_pm_stall(index)
         self._check_at_stall(index)
-        needs.merge_into(index, self.store.load_index())
-        self.store.save_index(index)
+        if self.store.index_writable:
+            needs.merge_into(index, self.store.load_index())
+            self.store.save_index(index)
         self.store.log_event({"type": "run.completed", "at": _now(),
                               "processed": summary["processed"],
                               "needs_person": summary["needs_person"],
