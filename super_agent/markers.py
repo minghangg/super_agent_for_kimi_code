@@ -186,6 +186,42 @@ def _first_hit(text: str) -> tuple[str, str] | None:
     return best[3], best[2]
 
 
+# --------------------------------------------------------------- session key
+#
+# The verdict markers say *what* was concluded; none of them says *who*
+# concluded it. Every role shares one GitHub token, so the author login is the
+# same for a real verdict and for a forgery. ``gh_issue.py comment --session-key``
+# therefore appends one more wrapped token, on **its own line** (issue #87):
+#
+#     [PM] 可关单 #42 <!-- verdict: ready -->
+#     <!-- session: pm-demo -->
+#
+# It has to be a separate line: every verdict token above is anchored at the end
+# of its line, so appending ``<!-- session: ... -->`` to the same line hides the
+# verdict from the parser - the trailing token would be the session token.
+#
+# **The last occurrence wins.** A body may quote another comment (and with it
+# that comment's session token); the declaration is the one written last, and
+# reading the first would let a quotation claim an identity.
+SESSION_TOKEN_RE = re.compile(r"<!--\s*session\s*:\s*([A-Za-z0-9_.-]+)\s*-->",
+                              re.I)
+
+
+def read_session_token(text: str) -> str:
+    """The session key named by a ``<!-- session: ... -->`` marker, or ``""``.
+
+    Scans the **whole body**, not the first line: the token is appended as the
+    last line on purpose (see above). No token answers ``""`` rather than a
+    guess - the caller treats an empty key as "no attribution", which is the
+    fail-closed side.
+
+    Only the **last** marker counts. A body that quotes another comment carries
+    that comment's token too, and the declaration is the one written last.
+    """
+    found = SESSION_TOKEN_RE.findall(str(text or ""))
+    return found[-1] if found else ""
+
+
 def read_fix_token(text: str) -> tuple[bool, str, bool]:
     """``(fix_needed, matched, structured)`` from the structured marker.
 

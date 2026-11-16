@@ -96,6 +96,12 @@ DEFAULTS: dict = {
         "worker_liveness_enabled": False,
         "worker_liveness_rounds": 2,
         "worker_liveness_interval_s": 60,
+        # Accept an untrustworthy cursor and re-scan every comment (ISS-87).
+        # Off by default: once a verdict has to name its session key, a re-scan
+        # turns every older verdict into an ``unverified`` row. The CLI flag
+        # ``--allow-empty-cursor`` sets this for one run; a config file that
+        # sets it makes the re-scan permanent, which is why it is spelled out.
+        "allow_empty_cursor": False,
     },
 }
 

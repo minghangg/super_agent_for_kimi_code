@@ -83,9 +83,10 @@ class Comments:
     def __init__(self):
         self.rows = []
 
-    def add(self, cid, body, author="pm"):
+    def add(self, cid, body, author="pm", session_key="pm-demo-3f7c1a90"):
         self.rows.append({"id": cid, "issue": 1, "body": body,
-                          "author": author, "created_at": ""})
+                          "author": author, "created_at": "",
+                          "session_key": session_key})
 
     def issues(self, limit=20):
         return [1]
@@ -117,14 +118,14 @@ class Base(unittest.TestCase):
         self.events.write_text("\n".join(json.dumps(r) for r in [
             {"seq": 1, "at": "2026-11-10T10:00:00+00:00",
              "type": session_events.CREATED, "sid": "session_pm",
-             "key": "pm-demo"},
+             "key": "pm-demo-3f7c1a90"},
             {"seq": 2, "at": "2026-11-10T10:00:01+00:00",
              "type": session_events.BOUND, "sid": "session_pm", "key": THREAD,
              "role": "pm", "issue": 1},
         ]) + "\n", encoding="utf-8")
         (self.events.parent / "sessions.json").write_text(
             json.dumps({"supervisor": {"id": "session_sup"},
-                        "pm-demo": {"id": "session_pm"}}), encoding="utf-8")
+                        "pm-demo-3f7c1a90": {"id": "session_pm"}}), encoding="utf-8")
 
     def tearDown(self):
         self.tmp.cleanup()

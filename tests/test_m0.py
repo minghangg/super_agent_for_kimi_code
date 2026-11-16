@@ -198,7 +198,11 @@ class NegativeControls(Base):
 
     def test_r2_no_cursor_write_reprocesses(self):
         # Cursor persistence disabled from the very first round: the engine
-        # then has no way to know these comments were already handled.
+        # then has no way to know these comments were already handled. The
+        # re-read is now an **opt-in** (issue #87): the same broken state is
+        # refused by default, which is what ``test_r2_refuses_the_same_state``
+        # pins. Here the opt-in keeps the original negative control visible.
+        self.cfg.setdefault("engine", {})["allow_empty_cursor"] = True
         saved = self.store.save_cursor
         self.store.save_cursor = lambda data: None
         try:
@@ -208,6 +212,18 @@ class NegativeControls(Base):
             self.store.save_cursor = saved
         self.assertGreater(first["processed"], 0)
         self.assertGreater(second["processed"], 0)
+
+    def test_r2_refuses_the_same_state_by_default(self):
+        """The counter-example to the opt-in above: refusal, not a re-scan."""
+        saved = self.store.save_cursor
+        self.store.save_cursor = lambda data: None
+        try:
+            self.engine.run_round()
+            with self.assertRaises(store_mod.CursorRefused) as caught:
+                self.engine.run_round()
+        finally:
+            self.store.save_cursor = saved
+        self.assertIn("re-read their whole history", str(caught.exception))
 
     def test_r3_naive_write_destroys_old_index(self):
         self.state.mkdir(parents=True, exist_ok=True)

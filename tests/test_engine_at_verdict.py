@@ -84,9 +84,10 @@ class Comments:
     def __init__(self):
         self.rows = []
 
-    def add(self, cid, body, author="at"):
+    def add(self, cid, body, author="at", session_key="at-demo"):
         self.rows.append({"id": cid, "issue": 1, "body": body,
-                          "author": author, "created_at": ""})
+                          "author": author, "created_at": "",
+                          "session_key": session_key})
 
     def issues(self, limit=20):
         return [1]
@@ -132,7 +133,7 @@ class Base(unittest.TestCase):
         self.sessions_path = self.events.parent / "sessions.json"
         self.sessions_path.write_text(json.dumps({
             "supervisor": {"id": "session_sup"},
-            "pm-demo": {"id": "session_pm"},
+            "pm-demo-3f7c1a90": {"id": "session_pm"},
             "at-demo": {"id": "session_at"},
         }), encoding="utf-8")
         self.issue_sessions = self.events.parent / "issue_sessions.json"
@@ -154,13 +155,13 @@ class Base(unittest.TestCase):
              "role": "worker", "issue": 1},
             {"seq": 3, "at": "2026-11-13T10:00:02+00:00",
              "type": session_events.CREATED, "sid": "session_q1",
-             "key": "qa-demo"},
+             "key": "qa-demo-3f7c1a90"},
             {"seq": 4, "at": "2026-11-13T10:00:03+00:00",
              "type": session_events.BOUND, "sid": "session_q1", "key": THREAD,
              "role": "qa", "issue": 1},
             {"seq": 5, "at": "2026-11-13T10:00:04+00:00",
              "type": session_events.CREATED, "sid": "session_pm",
-             "key": "pm-demo"},
+             "key": "pm-demo-3f7c1a90"},
             {"seq": 6, "at": "2026-11-13T10:00:05+00:00",
              "type": session_events.BOUND, "sid": "session_pm", "key": THREAD,
              "role": "pm", "issue": 1},
@@ -219,7 +220,7 @@ class TwoBooks(Base):
     def test_j2_a_pm_verdict_does_not_touch_the_at_book(self):
         engine = self.engine()
         self.deliver()
-        self.source.add(9100, PM_READY, author="pm")
+        self.source.add(9100, PM_READY, author="pm", session_key="pm-demo-3f7c1a90")
         engine.run_once()
         index = engine.store.load_index()
         self.assertNotIn(THREAD, index.get("at_verdicts") or {},
@@ -229,7 +230,7 @@ class TwoBooks(Base):
     def test_both_books_can_hold_the_same_thread(self):
         engine = self.engine()
         self.deliver()
-        self.source.add(9100, PM_READY, author="pm")
+        self.source.add(9100, PM_READY, author="pm", session_key="pm-demo-3f7c1a90")
         self.source.add(9200, AT_QUESTIONS)
         engine.run_once()
         index = engine.store.load_index()
@@ -329,7 +330,7 @@ class WatchdogsDoNotSeeEachOther(Base):
         engine.store.save_index(index)
         for _ in range(2):
             engine.run_once()
-        self.source.add(9100, PM_READY, author="pm")
+        self.source.add(9100, PM_READY, author="pm", session_key="pm-demo-3f7c1a90")
         engine.run_once()
         engine.run_once()
         kinds = self.bus.kinds("event.agent.supervisor")
@@ -436,7 +437,7 @@ class SessionKeys(Base):
     def test_a_non_at_key_is_not_verified(self):
         engine = self.engine()
         self.assertFalse(engine._at_verified(
-            THREAD, {"session_key": "pm-demo"}))
+            THREAD, {"session_key": "pm-demo-3f7c1a90"}))
 
     def test_an_unverified_at_verdict_rings_nothing(self):
         self.sessions_path.write_text(json.dumps(

@@ -25,6 +25,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from . import markers
+
 API = "https://api.github.com"
 PER_PAGE = 100
 
@@ -103,6 +105,8 @@ class FixtureSource:
                 "body": str(row.get("body") or ""),
                 "author": str(row.get("author") or ""),
                 "created_at": str(row.get("created_at") or ""),
+                "session_key": markers.read_session_token(
+                    str(row.get("body") or "")),
             })
         return sorted(out, key=lambda c: c["id"])
 
@@ -217,6 +221,8 @@ class LiveSource:
                 "body": str(row.get("body") or ""),
                 "author": str((row.get("user") or {}).get("login") or ""),
                 "created_at": str(row.get("created_at") or ""),
+                "session_key": markers.read_session_token(
+                    str(row.get("body") or "")),
             })
         return sorted(out, key=lambda c: c["id"])
 
@@ -261,6 +267,8 @@ class LiveSource:
                 "body": str(row.get("body") or ""),
                 "author": str((row.get("user") or {}).get("login") or ""),
                 "created_at": str(row.get("created_at") or ""),
+                "session_key": markers.read_session_token(
+                    str(row.get("body") or "")),
             })
         return sorted(out, key=lambda c: c["id"])
 

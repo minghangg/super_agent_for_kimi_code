@@ -91,6 +91,11 @@ class RedEvidence(unittest.TestCase):
         self.assertEqual(self.store.load_counters()["external_actions"], 1)
 
     def test_r2_a6_turns_red_without_cursor_persistence(self):
+        # The negative control needs the re-scan to actually happen, and since
+        # issue #87 a lost cursor is refused by default. The opt-in is the
+        # explicit "re-scan deliberately" answer; the default refusal is pinned
+        # by ``tests/test_cursor_guard.py`` and ``tests/test_m0.py``.
+        self.engine.cfg.setdefault("engine", {})["allow_empty_cursor"] = True
         saved = self.store.save_cursor
         self.store.save_cursor = lambda data: None      # cursor write commented out
         try:

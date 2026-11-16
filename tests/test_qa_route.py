@@ -63,9 +63,10 @@ class Comments:
     def __init__(self):
         self.rows = []
 
-    def add(self, cid, body, author="worker"):
+    def add(self, cid, body, author="worker", session_key="qa-demo-3f7c1a90"):
         self.rows.append({"id": cid, "issue": 1, "body": body,
-                          "author": author, "created_at": ""})
+                          "author": author, "created_at": "",
+                          "session_key": session_key})
 
     def issues(self, limit=20):
         return [1]
@@ -126,7 +127,7 @@ class Base(unittest.TestCase):
              "type": session_events.BOUND, "sid": "session_w1", "key": THREAD,
              "role": "worker", "issue": 1},
             {"seq": 3, "at": "2026-11-10T10:00:02+00:00",
-             "type": session_events.CREATED, "sid": "session_q1", "key": "qa-demo"},
+             "type": session_events.CREATED, "sid": "session_q1", "key": "qa-demo-3f7c1a90"},
             {"seq": 4, "at": "2026-11-10T10:00:03+00:00",
              "type": session_events.BOUND, "sid": "session_q1", "key": THREAD,
              "role": "qa", "issue": 1},
@@ -229,6 +230,107 @@ class VerdictGoesToPm(Base):
                           if e == "event.agent.project_pm"], [])
         rows = [r for r in self.rows() if r["type"] == "review.unmatched"]
         self.assertEqual(len(rows), 1)
+
+    def test_an_unattributed_reject_still_moves_and_is_marked(self):
+        """Issue #87: a QA miss changes the **record**, never the disposition.
+
+        A QA verdict that cannot be attributed still moves an assignment a
+        person can see; only the PM side withholds the action. ``sessions.json``
+        carries a qa key on purpose: without one, the pre-#87 check answered
+        False anyway and this test could not go red.
+        """
+        self.bind("session_w1")
+        self.events.parent.mkdir(parents=True, exist_ok=True)
+        (self.events.parent / "sessions.json").write_text(
+            json.dumps({"qa-demo-3f7c1a90": {"id": "session_q1"}}), encoding="utf-8")
+        self.source.add(9001, "[WK:wk-probe-1] done")
+        self.source.add(9100, "[QA] REJECT", session_key="")
+        engine = self.engine()
+        engine.run_once()
+        rec = engine.store.load_index()["assignments"]["asg_1_worker_1"]
+        self.assertEqual(rec["status"], "working")
+        self.assertFalse(rec["review_verified"])
+        rows = [r for r in self.rows() if r["type"] == "review.unverified"]
+        self.assertEqual(len(rows), 1)
+
+    def test_a_verdict_from_another_threads_qa_key_is_unverified(self):
+        self.bind("session_w1")
+        self.events.parent.mkdir(parents=True, exist_ok=True)
+        (self.events.parent / "sessions.json").write_text(
+            json.dumps({"qa-demo-3f7c1a90": {"id": "session_q1"}}), encoding="utf-8")
+        self.source.add(9001, "[WK:wk-probe-1] done")
+        self.source.add(9100, "[QA] REJECT", session_key="qa-other")
+        engine = self.engine()
+        engine.run_once()
+        rec = engine.store.load_index()["assignments"]["asg_1_worker_1"]
+        self.assertEqual(rec["status"], "working")
+        self.assertFalse(rec["review_verified"])
+
+    def test_a_verdict_from_this_threads_qa_key_is_verified(self):
+        self.bind_both()
+        # The key whitelist is read from ``sessions.json`` beside the session
+        # stream; the binding rows alone do not populate it.
+        self.events.parent.mkdir(parents=True, exist_ok=True)
+        (self.events.parent / "sessions.json").write_text(
+            json.dumps({"qa-demo-3f7c1a90": {"id": "session_q1"}}), encoding="utf-8")
+        self.source.add(9001, "[WK:wk-probe-1] done")
+        self.source.add(9100, "[QA] REJECT", session_key="qa-demo-3f7c1a90")
+        engine = self.engine()
+        engine.run_once()
+        rec = engine.store.load_index()["assignments"]["asg_1_worker_1"]
+        self.assertEqual(rec["status"], "working")
+        self.assertTrue(rec["review_verified"])
+        self.assertEqual([r for r in self.rows()
+                          if r["type"] == "review.unverified"], [])
+
+
+class TheQaWhitelistNeedsARandomTail(Base):
+    """Issue #87 round 2: a guessable ``qa-*`` key is not a credential.
+
+    Same root cause as the PM side. The second source used to be every
+    ``qa*`` key in ``sessions.json``, so anyone who could spell a QA name could
+    claim a verdict. The tail is the part that cannot be spelled.
+
+    A miss is downgraded, not blocked: the verdict still moves the assignment,
+    and the row names ``doctor`` as its only consumer.
+    """
+
+    def with_keys(self, *names):
+        payload = {name: {"id": f"session_q{i}"} for i, name in enumerate(names)}
+        self.events.parent.mkdir(parents=True, exist_ok=True)
+        (self.events.parent / "sessions.json").write_text(
+            json.dumps(payload), encoding="utf-8")
+
+    def verdict_with(self, key):
+        self.bind("session_w1")
+        self.with_keys("qa-lwa-ISS-87-3f7c1a90")
+        self.source.add(9001, "[WK:wk-probe-1] done")
+        self.source.add(9100, "[QA] REJECT", session_key=key)
+        engine = self.engine()
+        engine.run_once()
+        rec = engine.store.load_index()["assignments"]["asg_1_worker_1"]
+        return rec, [r for r in self.rows() if r["type"] == "review.unverified"]
+
+    def test_a_guessed_tail_is_unverified(self):
+        rec, rows = self.verdict_with("qa-lwa-ISS-87-00000000")
+        self.assertFalse(rec["review_verified"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["consumers"], ["doctor"])
+
+    def test_a_key_without_a_tail_is_unverified(self):
+        rec, rows = self.verdict_with("qa-lwa-ISS-87")
+        self.assertFalse(rec["review_verified"])
+        self.assertEqual(len(rows), 1)
+
+    def test_a_date_tail_is_unverified(self):
+        rec, rows = self.verdict_with("qa-lwa-ISS-87-20261116")
+        self.assertFalse(rec["review_verified"])
+        self.assertEqual(len(rows), 1)
+
+    def test_a_live_random_key_is_verified(self):
+        rec, rows = self.verdict_with("qa-lwa-ISS-87-3f7c1a90")
+        self.assertTrue(rec["review_verified"])
+        self.assertEqual(rows, [])
 
 
 class RoutingRetries(Base):
