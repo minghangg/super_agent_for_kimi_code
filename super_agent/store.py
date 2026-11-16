@@ -43,6 +43,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import issuekey
+
 # Test seam: called with the temporary path right before the atomic rename.
 # A test can set this to a callable that raises, proving the old file survives.
 FAULT_HOOK = None
@@ -135,6 +137,15 @@ STRICT_JSON = ("index.json", "outbox_state.json", "cursor.json", "health.json",
 ENGINE_FILES = ("index.json", "events.jsonl", "outbox.jsonl", "outbox_state.json",
                 "cursor.json", "counters.json", "run_heartbeat.json",
                 "health.json", "engine.pid")
+
+
+class CursorRefused(RuntimeError):
+    """The cursor cannot be trusted, so the round must not start.
+
+    A separate class from ``RuntimeError`` on purpose: ``cli`` turns it into a
+    refusal with the rebuild command, and the recovery path treats it as a
+    startup refusal rather than an error inside a round.
+    """
 
 
 def check_migration(root: Path) -> None:
@@ -463,7 +474,145 @@ class Store:
         self._lines[path] = self._lines.get(path, 0) + 1
 
     # ----------------------------------------------------------------- cursor
-    def load_cursor(self) -> dict:
+    def cursor_problem(self) -> str:
+        """Why the cursor cannot be trusted, or ``""`` when it can.
+
+        ``cursor.json`` is the only thing that stops the engine from re-reading
+        every comment an issue ever had. Once a verdict needs a session key
+        (issue #87), a lost cursor is not "some extra work": it re-triages the
+        whole history, and every verdict written before the key existed comes
+        back as ``unverified``.
+
+        Three states, and only the first is fine:
+
+        * the file parses and ``issues`` is a non-empty object - fine;
+        * the file is missing or unreadable, and **no issue in ``index.json``
+          has ever processed a comment** - fine. There is nothing to re-read,
+          which covers both a fresh install and a tracked issue that has no
+          comment yet;
+        * anything else - missing/unreadable beside an index that has processed
+          comments, or an empty ``issues`` object beside such an index -
+          refused. The index proves comments were read; the cursor that proves
+          *how far* is gone, so continuing would silently re-scan.
+
+        **``comments_seen`` decides, not the number of index rows.** The plan's
+        audit found 14 cursor entries at ``0`` whose ``comments_seen`` was also
+        ``0`` and which had no ``comment.processed`` event: new issues, not lost
+        data. Counting index rows instead would refuse exactly those, and
+        ``test_issue_three_state`` tracks an issue before any comment exists.
+
+        **A per-issue cursor value of ``0`` is likewise not a problem** - it is
+        where a fresh issue starts. The two questions are different and are
+        checked separately: this method asks "is the file trustworthy", never
+        "is every value positive".
+
+        **One issue with no entry at all is a gap, not a file-level loss.**
+        ``replay --issue <n>`` rebuilds one thread and writes one cursor entry;
+        with only the file-level checks, that single entry made the whole
+        cursor look trustworthy again while every other issue still had none,
+        and the next round re-read their history - the exact re-scan the guard
+        exists to stop, reached through the guard's own recommended repair
+        (issue #87 P0-2). So the check is per issue: the cursor is trustworthy
+        only when **every** index issue that has processed a comment has an
+        entry, in either key form.
+        """
+        issues, error = self._read_cursor_issues()
+        if not error and issues:
+            missing = self.cursor_gaps(issues)
+            if not missing:
+                return ""
+            shown = ", ".join(sorted(missing)[:5])
+            more = "" if len(missing) <= 5 else f" (+{len(missing) - 5} more)"
+            return (f"cursor has no entry for {len(missing)} issue(s) that "
+                    f"already processed comments: {shown}{more}. replay --issue "
+                    "rebuilds one thread at a time, so run it for every issue "
+                    "listed here; a round started now would re-read their whole "
+                    "history and turn old verdicts into unverified rows")
+        processed = self._issues_with_comments()
+        if not processed:
+            return ""
+        if error:
+            return (f"cursor {error}, but index.json records {processed} "
+                    "issue(s) that already processed comments: continuing "
+                    "would re-read their whole history and turn old verdicts "
+                    "into unverified rows")
+        return (f"cursor has no issue entries, but index.json records "
+                f"{processed} issue(s) that already processed comments: the "
+                "file was emptied or replaced, so their history would be "
+                "re-read")
+
+    def cursor_gaps(self, cursor_issues: dict | None = None) -> list[str]:
+        """Index threads that read a comment but have no cursor entry.
+
+        Both key forms are honoured (``read_both``): a legacy numeric entry is
+        still a cursor, and refusing on it would reject a healthy pre-migration
+        file. Presence, not value, is the question - a ``0`` is where a fresh
+        issue starts (see :meth:`cursor_problem`).
+        """
+        if cursor_issues is None:
+            cursor_issues, _error = self._read_cursor_issues()
+        missing: list[str] = []
+        for key, rec in (self.load_index().get("issues") or {}).items():
+            if not isinstance(rec, dict):
+                continue
+            try:
+                seen = int(rec.get("comments_seen") or 0)
+            except (TypeError, ValueError):
+                seen = 0
+            if seen <= 0:
+                continue
+            _repo, number = issuekey.split_key(key)
+            legacy = str(number) if number is not None else None
+            if issuekey.read_both(cursor_issues, str(key), legacy) is None:
+                missing.append(str(key))
+        return missing
+
+    def _issues_with_comments(self) -> int:
+        """Index issues that have read at least one comment.
+
+        ``comments_seen`` is written by the round itself (``engine.py``
+        increments it per triaged comment), so it says "this thread was read",
+        which is exactly the state a lost cursor would replay.
+        """
+        count = 0
+        for rec in (self.load_index().get("issues") or {}).values():
+            if not isinstance(rec, dict):
+                continue
+            try:
+                seen = int(rec.get("comments_seen") or 0)
+            except (TypeError, ValueError):
+                seen = 0
+            if seen > 0:
+                count += 1
+        return count
+
+    def _read_cursor_issues(self) -> tuple[dict, str]:
+        """``(issues, error)`` with ``error`` naming why the file is unusable."""
+        path = self.cursor_path
+        if not path.is_file():
+            return {}, f"{path} is missing"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return {}, f"{path} is unreadable ({type(exc).__name__}: {exc})"
+        if not isinstance(data, dict):
+            return {}, f"{path} is not a JSON object"
+        issues = data.get("issues")
+        if not isinstance(issues, dict):
+            return {}, f"{path} has no 'issues' object"
+        return issues, ""
+
+    def load_cursor(self, *, strict: bool = False) -> dict:
+        """The cursor, or :class:`CursorRefused` when it cannot be trusted.
+
+        ``strict`` is what the engine's round uses. The tolerant default stays
+        for the readers that must be able to *report* the fault instead of
+        dying on it: ``doctor`` and ``reporter``.
+        """
+        if strict:
+            problem = self.cursor_problem()
+            if problem:
+                raise CursorRefused(problem)
         try:
             data = json.loads(self.cursor_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):

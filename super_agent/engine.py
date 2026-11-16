@@ -252,6 +252,10 @@ class Engine:
         # thread+comment: the miss is a warning to look at, not one line per
         # round.
         self._release_key_missed: set[str] = set()
+        # Replayed lifecycle state, read once per round by the key whitelist
+        # (``_session_state``). Round scoped: a release or an archive performed
+        # during the round must be visible to the next one.
+        self._session_state_cache: dict | None = None
 
     # ------------------------------------------------------------ allowlist
     def allowlist_allows(self, issue: int | None, action: str | None) -> tuple[bool, str]:
@@ -535,50 +539,132 @@ class Engine:
         """Does this comment come from a QA key of this thread?
 
         A comment that names its session (``session_key``) is checked against
-        the whitelist exactly. Without that field the answer is "the thread has
-        a QA registered at all", which is the strongest statement the shared
-        login allows - and it is logged as unverified when it is false.
+        the whitelist exactly. Without that field the answer is **False**, and
+        that is the whole point of issue #87: "the thread has a QA registered
+        at all" was true for every comment on a thread with a QA, so the check
+        could not fail and was not a check. It is logged as unverified when the
+        answer is False.
+
+        A miss does **not** block the verdict: the caller records the warning
+        and still moves the assignment, because the shared login makes a key
+        mismatch a reason to look, not proof of a forgery.
         """
         keys = self._qa_session_keys(thread)
         claimed = str(comment.get("session_key") or "")
         if claimed:
             return claimed in keys
-        return bool(keys)
+        return False
+
+    def _thread_scopes(self, thread: str) -> set[str]:
+        """The names a key of ``thread`` may be scoped by (lower case).
+
+        Two spellings of the *same* thread: the allowlist project that lists
+        the issue, and the repository's short name. A PM key is named
+        ``pm-<scope>`` or ``pm-<scope>-<suffix>``; the QA's reproduction used
+        seven real ``pm-*`` keys against ``owner/demo#1``, and none of them is
+        scoped by ``demo``, which is the property this function exists for.
+        """
+        scopes: set[str] = set()
+        repo, number = issuekey.split_key(thread)
+        if repo:
+            scopes.add(repo.rsplit("/", 1)[-1])
+        if number is None:
+            return scopes
+        project = (self._project_for_repo(repo) if repo
+                   else self._project_for(number))
+        if project:
+            scopes.add(str(project).lower())
+        return {s for s in scopes if s and not s.isdigit()}
+
+    def _session_state(self) -> dict:
+        """Replayed lifecycle state, cached for the round.
+
+        ``None``-free on purpose: an unreadable stream returns ``{}`` and the
+        callers treat "cannot tell" as "no evidence to exclude a key". That is
+        the same weakness the key check already has; it must not become a new
+        way to fail closed on a healthy thread.
+        """
+        if self._session_state_cache is None:
+            try:
+                path, _sessions = self._session_stream()
+                self._session_state_cache = session_events.replay(
+                    session_events.load_events(path))
+            except Exception:  # noqa: BLE001  a broken stream must not block a verdict
+                self._session_state_cache = {}
+        return self._session_state_cache
 
     def _pm_session_keys(self, thread: str) -> set[str]:
         """Session keys that count as *this thread's* PM.
 
-        The same two sources as :meth:`_qa_session_keys`, so a rotation does not
-        lose the check: the ``pm`` entry of ``issue_sessions.json[thread]``, and
-        every ``pm-*`` key in ``sessions.json``. The author login cannot be used
-        - every role shares one token, so a forgery and a real verdict carry the
-        same login - and that is why this is a weak check treated as one.
+        Two sources, and the second is scoped by name (issue #87 P0-1):
+
+        * the ``pm`` entry of ``issue_sessions.json[thread]`` - the explicit
+          binding, and the only source that can express "this thread's PM";
+        * a rotation fallback: ``pm-*`` keys in ``sessions.json`` **whose name
+          carries this thread's repo or project**, still live (not archived,
+          not released). A rotation renames the key (``pm-<repo>-<date>``), so
+          a scope prefix keeps it working without accepting every ``pm-*`` key
+          on the machine.
+
+        **What this does not fix.** The key is still a name written in the
+        comment body, so the key name remains the credential. Scoping narrows
+        "any ``pm-*`` key anywhere rings any thread" to "a live ``pm-*`` key of
+        the same repo rings its repo's threads". Keys that were published in an
+        issue are therefore still usable against other threads of that same
+        repo - the remaining risk, and the reason (f) in the ticket (rename to
+        ``pm-<repo>-<random>`` and keep names out of issues) is the follow-up,
+        not a thing this change can finish.
+
+        The author login cannot be used either: every role shares one token, so
+        a forgery and a real verdict carry the same login.
         """
         keys: set[str] = set()
-        ledger = self._load_issue_sessions().get(thread) or {}
-        if isinstance(ledger, dict):
-            for role, entry in ledger.items():
-                if str(role).lower() != "pm" or not isinstance(entry, dict):
-                    continue
-                for field in ("name", "session"):
-                    value = str(entry.get(field) or "")
-                    if value:
-                        keys.add(value)
+        entry = self._issue_session_entry(thread).get("pm")
+        if isinstance(entry, dict):
+            for field in ("name", "session"):
+                value = str(entry.get(field) or "")
+                if value:
+                    keys.add(value)
+        scopes = self._thread_scopes(thread)
+        if not scopes:
+            return keys
         try:
             path = self._session_stream()[1]
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             data = {}
-        if isinstance(data, dict):
-            keys.update(str(k) for k in data if str(k).startswith("pm"))
+        if not isinstance(data, dict):
+            return keys
+        state = self._session_state()
+        released = set(state.get("released") or ())
+        sessions = state.get("sessions") or {}
+        for raw_name, item in data.items():
+            name = str(raw_name)
+            if not name.lower().startswith("pm"):
+                continue
+            body = name[2:].lstrip("-").lower()
+            if not body or not any(body == scope or body.startswith(scope + "-")
+                                   for scope in scopes):
+                continue
+            if name in released:
+                # The key was handed back; a session record may still hold it.
+                continue
+            sid = str((item or {}).get("id") or "") if isinstance(item, dict) else ""
+            if (sessions.get(sid) or {}).get("archived"):
+                # A rotation leaves the old key in ``sessions.json``; an
+                # archived session is not a credential any more.
+                continue
+            keys.add(name)
         return keys
 
     def _pm_verified(self, thread: str, comment: dict) -> bool:
         """Does this comment come from a PM key of this thread?
 
         A comment that names its session (``session_key``) is checked against
-        the whitelist exactly. Without that field the answer is "the thread has
-        a PM registered at all" - the strongest statement a shared login allows.
+        the whitelist exactly. Without that field the answer is **False**:
+        "the thread has a PM registered at all" was true for every comment on
+        a thread with a PM, so it could never fail and never checked anything
+        (issue #87).
 
         Unlike the QA side, a miss here **does not let the verdict through**:
         a QA verdict that cannot be attributed still moves an assignment a
@@ -589,7 +675,7 @@ class Engine:
         claimed = str(comment.get("session_key") or "")
         if claimed:
             return claimed in keys
-        return bool(keys)
+        return False
 
     # ------------------------------------------------------------- at routing
     def _at_session_keys(self, thread: str) -> set[str]:
@@ -3729,12 +3815,20 @@ class Engine:
 
     def run_round(self) -> dict:
         index = self.store.load_index()
-        cursor = self.store.load_cursor()
+        # A cursor that cannot be trusted is refused **before** anything is
+        # read: with a verdict requiring a session key (issue #87), re-reading
+        # an issue's whole history turns every older verdict into an
+        # ``unverified`` row. ``engine.allow_empty_cursor`` is the explicit
+        # "re-scan everything deliberately" answer, never a default.
+        allow_empty = bool((self.cfg.get("engine") or {}).get(
+            "allow_empty_cursor"))
+        cursor = self.store.load_cursor(strict=not allow_empty)
         # Both caches are round-scoped: the stream snapshot is re-read lazily
         # and each candidate sid is asked of the server at most once per round.
         self._archived_cache = None
         self._archived_unreadable = False
         self._live_check = {}
+        self._session_state_cache = None
         gh_cfg = self.cfg.get("github") or {}
         max_issues = int(gh_cfg.get("max_issues") or 20)
         max_comments = int(gh_cfg.get("max_comments_per_issue") or 50)
@@ -4087,8 +4181,14 @@ class Engine:
         bad_cursor = [k for k, v in (cursor.get("issues") or {}).items()
                       if not isinstance(v, int) or v < 0
                       or issuekey.issue_number(k) is None]
-        add("cursor", not bad_cursor,
-            "cursor ok" if not bad_cursor else f"invalid cursors: {bad_cursor}")
+        # A per-issue ``0`` is a fresh issue, not a fault (see
+        # ``Store.cursor_problem``), so the value check above and the emptiness
+        # check below are two different questions and are reported separately.
+        problem = self.store.cursor_problem()
+        add("cursor", not (bad_cursor or problem),
+            problem if problem else (
+                "cursor ok" if not bad_cursor
+                else f"invalid cursors: {bad_cursor}"))
 
         # The ``[PM:TASK]`` guard writes ``pm.task_book_conclusion`` and nothing
         # else reads it, so a conclusion written under the wrong prefix stayed
@@ -4224,12 +4324,16 @@ class Engine:
         self.store.save_index(index)
         cursor.setdefault("issues", {})[key] = rec["last_comment_id"]
         self.store.save_cursor(cursor)
+        # Read the gap *after* the save: the answer is about what a round would
+        # see now, and one rebuilt thread must not hide the others (#87 P0-2).
+        gap = self.store.cursor_gaps(cursor.get("issues") or {})
         self.store.log_event({"type": "replay.rebuilt", "at": _now(), "issue": issue,
                               "comments": rec["comments_seen"],
+                              "cursor_gap": len(gap),
                               "external_actions":
                                   self.store.load_counters().get("external_actions", 0)})
         return {"issue": issue, "comments": rec["comments_seen"],
-                "state": rec["state"],
+                "state": rec["state"], "cursor_gap": gap,
                 "external_actions": self.store.load_counters()
                 .get("external_actions", 0)}
 

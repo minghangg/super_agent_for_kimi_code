@@ -80,9 +80,10 @@ class Comments:
     def __init__(self):
         self.rows = []
 
-    def add(self, cid, body, author="pm"):
+    def add(self, cid, body, author="pm", session_key="pm-demo"):
         self.rows.append({"id": cid, "issue": 1, "body": body,
-                          "author": author, "created_at": ""})
+                          "author": author, "created_at": "",
+                          "session_key": session_key})
 
     def issues(self, limit=20):
         return [1]
@@ -508,6 +509,134 @@ class PMAuthorCheck(Base):
         # registered key still rings, which is why the check is called weak.
         self.sessions_path.write_text(json.dumps(
             {"supervisor": {"id": "session_sup"}}), encoding="utf-8")
+
+
+class NoKeyNoRing(Base):
+    """Issue #87: an unattributed ``ready`` must not ring the release bell.
+
+    Three constructed counter-examples over one delivery, differing only in
+    the comment's ``session_key``. Before the fix all three rang, because the
+    check was "does this thread have a PM at all" - true for every comment on
+    a thread with a PM, so it could never fail.
+    """
+
+    def test_a_pm_ready_without_a_session_key_does_not_ring(self):
+        engine = self.engine()
+        self.deliver()
+        self.source.add(9100, READY, session_key="")
+        engine.run_once()
+        self.assertEqual(self.bus.payloads("event.agent.supervisor"), [],
+                         "an unattributed ready must not ring")
+        self.assertEqual(len(self.pm_rows(engine, "pm.verdict_unverified[user]")),
+                         1)
+
+    def test_a_pm_ready_with_a_wrong_session_key_does_not_ring(self):
+        engine = self.engine()
+        self.deliver()
+        self.source.add(9100, READY, session_key="pm-other")
+        engine.run_once()
+        self.assertEqual(self.bus.payloads("event.agent.supervisor"), [],
+                         "a ready from another thread's pm key must not ring")
+        self.assertEqual(len(self.pm_rows(engine, "pm.verdict_unverified[user]")),
+                         1)
+
+    def test_a_pm_ready_with_a_correct_session_key_rings(self):
+        engine = self.engine()
+        self.deliver()
+        self.source.add(9100, READY, session_key="pm-demo")
+        engine.run_once()
+        payloads = self.bus.payloads("event.agent.supervisor")
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]["state"], "ready")
+        self.assertEqual(self.pm_rows(engine, "pm.verdict_unverified[user]"), [])
+
+
+class TheWhitelistIsPerThread(Base):
+    """Issue #87 P0-1: a ``pm-*`` key of *another* repo must not ring here.
+
+    The QA's counter-example: seven real ``pm-*`` keys from the live
+    ``sessions.json`` against ``owner/demo#1``, a thread that belongs to no
+    project, rang the release bell seven times. The second source was every
+    ``pm*`` key on the machine, so the ``thread`` argument did nothing.
+
+    The property pinned: the fallback accepts a key whose name is scoped by
+    this thread's repo or project (``pm-demo``, ``pm-demo-20261116``), and
+    rejects one scoped by anything else. The remaining risk is a key of the
+    same repo, which is why the check is still called weak.
+    """
+
+    def other_repo_keys(self, *names):
+        payload = {"supervisor": {"id": "session_sup"},
+                   "pm-demo": {"id": "session_pm"}}
+        for i, name in enumerate(names):
+            payload[name] = {"id": f"session_other_{i}"}
+        self.sessions_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_a_pm_key_of_another_repo_does_not_ring(self):
+        # Names shaped like the live ones (``pm-<other project>``), none of them
+        # scoped by this thread's repo (``demo``) - the QA's seven-key shape.
+        others = ("pm-alpha", "pm-beta", "pm-gamma-20261113", "pm-delta")
+        for name in others:
+            self.other_repo_keys(*others)
+            engine = self.engine()
+            self.other_repo_keys(*others)
+            self.source.add(9100, READY, session_key=name)
+            engine.run_once()
+            self.assertEqual(self.bus.payloads("event.agent.supervisor"), [],
+                             f"{name} must not ring a thread of another repo")
+            self.assertEqual(
+                len(self.pm_rows(engine, "pm.verdict_unverified[user]")), 1,
+                f"{name} must land as a row a person can read")
+            self.bus.injected.clear()
+            self.source.rows.clear()
+
+    def test_a_rotation_key_scoped_by_this_repo_rings(self):
+        self.sessions_path.write_text(json.dumps(
+            {"supervisor": {"id": "session_sup"},
+             "pm-other-repo": {"id": "session_x"},
+             "pm-demo-20261116": {"id": "session_pm2"}}), encoding="utf-8")
+        engine = self.engine()
+        self.deliver()
+        self.source.add(9100, READY, session_key="pm-demo-20261116")
+        engine.run_once()
+        payloads = self.bus.payloads("event.agent.supervisor")
+        self.assertEqual(len(payloads), 1,
+                         "a rotation of this repo's key must keep working")
+
+    def test_an_archived_rotation_key_does_not_ring(self):
+        # A rotation leaves the old key in sessions.json. The old session is
+        # archived, so it is not a credential any more.
+        self.sessions_path.write_text(json.dumps(
+            {"supervisor": {"id": "session_sup"},
+             "pm-demo-20261113": {"id": "session_old"}}), encoding="utf-8")
+        rows = [{"seq": 1, "at": "2026-11-10T10:00:00+00:00",
+                 "type": session_events.CREATED, "sid": "session_old",
+                 "key": "pm-demo-20261113"},
+                {"seq": 2, "at": "2026-11-10T10:00:01+00:00",
+                 "type": session_events.ARCHIVED, "sid": "session_old"}]
+        self.events.write_text("\n".join(json.dumps(r) for r in rows) + "\n",
+                               encoding="utf-8")
+        engine = self.engine()
+        self.deliver()
+        self.source.add(9100, READY, session_key="pm-demo-20261113")
+        engine.run_once()
+        self.assertEqual(self.bus.payloads("event.agent.supervisor"), [])
+        self.assertEqual(len(self.pm_rows(engine, "pm.verdict_unverified[user]")),
+                         1)
+
+    def test_the_explicit_binding_still_wins(self):
+        # The ledger entry is the only source that can say "this thread's PM"
+        # without naming a repo, so it must not be narrowed by the scoping.
+        engine = self.engine()
+        self.issue_sessions_path = self.events.parent / "issue_sessions.json"
+        self.issue_sessions_path.write_text(json.dumps(
+            {THREAD: {"pm": {"name": "pm-anything",
+                             "session": "session_pm3"}}}), encoding="utf-8")
+        self.deliver()
+        self.source.add(9100, READY, session_key="pm-anything")
+        engine.run_once()
+        self.assertEqual(len(self.bus.payloads("event.agent.supervisor")), 1,
+                         "a bound pm key must ring even when its name has no scope")
 
 
 class PMCoorclinateCheck(Base):

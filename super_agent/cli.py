@@ -186,8 +186,58 @@ def _recovery_refusal(result: dict) -> int:
     return 1
 
 
+def _cursor_refusal(exc, store) -> int:
+    """Refuse to run on an untrustworthy cursor, and name the way out.
+
+    Two ways out, in the order a person should try them: rebuild the cursor
+    from the event log (the ``comment.processed`` rows carry the ids), or - if
+    the log is gone too - accept the re-scan explicitly. The explicit flag is
+    printed as a command, so it cannot be reached by forgetting a setting.
+    """
+    print(f"cursor refused: {exc}", file=sys.stderr)
+    print("  rebuild it first: replay each issue from the source "
+          "(python -m super_agent.cli replay --issue <n>),", file=sys.stderr)
+    print("  which rewrites cursor.json from the comments it reads.", file=sys.stderr)
+    print("  to accept a full re-scan instead, run once with "
+          "--allow-empty-cursor.", file=sys.stderr)
+    print(f"  state dir: {store.root}", file=sys.stderr)
+    return 4
+
+
+def _common_options(parser: argparse.ArgumentParser) -> None:
+    """Flags shared by the commands that can start a round.
+
+    ``--allow-empty-cursor`` is the explicit "re-scan every comment" answer to
+    the refusal in :class:`super_agent.store.CursorRefused`. It is a flag on
+    the round-running commands, never a setting: a default would quietly
+    re-enable the silent full re-scan the guard exists to stop.
+    """
+    parser.add_argument("--allow-empty-cursor", action="store_true",
+                        help="run even when cursor.json cannot be trusted, "
+                             "accepting a full re-scan of every comment")
+
+
+def _refuse_bad_cursor(args, cfg: dict, store) -> int | None:
+    """Refuse **before** recovery, or return None when the cursor is fine.
+
+    Ordered before ``_recover`` on purpose: recovery replays ``prepared``
+    outbox actions, and a replay is a POST to GitHub. Refusing after that would
+    have already acted on the untrustworthy state.
+    """
+    if getattr(args, "allow_empty_cursor", False):
+        cfg.setdefault("engine", {})["allow_empty_cursor"] = True
+        return None
+    problem = store.cursor_problem()
+    if not problem:
+        return None
+    return _cursor_refusal(store_mod.CursorRefused(problem), store)
+
+
 def cmd_once(args) -> int:
     cfg, store = _build(args)
+    refusal = _refuse_bad_cursor(args, cfg, store)
+    if refusal is not None:
+        return refusal
     engine = _engine(cfg, store, _bus(cfg),
                       session_api=_session_api(getattr(args, "session_api", None)))
     try:
@@ -197,6 +247,8 @@ def cmd_once(args) -> int:
                 return _recovery_refusal(recovery)
             summary = engine.run_once()
             engine.write_health(running=False)
+    except store_mod.CursorRefused as exc:
+        return _cursor_refusal(exc, store)
     except LockError as exc:
         print(f"engine.pid: {exc}", file=sys.stderr)
         return 3
@@ -349,6 +401,9 @@ def run_loop(engine, store: Store, *, interval: float = 60.0,
 
 def cmd_run(args) -> int:
     cfg, store = _build(args)
+    refusal = _refuse_bad_cursor(args, cfg, store)
+    if refusal is not None:
+        return refusal
     engine = _engine(cfg, store, _bus(cfg),
                       session_api=_session_api(getattr(args, "session_api", None)))
     interval = args.interval
@@ -623,6 +678,18 @@ def cmd_replay(args) -> int:
         return 1
     print(f"issue=#{out['issue']} state={out['state']} "
           f"comments={out['comments']} external_actions={out['external_actions']}")
+    # The refusal names ``replay --issue <n>`` as the repair, so the repair has
+    # to say when it is not finished: one thread rebuilt leaves every other
+    # issue without a cursor, and a round started now would re-read them.
+    gap = out.get("cursor_gap") or []
+    if gap:
+        print(f"cursor still missing for {len(gap)} issue(s): "
+              f"{', '.join(gap[:5])}" + (" ..." if len(gap) > 5 else ""),
+              file=sys.stderr)
+        print("  run replay --issue <n> for each of them before starting a round",
+              file=sys.stderr)
+        return 0
+    print("cursor complete: every issue that read a comment has an entry")
     return 0
 
 
@@ -886,10 +953,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_once = sub.add_parser("once", help="run exactly one round and exit")
     _add_common(p_once, suppress=True)
+    _common_options(p_once)
     p_once.set_defaults(func=cmd_once)
 
     p_run = sub.add_parser("run", help="run rounds until SIGINT/SIGTERM")
     _add_common(p_run, suppress=True)
+    _common_options(p_run)
     p_run.add_argument("--interval", type=_positive_float, default=None,
                        help="seconds between rounds (default: github.poll_interval_s)")
     p_run.add_argument("--max-failures", type=_positive_int,
