@@ -139,7 +139,7 @@ class Base(unittest.TestCase):
              "role": "worker", "issue": 1},
             {"seq": 3, "at": "2026-11-10T10:00:02+00:00",
              "type": session_events.CREATED, "sid": "session_q1",
-             "key": "qa-demo"},
+             "key": "qa-demo-3f7c1a90"},
             {"seq": 4, "at": "2026-11-10T10:00:03+00:00",
              "type": session_events.BOUND, "sid": "session_q1", "key": THREAD,
              "role": "qa", "issue": 1},

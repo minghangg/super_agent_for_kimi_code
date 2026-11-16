@@ -78,7 +78,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import (at_serve, github_source, health, issuekey, markers, needs,
-               session_events)
+               session_events, sessionkeys)
 from . import assignments as asg_mod
 from .allowlist import ProjectAllowlist
 from .store import Store, action_id
@@ -508,8 +508,20 @@ class Engine:
         Two sources, unioned so a rotation does not lose the check:
 
         * the ``qa`` entry of ``issue_sessions.json[thread]`` (``name`` and
-          ``session``);
-        * every ``qa-*`` key in ``sessions.json`` - the one-shot naming rule.
+          ``session``) - an explicit binding, and the only source that can say
+          "this thread's QA" without naming a project;
+        * a ``qa-*`` key in ``sessions.json`` **that carries a random tail**,
+          still live (not archived, not released). The tail is the credential
+          (``sessionkeys.has_random_suffix``): the name is written in the
+          comment body and every role shares one token, so a guessable name is
+          not a check. A short-lived key of this project (``qa-<project>-...``)
+          is preferred, but any random-tailed ``qa-*`` key counts - QA sessions
+          are one per issue and are named after the issue, not the project.
+
+        What this does fix: a key name that can be **constructed** from public
+        information (a project name, a date) no longer verifies. What it does
+        not: a leaked random key is still a key. That is the design ceiling -
+        the entropy is the gate, not the prefix.
 
         The verdict's author login cannot be used: every role shares one token,
         so the login is the same for a rejection and for a forgery. This is a
@@ -531,8 +543,25 @@ class Engine:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             data = {}
-        if isinstance(data, dict):
-            keys.update(str(k) for k in data if str(k).startswith("qa"))
+        if not isinstance(data, dict):
+            return keys
+        state = self._session_state()
+        released = set(state.get("released") or ())
+        sessions = state.get("sessions") or {}
+        for raw_name, item in data.items():
+            name = str(raw_name)
+            if sessionkeys.role_of(name) != "qa":
+                continue
+            if not sessionkeys.has_random_suffix(name):
+                # Guessable name: the published-only credential this issue is
+                # about. It stays in sessions.json; it stops being a check.
+                continue
+            if name in released:
+                continue
+            sid = str((item or {}).get("id") or "") if isinstance(item, dict) else ""
+            if (sessions.get(sid) or {}).get("archived"):
+                continue
+            keys.add(name)
         return keys
 
     def _review_verified(self, thread: str, comment: dict) -> bool:
@@ -596,24 +625,27 @@ class Engine:
     def _pm_session_keys(self, thread: str) -> set[str]:
         """Session keys that count as *this thread's* PM.
 
-        Two sources, and the second is scoped by name (issue #87 P0-1):
+        Two sources, and the second has two conditions (issue #87 P0-1):
 
         * the ``pm`` entry of ``issue_sessions.json[thread]`` - the explicit
           binding, and the only source that can express "this thread's PM";
-        * a rotation fallback: ``pm-*`` keys in ``sessions.json`` **whose name
-          carries this thread's repo or project**, still live (not archived,
-          not released). A rotation renames the key (``pm-<repo>-<date>``), so
-          a scope prefix keeps it working without accepting every ``pm-*`` key
-          on the machine.
+        * a rotation fallback: ``pm-*`` keys in ``sessions.json`` whose name
+          **carries this thread's repo or project** *and* ends in a **random
+          tail** (``sessionkeys.has_random_suffix``), still live (not archived,
+          not released).
 
-        **What this does not fix.** The key is still a name written in the
-        comment body, so the key name remains the credential. Scoping narrows
-        "any ``pm-*`` key anywhere rings any thread" to "a live ``pm-*`` key of
-        the same repo rings its repo's threads". Keys that were published in an
-        issue are therefore still usable against other threads of that same
-        repo - the remaining risk, and the reason (f) in the ticket (rename to
-        ``pm-<repo>-<random>`` and keep names out of issues) is the follow-up,
-        not a thing this change can finish.
+        Why the tail and not just the scope: the scope is public. Anyone who
+        can read the repository name can spell ``pm-<repo>`` - the QA's
+        reproduction did exactly that with three published keys on twenty
+        threads. The prefix says *which* project; the random tail is what says
+        *a key was actually issued*. ``pm-demo-20261116`` is rejected even
+        though it looks like a tail, because a date is guessable.
+
+        **What this does not fix.** A key name is still written in a comment
+        body, so a *leaked* random key still verifies. That is the ceiling of a
+        name-as-credential design: the gate is the entropy, not the prefix. The
+        document rule (§37) keeps the name out of issues so the leak does not
+        happen by accident.
 
         The author login cannot be used either: every role shares one token, so
         a forgery and a real verdict carry the same login.
@@ -640,11 +672,13 @@ class Engine:
         sessions = state.get("sessions") or {}
         for raw_name, item in data.items():
             name = str(raw_name)
-            if not name.lower().startswith("pm"):
+            if sessionkeys.role_of(name) != "pm":
                 continue
-            body = name[2:].lstrip("-").lower()
-            if not body or not any(body == scope or body.startswith(scope + "-")
-                                   for scope in scopes):
+            if not any(sessionkeys.scoped_by(name, "pm", scope) for scope in scopes):
+                continue
+            if not sessionkeys.has_random_suffix(name):
+                # Guessable name: the credential this issue is about. The
+                # record stays in ``sessions.json``; it stops being a check.
                 continue
             if name in released:
                 # The key was handed back; a session record may still hold it.

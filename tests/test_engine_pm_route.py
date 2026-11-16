@@ -80,7 +80,7 @@ class Comments:
     def __init__(self):
         self.rows = []
 
-    def add(self, cid, body, author="pm", session_key="pm-demo"):
+    def add(self, cid, body, author="pm", session_key="pm-demo-3f7c1a90"):
         self.rows.append({"id": cid, "issue": 1, "body": body,
                           "author": author, "created_at": "",
                           "session_key": session_key})
@@ -128,7 +128,7 @@ class Base(unittest.TestCase):
         self.sessions_path = self.events.parent / "sessions.json"
         self.sessions_path.write_text(
             json.dumps({"supervisor": {"id": "session_sup"},
-                        "pm-demo": {"id": "session_pm"}}), encoding="utf-8")
+                        "pm-demo-3f7c1a90": {"id": "session_pm"}}), encoding="utf-8")
         self.bind()
 
     def tearDown(self):
@@ -144,13 +144,13 @@ class Base(unittest.TestCase):
              "role": "worker", "issue": 1},
             {"seq": 3, "at": "2026-11-10T10:00:02+00:00",
              "type": session_events.CREATED, "sid": "session_q1",
-             "key": "qa-demo"},
+             "key": "qa-demo-3f7c1a90"},
             {"seq": 4, "at": "2026-11-10T10:00:03+00:00",
              "type": session_events.BOUND, "sid": "session_q1", "key": THREAD,
              "role": "qa", "issue": 1},
             {"seq": 5, "at": "2026-11-10T10:00:04+00:00",
              "type": session_events.CREATED, "sid": "session_pm",
-             "key": "pm-demo"},
+             "key": "pm-demo-3f7c1a90"},
             {"seq": 6, "at": "2026-11-10T10:00:05+00:00",
              "type": session_events.BOUND, "sid": "session_pm", "key": THREAD,
              "role": "pm", "issue": 1},
@@ -543,7 +543,7 @@ class NoKeyNoRing(Base):
     def test_a_pm_ready_with_a_correct_session_key_rings(self):
         engine = self.engine()
         self.deliver()
-        self.source.add(9100, READY, session_key="pm-demo")
+        self.source.add(9100, READY, session_key="pm-demo-3f7c1a90")
         engine.run_once()
         payloads = self.bus.payloads("event.agent.supervisor")
         self.assertEqual(len(payloads), 1)
@@ -552,30 +552,33 @@ class NoKeyNoRing(Base):
 
 
 class TheWhitelistIsPerThread(Base):
-    """Issue #87 P0-1: a ``pm-*`` key of *another* repo must not ring here.
+    """Issue #87 P0-1/P0-1b: only a *this repo's, random-tailed* key counts.
 
-    The QA's counter-example: seven real ``pm-*`` keys from the live
-    ``sessions.json`` against ``owner/demo#1``, a thread that belongs to no
-    project, rang the release bell seven times. The second source was every
-    ``pm*`` key on the machine, so the ``thread`` argument did nothing.
+    Two counter-examples from the QA, over the same live ``sessions.json``:
 
-    The property pinned: the fallback accepts a key whose name is scoped by
-    this thread's repo or project (``pm-demo``, ``pm-demo-20261116``), and
-    rejects one scoped by anything else. The remaining risk is a key of the
-    same repo, which is why the check is still called weak.
+    * seven real ``pm-*`` keys rang ``owner/demo#1``, a thread of another repo -
+      the second source was every ``pm*`` key on the machine;
+    * after the first fix, three published keys of the *same* repo still rang
+      that repo's twenty threads, because the scope prefix is public.
+
+    The property pinned here: the fallback accepts a key that is scoped by this
+    thread's repo or project **and** ends in a random tail, and rejects every
+    other shape. The tail is what a forger cannot spell; the prefix only says
+    which project.
     """
 
     def other_repo_keys(self, *names):
         payload = {"supervisor": {"id": "session_sup"},
-                   "pm-demo": {"id": "session_pm"}}
+                   "pm-demo-3f7c1a90": {"id": "session_pm"}}
         for i, name in enumerate(names):
             payload[name] = {"id": f"session_other_{i}"}
         self.sessions_path.write_text(json.dumps(payload), encoding="utf-8")
 
     def test_a_pm_key_of_another_repo_does_not_ring(self):
-        # Names shaped like the live ones (``pm-<other project>``), none of them
-        # scoped by this thread's repo (``demo``) - the QA's seven-key shape.
-        others = ("pm-alpha", "pm-beta", "pm-gamma-20261113", "pm-delta")
+        # Names shaped like the live ones (``pm-<other project>-<tail>``), none
+        # of them scoped by this thread's repo (``demo``).
+        others = ("pm-alpha-1a2b3c4d", "pm-beta-1a2b3c4d",
+                  "pm-gamma-5e6f7a8b", "pm-delta-1a2b3c4d")
         for name in others:
             self.other_repo_keys(*others)
             engine = self.engine()
@@ -593,32 +596,72 @@ class TheWhitelistIsPerThread(Base):
     def test_a_rotation_key_scoped_by_this_repo_rings(self):
         self.sessions_path.write_text(json.dumps(
             {"supervisor": {"id": "session_sup"},
-             "pm-other-repo": {"id": "session_x"},
-             "pm-demo-20261116": {"id": "session_pm2"}}), encoding="utf-8")
+             "pm-other-repo-9f8e7d6c": {"id": "session_x"},
+             "pm-demo-20261116": {"id": "session_old_rotation"},
+             "pm-demo-3f7c1a90": {"id": "session_pm2"}}), encoding="utf-8")
         engine = self.engine()
         self.deliver()
-        self.source.add(9100, READY, session_key="pm-demo-20261116")
+        self.source.add(9100, READY, session_key="pm-demo-3f7c1a90")
         engine.run_once()
         payloads = self.bus.payloads("event.agent.supervisor")
         self.assertEqual(len(payloads), 1,
                          "a rotation of this repo's key must keep working")
+
+    def test_a_guessed_random_tail_does_not_ring(self):
+        """The gate is the tail: the same prefix with a guessed tail fails.
+
+        This is the round-2 core counter-example. ``pm-demo-`` is public (the
+        project name is on the repository); ``00000000`` is what a forger who
+        has read a published key name would try next.
+        """
+        self.sessions_path.write_text(json.dumps(
+            {"supervisor": {"id": "session_sup"},
+             "pm-demo-3f7c1a90": {"id": "session_pm"}}), encoding="utf-8")
+        engine = self.engine()
+        self.deliver()
+        self.source.add(9100, READY, session_key="pm-demo-00000000")
+        engine.run_once()
+        self.assertEqual(self.bus.payloads("event.agent.supervisor"), [],
+                         "a guessed random tail must not ring")
+        self.assertEqual(len(self.pm_rows(engine, "pm.verdict_unverified[user]")),
+                         1)
+
+    def test_a_date_tail_is_not_a_random_tail(self):
+        """``pm-demo-20261116`` is guessable, so it is not a credential.
+
+        The live keys had exactly this shape (``pm-<project>-<date>``). It
+        matches "eight hex characters" by accident, which is why the date shape
+        is rejected explicitly rather than counted as entropy.
+        """
+        self.sessions_path.write_text(json.dumps(
+            {"supervisor": {"id": "session_sup"},
+             "pm-demo-20261116": {"id": "session_pm"}}), encoding="utf-8")
+        engine = self.engine()
+        self.deliver()
+        self.source.add(9100, READY, session_key="pm-demo-20261116")
+        engine.run_once()
+        self.assertEqual(self.bus.payloads("event.agent.supervisor"), [],
+                         "a date-tailed key must not ring")
+        self.assertEqual(len(self.pm_rows(engine, "pm.verdict_unverified[user]")),
+                         1)
 
     def test_an_archived_rotation_key_does_not_ring(self):
         # A rotation leaves the old key in sessions.json. The old session is
         # archived, so it is not a credential any more.
         self.sessions_path.write_text(json.dumps(
             {"supervisor": {"id": "session_sup"},
-             "pm-demo-20261113": {"id": "session_old"}}), encoding="utf-8")
+             "pm-demo-20261113": {"id": "session_old"},
+             "pm-demo-11112222": {"id": "session_old"}}), encoding="utf-8")
         rows = [{"seq": 1, "at": "2026-11-10T10:00:00+00:00",
                  "type": session_events.CREATED, "sid": "session_old",
-                 "key": "pm-demo-20261113"},
+                 "key": "pm-demo-11112222"},
                 {"seq": 2, "at": "2026-11-10T10:00:01+00:00",
                  "type": session_events.ARCHIVED, "sid": "session_old"}]
         self.events.write_text("\n".join(json.dumps(r) for r in rows) + "\n",
                                encoding="utf-8")
         engine = self.engine()
         self.deliver()
-        self.source.add(9100, READY, session_key="pm-demo-20261113")
+        self.source.add(9100, READY, session_key="pm-demo-11112222")
         engine.run_once()
         self.assertEqual(self.bus.payloads("event.agent.supervisor"), [])
         self.assertEqual(len(self.pm_rows(engine, "pm.verdict_unverified[user]")),
