@@ -4478,12 +4478,20 @@ class Engine:
         itself stayed invisible (#74). This check turns the row
         :meth:`_note_malformed_supervisor_sid` writes into a doctor line.
 
-        Three states, and only the first is ``ok``:
+        Three states, and two of them are ``ok``:
 
-        * a resolvable sid **and** no malformed row in the tail ⇒ ok;
         * a malformed row in the tail ⇒ ``ok=false`` with the count, label
           ``supervisor-silent``: every frame is being refused right now;
-        * no sid at all ⇒ ``warn``: a config gap, not a refusal.
+        * no sid at all ⇒ ``ok=true``: a deployment shape, not a fault. An
+          engine with no supervisor never resolves one, so ``warn`` here keeps
+          every such deployment off-green for good and buries the real fault -
+          configured first, then broken - in routine noise;
+        * a resolvable sid **and** no malformed row ⇒ ``ok=true``.
+
+        The ``level`` slot is consulted only when ``ok`` is false (``add``
+        writes ``"ok"`` otherwise), so both ``ok`` branches spell it ``"ok"``:
+        a literal ``"fail"`` beside ``ok=true`` reads as a contradiction the
+        code never acted on.
 
         Reads the bounded tail for the same reason the ``[PM:TASK]`` check
         does: ``events.jsonl`` grows every round.
@@ -4505,13 +4513,14 @@ class Engine:
                     f"to the supervisor is refused",
                     "fail", "supervisor-silent")
         if not resolved:
-            return ("supervisor-visibility", False,
-                    "ok=false no supervisor sid (engine.supervisor_sid empty and "
-                    "engine.supervisor_keys resolve nothing)",
-                    "warn", "supervisor-silent")
+            return ("supervisor-visibility", True,
+                    "ok=true no supervisor sid (engine.supervisor_sid empty and "
+                    "engine.supervisor_keys resolve nothing) - deployment shape, "
+                    "not a fault",
+                    "ok", "supervisor-silent")
         return ("supervisor-visibility", True,
                 f"ok=true resolved_sid=yes {self.SUPERVISOR_SID_MALFORMED_ROW}=0",
-                "fail", "supervisor-silent")
+                "ok", "supervisor-silent")
 
     def _check_process(self) -> tuple:
         """Fault 1: a dead pid lock, or a health record with no live engine."""

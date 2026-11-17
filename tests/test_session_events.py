@@ -47,6 +47,22 @@ EVENT_TYPES_SEVEN = ("session.created", "session.archived", "session.restored",
                      "session.key_changed", "session.rotated",
                      "session.profile_changed", "session.bound")
 
+# The workbench CLIs gate every sid argument on the full shape
+# (``sess_events.check_sid``: ``session_<8>-<4>-<4>-<4>-<12>``), so a fixture
+# that reaches a CLI must be a full UUID. Short names pass in-process (``emit``
+# does not check shape) and are kept only where no subprocess sees them.
+SID_TARGET = "session_11111111-1111-4111-8111-111111111111"
+SID_OLD = "session_22222222-2222-4222-8222-222222222222"
+SID_A = "session_33333333-3333-4333-8333-333333333333"
+SID_B = "session_44444444-4444-4444-8444-444444444444"
+SID_STEW = "session_55555555-5555-4555-8555-555555555555"
+SID_1 = "session_66666666-6666-4666-8666-666666666666"
+SID_2 = "session_77777777-7777-4777-8777-777777777777"
+SID_3 = "session_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+SID_W = "session_88888888-8888-4888-8888-888888888888"
+SID_X = "session_99999999-9999-4999-8999-999999999999"
+SID_NEVER = "session_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
 
 def _load(name: str):
     """Import a workbench tool by file path (they are not a package)."""
@@ -116,17 +132,17 @@ class SevenActions(SessionStreamBase):
         return sess.main(["profile", sid, "--model", "cb-step-5-preview", "--effort", "low"])
 
     def test_seven_actions_all_land_with_contiguous_seq(self):
-        sid = "session_iss27_target"
+        sid = SID_TARGET
         # 1 建
         self.ev.emit("session.created", sid=sid, key="wk-iss27")
         # 2 档 / 3 复
         self.assertEqual(self._archive(sid), 0)
         self.assertEqual(self._restore(sid), 0)
         # 4 换血（同键换 sid ⇒ key_changed + rotated）/ 7 换键（新键）
-        self.assertEqual(self.run_tool("sessions.py", "set", "qa", "session_old").returncode, 0)
+        self.assertEqual(self.run_tool("sessions.py", "set", "qa", SID_OLD).returncode, 0)
         self.assertEqual(self.run_tool("sessions.py", "set", "qa", sid).returncode, 0)
         self.assertEqual(self.run_tool("sessions.py", "set", "steward",
-                                       "session_stew").returncode, 0)
+                                       SID_STEW).returncode, 0)
         # 5 改模
         self.assertEqual(self._profile(sid), 0)
         # 6 bind
@@ -143,14 +159,14 @@ class SevenActions(SessionStreamBase):
             self.assertIn(wanted, types, f"missing {wanted}: {sorted(types)}")
 
     def test_rotation_is_one_key_changed_plus_one_rotated(self):
-        self.assertEqual(self.run_tool("sessions.py", "set", "qa", "session_a").returncode, 0)
+        self.assertEqual(self.run_tool("sessions.py", "set", "qa", SID_A).returncode, 0)
         before = len(self.events())
-        self.assertEqual(self.run_tool("sessions.py", "set", "qa", "session_b").returncode, 0)
+        self.assertEqual(self.run_tool("sessions.py", "set", "qa", SID_B).returncode, 0)
         added = self.events()[before:]
         self.assertEqual([r["type"] for r in added],
                          ["session.key_changed", "session.rotated"])
-        self.assertEqual(added[1]["from_sid"], "session_a")
-        self.assertEqual(added[1]["to_sid"], "session_b")
+        self.assertEqual(added[1]["from_sid"], SID_A)
+        self.assertEqual(added[1]["to_sid"], SID_B)
 
 
 class RuntimeCounts(SessionStreamBase):
@@ -160,11 +176,11 @@ class RuntimeCounts(SessionStreamBase):
         cases = []
         # 新键 ⇒ +1
         n = len(self.events())
-        self.assertEqual(self.run_tool("sessions.py", "set", "qa", "session_1").returncode, 0)
+        self.assertEqual(self.run_tool("sessions.py", "set", "qa", SID_1).returncode, 0)
         cases.append(("set(new key)", len(self.events()) - n, 1))
         # 已存在键换 sid ⇒ +2
         n = len(self.events())
-        self.assertEqual(self.run_tool("sessions.py", "set", "qa", "session_2").returncode, 0)
+        self.assertEqual(self.run_tool("sessions.py", "set", "qa", SID_2).returncode, 0)
         cases.append(("set(existing key, new sid)", len(self.events()) - n, 2))
         # rm ⇒ +1
         n = len(self.events())
@@ -174,23 +190,23 @@ class RuntimeCounts(SessionStreamBase):
         sess = _load("sess")
         sess._req = lambda method, path, body=None: (200, {"code": 0, "data": {}})
         n = len(self.events())
-        self.assertEqual(sess.main(["archive", "session_x"]), 0)
+        self.assertEqual(sess.main(["archive", SID_X]), 0)
         cases.append(("sess archive", len(self.events()) - n, 1))
         # restore ⇒ +1
         n = len(self.events())
-        self.assertEqual(sess.main(["restore", "session_x"]), 0)
+        self.assertEqual(sess.main(["restore", SID_X]), 0)
         cases.append(("sess restore", len(self.events()) - n, 1))
         # profile ⇒ +1
         sess.BUSD.ctl = lambda *a, **k: (True, {"ok": True}, "direct(stub)")
         n = len(self.events())
-        self.assertEqual(sess.main(["profile", "session_x", "--model", "m1"]), 0)
+        self.assertEqual(sess.main(["profile", SID_X, "--model", "m1"]), 0)
         cases.append(("sess profile", len(self.events()) - n, 1))
         # bind ⇒ +1
         n = len(self.events())
         self.assertEqual(self.run_tool("gh_issue.py", "bind", "--role", "pm", "--project",
                                        any_project_key(), "--issue", "27",
                                        "--bind-role", "worker", "--session",
-                                       "session_w").returncode, 0)
+                                       SID_W).returncode, 0)
         cases.append(("gh_issue bind", len(self.events()) - n, 1))
         for name, got, want in cases:
             with self.subTest(entry=name):
@@ -201,12 +217,12 @@ class RuntimeCounts(SessionStreamBase):
         sess = _load("sess")
         sess._req = lambda method, path, body=None: (500, {"code": 50001})
         before = len(self.events())
-        sess.main(["archive", "session_never_archived"])
+        sess.main(["archive", SID_NEVER])
         self.assertEqual(len(self.events()), before)
 
     def test_read_only_entry_points_do_not_emit(self):
         """The ten sessions.json readers are reads only: listing writes no event."""
-        self.assertEqual(self.run_tool("sessions.py", "set", "qa", "session_1").returncode, 0)
+        self.assertEqual(self.run_tool("sessions.py", "set", "qa", SID_1).returncode, 0)
         before = len(self.events())
         self.run_tool("sessions.py", "list")
         self.run_tool("sessions.py", "busy")       # server down: still no event
@@ -217,11 +233,11 @@ class SeqRestart(SessionStreamBase):
     """Acceptance 5: a brand-new process continues from the last seq."""
 
     def test_new_process_continues_seq(self):
-        self.ev.emit("session.created", sid="session_a")
-        self.ev.emit("session.archived", sid="session_a")
+        self.ev.emit("session.created", sid=SID_A)
+        self.ev.emit("session.archived", sid=SID_A)
         tail = self.events()
         self.assertEqual([r["seq"] for r in tail], [1, 2])
-        done = self.run_tool("sess_events.py", "emit", "session.restored", "--sid", "session_a")
+        done = self.run_tool("sess_events.py", "emit", "session.restored", "--sid", SID_A)
         self.assertEqual(done.returncode, 0, done.stderr)
         rows = self.events()
         self.assertEqual([r["seq"] for r in rows], [1, 2, 3])
@@ -235,7 +251,7 @@ class SeqRestart(SessionStreamBase):
         self.assertTrue((self.root / "events.jsonl.1").is_file())
         self.assertEqual(self.events()[-1]["seq"], 3)
         self.assertEqual(self.ev.last_seq(), 3)
-        done = self.run_tool("sess_events.py", "emit", "session.archived", "--sid", "session_3")
+        done = self.run_tool("sess_events.py", "emit", "session.archived", "--sid", SID_3)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.ev.last_seq(), 4)
 
