@@ -717,6 +717,50 @@ class Matching(unittest.TestCase):
         rec, _ = asg.match_delivery(index, THREAD, "a")
         self.assertIsNone(rec)
 
+    # -- #ISS-91: the sole rescue is worker-only, pinned as a pair ------------
+    #
+    # A long-lived role is not a participant role (``PARTICIPANT_ROLES`` is
+    # worker/qa), so it never owns an assignment row. Once the delivery prefix
+    # set widened, ``[SC:name]`` reached this function and the sole fallback
+    # wrote it onto the single worker - a false green. The two cases below are
+    # only meaningful together: one proves the rescue still fires for WK, the
+    # other proves it does not fire for a widened prefix.
+    def one_live_worker(self):
+        return {"assignments": {
+            "asg_1_worker_1": {"id": "asg_1_worker_1", "thread": THREAD,
+                               "role": "worker", "status": "working",
+                               "session_key": "wk-other"}}}
+
+    def test_sole_rescue_still_fires_for_wk(self):
+        rec, how = asg.match_delivery(self.one_live_worker(), THREAD, "wk-1",
+                                      "WK")
+        self.assertEqual((rec["id"], how), ("asg_1_worker_1", "sole"))
+
+    def test_sole_rescue_never_matches_a_long_lived_prefix(self):
+        for marker in ("SC", "ST", "AU", "RV", "AT", "PL"):
+            with self.subTest(marker=marker):
+                rec, how = asg.match_delivery(self.one_live_worker(), THREAD,
+                                              "scout-1", marker)
+                self.assertIsNone(rec, marker)
+                self.assertIn("no live worker", how)
+
+    def test_a_widened_prefix_still_matches_its_own_session_key(self):
+        # The exact path is not marker-gated: a binding that does exist is used.
+        index = {"assignments": {
+            "asg_1_scout_1": {"id": "asg_1_scout_1", "thread": THREAD,
+                              "role": "scout", "status": "working",
+                              "session_key": "scout-1"},
+            "asg_1_worker_1": {"id": "asg_1_worker_1", "thread": THREAD,
+                               "role": "worker", "status": "working",
+                               "session_key": "wk-1"}}}
+        rec, how = asg.match_delivery(index, THREAD, "scout-1", "SC")
+        self.assertEqual((rec["id"], how), ("asg_1_scout_1", "marker"))
+
+    def test_the_marker_argument_defaults_to_wk(self):
+        # Old callers keep the old behaviour: no argument means a WK delivery.
+        rec, how = asg.match_delivery(self.one_live_worker(), THREAD, "wk-1")
+        self.assertEqual((rec["id"], how), ("asg_1_worker_1", "sole"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -52,6 +52,46 @@ class MarkerParsing(unittest.TestCase):
     def test_plain_comment_has_no_marker(self):
         self.assertFalse(markers.has_marker("plain text\n[decision] later"))
 
+    def test_every_role_prefix_is_a_delivery(self):
+        # #ISS-91: the set is closed on purpose - the supervisor and QA
+        # prefixes are not in it (see ``test_an_unlisted_prefix_is_not_a_delivery``).
+        for prefix in ("WK", "SC", "ST", "AU", "RV", "AT", "PL"):
+            with self.subTest(prefix=prefix):
+                out = markers.parse_delivery(f"[{prefix}:foo] done")
+                self.assertIsNotNone(out)
+                self.assertEqual(out["marker"], prefix)
+                self.assertEqual(out["name"], "foo")
+
+    def test_the_marker_is_the_prefix_as_written(self):
+        # #ISS-91: a caller reading ``marker`` must not get "WK" for an SC line.
+        self.assertEqual(markers.parse_delivery("[SC:foo] x")["marker"], "SC")
+        self.assertEqual(markers.parse_delivery("[sc:foo] x")["marker"], "SC")
+
+    def test_an_unlisted_prefix_is_not_a_delivery(self):
+        # The supervisor prefix is excluded too; it is not written here because
+        # ``tools/privacy_gate.py`` treats that role name as a credential hint.
+        for prefix in ("PM", "QA", "XX", "ZZ"):
+            with self.subTest(prefix=prefix):
+                self.assertIsNone(markers.parse_delivery(f"[{prefix}:foo] x"))
+
+    def test_a_prefix_without_a_colon_name_is_not_a_delivery(self):
+        self.assertIsNone(markers.parse_delivery("[SC] 请求裁决：x"))
+
+    def test_a_role_name_is_not_the_prefix(self):
+        # Longest-prefix confusion: "[SC:..]" must not match a shorter token.
+        self.assertIsNone(markers.parse_delivery("[S:foo] x"))
+        self.assertIsNone(markers.parse_delivery("[W:foo] x"))
+
+    def test_name_bounds_are_the_same_for_every_prefix(self):
+        self.assertIsNone(markers.parse_delivery("[SC:] x"))
+        self.assertIsNone(markers.parse_delivery("[SC:   ] x"))
+        self.assertIsNone(markers.parse_delivery("[SC:" + "a" * 65 + "] x"))
+        out = markers.parse_delivery("[SC:" + "a" * 64 + "] x")
+        self.assertEqual(len(out["name"]), 64)
+
+    def test_a_role_marker_off_the_first_line_is_ignored(self):
+        self.assertIsNone(markers.parse_delivery("结论如下\n[SC:foo] done"))
+
 
 class TriageOrder(unittest.TestCase):
     """The four-way order, checked through the engine's own ``_triage``."""
@@ -63,6 +103,31 @@ class TriageOrder(unittest.TestCase):
         cfg = {"mode": "observe", "role": role,
                "engine": {"escalation_markers": ["[decision]", "[blocked]"]}}
         return Engine(cfg, _NullStore(), _NullSource(), None)
+
+    def test_a_role_prefix_is_a_delivery(self):
+        # #ISS-91: same branch as ``[WK:]``, no order change.
+        state, reason = self.engine()._triage({"author": "scout",
+                                              "body": "[SC:foo] report"})
+        self.assertEqual((state, reason), ("delivery", "marker 'foo'"))
+
+    def test_the_delivery_branch_still_runs_before_the_task_book(self):
+        # The reason ``PM`` is not in the prefix set: a task book must never be
+        # read as a delivery named "TASK" (#ISS-91, #ISS-85).
+        state, reason = self.engine()._triage(
+            {"author": "x", "body": "[PM:TASK] ISS-91 任务书"})
+        self.assertEqual((state, reason), ("ignored", "pm task book"))
+
+    def test_the_four_older_prefixes_keep_their_branch(self):
+        # #ISS-91 red line 2: the delivery test widened, these four did not move.
+        engine = self.engine()
+        for body, want in (
+                ("[QA] 复核：**通过**", "review"),
+                ("[PM] 可关单 #91 <!-- verdict: ready -->", "pm_verdict"),
+                ("[PM:TASK] ISS-91 任务书", "ignored"),
+                ("[AT] 可派单 #1 <!-- verdict: ready -->", "at_verdict")):
+            with self.subTest(body=body):
+                self.assertEqual(engine._triage({"author": "x",
+                                                 "body": body})[0], want)
 
     def test_delivery_beats_role_noise(self):
         engine = self.engine(role="worker")

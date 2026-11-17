@@ -3155,7 +3155,8 @@ class Engine:
         """
         cid = int(comment["id"])
         assignment, matched_by = asg_mod.match_delivery(index, thread,
-                                                        delivery["name"])
+                                                        delivery["name"],
+                                                        delivery["marker"])
         if assignment is None:
             self.store.log_event({"type": "assignment.unmatched", "at": _now(),
                                   "thread": thread, "comment_id": cid,

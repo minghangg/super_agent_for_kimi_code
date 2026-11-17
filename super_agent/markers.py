@@ -43,12 +43,20 @@ import unicodedata
 
 from . import issuekey
 
-# ``[WK:name]`` with a name of 1..64 non-] characters, case-insensitive.
-WK_RE = re.compile(r"^\s*\[WK:([^\]\n]{1,64})\]", re.I)
+# A delivery is ``[<role>:<name>]`` on the first line, name 1..64 non-]
+# characters. The role set is closed on purpose: ``PM`` and ``QA`` are
+# **excluded** because they already own first-line prefixes of their own
+# (``[PM:TASK]`` dispatch, ``[PM]`` verdict, ``[QA]`` review) and the delivery
+# test runs before all of them - admitting ``PM`` would read every task book as
+# a delivery named ``TASK`` (#ISS-91, ``engine._triage``).
+DELIVERY_PREFIXES = ("WK", "SC", "ST", "AU", "RV", "AT", "PL")
+DELIVERY_RE = re.compile(
+    r"^\s*\[(" + "|".join(DELIVERY_PREFIXES) + r"):([^\]\n]{1,64})\]", re.I)
 
-# A delivery body may quote the marker later; that is not a marker. Only the
-# first line is examined, so nothing else is needed here.
-MARKER = "WK"
+# Kept because the name is public, but it is **no longer what
+# :func:`parse_delivery` uses**: ``[WK:x]`` is one member of ``DELIVERY_RE``.
+# Deprecated: new code must go through ``DELIVERY_RE``/``parse_delivery``.
+WK_RE = re.compile(r"^\s*\[WK:([^\]\n]{1,64})\]", re.I)
 
 # ``[QA]`` in either bracket width. ``gh_issue.py`` writes the ASCII form;
 # hand-written comments use the full-width one, and real corpora contain both
@@ -121,17 +129,22 @@ def first_line(body: str) -> str:
 
 
 def parse_delivery(body: str) -> dict | None:
-    """``{"marker", "name", "line"}`` when the body opens with a delivery marker."""
+    """``{"marker", "name", "line"}`` when the body opens with a delivery marker.
+
+    ``marker`` is the **prefix as written** (upper-cased: ``"WK"``, ``"SC"`` …),
+    never a fixed value - a caller that reads it must not get ``"WK"`` for an
+    ``[SC:…]`` line (#ISS-91).
+    """
     line = first_line(body)
     if not line:
         return None
-    match = WK_RE.match(line)
+    match = DELIVERY_RE.match(line)
     if not match:
         return None
-    name = match.group(1).strip()
+    name = match.group(2).strip()
     if not name:
         return None
-    return {"marker": MARKER, "name": name, "line": line}
+    return {"marker": match.group(1).upper(), "name": name, "line": line}
 
 
 def has_marker(body: str) -> bool:

@@ -227,14 +227,23 @@ def sync(index: dict, thread: str, issue, live: list[dict], *,
     return out
 
 
-def match_delivery(index: dict, thread: str, name: str) -> tuple[dict | None, str]:
-    """Find the assignment a ``[WK:<name>]`` delivery belongs to.
+def match_delivery(index: dict, thread: str, name: str,
+                   marker: str = "WK") -> tuple[dict | None, str]:
+    """Find the assignment a ``[<marker>:<name>]`` delivery belongs to.
 
     Returns ``(assignment, matched_by)`` or ``(None, reason)``. Matching order:
 
     1. ``session_key`` equals the marker name (exact, the normal path);
     2. the thread has exactly **one** live worker (``matched_by="sole"``);
     3. otherwise nothing matches and the caller must escalate.
+
+    The ``sole`` step is **worker-only rescue**: it exists for older comments
+    that carry no name. A long-lived role (``SC``/``ST``/``AU``/``RV``/``AT``/
+    ``PL``) is not a participant role yet (``PARTICIPANT_ROLES``), so without
+    this guard its delivery would be written onto the single worker's
+    assignment - a false green that appears the moment the delivery prefix set
+    widened (#ISS-91). An unmatched long-lived delivery returns ``None`` so the
+    caller raises ``needs_person``; it is visible, not silent.
     """
     assignments = index.get("assignments") or {}
     candidates = [rec for rec in assignments.values()
@@ -244,7 +253,7 @@ def match_delivery(index: dict, thread: str, name: str) -> tuple[dict | None, st
         if str(rec.get("session_key") or "") == name:
             return rec, "marker"
     workers = [rec for rec in candidates if str(rec.get("role") or "") == "worker"]
-    if len(workers) == 1:
+    if str(marker or "").upper() == "WK" and len(workers) == 1:
         return workers[0], "sole"
     return None, "no live worker matches the marker"
 
