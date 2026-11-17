@@ -373,6 +373,14 @@ class ProjectAllowlist:
         :data:`OVERLAY_FIELDS` and is never committed, so that is where the
         engine keeps "which issues are live right now".
 
+        **This call is the single source of truth for the in-flight set**
+        (``super_agent/engine.py:3996`` calls it once per round with what GitHub
+        reports as open-and-not-on-hold). The ``issues`` list in the *tracked*
+        file is an initial snapshot only: :func:`merge_overlay` replaces the
+        column wholesale, so a hand-added number there neither guarantees
+        delivery nor survives the next round. A number GitHub does not return
+        is never in flight, no matter what any file says (ISS-74 E).
+
         Idempotent: identical content is not rewritten. A write failure is
         reported, never raised - a read-only checkout must still run.
         """
