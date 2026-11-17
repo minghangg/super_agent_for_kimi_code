@@ -128,20 +128,42 @@ def resolve_sessions_path(cfg: dict | None = None, explicit: str | None = None) 
     return resolve_session_root(cfg) / "sessions.json"
 
 
+class StreamUnreadable(ValueError):
+    """A segment exists but its bytes are not UTF-8.
+
+    Two realistic causes: the writer was cut off mid-line, or an editor saved
+    the file as GBK/ANSI on a Chinese Windows. It is **not** a missing stream -
+    the caller must say which one it saw, because the operator either restores
+    a file or fixes an encoding, and the two answers differ.
+
+    A ``ValueError`` for the same reason ``SessionStreamNotConfigured`` is a
+    ``FileNotFoundError``: callers that already guard with ``ValueError`` (the
+    per-line JSON parse) keep their behaviour.
+    """
+
+
 def _read_jsonl(path: Path) -> list[dict]:
     """Rows of one segment. An unreadable segment raises; it is not an empty file."""
     rows: list[dict] = []
-    with open(path, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(rec, dict):
-                rows.append(rec)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict):
+                    rows.append(rec)
+    except UnicodeDecodeError as exc:
+        # Decoding happens while the file is iterated, so the failure surfaces
+        # mid-loop. Name the segment and the codec reason: "unreadable" alone
+        # would leave the operator guessing between a truncated write and a
+        # re-saved encoding.
+        raise StreamUnreadable(
+            f"{path.name}: {type(exc).__name__}: {exc}") from exc
     return rows
 
 

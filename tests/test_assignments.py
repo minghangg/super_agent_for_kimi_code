@@ -294,6 +294,59 @@ class Sync(Base):
         health = json.loads((self.state / "health.json").read_text("utf-8"))
         self.assertFalse(health["degraded"])
 
+    def test_unreadable_stream_degrades_instead_of_aborting_the_round(self):
+        """A segment that is not UTF-8 must reach health, not escape the round.
+
+        QA's finding (ISS-79 P1-1): ``open(..., encoding="utf-8")`` raises
+        ``UnicodeDecodeError``, which is a ``ValueError`` and therefore slipped
+        past the ``except OSError`` guard. The exception left ``run_round``
+        before its own ``write_health``, so ``health.json`` kept the previous,
+        healthy snapshot while every round failed.
+        """
+        self.events.write_bytes(b"\xff\xfe\x00bad\n")
+        engine = self.engine()
+        engine.run_once()
+        self.assertTrue(engine.degraded)
+        health = json.loads((self.state / "health.json").read_text("utf-8"))
+        self.assertTrue(health["degraded"], "health must not stay on the old snapshot")
+        self.assertIn("not decodable as UTF-8", health["last_error"])
+        self.assertNotIn("missing", health["last_error"],
+                         "an encoding fault is not a missing file")
+        kinds = [json.loads(x)["type"] for x in
+                 (self.state / "events.jsonl").read_text("utf-8").splitlines()]
+        self.assertIn("session.stream_unreadable", kinds)
+        self.assertNotIn("session.stream_missing", kinds)
+
+    def test_unreadable_survives_the_stop_write(self):
+        """The last health write of a process must not erase the fault.
+
+        ``cli once`` writes health twice: once at the end of the round and once
+        more after it, with ``running=False``. The second call passes no
+        ``error``, so unless ``health_record`` folds in ``_stream_error`` it
+        replaces a degraded snapshot with a healthy one.
+        """
+        self.events.write_bytes(b"\xff\xfe\x00bad\n")
+        engine = self.engine()
+        engine.run_once()
+        engine.write_health(running=False)
+        health = json.loads((self.state / "health.json").read_text("utf-8"))
+        self.assertTrue(health["degraded"])
+        self.assertIn("not decodable as UTF-8", health["last_error"])
+
+    def test_missing_and_unreadable_are_told_apart(self):
+        """The two faults need different repairs, so they need different words."""
+        engine = self.engine()
+        self.events.write_bytes(b"\xff\xfe\x00bad\n")
+        engine.run_once()
+        unhealthy = engine.health_record()["last_error"]
+        engine = self.engine()
+        self.events.unlink()
+        engine.run_once()
+        missing = engine.health_record()["last_error"]
+        self.assertIn("not decodable", unhealthy)
+        self.assertIn("missing", missing)
+        self.assertNotEqual(unhealthy, missing)
+
     def test_reader_failure_is_recorded_and_fails_closed(self):
         self.bind("session_w1")
         engine = self.engine()

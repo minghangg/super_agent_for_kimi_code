@@ -360,12 +360,23 @@ class Engine:
             self._active_assignments_last = active
         else:
             active = self._active_assignments_last
-        last_error = "; ".join(x for x in (error, self._index_error) if x)
+        # ``_stream_error`` is part of the record, not just of the round's own
+        # error list: the last write of a process (``cli once`` and the stop
+        # write of ``cli run``) passes no error, and leaving the stream fault
+        # out of here made that write flip a degraded snapshot back to healthy
+        # (ISS-79 P1-1). Duplicates are dropped: the round joins its own error
+        # list in, and the same reason must not appear twice.
+        reasons: list[str] = []
+        for reason in (error, self._index_error, self._stream_error):
+            if reason and reason not in reasons:
+                reasons.append(reason)
+        last_error = "; ".join(reasons)
         record = {"pid": os.getpid(), "mode": self.mode,
                   "last_loop_at": _now(),
                   "last_successful_action_at": self.last_successful_action_at,
                   "active_assignments": active,
-                  "degraded": bool(degraded or error or self._index_error),
+                  "degraded": bool(degraded or error or self._index_error
+                                   or self._stream_error),
                   "last_error": last_error,
                   "running": bool(running)}
         if phase:
@@ -4480,17 +4491,24 @@ class Engine:
         return events, sessions
 
     def _note_stream_state(self) -> str:
-        """Fail closed when a **declared** session stream is absent (ISS-79).
+        """Fail closed when a **declared** session stream is absent or unreadable.
 
-        Three cases, and only the second is a fault:
+        Four cases, and only the last two are faults:
 
         * nothing declared - the engine has no session truth by configuration;
           it runs, and it says nothing, because that is the configured state;
+        * declared and readable - the round is unaffected;
         * declared but no segment on disk - :func:`session_events.read_stream`
-          reports ``missing``; the round is degraded, one event is written and
-          the reason is folded into ``health.json``;
-        * declared, present, unreadable - the existing ``except`` in
-          ``_sync_assignments`` already reports it.
+          reports ``missing``; the round is degraded and one event says so;
+        * declared, present, but not UTF-8 - ``_read_jsonl`` raises
+          :class:`session_events.StreamUnreadable`. It is caught **here**, not
+          left to bubble out of the round: an escaping exception skipped the
+          round's own ``write_health``, so ``health.json`` kept the previous,
+          healthy snapshot while every round failed (ISS-79 P1-1).
+
+        Missing and unreadable are kept apart on purpose. The operator's next
+        action differs: one restores a file, the other fixes an encoding. A
+        single vague "stream unavailable" would leave them guessing.
 
         The judgement uses ``segments()``, never ``path.is_file()``: a stream
         whose current file was rotated to ``.1`` is still readable, and calling
@@ -4502,12 +4520,24 @@ class Engine:
             return ""
         try:
             rows, missing = session_events.read_stream(events)
+        except session_events.StreamUnreadable as exc:
+            self.degraded = True
+            self._stream_error = f"session stream not decodable as UTF-8: {exc}"
+            self.store.log_event({"type": "session.stream_unreadable", "at": _now(),
+                                  "path": str(events), "rows": 0,
+                                  "encoding": "utf-8",
+                                  "error": self._stream_error,
+                                  "level": "warn",
+                                  "consumers": ["doctor", "brief", "health"]})
+            return self._stream_error
         except OSError as exc:
             self.degraded = True
-            self._stream_error = f"{type(exc).__name__}: {exc}"
-            self.store.log_event({"type": "session.stream_missing", "at": _now(),
+            self._stream_error = f"session stream unreadable: {type(exc).__name__}: {exc}"
+            self.store.log_event({"type": "session.stream_unreadable", "at": _now(),
                                   "path": str(events), "rows": 0,
-                                  "error": self._stream_error})
+                                  "error": self._stream_error,
+                                  "level": "warn",
+                                  "consumers": ["doctor", "brief", "health"]})
             return self._stream_error
         if not missing:
             return ""
