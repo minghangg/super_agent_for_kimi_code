@@ -61,6 +61,22 @@ DEFAULTS: dict = {
         "cooldown_s": 900,
         "assignments": {},         # reserved; M0 must leave this empty
         "session_events_path": "",  # workbench lifecycle stream (read-only); "" = resolve
+        # ISS-79: the **session root** as one declared directory. The whole
+        # session state lives in one root (``events.jsonl``, ``sessions.json``,
+        # ``issue_sessions.json``, ``ledger.jsonl``) and one writer owns it, so
+        # the paths cannot be derived from each other. Declaring the root is
+        # level 3 of the resolution chain: explicit, then env, then this.
+        # "" = fall back to the parent of the resolved stream.
+        "session_state_dir": "",
+        # ISS-79: the workbench checkout root, for documents (charter, its
+        # playbooks). Independent of where the session stream lives: the brief
+        # used to infer it from ".../state/events.jsonl", which is a guess about
+        # a different question. "" = infer from the session root's parent.
+        "lwa_root": "",
+        # ISS-79: the session console (``sess.py``). Declared here so the path
+        # stops being assembled from a directory name; "" = the assembled
+        # default. Consumed by the CLI console lookup.
+        "session_console_path": "",
         "project_allowlist": "",   # "" = not configured; the CLI resolves the repo default
         "creation_mode": "pm_created",  # only pm_created is accepted
         # Ask the session service whether a candidate sid is archived. The
@@ -168,6 +184,15 @@ def validate(cfg: dict) -> dict:
     events_path = (cfg.get("engine") or {}).get("session_events_path")
     if events_path is not None and not isinstance(events_path, str):
         raise ConfigError("engine.session_events_path must be a path string (or empty)")
+    session_dir = (cfg.get("engine") or {}).get("session_state_dir", "")
+    if session_dir is not None and not isinstance(session_dir, str):
+        raise ConfigError("engine.session_state_dir must be a path string (or empty)")
+    lwa_root = (cfg.get("engine") or {}).get("lwa_root", "")
+    if lwa_root is not None and not isinstance(lwa_root, str):
+        raise ConfigError("engine.lwa_root must be a path string (or empty)")
+    console_path = (cfg.get("engine") or {}).get("session_console_path", "")
+    if console_path is not None and not isinstance(console_path, str):
+        raise ConfigError("engine.session_console_path must be a path string (or empty)")
     profiles_path = (cfg.get("engine") or {}).get("model_profiles_path", "")
     if profiles_path is not None and not isinstance(profiles_path, str):
         raise ConfigError("engine.model_profiles_path must be a path string (or empty)")

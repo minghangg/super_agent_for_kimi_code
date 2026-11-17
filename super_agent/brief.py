@@ -27,6 +27,7 @@ module does not have.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -150,13 +151,24 @@ def _strict_json(path: Path):
 
 
 def _lwa_root(cfg: dict, override: str | None) -> Path | None:
-    """Workbench checkout root, derived from where the session stream lives."""
+    """Workbench checkout root: where the charter and its playbooks live.
+
+    ``engine.lwa_root`` is the declared answer. Deriving it from the session
+    stream (the old behaviour) answered a different question: the stream's
+    parent is the *session root*, and a session root need not sit inside a
+    workbench checkout - so the guess silently produced ``None`` and the role
+    section quietly went empty (ISS-79). The override (``--lwa``) still wins.
+    """
     if override:
         return Path(override).expanduser().resolve()
-    events = session_events.resolve_events_path(cfg)
-    if events.parent.name == "state":
-        return events.parent.parent
-    return None
+    declared = str(((cfg or {}).get("engine") or {}).get("lwa_root") or "").strip()
+    if declared:
+        return Path(os.path.expanduser(declared)).resolve()
+    try:
+        root = session_events.resolve_session_root(cfg)
+    except OSError:
+        return None
+    return root.parent if root.name == "state" else None
 
 
 def _classify(reason: str, markers=None) -> int:

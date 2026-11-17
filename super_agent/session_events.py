@@ -16,11 +16,19 @@ with what the server actually has live.
 
 Path resolution, in order (first hit wins):
 
-1. an explicit ``--events`` argument;
+1. a path the caller passes explicitly;
 2. ``$SESS_EVENTS_STATE_DIR/events.jsonl`` (same env var the writer uses);
-3. ``engine.session_events_path`` from the config;
-4. ``$LWA_STATE_DIR/events.jsonl``;
-5. a workbench checkout's ``state/events.jsonl`` next to the working directory.
+3. ``engine.session_state_dir`` -- the declared session root;
+4. ``engine.session_events_path`` from the config;
+5. ``$LWA_STATE_DIR/events.jsonl``.
+
+Five levels, and **no guessing**: this module never derives a location from the
+working directory. When none of the five applies it raises
+:class:`SessionStreamNotConfigured` instead of returning a plausible-looking
+path. A declared path that does not exist is not an error here either - the
+caller that needs rows asks :func:`read_stream`, which reports ``missing`` so
+the engine can fail closed (degraded, event, health) rather than run a round
+on an empty stream.
 
 Nothing here writes: replay is read-only, and no file is created on import.
 """
@@ -59,50 +67,81 @@ KNOWN_TYPES = (CREATED, KEY_CHANGED, ROTATED, ARCHIVED, RESTORED,
                PROFILE_CHANGED, BOUND)
 
 
+class SessionStreamNotConfigured(FileNotFoundError):
+    """No level of the resolution chain applies.
+
+    A ``FileNotFoundError`` so callers that already guard with ``OSError`` keep
+    their behaviour; the name says *why* nothing was found (nothing declared),
+    which is a configuration fault, not a missing file.
+    """
+
+
+def _engine_cfg(cfg: dict | None) -> dict:
+    return (cfg or {}).get("engine") or {}
+
+
+def resolve_session_root(cfg: dict | None = None) -> Path:
+    """The session root: the one directory that holds the whole session state.
+
+    ``engine.session_state_dir`` is the declared root and wins. Otherwise the
+    root is inferred from the resolved stream's parent, because the other files
+    of this root (``sessions.json``, ``issue_sessions.json``, ``ledger.jsonl``)
+    are written beside ``events.jsonl`` by one writer.
+    """
+    declared = str(_engine_cfg(cfg).get("session_state_dir") or "").strip()
+    if declared:
+        return Path(os.path.expanduser(declared)).resolve()
+    return resolve_events_path(cfg).parent
+
+
 def resolve_events_path(cfg: dict | None = None, explicit: str | None = None) -> Path:
-    """Locate the workbench lifecycle stream (see the module docstring)."""
+    """Locate the workbench lifecycle stream (see the module docstring).
+
+    Raises :class:`SessionStreamNotConfigured` when none of the five levels
+    applies. That is the point of this function after ISS-79: a path is only
+    ever *declared* or *handed in*, never guessed from the working directory.
+    """
     if explicit:
         return Path(os.path.expanduser(str(explicit))).resolve()
     env = (os.environ.get(ENV_STATE_DIR) or "").strip()
     if env:
         return (Path(os.path.expanduser(env)) / EVENTS_NAME).resolve()
-    configured = str(((cfg or {}).get("engine") or {}).get("session_events_path") or "").strip()
+    declared = str(_engine_cfg(cfg).get("session_state_dir") or "").strip()
+    if declared:
+        return Path(os.path.expanduser(declared)).resolve() / EVENTS_NAME
+    configured = str(_engine_cfg(cfg).get("session_events_path") or "").strip()
     if configured:
         return Path(os.path.expanduser(configured)).resolve()
     lwa = (os.environ.get(ENV_LWA_STATE) or "").strip()
     if lwa:
         return (Path(os.path.expanduser(lwa)) / EVENTS_NAME).resolve()
-    cwd = Path.cwd()
-    for root in (cwd, cwd.parent):
-        candidate = root / LWA_DIRNAME / "state" / EVENTS_NAME
-        if candidate.is_file():
-            return candidate.resolve()
-    return (cwd / LWA_DIRNAME / "state" / EVENTS_NAME).resolve()
+    raise SessionStreamNotConfigured(
+        f"no session stream configured: set engine.session_state_dir, "
+        f"engine.session_events_path, ${ENV_STATE_DIR} or ${ENV_LWA_STATE} "
+        f"(this reader no longer guesses from the working directory)")
 
 
 def resolve_sessions_path(cfg: dict | None = None, explicit: str | None = None) -> Path:
     """Locate ``state/sessions.json`` next to the event stream by default."""
     if explicit:
         return Path(os.path.expanduser(str(explicit))).resolve()
-    return resolve_events_path(cfg).parent / "sessions.json"
+    return resolve_session_root(cfg) / "sessions.json"
 
 
 def _read_jsonl(path: Path) -> list[dict]:
+    """Rows of one segment. An unreadable segment raises; it is not an empty file."""
     rows: list[dict] = []
-    try:
-        with open(path, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(rec, dict):
-                    rows.append(rec)
-    except OSError:
-        return []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict):
+                rows.append(rec)
     return rows
 
 
@@ -112,13 +151,35 @@ def segments(path: Path) -> list[Path]:
                         path.with_name(path.name + ".2")) if p.is_file()]
 
 
-def load_events(path: Path) -> list[dict]:
-    """All segments, ordered by seq (missing seq sorts first, then ``at``)."""
+def read_stream(path: Path) -> tuple[list[dict], bool]:
+    """All segments plus a ``missing`` flag for the caller that must fail closed.
+
+    ``missing`` is true only when **no** segment exists: a stream whose current
+    file was just rotated away still has data in ``.1``, and calling that
+    "missing" would degrade a healthy engine once per rotation.
+
+    This is the pair the two silent points of ISS-79 needed. ``segments`` was
+    the first (an absent file yields ``[]``, so the read loop never ran), and
+    the ``except OSError: return []`` that used to live in the reader was the
+    second: fixing only one of them still produced a silent empty stream.
+    """
+    found = segments(path)
+    if not found:
+        return [], True
     rows: list[dict] = []
-    for seg in segments(path):
+    for seg in found:
         rows.extend(_read_jsonl(seg))
     rows.sort(key=lambda r: (_seq_of(r), str(r.get("at") or "")))
-    return rows
+    return rows, False
+
+
+def load_events(path: Path) -> list[dict]:
+    """All segments, ordered by seq (missing seq sorts first, then ``at``).
+
+    A missing stream yields ``[]`` here for compatibility with the read-only
+    callers; anyone who must *tell* missing from empty asks :func:`read_stream`.
+    """
+    return read_stream(path)[0]
 
 
 def _seq_of(rec: dict) -> int:

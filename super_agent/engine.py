@@ -225,6 +225,11 @@ class Engine:
         # and health reports degraded (fail closed, never an empty loop).
         self.degraded = False
         self._assignments_error = ""
+        # Set when a **declared** session stream has no segment on disk
+        # (``_note_stream_state``). Round-scoped: cleared at the top of every
+        # round, so a fixed stream does not carry yesterday's reason into
+        # today's health snapshot.
+        self._stream_error = ""
         # Set when index.json cannot be read (see ``_note_index_state``): the
         # round keeps running so the fault reaches health and the event log.
         self._index_error = ""
@@ -3330,11 +3335,18 @@ class Engine:
         Every sid the stream mentions is cached, archived **and** live. A sid
         that is absent from the cache is unknown to the stream and therefore
         needs the server check in :meth:`_live_archived`.
+
+        "Unavailable" means *no segment exists*, decided by
+        :func:`session_events.read_stream` - not ``path.is_file()``. The writer
+        rotates the current file to ``.1``, and the old ``is_file()`` test read
+        that instant as an unreadable stream: every sid then became "unknown"
+        and every binding fell to the server check (ISS-79, same family as the
+        two silent points in the reader).
         """
         try:
             events_path, _sessions = self._session_stream()
-            events = session_events.load_events(events_path)
-            if not events_path.is_file() or not events:
+            events, missing = session_events.read_stream(events_path)
+            if missing or not events:
                 raise RuntimeError(f"session stream unavailable: {events_path.name}")
             state = session_events.replay(events)
         except Exception:  # noqa: BLE001  unreadable means "assume archived"
@@ -3909,7 +3921,14 @@ class Engine:
         # ``index.unreadable`` event exist even when the write-back is refused
         # at the end of the round (see the two save sites below).
         self._index_skip_logged = False
+        # Round-scoped: a stream fault from the previous round must not linger
+        # in this round's health line after the stream came back.
+        self._stream_error = ""
         self._note_index_state()
+        # ISS-79 F: a declared-but-absent session stream must not turn into a
+        # quiet round. Checked here, before any issue is read, so the fault is
+        # in health and in the event log even when the round finds no comments.
+        self._note_stream_state()
         # A cursor that cannot be trusted is refused **before** anything is
         # read: with a verdict requiring a session key (issue #87), re-reading
         # an issue's whole history turns every older verdict into an
@@ -4028,6 +4047,11 @@ class Engine:
         health_errors = list(summary["errors"])
         if allowlist_reload:
             health_errors.append(f"allowlist kept previous copy: {allowlist_reload}")
+        # ISS-79 F: the stream fault is a round-level reason, so it belongs in
+        # the same health line as the other ones instead of living only on a
+        # private attribute where a reader would never see it.
+        if self._stream_error:
+            health_errors.append(self._stream_error)
         self.write_health(error="; ".join(health_errors), degraded=self.degraded)
         return summary
 
@@ -4442,11 +4466,57 @@ class Engine:
 
     # ------------------------------------------------------ session truth (ISS-27)
     def _session_stream(self) -> tuple[Path, Path]:
+        """``(events, sessions)``; raises ``SessionStreamNotConfigured`` when undeclared.
+
+        ISS-79: the stream is never guessed from the working directory. A config
+        that declares nothing has no session truth, and a config that declares a
+        path the engine cannot find is a fault the round must report - the two
+        cases are deliberately kept apart here.
+        """
         engine_cfg = self.cfg.get("engine") or {}
         events = session_events.resolve_events_path(
             self.cfg, engine_cfg.get("session_events_path") or None)
         sessions = session_events.resolve_sessions_path(self.cfg)
         return events, sessions
+
+    def _note_stream_state(self) -> str:
+        """Fail closed when a **declared** session stream is absent (ISS-79).
+
+        Three cases, and only the second is a fault:
+
+        * nothing declared - the engine has no session truth by configuration;
+          it runs, and it says nothing, because that is the configured state;
+        * declared but no segment on disk - :func:`session_events.read_stream`
+          reports ``missing``; the round is degraded, one event is written and
+          the reason is folded into ``health.json``;
+        * declared, present, unreadable - the existing ``except`` in
+          ``_sync_assignments`` already reports it.
+
+        The judgement uses ``segments()``, never ``path.is_file()``: a stream
+        whose current file was rotated to ``.1`` is still readable, and calling
+        that missing would degrade a healthy engine once per rotation.
+        """
+        try:
+            events, _sessions = self._session_stream()
+        except session_events.SessionStreamNotConfigured:
+            return ""
+        try:
+            rows, missing = session_events.read_stream(events)
+        except OSError as exc:
+            self.degraded = True
+            self._stream_error = f"{type(exc).__name__}: {exc}"
+            self.store.log_event({"type": "session.stream_missing", "at": _now(),
+                                  "path": str(events), "rows": 0,
+                                  "error": self._stream_error})
+            return self._stream_error
+        if not missing:
+            return ""
+        self.degraded = True
+        self._stream_error = f"session stream missing: {events}"
+        self.store.log_event({"type": "session.stream_missing", "at": _now(),
+                              "path": str(events), "rows": len(rows),
+                              "error": self._stream_error})
+        return self._stream_error
 
     def replay_sessions(self, at: str | None = None) -> dict:
         """Rebuild ``sid -> (role, issue, assignment, profile)`` as of ``at``.
@@ -4456,9 +4526,10 @@ class Engine:
         own ``events.jsonl`` is a different stream and stays untouched.
         """
         events_path, _sessions_path = self._session_stream()
-        events = session_events.load_events(events_path)
+        events, missing = session_events.read_stream(events_path)
         state = session_events.replay(events, at)
         state["events_path"] = str(events_path)
+        state["missing"] = missing
         state["keys_active"] = session_events.active_keys(state)
         return state
 

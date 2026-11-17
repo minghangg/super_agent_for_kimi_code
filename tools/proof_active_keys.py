@@ -75,11 +75,13 @@ def _hash(text: str) -> str:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--events", default="", help="events.jsonl to replay (default: resolved)")
+    ap.add_argument("--config", default="",
+                    help="engine config to resolve the stream from (default: DEFAULTS)")
     ap.add_argument("--baseline", default="",
                     help="pre-change copy (default: newest backup/super_agent/session_events_*.py)")
     args = ap.parse_args(argv)
 
-    from super_agent import session_events as live  # noqa: E402  (after sys.path)
+    from super_agent import config, session_events as live  # noqa: E402  (after sys.path)
 
     base_path = Path(args.baseline) if args.baseline else sorted(
         (ROOT / "backup" / "super_agent").glob("session_events_*.py"))[-1]
@@ -108,7 +110,8 @@ def main(argv=None) -> int:
     before_hash = _hash(inspect.getsource(baseline.active_keys).strip())
     after_hash = _hash(inspect.getsource(fixed.active_keys).strip())
 
-    events_path = Path(args.events) if args.events else live.resolve_events_path()
+    events_path = (Path(args.events) if args.events
+                   else live.resolve_events_path(config.load(args.config)))
     events = live.load_events(events_path)
     rows = live.replay(events)          # replay is identical in both copies
     import copy

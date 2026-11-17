@@ -253,14 +253,46 @@ class Sync(Base):
         self.assertEqual(len(unreachable), 1)
         self.assertIn("session_w1", unreachable[0]["sid"])
 
-    def test_unreadable_stream_creates_nothing_and_degrades(self):
+    def test_missing_stream_creates_nothing_and_degrades(self):
+        """A declared stream that is absent fails closed (ISS-79).
+
+        The old assertion here was the bug: ``assertFalse(engine.degraded, "a
+        missing stream is not an error")``. A missing stream *is* the fault -
+        it reads as "no events today", so the engine ran a healthy-looking
+        round with no session truth at all. The fault must show in
+        ``degraded``, in ``health.json`` and in the event log.
+        """
         self.events.unlink(missing_ok=True)
         engine = self.engine()
         engine.run_once()
         self.assertEqual(self.index(engine)["assignments"], {})
-        self.assertFalse(engine.degraded, "a missing stream is not an error")
+        self.assertTrue(engine.degraded, "a missing declared stream is a fault")
         health = json.loads((self.state / "health.json").read_text("utf-8"))
+        self.assertTrue(health["degraded"])
+        self.assertIn("session stream missing", health["last_error"])
         self.assertEqual(health["active_assignments"], 0)
+        kinds = [json.loads(x)["type"] for x in
+                 (self.state / "events.jsonl").read_text("utf-8").splitlines()]
+        self.assertIn("session.stream_missing", kinds)
+
+    def test_rotated_stream_is_not_missing(self):
+        """Only ``.1`` on disk is still data: rotation must not degrade a round.
+
+        The judgement is ``segments()``, never ``path.is_file()``: the writer
+        rotates the current file to ``.1`` and briefly leaves no ``events.jsonl``,
+        and calling that missing would raise a fault once per rotation.
+        """
+        self.bind("session_w1")
+        rotated = self.events.with_name(self.events.name + ".1")
+        self.events.replace(rotated)
+        self.assertFalse(self.events.is_file())
+        engine = self.engine()
+        engine.run_once()
+        self.assertFalse(engine.degraded)
+        self.assertEqual(sorted(self.index(engine)["assignments"]),
+                         ["asg_1_worker_1"], "the rotated segment still binds")
+        health = json.loads((self.state / "health.json").read_text("utf-8"))
+        self.assertFalse(health["degraded"])
 
     def test_reader_failure_is_recorded_and_fails_closed(self):
         self.bind("session_w1")

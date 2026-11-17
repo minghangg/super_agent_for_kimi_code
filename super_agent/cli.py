@@ -737,10 +737,14 @@ def _cmd_replay_sessions(engine, args) -> int:
     at = getattr(args, "at", None)
     try:
         state = engine.replay_sessions(at)
+    except session_events.SessionStreamNotConfigured as exc:
+        print(f"replay refused: {exc}", file=sys.stderr)
+        return 2
     except Exception as exc:  # noqa: BLE001
         print(f"replay failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
-    print(f"session replay  events={state['events_path']} "
+    missing = " (missing)" if state.get("missing") else ""
+    print(f"session replay  events={state['events_path']}{missing} "
           f"at={at or '(newest)'} applied={state['applied']} skipped={state['skipped']}")
     active = state["keys_active"]
     if not active:
@@ -778,6 +782,9 @@ def cmd_reconcile(args) -> int:
             server_sids = None
     try:
         report = engine.reconcile_sessions(at=args.at, server_sids=server_sids)
+    except session_events.SessionStreamNotConfigured as exc:
+        print(f"reconcile refused: {exc}", file=sys.stderr)
+        return 2
     except Exception as exc:  # noqa: BLE001
         print(f"reconcile failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
