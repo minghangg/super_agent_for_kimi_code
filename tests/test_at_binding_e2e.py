@@ -97,7 +97,7 @@ PROJECT, _REPO_RAW = _producer_target()
 REPO = _REPO_RAW.strip().lower()
 THREAD = f"{REPO}#64"                 # what the engine keys by
 CLI_KEY = f"{PROJECT}#64"             # what gh_issue.bind writes
-AT_SID = "session_at_e2e_64"
+AT_SID = "session_77777777-7777-4777-8777-777777777777"
 OTHER_REPO = "owner/other"
 
 
