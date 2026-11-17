@@ -68,12 +68,15 @@ class Fixture(unittest.TestCase):
 
 
 class DecisionMatrix(Fixture):
-    def test_original_22_branch_self_test_is_green(self):
+    def test_self_test_is_green(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             rc = ctx_gate.self_test()
         self.assertEqual(rc, 0, out.getvalue())
-        self.assertIn("--self-test: 25/25 通过", out.getvalue())
+        # The count is assertions inside ctx_gate.self_test(); it is a literal on
+        # purpose - see this file's Neutrality tests for why ctx_gate must not
+        # read another repo's sources. Bump this number when you add a check.
+        self.assertIn("--self-test: 30/30 通过", out.getvalue())
 
     def test_thresholds_and_force(self):
         cases = [
@@ -297,12 +300,13 @@ class CliMapping(Fixture):
         self.assertEqual(doc["verdict"], "allow-unknown")
         self.assertEqual(proc.stderr.strip(), "")
 
-    def test_self_test_cli_is_22_of_22(self):
+    def test_self_test_cli_matches_check_count(self):
         proc = subprocess.run(
             [sys.executable, "-m", "super_agent.ctx_gate", "--self-test"],
             cwd=str(ROOT), capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("--self-test: 25/25 通过", proc.stdout)
+        # Literal on purpose: bump it when you add a check to ctx_gate.self_test().
+        self.assertIn("--self-test: 30/30 通过", proc.stdout)
 
 
 class Neutrality(unittest.TestCase):

@@ -300,7 +300,7 @@ def gate(sid: str, *, force: bool = False, operator: str = "",
 
 
 def self_test() -> int:
-    """Offline assertions: 25 checks (22 original + 3 one-shot 35% rule)."""
+    """Offline assertions: 30 checks (22 original + 3 one-shot 35% rule + 5 more)."""
     fails: list[str] = []
     total = 0
 
