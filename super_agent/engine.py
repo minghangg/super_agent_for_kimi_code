@@ -1841,11 +1841,27 @@ class Engine:
         ``pm_verdicts`` stays empty and this watchdog counted rounds for a PM
         that had answered.
 
-        Evidence, and why this source: ``needs_person`` rows are written by the
-        engine itself for every PM comment it decided something about, so no
-        new fetch is needed - the row is already in ``index.json``. The row must
-        be **newer than the delivery**, which is what keeps #71 counting: it has
-        a pm row but an older one.
+        Two sources, in this order, and the first one is not optional:
+
+        1. ``pm_verdicts`` / ``_pm_pending`` - the signed path, which is the
+           only path that *still* works after #87. A signed verdict writes
+           ``pm_verdicts`` (``_record_pm_verdict``) and does **not** write a
+           ``needs_person`` row, so reading only the rows would make every
+           correctly signed verdict look like silence and restart the counter
+           (QA cid 6952398074). ``_pm_verdict_ahead`` is reused rather than
+           reimplemented, because it already carries the in-batch half.
+        2. ``needs_person`` rows with a ``pm.*`` reason - the unsigned path.
+           The row must be **newer than the delivery**, which is what keeps #71
+           counting: it has a pm row but an older one.
+
+        Three of those rows are ``pm.delivery_unknown``: ``#85`` cid
+        ``6899552353``, ``#87`` cid ``6920036610``, ``#78`` cid ``6922331512``.
+        All three are newer than their own thread's max delivery, and only
+        ``#78`` is currently inside a hold, so only it is caught today. When a
+        row like that is caught here, the meaning is "the PM spoke and its
+        ``delivery:`` coordinate was wrong" - **not** "the PM forgot the key".
+        Fixing the coordinate is a different job; silence is not the right
+        answer to a PM that talked.
 
         ``pm.stall`` is excluded by name, not by luck: that reason is written by
         this very watchdog, and reading it back would let the alarm silence
@@ -1861,6 +1877,8 @@ class Engine:
         counter (``_check_pm_stall`` pops it), so a new hold starts counting
         from zero and needs a fresh PM row to go quiet again.
         """
+        if self._pm_verdict_ahead(index, thread):
+            return True
         delivery = 0
         for aid, rec in (index.get("assignments") or {}).items():
             if not isinstance(rec, dict) or str(rec.get("thread") or "") != thread:
