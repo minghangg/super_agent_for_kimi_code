@@ -4039,6 +4039,12 @@ class Engine:
         # quiet round. Checked here, before any issue is read, so the fault is
         # in health and in the event log even when the round finds no comments.
         self._note_stream_state()
+        # ISS-74 C(a): resolve the supervisor sid once per round even when no
+        # frame needs it. A malformed id otherwise stayed invisible until it was
+        # used - and then the symptom was a refused *frame*, not the id. The
+        # value is discarded on purpose: this call exists for its side effect
+        # (one ``engine.supervisor_sid_malformed`` row, see the docstring).
+        self._supervisor_sid(index)
         # A cursor that cannot be trusted is refused **before** anything is
         # read: with a verdict requiring a session key (issue #87), re-reading
         # an issue's whole history turns every older verdict into an
