@@ -118,6 +118,17 @@ REVIEW_TARGET_STATES = ("working", "waiting_review", "blocked",
 TASK_PREFIX_RE = re.compile(
     r"^\s*[\[［]\s*(?:PM|supervisor)\s*[:：]\s*TASK\s*[\]］]\s*", re.I)
 
+# A full session id: ``session_`` + a UUID. Anything shorter is a *truncated*
+# id, and a truncated id can never be delivered to - the server answers 40401
+# for it. This repository is public and must not import the private workbench,
+# so the regex exists here as a second copy by necessity; its docstring
+# counterpart is ``tools/sess_events.py:FULL_SID_RE`` in the workbench, and the
+# two must change together (ISS-74).
+SID_RE = re.compile(
+    r"^session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE)
+
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -1521,17 +1532,81 @@ class Engine:
             "detail": "the supervisor record carries no sup_eligible decision",
         })
 
-    def _supervisor_sid(self) -> str:
+    # The one row a malformed supervisor sid produces, once (see
+    # ``_note_malformed_supervisor_sid``). It is the doctor's input: without it
+    # every frame to the supervisor is refused and nothing says why.
+    SUPERVISOR_SID_MALFORMED_ROW = "engine.supervisor_sid_malformed"
+
+    def _note_malformed_supervisor_sid(self, index: dict | None, sid: str) -> None:
+        """Write one ``warn`` when the supervisor sid is not a full session id.
+
+        A truncated id (``session_6a5e``) still resolves from the config, so
+        ``_supervisor_sid`` returns it and every frame built from it is refused
+        with 40401 - silently, because a refusal is a route event about the
+        *frame*, not about the sid being unusable. This row is the missing half:
+        one ``warn`` naming the shape problem, consumed by the doctor's
+        ``supervisor-visibility`` check.
+
+        **Deduplication, stated precisely** (no stronger claim is made):
+
+        * the key lives in ``index["meta"]["warned"]`` - **a new key**, added
+          here, not an existing ``index_meta``/``index["warned"]`` field;
+        * on the first use of a process the key is seeded from the **current
+          segment** of ``events.jsonl`` (the same bounded tail the doctor
+          reads). Rotation moves that segment to ``.1`` and the memory goes
+          with it, so a rotation costs **one repeated row**, never a wrong
+          decision;
+        * nothing here is consulted when deciding whether to deliver - the
+          refusal path is unchanged.
+
+        The sid **value** is never logged; ``sid_len`` says "it was cut short"
+        without copying a possibly-still-valid prefix into the event stream.
+        """
+        if not sid or SID_RE.match(sid):
+            return
+        if not isinstance(index, dict):
+            return
+        meta = index.setdefault("meta", {})
+        if not isinstance(meta, dict):
+            meta = index["meta"] = {}
+        warned = meta.setdefault("warned", {})     # new key, see the docstring
+        if not isinstance(warned, dict):
+            warned = meta["warned"] = {}
+        key = self.SUPERVISOR_SID_MALFORMED_ROW
+        if key in warned:
+            return
+        warned[key] = _now()
+        try:
+            seen = any(row.get("type") == key for row in
+                       _tail_events(self.store.events_path, limit=500))
+        except OSError:
+            seen = False
+        if seen:
+            return
+        self.store.log_event({
+            "type": key, "at": _now(), "sid_len": len(sid),
+            "detail": "engine.supervisor_sid is not a full session UUID; "
+                      "every frame to the supervisor will be refused",
+            "level": "warn", "consumers": ["doctor"],
+        })
+
+    def _supervisor_sid(self, index: dict | None = None) -> str:
         """The supervisor's session id, resolved fresh every round.
 
         Configured ``supervisor_sid`` first, then the session keys in order -
         reusing the same resolver the rest of the engine uses, so an overlay
         that redirects the workbench moves this with it. Nothing is cached: a
         key that was missing last round may exist now.
+
+        ``index`` is passed in by every caller so a malformed id can be
+        reported once (see :meth:`_note_malformed_supervisor_sid`). It does not
+        change the value returned - a truncated id is still returned, and the
+        refusal that follows is what a person must see.
         """
         engine_cfg = self.cfg.get("engine") or {}
         sid = str(engine_cfg.get("supervisor_sid") or "").strip()
         if sid:
+            self._note_malformed_supervisor_sid(index, sid)
             return sid
         keys = engine_cfg.get("supervisor_keys") or ["supervisor"]
         if not isinstance(keys, (list, tuple)):
@@ -1550,6 +1625,7 @@ class Engine:
             else:
                 found = str(entry or "")
             if found:
+                self._note_malformed_supervisor_sid(index, found)
                 return found
         return ""
 
@@ -1584,7 +1660,7 @@ class Engine:
         if self.store.action_attempted(sup_base) > 0:
             return {"dispatched": False, "reason": "already attempted",
                     "action_id": sup_base}
-        sid = self._supervisor_sid()
+        sid = self._supervisor_sid(index)
         if not sid:
             record["ok"] = False
             record["undeliverable"] = True
@@ -1609,6 +1685,15 @@ class Engine:
         record["ok"] = bool(result.get("ok")) if result.get("dispatched") else False
         record["refused"] = bool(result.get("refused"))
         record["action_id"] = result.get("action_id") or sup_base
+        # ISS-74 C(b): the same single place a round learns the outcome, now on
+        # this path too. Before this, only the PM route counted refusals, so a
+        # supervisor route could be refused every round for hours without one
+        # ``route.refused_retryable`` row - and a refusal here is exactly what
+        # an allowlist miss or a malformed sid looks like.
+        if result.get("dispatched"):
+            self._clear_route_refusal(record)
+        elif result.get("refused") is True:
+            self._count_route_refusal(index, record, thread, cid, result)
         self.store.log_event({
             "type": "route.decided", "at": _now(), "thread": thread,
             "comment_id": cid, "to": "supervisor",
@@ -1960,7 +2045,7 @@ class Engine:
         if self.store.action_attempted(base) > 0:
             return {"dispatched": False, "reason": "already attempted",
                     "action_id": base}
-        sid = self._supervisor_sid()
+        sid = self._supervisor_sid(index)
         if not sid:
             record["ok"] = False
             record["undeliverable"] = True
@@ -1985,6 +2070,14 @@ class Engine:
         record["ok"] = bool(result.get("ok")) if result.get("dispatched") else False
         record["refused"] = bool(result.get("refused"))
         record["action_id"] = result.get("action_id") or base
+        # ISS-74 C(b): counted here as well. An AT frame has no *retry pass* of
+        # its own, but a refused one leaves no attempt on record, so the next
+        # round tries it again - a streak is exactly what that loop looks like
+        # from outside, and it was invisible until this call existed.
+        if result.get("dispatched"):
+            self._clear_route_refusal(record)
+        elif result.get("refused") is True:
+            self._count_route_refusal(index, record, thread, cid, result)
         self.store.log_event({
             "type": "route.decided", "at": _now(), "thread": thread,
             "comment_id": cid, "to": "supervisor", "origin": "at",
@@ -2427,7 +2520,7 @@ class Engine:
         if self.store.action_attempted(base) > 0:
             return {"dispatched": False, "reason": "already attempted",
                     "action_id": base}
-        sid = self._supervisor_sid()
+        sid = self._supervisor_sid(index)
         if not sid:
             record["ok"] = False
             record["undeliverable"] = True
@@ -2454,6 +2547,12 @@ class Engine:
         record["ok"] = bool(result.get("ok")) if result.get("dispatched") else False
         record["refused"] = bool(result.get("refused"))
         record["action_id"] = result.get("action_id") or base
+        # ISS-74 C(b): this frame follows the same rule as the PM route and the
+        # release route - one increment per round while it keeps being refused.
+        if result.get("dispatched"):
+            self._clear_route_refusal(record)
+        elif result.get("refused") is True:
+            self._count_route_refusal(index, record, thread, cid, result)
         self.store.log_event({
             "type": "route.decided", "at": _now(), "thread": thread,
             "comment_id": cid, "to": "supervisor", "origin": "pm",
@@ -2824,7 +2923,7 @@ class Engine:
             base = action_id(f"release_timeout:{aid}", "bus_inject", start)
             if self.store.action_attempted(base) > 0:
                 continue
-            sid = self._supervisor_sid()
+            sid = self._supervisor_sid(index)
             issue = rec.get("issue")
             if not sid:
                 self._note_undeliverable(
@@ -4356,12 +4455,58 @@ class Engine:
             "none" if not residual else f"non-terminal: {sorted(residual)}",
             level="warn")
 
+        add(*self._check_supervisor_visibility())
+
         counters = self.store.load_counters()
         return {"checks": checks, "external_actions":
                 int(counters.get("external_actions") or 0),
                 "mode": self.mode}
 
     # ------------------------------------------------------ doctor sub-checks
+    def _check_supervisor_visibility(self) -> tuple:
+        """Fault 10: a supervisor sid that no frame can reach.
+
+        The engine resolves ``engine.supervisor_sid`` from config first, so a
+        truncated id is *returned* and every frame built from it is refused -
+        each refusal is a route event about one frame, so the shape problem
+        itself stayed invisible (#74). This check turns the row
+        :meth:`_note_malformed_supervisor_sid` writes into a doctor line.
+
+        Three states, and only the first is ``ok``:
+
+        * a resolvable sid **and** no malformed row in the tail ⇒ ok;
+        * a malformed row in the tail ⇒ ``ok=false`` with the count, label
+          ``supervisor-silent``: every frame is being refused right now;
+        * no sid at all ⇒ ``warn``: a config gap, not a refusal.
+
+        Reads the bounded tail for the same reason the ``[PM:TASK]`` check
+        does: ``events.jsonl`` grows every round.
+        """
+        sid = str(((self.cfg.get("engine") or {}).get("supervisor_sid")) or "").strip()
+        # Only the config field is read here on purpose: calling
+        # ``_supervisor_sid()`` would let a health check write an event, and a
+        # check that mutates the thing it measures is not a check. The session
+        # keys are a fallback the route path resolves; a config that only has
+        # those is reported as "no sid" until a frame actually resolves one.
+        resolved = bool(sid)
+        rows = [r for r in _tail_events(self.store.events_path, limit=500)
+                if r.get("type") == self.SUPERVISOR_SID_MALFORMED_ROW]
+        if rows:
+            return ("supervisor-visibility", False,
+                    f"ok=false {self.SUPERVISOR_SID_MALFORMED_ROW}="
+                    f"{len(rows)} sid_len={rows[-1].get('sid_len')} "
+                    f"resolved_sid={'yes' if resolved else 'no'} - every frame "
+                    f"to the supervisor is refused",
+                    "fail", "supervisor-silent")
+        if not resolved:
+            return ("supervisor-visibility", False,
+                    "ok=false no supervisor sid (engine.supervisor_sid empty and "
+                    "engine.supervisor_keys resolve nothing)",
+                    "warn", "supervisor-silent")
+        return ("supervisor-visibility", True,
+                f"ok=true resolved_sid=yes {self.SUPERVISOR_SID_MALFORMED_ROW}=0",
+                "fail", "supervisor-silent")
+
     def _check_process(self) -> tuple:
         """Fault 1: a dead pid lock, or a health record with no live engine."""
         from .pidlock import process_alive
