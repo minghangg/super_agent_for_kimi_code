@@ -332,6 +332,61 @@ PM_CONCLUSION_WORDS = tuple([w for w, _ in STATE_TABLE]
                             + [w for w, _ in WORD_TABLE]
                             + ["可以关", "lgtm", "approve", "done"])
 
+# A conclusion word that describes somebody else's result is a receipt, not a
+# verdict: ``[PM] 通过 QA 的复核结论`` reports QA's pass, and
+# ``[PM] 关单 #80 已由 QA 通过`` reports it in the other word order. Both used
+# to file "PM 结论 unreadable" and ring the exception bell for a correct
+# message (5 unreadable rows on 2026-11-17, #80).
+REPORTED_SUBJECTS = ("qa", "worker", "wk-", "scout", "reviewer", "at")
+REPORTED_MARKERS = ("已由", "由", "经", "被")
+# ``—`` and ``–`` belong here: a dash opens a side note, and a side note names
+# a different agent without becoming the subject of the hit (ISS-80 P2-2).
+CLAUSE_PUNCT = "，。；！？,;.!?—–"
+
+
+def _clause_of(text: str, pos: int) -> str:
+    """The punctuation-delimited clause that contains ``pos``.
+
+    A clause is the unit a Chinese sentence is read in. An earlier candidate
+    used a character window, which crosses commas: ``退回 #80，由 worker 重做``
+    had its own dispatch read as a report of somebody else's work, and the
+    exception frame was never sent (measured 2026-11-17).
+    """
+    start = 0
+    for i in range(pos - 1, -1, -1):
+        if text[i] in CLAUSE_PUNCT:
+            start = i + 1
+            break
+    end = len(text)
+    for i in range(pos, len(text)):
+        if text[i] in CLAUSE_PUNCT:
+            end = i
+            break
+    return text[start:end]
+
+
+def _reports_other(text: str, start: int, end: int) -> bool:
+    """Is the hit at ``[start, end)`` reporting somebody else's result?
+
+    Two tests, both **inside one clause** - never across a comma:
+
+    1. forward - ``通过 QA 的复核结论``: the hit is followed by an agent.
+    2. anywhere in the clause - ``关单 #80 已由 QA 通过``: the agent sits five
+       characters after the hit, behind a passive marker.
+
+    A bare conclusion carries neither, so ``通过 #80`` still counts.
+    """
+    clause = _clause_of(text, start)
+    rel = clause.find(text[start:end])
+    if rel < 0:
+        return False
+    after = clause[rel + (end - start):].lstrip()
+    if any(after.lower().startswith(s) for s in REPORTED_SUBJECTS):
+        return True
+    lowered = clause.lower()
+    return (any(m in clause for m in REPORTED_MARKERS)
+            and any(s in lowered for s in REPORTED_SUBJECTS))
+
 # ``关单`` is a conclusion **unless it is somebody's object**. ``挡关单``,
 # ``拒绝关单``, ``防止关单`` are about blocking a close, not announcing one, and
 # the third-round task book that said ``本轮只 P0 挡关单`` rang every round
@@ -802,6 +857,7 @@ def is_pm_conclusion(text: str, *, structured: bool = False) -> bool:
             after = lowered[start + len(needle): start + len(needle) + 1]
             if not _negated_at(lowered, start) and \
                     not _closing_is_object(lowered, start) and \
+                    not _reports_other(raw, start, start + len(needle)) and \
                     not (after and after in TAILS):
                 return True
             start = lowered.find(needle, start + 1)
@@ -817,7 +873,8 @@ def is_pm_conclusion(text: str, *, structured: bool = False) -> bool:
     while start != -1:
         before = lowered[start - 1: start] if start else ""
         if before not in CLOSING_ISSUE_OBJECT_VERB and \
-                not _negated_at(lowered, start):
+                not _negated_at(lowered, start) and \
+                not _reports_other(body, start, start + len(CLOSING_ISSUE_WORD)):
             return True
         start = lowered.find(CLOSING_ISSUE_WORD, start + 1)
     for word in BARE_CLOSING_WORDS:
@@ -828,6 +885,7 @@ def is_pm_conclusion(text: str, *, structured: bool = False) -> bool:
             if before not in BARE_CLOSING_BEFORE[word] and \
                     not _negated_at(lowered, start) and \
                     not _closing_is_object(lowered, start) and \
+                    not _reports_other(body, start, start + 1) and \
                     (not after or after in BARE_CLOSING_AFTER
                      or after in " \t，。、,;；:：!！?？#-—()（）"):
                 return True
@@ -841,8 +899,9 @@ def is_pm_conclusion(text: str, *, structured: bool = False) -> bool:
         # closing answer ends its clause or names the issue. The verb tail and
         # the state head are the tests, because the answer forms carry neither.
         if before not in CLOSING_STATE_HEAD and \
-                not _negated_at(lowered, start) and not (
-                        after and after in CLOSING_VERB_TAIL):
+                not _negated_at(lowered, start) and \
+                not _reports_other(body, start, start + len(CLOSING_WORD)) and \
+                not (after and after in CLOSING_VERB_TAIL):
             return True
         start = lowered.find(CLOSING_WORD, start + 1)
     return False

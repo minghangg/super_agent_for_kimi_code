@@ -1831,6 +1831,60 @@ class Engine:
         return bool(self._pm_verdict(index, thread)
                     or thread in self._pm_pending)
 
+    def _pm_answered(self, index: dict, thread: str) -> bool:
+        """Did the PM speak on this thread after the delivery it judges?
+
+        The stall watchdog asks "has the PM gone quiet", not "has the PM filed
+        a signed verdict". Those were one question until #87 made an unsigned
+        verdict *not* a verdict: a PM comment without a session key is dropped
+        by ``_pm_verified`` before ``_record_pm_verdict`` ever runs, so
+        ``pm_verdicts`` stays empty and this watchdog counted rounds for a PM
+        that had answered.
+
+        Evidence, and why this source: ``needs_person`` rows are written by the
+        engine itself for every PM comment it decided something about, so no
+        new fetch is needed - the row is already in ``index.json``. The row must
+        be **newer than the delivery**, which is what keeps #71 counting: it has
+        a pm row but an older one.
+
+        ``pm.stall`` is excluded by name, not by luck: that reason is written by
+        this very watchdog, and reading it back would let the alarm silence
+        itself.
+
+        A ``pm.escalation`` row counts too: asking for a person is the PM
+        speaking, and it is the louder kind. The catch, stated so the next
+        reader is not surprised: one escalation row keeps this hold quiet for
+        as long as the row is newer than the delivery, and
+        ``_pm_needs_person`` updates a ``(thread, reason)`` row in place rather
+        than appending, so a PM that escalates once and then stops talking is
+        never reported stalled for that hold. Leaving the hold clears the
+        counter (``_check_pm_stall`` pops it), so a new hold starts counting
+        from zero and needs a fresh PM row to go quiet again.
+        """
+        delivery = 0
+        for aid, rec in (index.get("assignments") or {}).items():
+            if not isinstance(rec, dict) or str(rec.get("thread") or "") != thread:
+                continue
+            try:
+                delivery = max(delivery, int(rec.get("delivery_comment_id") or 0))
+            except (TypeError, ValueError):
+                continue
+        rows = ((index.get("issues") or {}).get(thread) or {}).get(
+            "needs_person") or []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            reason = str(row.get("reason") or "")
+            if not reason.startswith("pm.") or reason.startswith("pm.stall"):
+                continue
+            try:
+                cid = int(row.get("comment_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if cid > delivery:
+                return True
+        return False
+
     # --------------------------------------------------------- at verdicts
     def _at_verdict(self, index: dict, thread: str) -> dict | None:
         """The AT verdict recorded for ``thread``, if any."""
@@ -2695,8 +2749,16 @@ class Engine:
                                                     "close_reconcile"):
                 continue
             thread = str(rec.get("thread") or "")
-            if thread and str(rec.get("qa_verdict") or "") == "pass":
-                held[thread] = (aid, rec)
+            if not thread or str(rec.get("qa_verdict") or "") != "pass":
+                continue
+            # A closed issue is not stalled: the hold has reached its end state
+            # and only the archive is outstanding. Reading it as "PM went quiet"
+            # keeps a counter growing for a thread nobody can act on (#78 held
+            # 878 rounds while already closed).
+            issue = rec.get("issue")
+            if issue is not None and self._issue_state(issue) == "closed":
+                continue
+            held[thread] = (aid, rec)
         for thread in list(stall):
             if thread not in held:
                 # Left the hold: the next hold is a new notice, so the seq
@@ -2707,7 +2769,7 @@ class Engine:
                 stall.pop(thread, None)
         fired = 0
         for thread, (aid, rec) in sorted(held.items()):
-            if self._pm_verdict_ahead(index, thread):
+            if self._pm_answered(index, thread):
                 stall.pop(thread, None)
                 continue
             entry = stall.get(thread)
@@ -2911,6 +2973,14 @@ class Engine:
                                                     "close_reconcile"):
                 continue
             thread = str(rec.get("thread") or "")
+            issue = rec.get("issue")
+            # A closed issue has nothing to release. Reconciling a closed issue
+            # is the end state, not a stuck state; reading it as "overdue" is
+            # the false alarm (#80). The attempt de-dup below stays: it is what
+            # ended the 57-round re-send of #68, and removing it to "make the
+            # alarm show up" would trade one noise for another.
+            if issue is not None and self._issue_state(issue) == "closed":
+                continue
             start = self._release_start(index, thread, rec)
             parsed = _parse_ts(start)
             if parsed is None:

@@ -2013,12 +2013,10 @@ def _inject(etype: str, payload: dict) -> None:
 def _trip_breaker(st: dict, key: str, now: float, dry: bool) -> None:
     st.setdefault("breakers", {})[key] = {"date": _date_of(now), "count": DELIVERY_MAX_PER_DAY + 1,
                                           "enabled": False}
+    # The breaker is a noise-reduction device. Announcing its own trip is one
+    # more interruption, which is the opposite of what it is for - the log line
+    # is the record, and the day rolls over on its own.
     delivery_log(f"breaker tripped: {key} 当日第 {DELIVERY_MAX_PER_DAY + 1} 次交付提醒 ⇒ 该单停发至次日 0 点")
-    text = (f"【收单·熔断】{key} 今日交付提醒已超 {DELIVERY_MAX_PER_DAY} 次，"
-            f"该单自动停发至次日 0 点（跨日自动解除）。")
-    for _name, sid in resolve_recipients(key.split("#")[0]):
-        if delivery_notify(sid, text, dry):
-            break
 
 
 def _summary_add(st: dict, key: str, rec: dict, now: float) -> None:
@@ -2142,6 +2140,15 @@ def enqueue_delivery(st: dict, rec: dict, *, dry: bool, now: float,
         return 0
     st.setdefault("seen", {})[skey] = now
     _prune(st, now)
+
+    # A delivery the PM has already answered is not a nudge the breaker should
+    # count. The counter means "I told the supervisor and nothing came back";
+    # several delivery rounds on one issue is a normal rhythm - a worker fixes,
+    # delivers again, and the PM answers each time - and counting those tails
+    # as unanswered nudges trips the breaker on a healthy thread (#80).
+    if has_pm_receipt(rec["repo"], rec["issue"], after_ts=rec["detected_ts"]):
+        stats_inc(st, "pm_receipted", now=now)
+        return 0
 
     today = _date_of(now)
     day = (st.setdefault("day_nudges", {}).get(key) or {})
