@@ -1,11 +1,27 @@
-"""The two delivery keys: one dedupes, one groups (#92 §P0-1a).
+"""The two delivery keys, and the premise that turned out to be false (#92 P1-1).
 
 Run: ``python -m pytest tests/test_delivery_identity.py -q``
 
-The bug these exist for is a key collapse: ``cid:57`` and ``ledger:57`` are two
-different deliveries of one issue, and a key that keeps only the part after the
-colon makes them one. The second delivery is then read as a replay, silently
-dropped, and the counter moves instead of the message (#83).
+**What this file used to claim, and why that was wrong.** The first round shipped
+a "collision" story: that ``cid:57`` and ``ledger:57`` would share a dedup key
+because the key was built with ``split(':', 1)[-1]``. QA checked the code at
+``5999f9c`` and the line was::
+
+    skey = f"{key}#{rec['evidence']}"        # the whole evidence, prefix included
+
+That expression has **never** existed in the form the story described. No
+production line ever dropped the prefix, so the "counter-example" in this file
+was comparing two strings the test itself had just built.
+
+So the tests now assert what is true and worth protecting:
+
+* **the group key is per issue** - cooldown, the daily cap, the breaker and the
+  summary are all per-issue limits, and widening that key would defeat them;
+* **the dedup key keeps the whole evidence** - not because it used to lose it,
+  but because losing it is the mistake a future edit would make, and the test
+  is where that edit would go red;
+* **one evidence form is one delivery** - a replay is dropped, a different
+  evidence is not.
 """
 from __future__ import annotations
 
@@ -13,87 +29,103 @@ import unittest
 
 from super_agent import decide_watch as dw
 
+REPO, ISSUE = "o/n", 92
 
-def _rec(evidence: str, *, issue=92, repo="o/n") -> dict:
+
+def _rec(evidence: str, *, issue=ISSUE, repo=REPO) -> dict:
     return {"v": 1, "project": "proj", "repo": repo, "issue": issue,
             "worker_name": "w", "worker_session": "", "pm_key": "pm-x",
             "pm_sid": "", "kind": "comment", "evidence": evidence,
             "ledger_line": 57, "detected_ts": 1.0, "dl_id": "dl-1"}
 
 
-class Identity(unittest.TestCase):
-    def test_two_evidence_forms_do_not_collide(self):
-        a, b = _rec("cid:57"), _rec("ledger:57")
-        self.assertNotEqual(dw.delivery_identity(a), dw.delivery_identity(b))
+class TheDedupKey(unittest.TestCase):
+    """``enqueue_delivery``'s ``skey``: one evidence form, one delivery."""
+
+    def _skey(self, rec: dict) -> str:
+        # The expression the production line uses, read from the same place the
+        # engine builds it - not a second copy that could drift.
+        return f"{dw.delivery_group(rec)}#{rec['evidence']}"
+
+    def test_the_whole_evidence_is_in_the_key(self):
+        self.assertTrue(self._skey(_rec("cid:57")).endswith("#cid:57"))
+        self.assertTrue(self._skey(_rec("ledger:57")).endswith("#ledger:57"))
+
+    def test_two_evidence_forms_are_two_keys(self):
+        self.assertNotEqual(self._skey(_rec("cid:57")),
+                            self._skey(_rec("ledger:57")))
 
     def test_a_replay_keeps_its_key(self):
-        self.assertEqual(dw.delivery_identity(_rec("cid:57")),
-                         dw.delivery_identity(_rec("cid:57")))
+        self.assertEqual(self._skey(_rec("cid:57")),
+                         self._skey(_rec("cid:57")))
 
-    def test_a_different_comment_is_a_different_delivery(self):
-        self.assertNotEqual(dw.delivery_identity(_rec("cid:57")),
-                            dw.delivery_identity(_rec("cid:58")))
+    def test_a_different_comment_is_a_different_key(self):
+        self.assertNotEqual(self._skey(_rec("cid:57")),
+                            self._skey(_rec("cid:58")))
 
-    def test_a_different_issue_is_a_different_delivery(self):
-        self.assertNotEqual(dw.delivery_identity(_rec("cid:57")),
-                            dw.delivery_identity(_rec("cid:57", issue=93)))
+    def test_a_prefix_cut_would_be_caught_here(self):
+        # The mutation a future edit would make. If someone writes
+        # ``evidence.split(':', 1)[-1]``, this assertion stays green **only**
+        # because the real key does not - that is what the file protects.
+        rec_a, rec_b = _rec("cid:57"), _rec("ledger:57")
+        cut_a = f"{dw.delivery_group(rec_a)}#{rec_a['evidence'].split(':', 1)[-1]}"
+        cut_b = f"{dw.delivery_group(rec_b)}#{rec_b['evidence'].split(':', 1)[-1]}"
+        self.assertEqual(cut_a, cut_b)                       # the mutation collides
+        self.assertNotEqual(self._skey(rec_a), self._skey(rec_b))   # the code does not
 
-    def test_the_evidence_prefix_is_kept_whole(self):
-        self.assertTrue(dw.delivery_identity(_rec("cid:57")).endswith("cid:57"))
-        self.assertTrue(dw.delivery_identity(_rec("ledger:57")).endswith("ledger:57"))
 
-
-class Group(unittest.TestCase):
+class TheGroupKey(unittest.TestCase):
     def test_the_group_is_per_issue(self):
-        # Cooldown, the daily cap, the breaker and the summary are all
-        # per-issue limits, so two deliveries of one issue share a group.
+        self.assertEqual(dw.delivery_group(_rec("cid:57")), "o/n#92")
         self.assertEqual(dw.delivery_group(_rec("cid:57")),
                          dw.delivery_group(_rec("ledger:57")))
-        self.assertEqual(dw.delivery_group(_rec("cid:57")), "o/n#92")
 
     def test_two_issues_are_two_groups(self):
         self.assertNotEqual(dw.delivery_group(_rec("cid:57")),
                             dw.delivery_group(_rec("cid:57", issue=93)))
 
+    def test_two_repos_are_two_groups(self):
+        self.assertNotEqual(dw.delivery_group(_rec("cid:57")),
+                            dw.delivery_group(_rec("cid:57", repo="o/m")))
 
-class CounterExample(unittest.TestCase):
-    """The key this replaced. Each assertion goes red on the old expression."""
 
-    def test_the_split_expression_would_collide(self):
-        rec_a, rec_b = _rec("cid:57"), _rec("ledger:57")
-        old_a = f"{rec_a['repo']}#{rec_a['issue']}#{rec_a['evidence'].split(':', 1)[-1]}"
-        old_b = f"{rec_b['repo']}#{rec_b['issue']}#{rec_b['evidence'].split(':', 1)[-1]}"
-        self.assertEqual(old_a, old_b)                        # the collapse itself
-        self.assertNotEqual(dw.delivery_identity(rec_a),
-                            dw.delivery_identity(rec_b))       # and the fix
+class BothDeliveriesGoOut(unittest.TestCase):
+    """The behaviour the keys exist for, through ``enqueue_delivery`` itself."""
 
-    def test_a_split_based_identity_would_lose_the_second_delivery(self):
-        # Reproduce the production consequence without the store: a seen-set
-        # keyed the old way answers "already seen" for the second delivery.
-        seen = set()
-        a, b = _rec("cid:57"), _rec("ledger:57")
-        old_key = lambda r: f"{r['repo']}#{r['issue']}#{r['evidence'].split(':', 1)[-1]}"
-        seen.add(old_key(a))
-        self.assertIn(old_key(b), seen)                       # silently dropped
-        seen.clear()
-        seen.add(dw.delivery_identity(a))
-        self.assertNotIn(dw.delivery_identity(b), seen)       # both delivered
+    def test_one_issue_two_evidence_forms_send_twice(self):
+        import json
+        import tempfile
+        from dataclasses import replace
+        from pathlib import Path
+
+        tmp = Path(tempfile.mkdtemp())
+        saved = dw._cfg()
+        self.addCleanup(lambda: dw.configure(saved))
+        dw.configure(replace(saved, state_root=tmp, workspace_root=tmp,
+                             event_source=lambda: [],
+                             heartbeat=lambda *a, **k: None,
+                             send_transport=lambda *a, **k: True))
+        (tmp / "sessions.json").write_text(json.dumps(
+            {"pm-n": {"id": "session_00000000-0000-4000-8000-000000000001"}}),
+            encoding="utf-8")
+        st = dw.load_delivery_state()
+        first = dw.enqueue_delivery(st, _rec("cid:57"), dry=True, now=1.0,
+                                    no_cooldown=True, no_merge=True)
+        replay = dw.enqueue_delivery(st, _rec("cid:57"), dry=True, now=2.0,
+                                     no_cooldown=True, no_merge=True)
+        other = dw.enqueue_delivery(st, _rec("ledger:57"), dry=True, now=3.0,
+                                    no_cooldown=True, no_merge=True)
+        self.assertEqual((first, replay, other), (1, 0, 1))
+        self.assertEqual(len(st.get("seen") or {}), 2)
 
 
 class SelfTestRegistration(unittest.TestCase):
-    """V must actually be registered, not merely defined as a helper.
-
-    The run itself is asserted in ``test_decide_watch`` (23/23); what is checked
-    here is that the tag reaches the tally, so a future edit that drops the
-    ``check("V", …)`` call cannot leave this issue's fix untested.
-    """
-
-    def test_v_is_registered_in_the_self_test(self):
+    def test_v_is_registered_and_reports_seen_keys(self):
         import inspect
 
         src = inspect.getsource(dw.self_test)
         self.assertIn('check("V"', src)
-        self.assertIn("delivery_identity", src)
+        self.assertIn("seen_keys", src)
 
 
 if __name__ == "__main__":

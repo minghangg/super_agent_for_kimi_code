@@ -67,6 +67,56 @@ class TheSeamIsReal(unittest.TestCase):
             self.assertEqual(dw.recipients({"repo": "o/n", "to_role": ["pm"]}), [])
 
 
+class OnTheDeliveryPath(unittest.TestCase):
+    """P0-2: ``_send_delivery`` really goes through ``recipients()``.
+
+    The other assertions in this file prove the function is correct. This one
+    proves it is **reached** - the difference #92's first round got wrong.
+    """
+
+    def test_every_send_passes_through_the_shell(self):
+        import json
+        import tempfile
+        from dataclasses import replace
+        from pathlib import Path
+
+        tmp = Path(tempfile.mkdtemp())
+        saved = dw._cfg()
+        self.addCleanup(lambda: dw.configure(saved))
+        dw.configure(replace(saved, state_root=tmp, workspace_root=tmp,
+                             event_source=lambda: [],
+                             heartbeat=lambda *a, **k: None,
+                             send_transport=lambda *a, **k: True))
+        (tmp / "sessions.json").write_text(json.dumps(
+            {"pm-demo": {"id": "session_00000000-0000-4000-8000-000000000001"}}),
+            encoding="utf-8")
+        rec = {"v": 1, "project": "demo", "repo": "acme/demo", "issue": 1,
+               "worker_name": "wk", "worker_session": "", "pm_key": "pm-demo",
+               "pm_sid": "", "kind": "comment", "evidence": "cid:1",
+               "ledger_line": 1, "detected_ts": 1e6, "dl_id": "dl-1"}
+        seen = []
+        real = dw.recipients
+
+        def spy(env, resolve=None):
+            seen.append(dict(env or {}))
+            return real(env, resolve)
+
+        with mock.patch.object(dw, "recipients", spy):
+            sent = dw.enqueue_delivery(dw.load_delivery_state(), rec, dry=True,
+                                       now=1e6, no_cooldown=True, no_merge=True)
+        self.assertEqual(sent, 1)
+        self.assertEqual(len(seen), 1, "the send must go through recipients()")
+        self.assertEqual(seen[0]["repo"], "acme/demo")
+        self.assertEqual(seen[0]["issue"], 1)
+
+    def test_the_send_line_no_longer_calls_the_chain_directly(self):
+        import inspect
+
+        src = inspect.getsource(dw._send_delivery)
+        self.assertIn("recipients(", src)
+        self.assertNotIn("resolve_recipients(rec[", src)
+
+
 class TheFourSitesAreMarked(unittest.TestCase):
     """§P0-1b: the four ``f"pm-{proj}"`` sites carry the #72 marker."""
 

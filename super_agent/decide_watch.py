@@ -1912,22 +1912,26 @@ def _load_alarm_module():
 def recipients(env: dict | None, resolve=None) -> list[tuple[str, str]]:
     """收件人入口：有 ``to_role`` 走它，没有就回落到四级链（#92 §P0-1b）。
 
-    **本单只摆这一层，``to_role`` 路径不实现**（归 #72）。判据是签名不是装饰：
+    **本单只摆这一层，``to_role`` 路径不实现**（归 #72）。但它在**投递路径上**
+    真实执行：``_send_delivery`` 每条交付都先过这里，所以下面三条判据在生产可达。
 
-    * ``recipients(None) == resolve_recipients("o/n")`` —— 现状行为一字不变；
-    * ``recipients({"repo": "o/n", "to_role": []})`` 同上（空列表＝广播，不是指定）；
+    * ``recipients(None) == resolve_recipients("")``；
+    * ``recipients({"repo": "o/n", "to_role": []})`` 同（空列表＝广播，不是指定）；
     * ``recipients({"to_role": ["pm"]}, resolve=…)`` 真的走 ``resolve``。
+
+    第二个参数是**收件人解析器**，签名 ``fn(env) -> [(name, sid)]``；缺省 ``None``
+    时由本函数自己按 ``env["repo"]`` 走四级链，所以 ``to_role`` 有值而无人解析时
+    返回空列表，**不**降级成广播——一个解析不了的收件人必须静默失败，不许变成
+    「发给所有人」。
 
     为什么先摆而不用：``to_role`` 的收件来源依赖「``pm`` 可绑定」，而
     ``gh_issue.py`` 的 ``--bind-role`` 闭集是 ``{qa, worker, at}``，现网
     ``issue_sessions.json`` 里 ``pm`` 槽位 0 个 ⇒ 前置未成立。扩闭集属 #74／#87
-    的权限边界，须 supervisor 裁定，本单不越权。
+    的权限边界，须 supervisor 裁定。
 
     ``f"pm-{proj}"`` 的四处下刀点（本单**只标注、不改行为**）：
     ``decide_watch.py:1921``（查找 ① 级）、``:2284``／``:2288``（进投递载荷）、
-    ``brief.py:230``（brief projects 过滤，现网命中 0 条＝哑过滤）。#72 落地时四处
-    必须同改：只改 ``:1921`` 会让投递帧的收件人与实际收件人不一致
-    （``_send_delivery`` 把 ``pm_key``／``pm_sid`` 一起注入 ``DELIVERY_EVENT``）。
+    ``brief.py:230``（brief projects 过滤，现网命中 0 条＝哑过滤）。
     """
     env = env if isinstance(env, dict) else {}
     if env.get("to_role"):
@@ -2058,9 +2062,15 @@ def _summary_add(st: dict, key: str, rec: dict, now: float) -> None:
 
 
 def _send_delivery(st: dict, rec: dict, dry: bool, now: float) -> int:
-    key = f"{rec['repo']}#{rec['issue']}"
+    key = delivery_group(rec)
     text = render_delivery_text(rec)
-    targets = resolve_recipients(rec["repo"])
+    # The recipients shell is on the delivery path (#92 §P0-1b): every send
+    # goes through ``recipients()``, which answers the four-level chain today
+    # and takes ``to_role`` the day #72 lands. The resolver is an adapter, not
+    # ``resolve_recipients`` itself - that takes a repo string, so passing it
+    # directly would raise ``TypeError`` and be read as "nobody to send to".
+    targets = recipients(rec, lambda env: resolve_recipients(
+        str((env or {}).get("repo") or "")))
     ok = False
     for _name, sid in targets:
         if delivery_notify(sid, text, dry):
@@ -2162,33 +2172,29 @@ def _prune(st: dict, now: float) -> None:
 def delivery_group(rec: dict) -> str:
     """冷却／日额／熔断／摘要的**分组**键：``repo#issue``。
 
-    分组是**按单**的，这是既有设计：同单当日第 2 次起合并进摘要（``_summary_add``）、
-    冷却窗 ``DELIVERY_COOLDOWN_S``、单日上限与熔断都以「一张单」为单位计数
+    分组是**按单**的：同单当日第 2 次起合并进摘要（``_summary_add``）、冷却窗
+    ``DELIVERY_COOLDOWN_S``、单日上限与熔断都以「一张单」为单位计数
     （自检 N 就是照这个口径写的：熔断键 ``owner/x#999`` 只停该单）。
     把 ``evidence`` 并进这个键会让「同单第二条交付」绕过冷却与日额，
-    等于废掉限流 —— 那不是 #83 的病灶。
+    等于废掉限流。
 
-    **#83 的病灶在去重键**，不在分组键，见 :func:`delivery_identity`。
+    这里只把内联表达式提成命名函数，行为与改前一字不差（ISS-92 P1-1 复核后：
+    方案 §P0-1a 的「撞键」前提不成立，去重键从未用 ``split`` 丢过 evidence）。
     """
     return f"{rec['repo']}#{rec['issue']}"
-
-
-def delivery_identity(rec: dict) -> str:
-    """去重（``seen``）键：同一条交付重放同键，不同交付不同键。
-
-    必须保留**完整** ``evidence``（含 ``cid:``／``ledger:`` 前缀）。只取冒号后半段
-    会让同号的两条不同证据撞成一个键（``cid:57`` 与 ``ledger:57`` 都变
-    ``o/n#92#57``）⇒ 第二条被当成重放**静默丢弃**，既不发也不进摘要，
-    ``dedup_skips`` 悄悄 +1 —— 这才是 #83 病灶（#92 §P0-1a）。
-    """
-    return f"{rec['repo']}#{rec['issue']}:{rec['evidence']}"
 
 
 def enqueue_delivery(st: dict, rec: dict, *, dry: bool, now: float,
                      no_cooldown: bool = False, no_merge: bool = False,
                      breaker_off: bool = False) -> int:
     key = delivery_group(rec)
-    skey = delivery_identity(rec)
+    # The dedup key keeps the **whole** evidence, prefix included: ``cid:57``
+    # and ``ledger:57`` are two deliveries of one issue, and a key that dropped
+    # the prefix would read the second as a replay of the first. This is the
+    # expression that was already here before #92 - kept verbatim, now with the
+    # reason written down (P1-1: the "collision" §P0-1a was written for never
+    # existed in this line).
+    skey = f"{key}#{rec['evidence']}"
     stats_inc(st, "hits", now=now)
     if skey in (st.get("seen") or {}):
         stats_inc(st, "dedup_skips", now=now)
@@ -3245,9 +3251,11 @@ def self_test() -> int:
         check("N", s1 == 0 and s2 == 1, f"blocked={s1} other={s2}")
 
         # ---------- V：同单同号、不同证据形态的两条交付必须都发得出去
-        # `cid:57` 与 `ledger:57` 只差前缀。去重键若退化成
-        # `split(':',1)[-1]`，两条撞成同一个键 ⇒ 第二条被当重放静默丢弃
-        # ⇒ #83 病灶复发（ISS-92 §P0-1a）。
+        # `cid:57` 与 `ledger:57` 只差前缀，是两条不同交付。去重键若丢掉前缀
+        # （只取冒号后半段），第二条会被当重放静默丢弃 ⇒ `dedup_skips` 悄悄 +1
+        # 而消息永远不发。**这是回归护栏，不是缺陷修复**：改前那一行
+        # `f"{key}#{rec['evidence']}"` 本来就保留完整 evidence（ISS-92 P1-1
+        # 复核结论），它防的是**将来有人把前缀切掉**。
         now = time.time()
         _fresh(root, [])
         DELIVERY_SINK = []
@@ -3264,9 +3272,10 @@ def self_test() -> int:
                               no_merge=True)
         v2 = enqueue_delivery(st, rb, dry=True, now=now, no_cooldown=True,
                               no_merge=True)
-        distinct = delivery_identity(ra) != delivery_identity(rb)
-        check("V", v1 == 1 and v2 == 1 and distinct,
-              f"cid={v1} ledger={v2} distinct={distinct}")
+        seen_keys = set((st.get("seen") or {}))
+        two_keys = len(seen_keys) == 2
+        check("V", v1 == 1 and v2 == 1 and two_keys,
+              f"cid={v1} ledger={v2} seen_keys={len(seen_keys)}")
 
         # ---------- O：跨日自动解除熔断并写日志
         now = time.time()
