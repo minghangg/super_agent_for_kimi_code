@@ -155,7 +155,8 @@ def session_info(sid: str, caller: str = "session_info") -> dict | None:
     return info
 
 
-def tasks_src(sid: str, caller: str = "tasks") -> tuple[list | None, str]:
+def tasks_src(sid: str, caller: str = "tasks",
+              cache_file: Path | None = None) -> tuple[list | None, str]:
     """返回 (任务列表, 来源标记)。来源一定是 "bus" 或 "direct"。
 
     为什么要单独返回来源（2026-11-06 步 2 返工 P0-1）：
@@ -171,15 +172,17 @@ def tasks_src(sid: str, caller: str = "tasks") -> tuple[list | None, str]:
             return None, "bus"
     if mode() == "bus":
         return None, "bus"
-    return K.tasks(sid), "direct"
+    return K.tasks(sid, cache_file=cache_file), "direct"
 
 
-def tasks(sid: str, caller: str = "tasks") -> list | None:
+def tasks(sid: str, caller: str = "tasks",
+          cache_file: Path | None = None) -> list | None:
     """兼容旧签名：只要列表。需要区分来源请用 `tasks_src()`。"""
-    return tasks_src(sid, caller)[0]
+    return tasks_src(sid, caller, cache_file=cache_file)[0]
 
 
-def pending_src(sid: str, caller: str = "pending") -> tuple[list | None, str]:
+def pending_src(sid: str, caller: str = "pending",
+                cache_file: Path | None = None) -> tuple[list | None, str]:
     """返回 (待批列表, 来源标记)。理由同 `tasks_src()`。"""
     if mode() != "direct":
         d = get(f"/pending/{sid}", caller)
@@ -189,7 +192,7 @@ def pending_src(sid: str, caller: str = "pending") -> tuple[list | None, str]:
             return None, "bus"
     if mode() == "bus":
         return None, "bus"
-    return K.pending_interactions(sid), "direct"
+    return K.pending_interactions(sid, cache_file=cache_file), "direct"
 
 
 def pending(sid: str, caller: str = "pending") -> list | None:
