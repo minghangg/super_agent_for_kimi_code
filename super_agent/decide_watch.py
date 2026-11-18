@@ -3735,7 +3735,7 @@ def self_test() -> int:
         t0 = datetime(2026, 6, 1, 12, 0, 0).timestamp()
         env = _fresh(root, [])
         led = Path(env["ledger"])
-        _append(led, _worker_row(999, note="cid:f2-mark [WK:wk-ISS-83-dev-20261118]"))
+        _append(led, _worker_row(999, note="cid:f2-mark [WK:wk-selftest-mark]"))
         _append(led, _worker_row(999, note="cid:f2-plain"))
         _append(led, _worker_row(999, note=""))
         DELIVERY_SINK = []
