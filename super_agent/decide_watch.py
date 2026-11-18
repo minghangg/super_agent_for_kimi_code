@@ -30,7 +30,6 @@ from datetime import datetime
 from pathlib import Path
 
 from . import autostart as autostart
-from . import session_alarm as alarm_mod
 from . import session_health as health_mod
 from . import paths as kimi_paths
 
@@ -56,6 +55,7 @@ class DecideWatchConfig:
     supervisor_notice_last_path: Path | None = None
     session_script: Path | None = None
     supervisor_key: str = "supervisor"
+    # 保留的注入面（#72 P2-1）：无读取点，但 lwa 薄壳按名传，删字段即 TypeError。
     alarm_state_file: str = "session_alarm_state.json"
     event_source: object | None = None
     heartbeat: object | None = None
@@ -76,6 +76,10 @@ class DecideWatchConfig:
     # belongs in the untracked overlay or `engine.supervisor_keys`, never here.
     supervisor_keys: tuple = ("supervisor",)
     send_transport: object | None = None
+    # 保留的注入面（#72 P2-1）：`_load_alarm_module` 与其 `session_alarm` 导入已
+    # 删除（唯一调用点是①/③级收件人降级腿）。这两个字段**不能删**——lwa 薄壳按名
+    # 传 `alarm_state_file`，少一个字段即 `TypeError`。字段在、无读取点，是已知的
+    # 死面；再次接线前先读 `resolve_recipients`（收件人只有 supervisor 一级）。
     alarm_module: object | None = None
     health_module: object | None = None
     autostart_name: str = "DecisionWatch"
@@ -1933,24 +1937,6 @@ def _bind_name(repo: str, issue) -> tuple[str, str]:
         return "unknown", ""
     return str(w.get("name") or "unknown"), str(w.get("session") or "")
 
-
-def _load_alarm_module():
-    """Load the injected alarm recipient module; never import a workbench module.
-
-    **停用（#72）**：本函数的唯一调用点是①/③级收件人降级腿，该两腿已删
-    ⇒ 生产路径不再执行它。保留是因为 `DecideWatchConfig.alarm_module`／
-    `alarm_state_file` 是注入面（lwa 薄壳按名传 `alarm_state_file`），
-    删字段会 `TypeError`。再次接线前先想清楚：收件人只有 supervisor 一级，
-    这一点不许回退（见 `resolve_recipients`）。
-    """
-    cfg = _cfg()
-    mod = cfg.alarm_module or alarm_mod
-    if hasattr(mod, "configure"):
-        mod.configure(state_root=_state_root(), sessions=SESSIONS(), log=LOG(),
-                      state_file=_path("health_state_path", cfg.alarm_state_file),
-                      live_root=_state_root(), probe=cfg.probe_session,
-                      sess_script=cfg.session_script)
-    return mod
 
 def recipients(env: dict | None, resolve=None) -> list[tuple[str, str]]:
     """收件人入口：有 ``to_role`` 走它，没有就回落到 ``resolve_recipients``（#92 §P0-1b）。
