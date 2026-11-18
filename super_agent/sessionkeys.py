@@ -47,13 +47,24 @@ def has_random_suffix(name: str) -> bool:
 
 
 def role_of(name: str) -> str:
-    """``pm`` / ``qa`` / ``at`` for a key name, else ``""``.
+    """The **prefix as written** for a key name, else ``""``.
 
-    Only the prefix matters here; it is what tells a ``pm-*`` key from a
-    ``qa-*`` one without a lookup table.
+    ``pm`` / ``qa`` / ``at`` / ``wk`` / ``scout`` / ``steward`` / ``auditor`` /
+    ``reviewer`` / ``analyst`` / ``supervisor`` / ``worker`` - eleven spellings,
+    because the envelope's ``from_role`` enumerates nine roles and six of them
+    had no way to be read before this (#92 §P0-2).
+
+    The answer is the prefix, **not a normalised role name**: ``scoped_by`` and
+    ``preferred_key`` compare it for equality against the role they were asked
+    for (``engine._pm_session_keys`` passes ``"pm"``), so returning ``worker``
+    for a ``wk-`` key would break the two callers that already work.
+
+    Longer names are tried first so ``steward-`` cannot be read as a ``st-``
+    prefix (#92 §P0-2 长名优先).
     """
     text = str(name or "").strip().lower()
-    for role in ("pm", "qa", "at"):
+    for role in ("supervisor", "analyst", "auditor", "reviewer", "steward",
+                 "scout", "worker", "wk", "pm", "qa", "at"):
         if text == role or text.startswith(role + "-"):
             return role
     return ""

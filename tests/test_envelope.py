@@ -159,5 +159,38 @@ class Rejections(unittest.TestCase):
             self._ok(result_ref={"kind": "issue_comment", "cid": 9}))[0])
 
 
+class RoleMapping(unittest.TestCase):
+    """§P0-2 归一表: the whitelist decides, the marker never self-certifies."""
+
+    def test_a_verified_key_names_its_role(self):
+        for key, want in (("supervisor", "supervisor"),
+                          ("pm-demo-1a2b3c4d", "pm"),
+                          ("qa-lwa-ISS-92-1a2b3c4d", "qa"),
+                          ("wk-ISS-92-dev", "worker"),
+                          ("worker-x", "worker"),
+                          ("scout-x", "scout"),
+                          ("steward-x", "steward"),
+                          ("auditor-x", "auditor"),
+                          ("reviewer-x", "reviewer"),
+                          ("analyst-x", "analyst"),
+                          ("at-x", "analyst")):
+            with self.subTest(key=key):
+                self.assertEqual(envelope.from_role_of(key, verified=True), want)
+
+    def test_an_unverified_key_is_empty_even_with_a_marker(self):
+        # ``[WK:<some pm key>]`` must not certify itself (§D.2 反例 A).
+        self.assertEqual(
+            envelope.from_role_of("pm-other-1a2b3c4d", "WK", verified=False), "")
+        self.assertEqual(envelope.from_role_of("", "WK", verified=False), "")
+
+    def test_every_enumerated_role_is_reachable(self):
+        # The whole point of widening ``role_of``: no enum value is dead.
+        reachable = {envelope.from_role_of(k, verified=True)
+                     for k in ("pm-x", "qa-x", "wk-x", "scout-x", "steward-x",
+                               "analyst-x", "auditor-x", "reviewer-x",
+                               "supervisor")}
+        self.assertEqual(reachable, set(envelope.FROM_ROLES))
+
+
 if __name__ == "__main__":
     unittest.main()

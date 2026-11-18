@@ -218,6 +218,12 @@ MARKER_ROLES = {"WK": "worker", "SC": "scout", "ST": "steward",
                 "AU": "auditor", "RV": "reviewer", "PL": "analyst",
                 "AT": "analyst"}
 
+#: Which ``from_role`` a ``role_of`` prefix normalises to (§P0-2 末表).
+PREFIX_ROLES = {"supervisor": "supervisor", "pm": "pm", "qa": "qa",
+                "wk": "worker", "worker": "worker", "scout": "scout",
+                "steward": "steward", "auditor": "auditor",
+                "reviewer": "reviewer", "analyst": "analyst", "at": "analyst"}
+
 #: Every legacy first line this module can read, by the shape it opens with.
 LEGACY_MARKERS = ("WK", "SC", "ST", "AU", "RV", "AT", "PL", "QA", "PM:TASK",
                   "PM", "AT")
@@ -235,6 +241,33 @@ def first_line_sha1(body: str) -> str:
 
     line = markers.first_line(body)
     return _hashlib.sha1(line.encode("utf-8", "replace")).hexdigest()
+
+
+def from_role_of(claimed_key: str = "", marker: str = "",
+                 verified: bool = False) -> str:
+    """The ``from_role`` for a comment: **whitelist first, marker second**.
+
+    Three answers, and the order is the whole point (§D.2):
+
+    * ``verified`` and the key names a role → that role. The whitelist already
+      decided the key belongs to this thread, so its prefix is the identity;
+    * not verified → ``""``. The marker letter is **not** a fallback: a body
+      that writes ``[WK:<someone else's key>]`` would otherwise certify itself,
+      which is the forgery ``DELIVERY_RE``'s ``([^\\]\\n]{1,64})`` allows;
+    * no claimed key at all → ``""`` as well. Unverified is a meaning, not a
+      gap to be filled from the text.
+
+    ``MARKER_ROLES`` and ``PREFIX_ROLES`` are consulted here and nowhere else,
+    so the two tables cannot drift apart from what is actually used.
+    """
+    if not verified:
+        return ""
+    from . import sessionkeys
+
+    role = PREFIX_ROLES.get(sessionkeys.role_of(claimed_key), "")
+    if role:
+        return role
+    return MARKER_ROLES.get(str(marker or "").upper(), "")
 
 
 def _task_prefix_re():

@@ -44,9 +44,36 @@ class RoleAndScope(unittest.TestCase):
         self.assertEqual(sessionkeys.role_of("pm-demo-3f7c1a90"), "pm")
         self.assertEqual(sessionkeys.role_of("qa"), "qa")
         self.assertEqual(sessionkeys.role_of("at-demo-3f7c1a90"), "at")
-        self.assertEqual(sessionkeys.role_of("wk-probe"), "")
+        self.assertEqual(sessionkeys.role_of("wk-probe"), "wk")
         # ``pmx`` is not a ``pm`` key: the separator is what separates.
         self.assertEqual(sessionkeys.role_of("pmx-demo"), "")
+
+    def test_every_envelope_role_has_a_prefix(self):
+        # #92 §P0-2: the nine roles the envelope enumerates must all be
+        # readable, or six of them are unreachable by construction.
+        for name, want in (("supervisor", "supervisor"),
+                           ("analyst-20261118a", "analyst"),
+                           ("auditor-20261118a", "auditor"),
+                           ("reviewer-20261118a", "reviewer"),
+                           ("steward-20261118a", "steward"),
+                           ("scout-20261118a", "scout"),
+                           ("worker-20261118a", "worker"),
+                           ("wk-ISS-92-dev-20261118", "wk"),
+                           ("pm-demo-1a2b3c4d", "pm"),
+                           ("qa-lwa-ISS-92-1a2b3c4d", "qa"),
+                           ("at-demo-1a2b3c4d", "at")):
+            with self.subTest(name=name):
+                self.assertEqual(sessionkeys.role_of(name), want)
+
+    def test_long_names_win_over_short_prefixes(self):
+        # ``st-`` is not a prefix here, but ``steward`` must not be read as one
+        # either: the table is consulted longest first.
+        self.assertEqual(sessionkeys.role_of("steward-x"), "steward")
+        self.assertEqual(sessionkeys.role_of("scout-x"), "scout")
+        self.assertEqual(sessionkeys.role_of("supervisor-x"), "supervisor")
+        for name in ("", "weird_name", "pmx-demo", "atx-demo", "wkx-demo"):
+            with self.subTest(name=name):
+                self.assertEqual(sessionkeys.role_of(name), "")
 
     def test_scope_matches_the_bare_and_the_suffixed_name(self):
         self.assertTrue(sessionkeys.scoped_by("pm-demo", "pm", "demo"))
