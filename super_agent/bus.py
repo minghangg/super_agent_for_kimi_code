@@ -195,9 +195,10 @@ def pending_src(sid: str, caller: str = "pending",
     return K.pending_interactions(sid, cache_file=cache_file), "direct"
 
 
-def pending(sid: str, caller: str = "pending") -> list | None:
+def pending(sid: str, caller: str = "pending",
+            cache_file: Path | None = None) -> list | None:
     """兼容旧签名：只要列表。需要区分来源请用 `pending_src()`。"""
-    return pending_src(sid, caller)[0]
+    return pending_src(sid, caller, cache_file=cache_file)[0]
 
 
 def sessions(caller: str = "sessions", busy_only: bool = False) -> list | None:
