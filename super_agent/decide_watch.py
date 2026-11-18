@@ -2544,18 +2544,32 @@ def check_pending(st: dict, *, dry: bool, now: float) -> dict:
                 break
         rec["escalated"] = True
         delivery_log(f"升级：{rec['project']}#{rec['issue']} {rec['evidence']}（1h 无收据）")
-    _prune_pending(st)
+    _prune_pending(st, now)
     return out
 
 
-def _prune_pending(st: dict) -> None:
-    """`pending` 只留**已升级**的最近 ``DELIVERY_PENDING_MAX`` 条。
+def _prune_pending(st: dict, now: float | None = None) -> None:
+    """`pending` 只留**已升级**的、且 `nudge_ts` 在 ``DELIVERY_SEEN_DAYS`` 天内的条目。
 
-    未升级的一条都不能丢：它们是升级判定的输入，丢了就等于放弃告警。
-    淘汰只按 `nudge_ts` 从旧到新，所以被淘汰的一定是最早升过级的那批。
+    三个判据按序执行：
+
+    1. **未升级的一条都不丢**：它们是升级判定的输入，丢了就等于放弃告警。
+    2. **升级且超 7 天的丢掉**（P1-1，ISS-83 退修）：升级已经发过、账也记过，
+       留着只让状态文件无界增长；实测 12 条 30 天前的已升级条目 12/12 全留。
+       判据与 ``_prune`` 的 `seen` 窗同一常量 ``DELIVERY_SEEN_DAYS``，不另设天数。
+    3. **`MAX` 只在升级集合内按 `nudge_ts` 最旧淘汰**：淘汰的必是升过级的最早那批。
     """
     pending = st.get("pending") or {}
-    escalated = [(k, v) for k, v in pending.items() if (v or {}).get("escalated")]
+    ts_now = time.time() if now is None else float(now)
+    cutoff = ts_now - DELIVERY_SEEN_DAYS * 86400
+    escalated = []
+    for k, v in list(pending.items()):
+        if not (v or {}).get("escalated"):
+            continue
+        if float((v or {}).get("nudge_ts") or 0) < cutoff:
+            pending.pop(k, None)
+            continue
+        escalated.append((k, v))
     if len(escalated) <= DELIVERY_PENDING_MAX:
         return
     escalated.sort(key=lambda kv: float((kv[1] or {}).get("nudge_ts") or 0))
@@ -3905,6 +3919,48 @@ def self_test() -> int:
               f"breaker_enabled={br_before.get('enabled')} plain={plain} forced={forced} "
               f"br 保持={br_after_force == br_before}")
 
+        # ---------- P7（ISS-83 P1-1）：`_prune_pending` 补 7 天判据
+        # 12 条 30 天前的 escalated 必须全清；未 escalated 的 30 天条目必须保留
+        # （升级判定的输入，丢了等于放弃告警）；`MAX=200` 只在 escalated 内淘汰。
+        now = time.time()
+        st = {"pending": {}}
+        for i in range(12):
+            st["pending"][f"dl-old-{i}"] = {"repo": "owner/neutral_project", "issue": 999,
+                                            "evidence": f"cid:old-{i}", "nudge_ts":
+                                            now - 30 * 86400, "escalated": True}
+        for i in range(2):
+            st["pending"][f"dl-oldun-{i}"] = {"repo": "owner/neutral_project", "issue": 999,
+                                              "evidence": f"cid:oldun-{i}", "nudge_ts":
+                                              now - 30 * 86400, "escalated": False}
+        for i in range(3):
+            st["pending"][f"dl-fresh-{i}"] = {"repo": "owner/neutral_project", "issue": 999,
+                                              "evidence": f"cid:fresh-{i}", "nudge_ts":
+                                              now - 60, "escalated": True}
+        _prune_pending(st, now)
+        left = set(st["pending"])
+        old_gone = not any(k.startswith("dl-old-") for k in left)
+        un_kept = all(f"dl-oldun-{i}" in left for i in range(2))
+        fresh_kept = all(f"dl-fresh-{i}" in left for i in range(3))
+
+        # MAX 仍只在 escalated 集合内按最旧淘汰（201 条 ⇒ 留 200）
+        st2 = {"pending": {f"dl-cap-{i}": {"nudge_ts": now - i, "escalated": True}
+                           for i in range(201)}}
+        _prune_pending(st2, now)
+        cap_kept = len(st2["pending"]) == DELIVERY_PENDING_MAX
+
+        # 生产路径：`check_pending` 把 `now` 传下来，老条目在同一轮被清掉
+        st3 = {"pending": {"dl-path": {"repo": "owner/neutral_project", "issue": 999,
+                                       "project": "neutral_project",
+                                       "evidence": "cid:path", "nudge_ts": now - 30 * 86400,
+                                       "escalated": True}},
+               "summaries": {}, "stats": {"date": _date_of(now)}}
+        DELIVERY_SINK = []
+        check_pending(st3, dry=True, now=now)
+        path_pruned = not st3["pending"]
+        check("P7", old_gone and un_kept and fresh_kept and cap_kept and path_pruned,
+              f"old_gone={old_gone} un_kept={un_kept} fresh_kept={fresh_kept} "
+              f"cap={len(st2['pending'])} path_pruned={path_pruned}")
+
         # ---------- 回归 8：单条交付立刻 sink=1，正文是【收单】
         env = _fresh(root, [])
         _append(Path(env["ledger"]), _worker_row(999, note="cid:reg-8"))
@@ -3961,9 +4017,9 @@ def self_test() -> int:
         os.environ.pop("DELIVERY_NO_INJECT", None)
 
     passed = sum(1 for _t, ok, _d in results if ok)
-    total = 32          # A–T ＋ V（#92 去重键）＋ GATE ＋ SM（#18 --send-mode）
+    total = 33          # A–T ＋ V（#92 去重键）＋ GATE ＋ SM（#18 --send-mode）
                         # ＋ ISS-83 新增 7：A-新／B-新／U-新／X-新／Y-新／F-3(no_evidence)／F-4(force_replay)
-                        # ＋ ISS-83 退修 2：FS(force_send 唯一发出口)／FS-BR(QA 原靶时序)
+                        # ＋ ISS-83 退修 3：FS(force_send 唯一发出口)／FS-BR(QA 原靶时序)／P7(pending 7 天判据)
     for tag, ok, detail in results:
         print(f"[self-test] {tag} {'通过' if ok else '失败'}" + (f"（{detail}）" if detail else ""))
     for tag, ok, detail in extras:

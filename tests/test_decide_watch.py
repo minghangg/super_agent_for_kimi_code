@@ -287,11 +287,11 @@ class Behaviour(Fixture):
         self.assertEqual(list(self.ws.glob("**/*")), [])
         self.assertEqual(self.sends, [])
 
-    def test_package_default_self_test_is_32_of_32(self):
+    def test_package_default_self_test_is_33_of_33(self):
         with contextlib.redirect_stdout(io.StringIO()) as out:
             rc = dw.self_test()
         self.assertEqual(rc, 0, out.getvalue())
-        self.assertIn("--self-test: A–T＋V＋SM 32/32 通过", out.getvalue())
+        self.assertIn("--self-test: A–T＋V＋SM 33/33 通过", out.getvalue())
         self.assertEqual(self.sends, [])
         self.assertEqual(self.injections, [])
 
