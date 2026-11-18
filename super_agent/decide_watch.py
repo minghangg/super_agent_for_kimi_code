@@ -2297,7 +2297,7 @@ def delivery_group(rec: dict) -> str:
 
 def enqueue_delivery(st: dict, rec: dict, *, dry: bool, now: float,
                      no_cooldown: bool = False, no_merge: bool = False,
-                     breaker_off: bool = False) -> int:
+                     force_send: bool = False, breaker_off: bool = False) -> int:
     """一条交付进投递决策。返回本轮**实际发送**条数（0 或 1）。
 
     三层结构（ISS-83）：① 证据去重 → ② 同单当日第 1 条立即发、其后 W 秒内的
@@ -2307,7 +2307,14 @@ def enqueue_delivery(st: dict, rec: dict, *, dry: bool, now: float,
     「第 2 次起延后 30 分钟」两条条件（窗判定改由 ``_window_open`` 承担，合并不再
     可关），但 lwa shim 的两处包装与三个 safkc 测试仍按位置传它们。留着不分支，
     免得调用方 ``TypeError``；两个开关都不再有行为。
+
+    ``force_send`` 是**唯一**的强制发出口：三处抑制（熔断、当日超限、窗内合并）
+    全部跳过。它取代旧名 ``breaker_off``——那个名字只说得出第一处，第三处因此
+    在 ISS-83 的改稿里漏了旁路（窗内新 cid 被并入汇总，17 秒内两次熔断放行只
+    发出一条）。旧名保留为**别名**，见下面第一行。
     """
+    # 旧名，ISS-83 后废弃，下个单删（lwa shim 仍按名传它，删则 TypeError）
+    force_send = force_send or breaker_off
     key = delivery_group(rec)
     # The dedup key keeps the **whole** evidence, prefix included: ``cid:57``
     # and ``ledger:57`` are two deliveries of one issue, and a key that dropped
@@ -2340,18 +2347,18 @@ def enqueue_delivery(st: dict, rec: dict, *, dry: bool, now: float,
 
     br = (st.get("breakers") or {}).get(key) or {}
     tripped = br.get("date") == today and br.get("enabled") is False
-    if tripped and not breaker_off:
+    if tripped and not force_send:
         stats_inc(st, "dedup_skips", now=now)
         delivery_log(f"熔断中，跳过 {key} {rec['evidence']}")
         return 0
 
     day["count"] = int(day.get("count") or 0) + 1
-    if day["count"] > DELIVERY_MAX_PER_DAY and not breaker_off:
+    if day["count"] > DELIVERY_MAX_PER_DAY and not force_send:
         _trip_breaker(st, key, now, dry)
         stats_inc(st, "dedup_skips", now=now)
         return 0
 
-    if _window_open(st, key, now):
+    if not force_send and _window_open(st, key, now):
         _burst_add(st, key, rec, now)
         stats_inc(st, "merged", now=now)     # 合并 ≠ 去重：`dedup_skips` 只记真丢的
         return 0
@@ -2359,10 +2366,23 @@ def enqueue_delivery(st: dict, rec: dict, *, dry: bool, now: float,
     return _send_delivery(st, rec, dry, now)
 
 
+# 未包装的实现本体（ISS-83 退修）。lwa 的 shim 会把 `enqueue_delivery` 在**内存里**
+# 换成按旧名转发的包装（`setattr` 到本模块全局），签名里没有 `force_send`。
+# 自检要用新名直接验语义时走这个引用：它在导入时绑定，不随全局改名而变。
+# 生产路径不受影响——包装只是加护栏，最终仍调用本体。
+_ENQUEUE_IMPL = enqueue_delivery
+
+
 def scan_deliveries(st: dict, *, dry: bool, now: float, force_replay: bool = False,
                     no_cooldown: bool = False, no_merge: bool = False,
-                    breaker_off: bool = False) -> int:
-    """增量读台账，产出/发送「交付」提醒。返回本轮**实际发送**条数。"""
+                    force_send: bool = False, breaker_off: bool = False) -> int:
+    """增量读台账，产出/发送「交付」提醒。返回本轮**实际发送**条数。
+
+    ``force_send`` 原样透传给 ``enqueue_delivery``；``breaker_off`` 是它的旧名
+    （ISS-83 后废弃，下个单删），只为 lwa shim 的按名调用留一条路。
+    """
+    # 旧名，ISS-83 后废弃，下个单删（lwa shim 仍按名传它，删则 TypeError）
+    force_send = force_send or breaker_off
     p = _delivery_paths()["ledger"]
     if not p.is_file():
         return 0
@@ -2475,8 +2495,12 @@ def scan_deliveries(st: dict, *, dry: bool, now: float, force_replay: bool = Fal
             "kind": "comment", "evidence": evidence, "ledger_line": line_no,
             "detected_ts": now, "dl_id": f"dl-{line_no}",
         }
+        # 转发用**旧名**：调用链上可能套着外部包装（`_guard_enqueue_delivery` 的
+        # 签名不在本仓，本单禁改），它按名转发 `breaker_off`。本模块那行别名把它折成
+        # `force_send`，语义仍是「三处抑制全跳过」。
+        # 下一个单把包装改名后，这里改回 `force_send=force_send` 并删别名。
         sent += enqueue_delivery(st, rec, dry=dry, now=now, no_cooldown=no_cooldown,
-                                 no_merge=no_merge, breaker_off=breaker_off)
+                                 no_merge=no_merge, breaker_off=force_send)
     return sent
 
 
@@ -3264,10 +3288,10 @@ def self_test() -> int:
         results.append((tag, bool(ok), detail))
 
     def extra(tag: str, ok: bool, detail: str = "") -> None:
-        """不计入 30 条口径的补充反例（F-1／F-2／F-5／回归 8）。
+        """不计入主口径的补充反例（F-1／F-2／F-5／C-1…C-4／回归 8）。
 
-        它们与 self-test 共用同一靶场与同一判据，但任务书把 self-test 总数锁死在
-        30（`total = 30`），所以单独打印，失败也算自检失败。
+        它们与 self-test 共用同一靶场与同一判据，但主口径只数 `check()` 的用例
+        （`total = 33`），所以单独打印，失败也算自检失败。
         """
         extras.append((tag, bool(ok), detail))
 
@@ -3317,8 +3341,10 @@ def self_test() -> int:
         heads = _cid_head_count(root / "ledger.jsonl")
         DELIVERY_SINK = []
         st = load_delivery_state()
-        sent = scan_deliveries(st, dry=True, now=time.time(), force_replay=True,
-                               breaker_off=True)
+        # E 现在**不给强制开关**：本条要验的是「没强制时，一轮内每单只发首条」，
+        # 而归一后的强制开关会把三处抑制一起跳过（`force_send` 语义），
+        # 那样每条 cid 各发一条、`sent` 恒等于行数，这一条就退化成数行数了。
+        sent = scan_deliveries(st, dry=True, now=time.time(), force_replay=True)
         check("E", sent == heads, f"sent={sent} cid_heads={heads}")
 
         # ---------- F：1h 无收据 ⇒ 升级
@@ -3828,6 +3854,57 @@ def self_test() -> int:
         check("Y-新", y_ok, f"first={y1} flush={y_texts} second={y2} "
                             f"last_nudge={'保留' if st.get('last_nudge') else '空'}")
 
+        # ---------- FS（ISS-83 P0-1）：`force_send` 是唯一强制发出口，三处抑制全跳过
+        # 窗内（首条 +5s）给 `force_send=True` ⇒ 立即发；不给 ⇒ 并入汇总。
+        # 旧写法只在前两处有 `breaker_off` 旁路，第三处 `_window_open` 没有 ⇒ 窗内
+        # 新 cid 被并进汇总（生产实测：13:47:13 与 13:47:30 相隔 17 秒两次熔断放行，
+        # 旧代码两次都紧跟一条【收单】，新代码只发出一条）。
+        t0 = datetime(2026, 6, 1, 12, 0, 0).timestamp()
+        _fresh(root, [])
+        DELIVERY_SINK = []
+        st = load_delivery_state()
+        st["baseline_established"] = True
+        st["stats"] = {"date": _date_of(t0)}
+        fs_1 = _ENQUEUE_IMPL(st, _selftest_rec(999, "cid:fs-1", t0), dry=True, now=t0)
+        fs_2 = _ENQUEUE_IMPL(st, _selftest_rec(999, "cid:fs-2", t0), dry=True, now=t0 + 5)
+        merged_2 = int((st.get("stats") or {}).get("merged") or 0)
+        fs_3 = _ENQUEUE_IMPL(st, _selftest_rec(999, "cid:fs-3", t0), dry=True,
+                                now=t0 + 6, force_send=True)
+        merged_3 = int((st.get("stats") or {}).get("merged") or 0)
+        fs_4 = _ENQUEUE_IMPL(st, _selftest_rec(999, "cid:fs-4", t0), dry=True,
+                                now=t0 + 7, breaker_off=True)     # 旧名别名
+        check("FS", fs_1 == 1 and fs_2 == 0 and merged_2 == 1 and fs_3 == 1
+              and merged_3 == 1 and fs_4 == 1,
+              f"first={fs_1} window={fs_2}(merged={merged_2}) "
+              f"force={fs_3}(merged={merged_3}) alias={fs_4}")
+
+        # ---------- FS-BR（QA 原靶）：3 发 → 熔断 → 21 秒后新 cid，`force_send` ⇒ 发 1 条
+        # 两个 cid 必须不同：同一 evidence 会先被精确键去重（返回 0 且不记 `dedup_skips`），
+        # 那样「plain=0」证明的是去重而不是熔断，判据就废了。
+        # 同时钉住「force 不污染熔断态」：熔断记录原样保留（date/count/enabled 不变），
+        # 不给 force 的新 cid 仍被判 0 ⇒ 闸确实还在读，不是被 force 关掉。
+        t0 = datetime(2026, 6, 1, 12, 0, 0).timestamp()
+        _fresh(root, [])
+        DELIVERY_SINK = []
+        st = load_delivery_state()
+        st["baseline_established"] = True
+        st["stats"] = {"date": _date_of(t0)}
+        for i in range(4):
+            _ENQUEUE_IMPL(st, _selftest_rec(999, f"cid:fsbr-{i}", t0), dry=True,
+                             now=t0 + i * 10)
+        key = "owner/neutral_project#999"
+        br_before = dict((st.get("breakers") or {}).get(key) or {})
+        plain = _ENQUEUE_IMPL(st, _selftest_rec(999, "cid:fsbr-plain", t0), dry=True,
+                                 now=t0 + 21)
+        br_after_plain = dict((st.get("breakers") or {}).get(key) or {})
+        forced = _ENQUEUE_IMPL(st, _selftest_rec(999, "cid:fsbr-forced", t0), dry=True,
+                                  now=t0 + 21, force_send=True)
+        br_after_force = dict((st.get("breakers") or {}).get(key) or {})
+        check("FS-BR", br_before.get("enabled") is False and plain == 0 and forced == 1
+              and br_after_plain == br_before and br_after_force == br_before,
+              f"breaker_enabled={br_before.get('enabled')} plain={plain} forced={forced} "
+              f"br 保持={br_after_force == br_before}")
+
         # ---------- 回归 8：单条交付立刻 sink=1，正文是【收单】
         env = _fresh(root, [])
         _append(Path(env["ledger"]), _worker_row(999, note="cid:reg-8"))
@@ -3884,8 +3961,9 @@ def self_test() -> int:
         os.environ.pop("DELIVERY_NO_INJECT", None)
 
     passed = sum(1 for _t, ok, _d in results if ok)
-    total = 30          # A–T ＋ V（#92 去重键）＋ GATE ＋ SM（#18 --send-mode）
+    total = 32          # A–T ＋ V（#92 去重键）＋ GATE ＋ SM（#18 --send-mode）
                         # ＋ ISS-83 新增 7：A-新／B-新／U-新／X-新／Y-新／F-3(no_evidence)／F-4(force_replay)
+                        # ＋ ISS-83 退修 2：FS(force_send 唯一发出口)／FS-BR(QA 原靶时序)
     for tag, ok, detail in results:
         print(f"[self-test] {tag} {'通过' if ok else '失败'}" + (f"（{detail}）" if detail else ""))
     for tag, ok, detail in extras:
