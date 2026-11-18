@@ -1673,10 +1673,14 @@ def notice_registration_problem() -> str:
 # 那次「5 个真 PM 同时被刷」的事故）。
 DELIVERY_EVENT = "event.delivery_ready"
 DELIVERY_HEARTBEAT_S = 600.0        # 每 10 分钟一行心跳（第一笔只保证「可查」，「会叫」在第二笔）
-DELIVERY_COOLDOWN_S = 1800.0        # 同 (repo,issue) 冷却
-DELIVERY_SUMMARY_DELAY_S = 1800.0   # 同单当日第 2 次起合并，30 分钟后汇总一条
+# 收单三层结构（ISS-83，方案 v4）：① skey 证据去重 → ② 首条立即发、其后 W 秒内追加合并
+# → ③ 熔断 DELIVERY_MAX_PER_DAY。旧的「冷却窗」与「第 2 次起延后 30 分钟」两条条件已删除：
+# 它们让同单第二条既不发也不汇总，第二条要等 30 分钟才有一条迟到的汇总。
+DELIVERY_BURST_WINDOW_S = 300.0     # 首条之后多少秒内的追加合并成一条汇总（红线 ≤300）
+BURST_LIST_MAX = 50                 # 汇总正文最多列 50 个 cid，其余给 ledger 行区间
 DELIVERY_SEEN_DAYS = 7              # 精确键保留窗口
 DELIVERY_MAX_PER_DAY = 3            # 当日 nudge > 3 ⇒ **只停该单**
+DELIVERY_PENDING_MAX = 200          # 已升级的 pending 只保留最近 200 条
 DELIVERY_ESCALATE_S = 3600.0        # 1h 内无 pm 收据 ⇒ 升级
 DELIVERY_PENDING_CHECK_S = 60.0     # 收据/汇总/升级的检查节流
 EXIT_FIXTURE_INVALID = 6            # 夹具前置校验失败（--send-mode 的 unknown 预留给 8，勿混）
@@ -1837,8 +1841,8 @@ def _stats(st: dict, now: float) -> dict:
             except OSError:
                 pass
         s = {"date": today, "hits": 0, "nudges": 0, "summaries": 0, "dedup_skips": 0,
-             "escalations": 0, "undelivered": 0, "false_pos": 0, "missed": 0,
-             "parse_errors": 0}
+             "merged": 0, "escalations": 0, "undelivered": 0, "false_pos": 0, "missed": 0,
+             "no_evidence": 0, "parse_errors": 0}
         st["stats"] = s
     return s
 
@@ -1848,8 +1852,18 @@ def stats_inc(st: dict, key: str, n: int = 1, now: float = 0.0) -> None:
     s[key] = int(s.get(key) or 0) + n
 
 
-def stats_roll(st: dict, now: float) -> list[str]:
-    """日切：旧日 stats 落盘 ＋ **跨日自动解除全部熔断**（issue #15 N3）。"""
+def stats_roll(st: dict, now: float, *, dry: bool = False, flush=None) -> list[str]:
+    """日切：旧日 stats 落盘 ＋ 解熔断 ＋ **把缓冲里的追加先发出去**（issue #15 N3／ISS-83）。
+
+    顺序是**必须成功的事在前**：`_stats` 与解熔断都不依赖 flush 结果，flush 再失败
+    也不至于「丢一天状态」。flush 逐 key `try`：异常只让本 key 的缓冲留下、下轮再发，
+    绝不让 `delivery_tick` 抛出——那会让 `save_delivery_state` 不执行，下一轮重读同一批
+    台账行、`seen` 也没落盘 ⇒ 同一批交付重发。
+
+    `last_nudge` **不清**（ISS-83 P0-3）：lwa shim 的 `_nudge_floor()` 拿它的最大值当
+    重启下界，清空会让那个下界归零、跨日后护栏失效。窗判定改由 `_window_open()` 做
+    日期比对，跨日不再当窗内。
+    """
     today = _date_of(now)
     old = (st.get("stats") or {}).get("date")
     if old == today:
@@ -1858,10 +1872,32 @@ def stats_roll(st: dict, now: float) -> list[str]:
     tripped = [k for k, v in (st.get("breakers") or {}).items() if not v.get("enabled", True)]
     st["breakers"] = {}
     st["day_nudges"] = {}
-    st["summaries"] = {}
     if tripped:
         delivery_log(f"delivery breaker reset (date={today}, was={len(tripped)} issues)")
+    _flush_buffers(st, now=now, dry=dry, flush=flush, why="日切")
     return tripped
+
+
+def _flush_buffers(st: dict, *, now: float, dry: bool, flush=None, why: str) -> int:
+    """把 `summaries` 里的缓冲逐 key 发出去；失败**只跳过本 key、保留缓冲**。
+
+    `flush` 可注入（自检要替身），缺省就是 `_flush_one`。返回成功发出的条数。
+    """
+    send = flush or _flush_one
+    sent = 0
+    for key, buf in list((st.get("summaries") or {}).items()):
+        items = (buf or {}).get("items") or []
+        if not items:
+            st["summaries"].pop(key, None)
+            continue
+        try:
+            send(st, key, items, dry=dry, now=now)
+        except Exception as exc:                        # noqa: BLE001
+            delivery_log(f"{why} flush 失败，保留缓冲：{key} {type(exc).__name__}: {exc}")
+            continue                                    # 不 pop ⇒ 下轮还会看到它
+        st["summaries"].pop(key, None)
+        sent += 1
+    return sent
 
 
 def _sessions() -> dict:
@@ -2053,12 +2089,80 @@ def _trip_breaker(st: dict, key: str, now: float, dry: bool) -> None:
     delivery_log(f"breaker tripped: {key} 当日第 {DELIVERY_MAX_PER_DAY + 1} 次交付提醒 ⇒ 该单停发至次日 0 点")
 
 
-def _summary_add(st: dict, key: str, rec: dict, now: float) -> None:
-    buf = st.setdefault("summaries", {}).setdefault(key, {"flush_at": now + DELIVERY_SUMMARY_DELAY_S,
-                                                          "items": [], "date": _date_of(now)})
-    buf["items"].append({"evidence": rec["evidence"], "line": rec["ledger_line"],
-                         "worker": rec["worker_name"]})
-    delivery_log(f"合并进摘要 {key}：{rec['evidence']}（当日第 2 次起不单独打扰）")
+def _window_open(st: dict, key: str, now: float) -> bool:
+    """首条发出后 W 秒内 ⇒ 窗内（后续交付合并成一条汇总，不单独打扰）。
+
+    两个条件缺一不可：**同一天**且**未超窗**。只比时间差会在跨日后把昨日的
+    `last_nudge` 当今日锚点（23:59:30 发过首条，00:00:10 到的交付被判窗内，
+    于是新一天的第一条不进「立即发」）。`last_nudge` 因此不清（见 `stats_roll`），
+    日期比对放在这里做。
+    """
+    last = float((st.get("last_nudge") or {}).get(key) or 0)
+    if not last:
+        return False
+    if _date_of(last) != _date_of(now):
+        return False
+    return (now - last) < DELIVERY_BURST_WINDOW_S
+
+
+def _burst_add(st: dict, key: str, rec: dict, now: float) -> None:
+    """把一条交付追加进本单当日的缓冲。**只在追加时建壳**。
+
+    不 `setdefault` 预建空壳：空壳会让下一条被误判为「窗内追加」，而首条其实
+    已经发完（自检 A-新 守的是这个）。
+    `flush_at` 锚在**首条发送时刻**（`last_nudge + W`），不是本条到达时刻：
+    锚在到达时刻会让实际最长窗口变成 2×W，红线「不得 >300 秒」就不可验。
+    """
+    buf = (st.get("summaries") or {}).get(key)
+    if buf is None:
+        anchor = float((st.get("last_nudge") or {}).get(key) or now)
+        buf = {"flush_at": anchor + DELIVERY_BURST_WINDOW_S,
+               "items": [], "date": _date_of(now)}
+        st.setdefault("summaries", {})[key] = buf
+    buf["items"].append({**rec, "line": rec["ledger_line"], "worker": rec["worker_name"]})
+    delivery_log(f"并入本单汇总 {key}：{rec['evidence']}（首条已单独提醒）")
+
+
+def _render_burst(key: str, items: list) -> str:
+    """合成一条【收单·汇总】：≤50 条列全部 cid，>50 条列前 50 个 ＋ ledger 行区间。
+
+    单条消息过长会被 send 传输截断，所以超过上限时给定位而不是硬列。
+    元素形态两种都收：`_burst_add` 写进去的扁平 dict，和单条 rec 本身。
+    """
+    evs = [str((it.get("rec") or {}).get("evidence") or it.get("evidence") or "?")
+           for it in items]
+    shown = evs[:BURST_LIST_MAX]
+    more = len(evs) - len(shown)
+    body = "、".join(shown)
+    if more > 0:
+        first = int((items[0].get("rec") or {}).get("ledger_line") or items[0].get("line") or 0)
+        last = int((items[-1].get("rec") or {}).get("ledger_line") or items[-1].get("line") or 0)
+        body += f"…（共 {len(evs)} 条，见 ledger 第 {first}-{last} 行）"
+    return f"【收单·汇总】{key} 另有 {len(evs)} 条交付未单独提醒：{body}。请一并收取。"
+
+
+def _flush_one(st: dict, key: str, items: list, *, dry: bool, now: float) -> bool:
+    """把一批 items 合成一条发出；一条都发不出去就整批落 `undelivered`。
+
+    与 `check_pending`／日切 `stats_roll` **共用这一份失败处置**，不写两份。
+    元素形态归一在 `rec = it.get("rec") or it`：`_burst_add` 写扁平形态（`repo`／
+    `evidence`／`ledger_line` 都在外层），旧摘要形态把 rec 套在 `"rec"` 键下。
+    不用 `assert` 兜形态——`python -O` 会剥掉 assert，`None` 就会当有效值写进
+    `undelivered`，那行 `rec=null` 会让 `retry_undelivered` 永久跳过它。
+    """
+    text = _render_burst(key, items)
+    for _n, sid in resolve_recipients(key.split("#")[0]):
+        if delivery_notify(sid, text, dry):
+            stats_inc(st, "summaries", now=now)
+            return True
+    for it in items:
+        rec = it.get("rec") or it
+        if not isinstance(rec, dict) or not rec.get("repo"):
+            delivery_log(f"汇总项形态不可用，跳过重试：{key} {type(rec).__name__}")
+            continue
+        _append_undelivered(st, rec, now)
+    delivery_log(f"汇总未投递 ⇒ 落 undelivered：{key} {len(items)} 条")
+    return False
 
 
 def _send_delivery(st: dict, rec: dict, dry: bool, now: float) -> int:
@@ -2098,11 +2202,18 @@ def _send_delivery(st: dict, rec: dict, dry: bool, now: float) -> int:
 
 
 def _append_undelivered(st: dict, rec: dict, now: float) -> None:
+    """落一行待重试记录。`enqueued_ts` 取**本轮开始时刻**。
+
+    取 tick 开始时刻才能让 `retry_undelivered` 的「本轮才入队不重试」判据生效：
+    取 `now` 也行，但同轮里 `now` 会晚于 `_tick_started`，边界处容易判错，
+    所以统一用 tick 起点。
+    """
     try:
         p = _delivery_paths()["undelivered"]
         p.parent.mkdir(parents=True, exist_ok=True)
+        stamp = float(st.get("_tick_started") or now)
         with p.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"t": now, "enqueued_ts": now, "rec": rec},
+            fh.write(json.dumps({"t": now, "enqueued_ts": stamp, "rec": rec},
                                 ensure_ascii=False) + "\n")
     except OSError:
         pass
@@ -2170,12 +2281,12 @@ def _prune(st: dict, now: float) -> None:
 
 
 def delivery_group(rec: dict) -> str:
-    """冷却／日额／熔断／摘要的**分组**键：``repo#issue``。
+    """日额／熔断／汇总的**分组**键：``repo#issue``。
 
-    分组是**按单**的：同单当日第 2 次起合并进摘要（``_summary_add``）、冷却窗
-    ``DELIVERY_COOLDOWN_S``、单日上限与熔断都以「一张单」为单位计数
-    （自检 N 就是照这个口径写的：熔断键 ``owner/x#999`` 只停该单）。
-    把 ``evidence`` 并进这个键会让「同单第二条交付」绕过冷却与日额，
+    分组是**按单**的：同单当日第 2 条起并入当日汇总（``_burst_add``，上限
+    ``DELIVERY_MAX_PER_DAY`` 条），熔断也以「一张单」为单位计数（自检 N 就是照
+    这个口径写的：熔断键 ``owner/x#999`` 只停该单）。
+    把 ``evidence`` 并进这个键会让「同单第二条交付」绕过日额，
     等于废掉限流。
 
     这里只把内联表达式提成命名函数，行为与改前一字不差（ISS-92 P1-1 复核后：
@@ -2187,6 +2298,16 @@ def delivery_group(rec: dict) -> str:
 def enqueue_delivery(st: dict, rec: dict, *, dry: bool, now: float,
                      no_cooldown: bool = False, no_merge: bool = False,
                      breaker_off: bool = False) -> int:
+    """一条交付进投递决策。返回本轮**实际发送**条数（0 或 1）。
+
+    三层结构（ISS-83）：① 证据去重 → ② 同单当日第 1 条立即发、其后 W 秒内的
+    追加并入汇总 → ③ 当日超过 ``DELIVERY_MAX_PER_DAY`` 条 ⇒ 只停该单。
+
+    ``no_cooldown``／``no_merge`` 是**兼容形参**：ISS-83 删掉了「冷却窗」与
+    「第 2 次起延后 30 分钟」两条条件（窗判定改由 ``_window_open`` 承担，合并不再
+    可关），但 lwa shim 的两处包装与三个 safkc 测试仍按位置传它们。留着不分支，
+    免得调用方 ``TypeError``；两个开关都不再有行为。
+    """
     key = delivery_group(rec)
     # The dedup key keeps the **whole** evidence, prefix included: ``cid:57``
     # and ``ledger:57`` are two deliveries of one issue, and a key that dropped
@@ -2230,15 +2351,9 @@ def enqueue_delivery(st: dict, rec: dict, *, dry: bool, now: float,
         stats_inc(st, "dedup_skips", now=now)
         return 0
 
-    last = float((st.get("last_nudge") or {}).get(key) or 0)
-    if not no_cooldown and last and now - last < DELIVERY_COOLDOWN_S:
-        _summary_add(st, key, rec, now)
-        stats_inc(st, "dedup_skips", now=now)
-        return 0
-
-    if not no_merge and int(day["count"]) > 1:
-        _summary_add(st, key, rec, now)
-        stats_inc(st, "dedup_skips", now=now)
+    if _window_open(st, key, now):
+        _burst_add(st, key, rec, now)
+        stats_inc(st, "merged", now=now)     # 合并 ≠ 去重：`dedup_skips` 只记真丢的
         return 0
 
     return _send_delivery(st, rec, dry, now)
@@ -2286,9 +2401,9 @@ def scan_deliveries(st: dict, *, dry: bool, now: float, force_replay: bool = Fal
     if reason:
         st["offset"] = size
         st["baseline_established"] = True
+        # 只清半行：`seen`／`pending` **不清**——重建基线的意思是不回放历史，
+        # 不是忘记已经提醒过谁。清了会让同一条证据重建后重新提醒一遍。
         st["pending_partial"] = ""
-        st["seen"] = {}
-        st["pending"] = {}
         delivery_log(f"baseline rebuilt (reason={reason}) offset={size}")
         return 0
 
@@ -2339,7 +2454,14 @@ def scan_deliveries(st: dict, *, dry: bool, now: float, force_replay: bool = Fal
         if not repo or issue is None:
             continue
         note = str(row.get("note") or "")
-        evidence = note if note.startswith("cid:") else f"ledger:{line_no}"
+        # E-2b（ISS-83）：证据**只认** `cid:`。旧写法的 `ledger:<行号>` 兜底造出的
+        # 是一条没有可核对证据的提醒——收件人拿到行号也确认不了「哪一次交付」。
+        # 没有 cid 的台账行因此**不建 rec、不发**，只计数 `stats.no_evidence`。
+        # 代价写明：这类交付**没有自动告警，靠人读台账**。
+        if not note.startswith("cid:"):
+            stats_inc(st, "no_evidence", now=now)
+            continue
+        evidence = note
         worker_name, worker_sid = _bind_name(repo, issue)
         proj = _project_of_repo(repo)
         # #72 落地点（本单不改行为）：这两行把 pm 收件人**写进投递载荷**
@@ -2359,20 +2481,24 @@ def scan_deliveries(st: dict, *, dry: bool, now: float, force_replay: bool = Fal
 
 
 def check_pending(st: dict, *, dry: bool, now: float) -> dict:
-    """① 汇总（同单当日第 2 次起）② 1h 无收据 ⇒ 升级。"""
+    """① 把到期的本单汇总 flush 出去 ② 1h 无收据 ⇒ 升级。"""
     out = {"summaries": 0, "escalations": 0}
     for key, buf in list((st.get("summaries") or {}).items()):
-        if float(buf.get("flush_at") or 0) > now or not buf.get("items"):
+        items = (buf or {}).get("items") or []
+        if not items:
+            st["summaries"].pop(key, None)      # 空壳一律清掉，免得被当窗内追加
             continue
-        items = buf.get("items") or []
-        text = (f"【收单·汇总】{key} 今日另有 {len(items)} 条交付未单独提醒："
-                + "、".join(f"{it.get('evidence')}" for it in items[:5])
-                + ("…" if len(items) > 5 else "") + "。请一并收取。")
-        for _name, sid in resolve_recipients(key.split("#")[0]):
-            if delivery_notify(sid, text, dry):
+        if float((buf or {}).get("flush_at") or 0) > now:
+            continue
+        # 逐 key `try`：与日切同一份失败处置。异常必须停在本 key 里——抛到
+        # `delivery_tick` 外面会让 `save_delivery_state` 不执行，下一轮重读同一批
+        # 台账行、`seen` 也没落盘 ⇒ 同一批交付重发，且缓冲永远发不出去。
+        try:
+            if _flush_one(st, key, items, dry=dry, now=now):
                 out["summaries"] += 1
-                stats_inc(st, "summaries", now=now)
-                break
+        except Exception as exc:                        # noqa: BLE001
+            delivery_log(f"汇总 flush 失败，保留缓冲：{key} {type(exc).__name__}: {exc}")
+            continue                                    # 不 pop ⇒ 下轮再试
         st["summaries"].pop(key, None)
 
     for dl_id, rec in list((st.get("pending") or {}).items()):
@@ -2394,7 +2520,23 @@ def check_pending(st: dict, *, dry: bool, now: float) -> dict:
                 break
         rec["escalated"] = True
         delivery_log(f"升级：{rec['project']}#{rec['issue']} {rec['evidence']}（1h 无收据）")
+    _prune_pending(st)
     return out
+
+
+def _prune_pending(st: dict) -> None:
+    """`pending` 只留**已升级**的最近 ``DELIVERY_PENDING_MAX`` 条。
+
+    未升级的一条都不能丢：它们是升级判定的输入，丢了就等于放弃告警。
+    淘汰只按 `nudge_ts` 从旧到新，所以被淘汰的一定是最早升过级的那批。
+    """
+    pending = st.get("pending") or {}
+    escalated = [(k, v) for k, v in pending.items() if (v or {}).get("escalated")]
+    if len(escalated) <= DELIVERY_PENDING_MAX:
+        return
+    escalated.sort(key=lambda kv: float((kv[1] or {}).get("nudge_ts") or 0))
+    for k, _v in escalated[:len(escalated) - DELIVERY_PENDING_MAX]:
+        pending.pop(k, None)
 
 
 def retry_undelivered(st: dict, *, dry: bool, now: float) -> int:
@@ -2403,7 +2545,11 @@ def retry_undelivered(st: dict, *, dry: bool, now: float) -> int:
     **P1-1（退修）**：同一 tick 内刚落队列的条目不参与本轮重试——否则
     `scan_deliveries` 落队列后本函数立刻又读又发，同一轮发两次
     （实测 `stats.undelivered=2`、日志 2 条、队列 2 行）。
-    判据：只取 `tick_started` **之前**入队的条目。
+
+    **U-新（ISS-83）**：offset 只按**整行**推进，遇到本轮才入队的行就 `break`。
+    旧写法无条件把 offset 推到文件末尾、还用 `continue` 跳过整行，两件事同时发生
+    ⇒ 本轮入队的那行被越过、下轮永远读不到（实测 `off=277/277`、次轮 `retried=0`）。
+    `break` 之后 offset 停在「第一个本轮才入队的行之前」，下轮从那里继续。
     """
     p = _delivery_paths()["undelivered"]
     try:
@@ -2420,28 +2566,44 @@ def retry_undelivered(st: dict, *, dry: bool, now: float) -> int:
     except OSError:
         return 0
     pieces = chunk.decode("utf-8", "replace").split("\n")
-    partial = pieces.pop()
-    tick_started = float(st.pop("_tick_started", now))
+    partial = pieces.pop()                     # 尾半行：不消费，也不计字节
+    tick_started = float(st.get("_tick_started") or now)
     sent = 0
+    consumed = 0                               # 只累加**整行**字节，含行尾换行
     for raw in pieces:
-        raw = raw.strip()
-        if not raw:
+        if float(_undelivered_ts(raw) or 0) >= tick_started:
+            break                              # 本轮才入队 ⇒ 留到下一轮，从这里续读
+        consumed += len(raw.encode("utf-8")) + 1
+        line = raw.strip()
+        if not line:
             continue
         try:
-            item = json.loads(raw)
+            item = json.loads(line)
         except ValueError:
             continue
         if not isinstance(item, dict):
             continue
-        if float(item.get("enqueued_ts") or item.get("t") or 0) >= tick_started:
-            continue                       # 本轮才入队 ⇒ 下一轮再试
-        rec = (item or {}).get("rec") or {}
+        rec = item.get("rec") or item         # 两种形态：套 rec，或扁平即 rec
         if not isinstance(rec, dict) or not rec.get("repo"):
             continue
         if _send_delivery(st, {**rec, "detected_ts": rec.get("detected_ts") or now}, dry, now):
             sent += 1
-    st["undelivered_offset"] = size - len(partial.encode("utf-8"))
+    st["undelivered_offset"] = off + consumed
     return sent
+
+
+def _undelivered_ts(raw: str) -> float:
+    """读一条 undelivered 行的入队时刻；读不出返回 0.0（当旧行，照常重试）。"""
+    try:
+        item = json.loads(raw)
+    except ValueError:
+        return 0.0
+    if not isinstance(item, dict):
+        return 0.0
+    try:
+        return float(item.get("enqueued_ts") or item.get("t") or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _write_hb(name: str, extra: dict | None = None) -> None:
@@ -2461,7 +2623,7 @@ def delivery_tick(*, dry: bool, now: float | None = None) -> dict:
     now = time.time() if now is None else now
     st = load_delivery_state()
     st["_tick_started"] = now                 # P1-1：本轮入队的不参与本轮 retry
-    stats_roll(st, now)
+    stats_roll(st, now, dry=dry)
     sent = scan_deliveries(st, dry=dry, now=now)
     pend = {"summaries": 0, "escalations": 0}
     if now - float(st.get("last_pending_check") or 0) >= DELIVERY_PENDING_CHECK_S:
@@ -2978,8 +3140,13 @@ def _self_fixture(root: Path) -> dict:
     return fake
 
 
-def _eligible_count(ledger: Path) -> int:
-    n = 0
+def _cid_head_count(ledger: Path) -> int:
+    """一轮之内会**立即发**的条数：每个 (repo, issue) 的第一条带 cid 证据的行。
+
+    第 2 条起在窗内并入汇总（`_window_open`），所以一轮发送数等于「有 cid 证据的
+    不同单号个数」，不是「带 cid 的行数」。
+    """
+    seen: set = set()
     try:
         with ledger.open("r", encoding="utf-8", errors="replace") as fh:
             for ln in fh:
@@ -2990,13 +3157,18 @@ def _eligible_count(ledger: Path) -> int:
                     r = json.loads(ln)
                 except ValueError:
                     continue
-                if (isinstance(r, dict) and str(r.get("role")).lower() == "worker"
-                        and str(r.get("act")).lower() == "comment" and r.get("ok") is True
-                        and r.get("repo") and r.get("issue") is not None):
-                    n += 1
+                if not isinstance(r, dict):
+                    continue
+                if (str(r.get("role")).lower() != "worker"
+                        or str(r.get("act")).lower() != "comment"
+                        or r.get("ok") is not True
+                        or not r.get("repo") or r.get("issue") is None
+                        or not str(r.get("note") or "").startswith("cid:")):
+                    continue
+                seen.add((r.get("repo"), r.get("issue")))
     except OSError:
         pass
-    return n
+    return len(seen)
 
 
 def _fresh(root: Path, ledger_lines: list[dict] | None = None,
@@ -3049,11 +3221,23 @@ def _fresh(root: Path, ledger_lines: list[dict] | None = None,
 
 
 def _worker_row(issue=999, ok=True, **kw):
+    """自检台账行。默认带 `cid:` 证据——E-2b 之后没有 cid 的行**不投递**（只计数
+    `no_evidence`），所以 A–T 里凡是期望「发得出去」的行都必须带证据。"""
     row = {"t": datetime.now().isoformat(timespec="seconds"), "role": "worker",
            "act": "comment", "repo": "owner/neutral_project",
-           "issue": issue, "ok": ok, "note": ""}
+           "issue": issue, "ok": ok, "note": f"cid:s{issue}"}
     row.update(kw)
     return row
+
+
+def _selftest_rec(issue, evidence, now, repo="owner/neutral_project"):
+    """自检用的完整交付 rec（形态与 `scan_deliveries` 造的一致）。"""
+    proj = _project_of_repo(repo)
+    return {"v": 1, "project": proj, "repo": repo, "issue": issue,
+            "worker_name": "wk-selftest", "worker_session": "",
+            "pm_key": f"pm-{proj}" if proj else "", "pm_sid": "",
+            "kind": "comment", "evidence": evidence, "ledger_line": 1,
+            "detected_ts": now, "dl_id": f"dl-selftest-{evidence}"}
 
 
 def _append(ledger: Path, row: dict) -> None:
@@ -3071,12 +3255,21 @@ def self_test() -> int:
     root = _cfg().self_test_root or Path(tempfile.mkdtemp(prefix="decide_watch_selftest_"))
     started = time.time()
     results: list[tuple[str, bool, str]] = []
+    extras: list[tuple[str, bool, str]] = []
     saved_config = _cfg()
     os.environ["DELIVERY_NO_INJECT"] = "1"
     saved_sink = DELIVERY_SINK
 
     def check(tag: str, ok: bool, detail: str = "") -> None:
         results.append((tag, bool(ok), detail))
+
+    def extra(tag: str, ok: bool, detail: str = "") -> None:
+        """不计入 30 条口径的补充反例（F-1／F-2／F-5／回归 8）。
+
+        它们与 self-test 共用同一靶场与同一判据，但任务书把 self-test 总数锁死在
+        30（`total = 30`），所以单独打印，失败也算自检失败。
+        """
+        extras.append((tag, bool(ok), detail))
 
     try:
         root = Path(root)
@@ -3116,14 +3309,17 @@ def self_test() -> int:
         _run_tick()
         check("D", len(DELIVERY_SINK) == 0, f"sink={len(DELIVERY_SINK)}")
 
-        # ---------- E：no-cooldown + no-merge + 熔断关 ⇒ 等于 eligible
+        # ---------- E：全量台账上，一轮之内**每张单最多发一条首条**，其余并入汇总
+        # 两条旧口径都不能再用：`no_cooldown`／`no_merge` 是兼容形参（ISS-83 删了那两条
+        # 条件），而 E-2b 之后没有 `cid:` 的行不投递。所以等价式的右边改成
+        # 「带 cid 证据的**不同单号**个数」——每张单第一条立即发，正是本轮发送数。
         _fresh(root, copy_full_ledger=True)
-        elig = _eligible_count(root / "ledger.jsonl")
+        heads = _cid_head_count(root / "ledger.jsonl")
         DELIVERY_SINK = []
         st = load_delivery_state()
         sent = scan_deliveries(st, dry=True, now=time.time(), force_replay=True,
-                               no_cooldown=True, no_merge=True, breaker_off=True)
-        check("E", sent == elig, f"sent={sent} eligible={elig}")
+                               breaker_off=True)
+        check("E", sent == heads, f"sent={sent} cid_heads={heads}")
 
         # ---------- F：1h 无收据 ⇒ 升级
         _fresh(root, [])
@@ -3250,12 +3446,13 @@ def self_test() -> int:
         s2 = enqueue_delivery(st, r_other, dry=True, now=now)
         check("N", s1 == 0 and s2 == 1, f"blocked={s1} other={s2}")
 
-        # ---------- V：同单同号、不同证据形态的两条交付必须都发得出去
-        # `cid:57` 与 `ledger:57` 只差前缀，是两条不同交付。去重键若丢掉前缀
-        # （只取冒号后半段），第二条会被当重放静默丢弃 ⇒ `dedup_skips` 悄悄 +1
+        # ---------- V：同单同号、不同 cid 的两条交付必须都发得出去
+        # `cid:57` 与 `cid:57b` 只差尾部，是两条不同交付。去重键若只取冒号后半段
+        # 或做了前缀裁剪，第二条会被当重放静默丢弃 ⇒ `dedup_skips` 悄悄 +1
         # 而消息永远不发。**这是回归护栏，不是缺陷修复**：改前那一行
         # `f"{key}#{rec['evidence']}"` 本来就保留完整 evidence（ISS-92 P1-1
         # 复核结论），它防的是**将来有人把前缀切掉**。
+        # ISS-83 起 `ledger:` 形态不再进投递（E-2b），所以两个形态都用 `cid:`。
         now = time.time()
         _fresh(root, [])
         DELIVERY_SINK = []
@@ -3267,15 +3464,15 @@ def self_test() -> int:
                 "pm_sid": "", "kind": "comment", "ledger_line": 57,
                 "detected_ts": now}
         ra = {**base, "evidence": "cid:57", "dl_id": "dl-v1"}
-        rb = {**base, "evidence": "ledger:57", "dl_id": "dl-v2"}
-        v1 = enqueue_delivery(st, ra, dry=True, now=now, no_cooldown=True,
-                              no_merge=True)
-        v2 = enqueue_delivery(st, rb, dry=True, now=now, no_cooldown=True,
-                              no_merge=True)
+        rb = {**base, "evidence": "cid:v1-57", "dl_id": "dl-v2"}
+        v1 = enqueue_delivery(st, ra, dry=True, now=now)
+        # 第 2 条放在窗外：这条测的是**去重键**（两条不同 evidence 不是重放），
+        # 窗内合并由 A-新／F-1 覆盖，混在一起会让两个判据互相掩盖。
+        v2 = enqueue_delivery(st, rb, dry=True, now=now + DELIVERY_BURST_WINDOW_S + 1)
         seen_keys = set((st.get("seen") or {}))
         two_keys = len(seen_keys) == 2
         check("V", v1 == 1 and v2 == 1 and two_keys,
-              f"cid={v1} ledger={v2} seen_keys={len(seen_keys)}")
+              f"cid={v1} cid2={v2} seen_keys={len(seen_keys)}")
 
         # ---------- O：跨日自动解除熔断并写日志
         now = time.time()
@@ -3400,6 +3597,247 @@ def self_test() -> int:
         check("T", r["sent"] == 0 and len(DELIVERY_SINK) == 0 and (after - before) == 1,
               f"sent={r['sent']} sink={len(DELIVERY_SINK)} rebuilt={after - before}（期望 0/0/1）")
 
+        # ---------- A-新（ISS-83 P0-A）：发完首条不留空壳
+        # A(t0) 发 1 条；B(t0+1000) 跨出窗外 ⇒ **立即发**。
+        # 旧写法用 `setdefault` 预建缓冲壳 ⇒ B 被判窗内、立即 0。
+        now = time.time()
+        _fresh(root, [])
+        DELIVERY_SINK = []
+        st = load_delivery_state()
+        st["baseline_established"] = True
+        ra = _selftest_rec(999, "cid:a-new-1", now)
+        rb = _selftest_rec(999, "cid:a-new-2", now)
+        a_new = enqueue_delivery(st, ra, dry=True, now=now)
+        no_shell = not (st.get("summaries") or {}).get("owner/neutral_project#999")
+        b_new = enqueue_delivery(st, rb, dry=True, now=now + 1000.0)
+        check("A-新", a_new == 1 and no_shell and b_new == 1,
+              f"A={a_new} no_shell={no_shell} B={b_new}")
+
+        # ---------- F-3：note="" ⇒ sink=0、no_evidence+1（不再 fallback leder:<行号>）
+        env = _fresh(root, [])
+        _append(Path(env["ledger"]), _worker_row(999, note=""))
+        DELIVERY_SINK = []
+        r = _run_tick(dry=False)
+        st = load_delivery_state()
+        f3 = int((st.get("stats") or {}).get("no_evidence") or 0)
+        check("F-3", r["sent"] == 0 and f3 == 1, f"sent={r['sent']} no_evidence={f3}")
+
+        # ---------- F-4：force_replay 两遍 ⇒ 第一遍重放、第二遍 dedup_skips 增
+        env = _fresh(root, [])
+        led = Path(env["ledger"])
+        _append(led, _worker_row(999, note="cid:f4"))
+        st = load_delivery_state()
+        st["baseline_established"] = True
+        DELIVERY_SINK = []
+        s1 = scan_deliveries(st, dry=True, now=time.time(), force_replay=True)
+        skip1 = int((st.get("stats") or {}).get("dedup_skips") or 0)
+        s2 = scan_deliveries(st, dry=True, now=time.time(), force_replay=True)
+        skip2 = int((st.get("stats") or {}).get("dedup_skips") or 0)
+        check("F-4", s1 == 1 and skip2 > skip1, f"first={s1} skips={skip1}→{skip2}")
+
+        # ---------- F-5：置 baseline_established=False ⇒ seen 键数**不变**（重建只清半行）
+        env = _fresh(root, [])
+        led = Path(env["ledger"])
+        _append(led, _worker_row(999, note="cid:f5-keep"))
+        st = load_delivery_state()
+        st["baseline_established"] = True
+        enqueue_delivery(st, _selftest_rec(999, "cid:f5-keep", time.time()), dry=True,
+                         now=time.time())
+        before_keys = len(st.get("seen") or {})
+        st["baseline_established"] = False
+        scan_deliveries(st, dry=True, now=time.time())
+        after_keys = len(st.get("seen") or {})
+        extra("F-5", before_keys == 1 and after_keys == 1,
+              f"seen {before_keys}→{after_keys}")
+
+        # ---------- C-1：同单 2 条不同 cid、差 100s ⇒ 1 立即＋1 汇总；flush_at-t0=300
+        t0 = datetime(2026, 6, 1, 12, 0, 0).timestamp()
+        _fresh(root, [])
+        DELIVERY_SINK = []
+        st = load_delivery_state()
+        st["baseline_established"] = True
+        st["stats"] = {"date": _date_of(t0)}
+        c1_a = enqueue_delivery(st, _selftest_rec(999, "cid:c1-a", t0), dry=True, now=t0)
+        c1_b = enqueue_delivery(st, _selftest_rec(999, "cid:c1-b", t0), dry=True, now=t0 + 100)
+        buf1 = (st.get("summaries") or {}).get("owner/neutral_project#999") or {}
+        gap = float(buf1.get("flush_at") or 0) - t0
+        middle = len(DELIVERY_SINK)
+        flush1 = check_pending(st, dry=True, now=t0 + 301)
+        extra("C-1", c1_a == 1 and c1_b == 0 and abs(gap - 300.0) < 0.001
+              and middle == 1 and flush1["summaries"] == 1 and len(DELIVERY_SINK) == 2,
+              f"first={c1_a} second={c1_b} gap={gap:.1f} mid={middle} "
+              f"flush={flush1['summaries']} sink={len(DELIVERY_SINK)}")
+
+        # ---------- C-2：同 evidence 重扫两遍 ⇒ sink 不增、dedup_skips 增
+        t0 = datetime(2026, 6, 1, 12, 0, 0).timestamp()
+        _fresh(root, [])
+        DELIVERY_SINK = []
+        st = load_delivery_state()
+        st["baseline_established"] = True
+        st["stats"] = {"date": _date_of(t0)}
+        c2_a = enqueue_delivery(st, _selftest_rec(999, "cid:c2", t0), dry=True, now=t0)
+        skip_a = int((st.get("stats") or {}).get("dedup_skips") or 0)
+        c2_b = enqueue_delivery(st, _selftest_rec(999, "cid:c2", t0), dry=True, now=t0 + 5)
+        skip_b = int((st.get("stats") or {}).get("dedup_skips") or 0)
+        extra("C-2", c2_a == 1 and c2_b == 0 and len(DELIVERY_SINK) == 1 and skip_b > skip_a,
+              f"first={c2_a} replay={c2_b} sink={len(DELIVERY_SINK)} skips={skip_a}->{skip_b}")
+
+        # ---------- C-3：同单 4 条不同 cid ⇒ 首条立即、2/3 入缓冲、第 4 条熔断
+        t0 = datetime(2026, 6, 1, 12, 0, 0).timestamp()
+        _fresh(root, [])
+        DELIVERY_SINK = []
+        st = load_delivery_state()
+        st["baseline_established"] = True
+        st["stats"] = {"date": _date_of(t0)}
+        c3 = [enqueue_delivery(st, _selftest_rec(999, f"cid:c3-{i}", t0), dry=True,
+                               now=t0 + i * 10) for i in range(4)]
+        br = (st.get("breakers") or {}).get("owner/neutral_project#999") or {}
+        buffered = len(((st.get("summaries") or {}).get("owner/neutral_project#999") or {})
+                       .get("items") or [])
+        flush3 = check_pending(st, dry=True, now=t0 + 301)
+        extra("C-3", c3 == [1, 0, 0, 0] and br.get("count") == 4 and buffered == 2
+              and br.get("enabled") is False and flush3["summaries"] == 1
+              and len(DELIVERY_SINK) == 2,
+              f"sends={c3} breaker_count={br.get('count')} buffered={buffered} "
+              f"sink={len(DELIVERY_SINK)}")
+
+        # ---------- C-4：≤50 列全 cid、无「…（共」；>50 列前 50 个＋行区间
+        def _mk(n):
+            return [{"evidence": f"cid:c4-{i}", "line": i + 1, "ledger_line": i + 1,
+                     "repo": "owner/neutral_project", "issue": 999} for i in range(n)]
+        text50 = _render_burst("owner/neutral_project#999", _mk(50))
+        text51 = _render_burst("owner/neutral_project#999", _mk(51))
+        c4_ok = (text50.count("cid:c4-") == 50 and "…（共" not in text50
+                 and text51.count("cid:c4-") == 50 and "…（共 51 条" in text51
+                 and "第 1-51 行" in text51)
+        extra("C-4", c4_ok, f"le50_listed={text50.count('cid:c4-')} "
+                            f"le50_more={'…（共' in text50} "
+                            f"gt50_listed={text51.count('cid:c4-')} gt50_more={'…（共 51 条' in text51}")
+
+        # ---------- F-1：同单 3 条不同 cid ⇒ PM 收 2 条（1 首单＋1 汇总含 2 cid）
+        t0 = datetime(2026, 6, 1, 12, 0, 0).timestamp()
+        _fresh(root, [])
+        DELIVERY_SINK = []
+        st = load_delivery_state()
+        st["baseline_established"] = True
+        st["stats"] = {"date": _date_of(t0)}
+        f1 = [enqueue_delivery(st, _selftest_rec(999, f"cid:f1-{i}", t0), dry=True,
+                               now=t0 + i * 10) for i in range(3)]
+        f1_flush = check_pending(st, dry=True, now=t0 + 301)
+        f1_texts = [r.get("text") or "" for r in DELIVERY_SINK]
+        extra("F-1", f1 == [1, 0, 0] and f1_flush["summaries"] == 1 and len(f1_texts) == 2
+              and sum(t.count("cid:f1-") for t in f1_texts) == 3,
+              f"sends={f1} flush={f1_flush['summaries']} sink={len(f1_texts)}")
+
+        # ---------- F-2（P2-1 改写）：3 行里 1 条带标记、1 条不带、1 条空 note
+        # 与 F-1 的输入**不同**：这里走真实台账（`scan_deliveries`），标记只出现在
+        # 正文里、不参与任何判定；空 note 的行按 E-2b 不投递，只记 `no_evidence`。
+        t0 = datetime(2026, 6, 1, 12, 0, 0).timestamp()
+        env = _fresh(root, [])
+        led = Path(env["ledger"])
+        _append(led, _worker_row(999, note="cid:f2-mark [WK:wk-ISS-83-dev-20261118]"))
+        _append(led, _worker_row(999, note="cid:f2-plain"))
+        _append(led, _worker_row(999, note=""))
+        DELIVERY_SINK = []
+        st = load_delivery_state()
+        st["baseline_established"] = True
+        st["offset"] = 0
+        st["stats"] = {"date": _date_of(t0)}
+        f2_sent = scan_deliveries(st, dry=True, now=t0)
+        f2_flush = check_pending(st, dry=True, now=t0 + 301)
+        f2_texts = [r.get("text") or "" for r in DELIVERY_SINK]
+        f2_noev = int((st.get("stats") or {}).get("no_evidence") or 0)
+        extra("F-2", f2_sent == 1 and f2_flush["summaries"] == 1 and len(f2_texts) == 2
+              and f2_noev == 1,
+              f"sent={f2_sent} flush={f2_flush['summaries']} sink={len(f2_texts)} "
+              f"no_evidence={f2_noev}")
+
+        # ---------- B-新：23:59:30 入缓冲；00:00:10 日切 ⇒ 日切 tick 发 1 条
+        day1 = datetime(2026, 11, 17, 23, 59, 30).timestamp()
+        day2 = day1 + 40.0
+        _fresh(root, [])
+        DELIVERY_SINK = []
+        st = load_delivery_state()
+        st["baseline_established"] = True
+        st["stats"] = {"date": _date_of(day1)}
+        first_b = enqueue_delivery(st, _selftest_rec(999, "cid:early", day1), dry=True, now=day1)
+        second_b = enqueue_delivery(st, _selftest_rec(999, "cid:late", day1), dry=True,
+                                    now=day1 + 1)
+        DELIVERY_SINK = []
+        stats_roll(st, day2, dry=True)
+        b_new_texts = [r.get("text") or "" for r in DELIVERY_SINK]
+        b_new_ok = (first_b == 1 and second_b == 0 and len(b_new_texts) == 1
+                    and "cid:late" in b_new_texts[0] and not (st.get("summaries") or {}))
+        check("B-新", b_new_ok, f"first={first_b} second={second_b} "
+                                f"sink={len(b_new_texts)} summaries={len(st.get('summaries') or {})}")
+
+        # ---------- U-新：本 tick 入队 1 条 undelivered ⇒ 本轮 retried=0 且 offset 不越该行
+        _fresh(root, [])
+        st = load_delivery_state()
+        st["baseline_established"] = True
+        st["_tick_started"] = 5000.0
+        _append_undelivered(st, _selftest_rec(999, "cid:u-new", 5000.0), 5000.0)
+        off_before = int(st.get("undelivered_offset") or 0)
+        r1 = retry_undelivered(st, dry=True, now=5000.0)
+        off_mid = int(st.get("undelivered_offset") or 0)
+        DELIVERY_SINK = []
+        st["_tick_started"] = 5100.0                   # 下一轮 tick
+        r2 = retry_undelivered(st, dry=True, now=5100.0)
+        u_ok = (r1 == 0 and off_mid == off_before and r2 == 1)
+        check("U-新", u_ok, f"first={r1} offset {off_before}→{off_mid} next={r2}")
+
+        # ---------- X-新：日切 flush 抛异常 ⇒ 熔断已解、缓冲保留、save 仍执行
+        day1 = datetime(2026, 11, 17, 23, 59, 0).timestamp()
+        day2 = day1 + 120.0
+        _fresh(root, [])
+        st = load_delivery_state()
+        st["baseline_established"] = True
+        st["stats"] = {"date": _date_of(day1)}
+        st["breakers"] = {"owner/neutral_project#999":
+                          {"date": _date_of(day1), "count": 4, "enabled": False}}
+        st["summaries"] = {"owner/neutral_project#999":
+                           {"flush_at": day1 + 300, "date": _date_of(day1),
+                            "items": [{"evidence": "cid:x-new", "line": 1,
+                                       "worker": "w", "repo": "owner/neutral_project",
+                                       "issue": 999, "ledger_line": 1,
+                                       "detected_ts": day1}]}}
+
+        def _boom(*a, **kw):
+            raise RuntimeError("sink down")
+        stats_roll(st, day2, dry=True, flush=_boom)
+        x_ok = (st.get("breakers") == {}
+                and "owner/neutral_project#999" in (st.get("summaries") or {}))
+        check("X-新", x_ok, f"breakers={st.get('breakers')} "
+                            f"kept={'owner/neutral_project#999' in (st.get('summaries') or {})}")
+
+        # ---------- Y-新：23:59:30 发首条；00:00:10 到第 2 条 ⇒ 立即发（不当窗内）
+        day1 = datetime(2026, 11, 17, 23, 59, 30).timestamp()
+        day2 = day1 + 40.0
+        _fresh(root, [])
+        DELIVERY_SINK = []
+        st = load_delivery_state()
+        st["baseline_established"] = True
+        st["stats"] = {"date": _date_of(day1)}
+        y1 = enqueue_delivery(st, _selftest_rec(999, "cid:y1", day1), dry=True, now=day1)
+        after_y1 = len(DELIVERY_SINK)
+        stats_roll(st, day2, dry=True)                 # 日切：锚点仍在，但日期变了
+        y_texts = len(DELIVERY_SINK) - after_y1         # 日切不应有新增（缓冲是空的）
+        y2 = enqueue_delivery(st, _selftest_rec(999, "cid:y2", day2), dry=True, now=day2)
+        y_ok = (y1 == 1 and y_texts == 0 and y2 == 1
+                and bool(st.get("last_nudge")))
+        check("Y-新", y_ok, f"first={y1} flush={y_texts} second={y2} "
+                            f"last_nudge={'保留' if st.get('last_nudge') else '空'}")
+
+        # ---------- 回归 8：单条交付立刻 sink=1，正文是【收单】
+        env = _fresh(root, [])
+        _append(Path(env["ledger"]), _worker_row(999, note="cid:reg-8"))
+        DELIVERY_SINK = []
+        r = _run_tick(dry=False)
+        reg_texts = [r.get("text") or "" for r in DELIVERY_SINK]
+        extra("回归 8", r["sent"] == 1 and len(reg_texts) == 1
+              and reg_texts[0].startswith("【收单】"),
+              f"sent={r['sent']} text={reg_texts[0][:12] if reg_texts else '无'}")
+
         # ---------- 红线断言：三道闸真能被读到（U1 的反向断言）
         # 这一步**必须**放在最后，且必须能在闸缺失时变红。
         os.environ["DELIVERY_FIXTURE"] = "1"
@@ -3446,13 +3884,18 @@ def self_test() -> int:
         os.environ.pop("DELIVERY_NO_INJECT", None)
 
     passed = sum(1 for _t, ok, _d in results if ok)
-    total = 23          # A–T ＋ V（#92 去重键）＋ GATE ＋ SM（#18 --send-mode）
+    total = 30          # A–T ＋ V（#92 去重键）＋ GATE ＋ SM（#18 --send-mode）
+                        # ＋ ISS-83 新增 7：A-新／B-新／U-新／X-新／Y-新／F-3(no_evidence)／F-4(force_replay)
     for tag, ok, detail in results:
         print(f"[self-test] {tag} {'通过' if ok else '失败'}" + (f"（{detail}）" if detail else ""))
+    for tag, ok, detail in extras:
+        print(f"[verify] {tag} {'通过' if ok else '失败'}" + (f"（{detail}）" if detail else ""))
     elapsed = time.time() - started
     print(f"--self-test: A–T＋V＋SM {passed}/{total} 通过 · 耗时 {elapsed:.1f}s")
     if elapsed > 30:
         print("[self-test] 超时（预算 30s）", file=sys.stderr)
+        return EXIT_SELFTEST_FAILED
+    if any(not ok for _t, ok, _d in extras):
         return EXIT_SELFTEST_FAILED
     return 0 if passed == total else EXIT_SELFTEST_FAILED
 
