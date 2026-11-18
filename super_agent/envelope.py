@@ -210,3 +210,153 @@ def rejected_event(env: dict, reason: str, *, at: str = "") -> dict:
     return {"type": "envelope.rejected", "at": at or _now(), "reason": reason,
             "envelope_type": env.get("type"), "comment_id": cid,
             "message_id": env.get("message_id")}
+
+
+# --------------------------------------------------------------------- 旧格式
+#: Which role a delivery marker letter belongs to (§P0-2 归一表).
+MARKER_ROLES = {"WK": "worker", "SC": "scout", "ST": "steward",
+                "AU": "auditor", "RV": "reviewer", "PL": "analyst",
+                "AT": "analyst"}
+
+#: Every legacy first line this module can read, by the shape it opens with.
+LEGACY_MARKERS = ("WK", "SC", "ST", "AU", "RV", "AT", "PL", "QA", "PM:TASK",
+                  "PM", "AT")
+
+
+def first_line_sha1(body: str) -> str:
+    """SHA-1 of the first non-empty line - a reference that leaks no text.
+
+    An unknown marker is counted, not quoted: the line may carry a session key
+    name, and a key name is a credential (RULES §37).
+    """
+    import hashlib as _hashlib
+
+    from . import markers
+
+    line = markers.first_line(body)
+    return _hashlib.sha1(line.encode("utf-8", "replace")).hexdigest()
+
+
+def _task_prefix_re():
+    """The engine's own ``[PM:TASK]`` prefix pattern, imported lazily.
+
+    Reused rather than copied: two patterns for one prefix would drift, and the
+    mapping must agree with ``engine._triage`` about what a task book is
+    (§C.2 note 1).
+    """
+    from .engine import TASK_PREFIX_RE
+
+    return TASK_PREFIX_RE
+
+
+def _looks_like_marker(line: str) -> bool:
+    """Does the first line open with *any* bracketed marker?
+
+    Bracketed and colon-led, half- or full-width, case-insensitive: the shape a
+    tool writes. Prose that merely starts with a word is not a marker.
+    """
+    if not line:
+        return False
+    head = line.lstrip()
+    if head[:1] not in ("[", "［"):
+        return False
+    close = head.find("]")
+    if close < 0:
+        close = head.find("］")
+    return close > 1
+
+
+def legacy_map(body: str, *, repo: str, issue, cid, from_role: str = "",
+               project: str = "", created_at: str = "", thread: str = "",
+               thread_scope: str = "issue") -> dict:
+    """Map one legacy comment onto an envelope. **Read-only, one way** (#92 §C).
+
+    Five first lines, and one row of answers no parser produces:
+
+    * ``[WK:…]`` and the other six delivery prefixes → ``type="delivery"``;
+    * ``[QA]`` → ``type="review"``;
+    * ``[PM:TASK]`` → ``type="pm_task"`` with ``result_ref`` always empty - it
+      is a **prefix judgment**, not a parsed verdict (§C.2 note 1);
+    * ``[PM]`` → ``type="pm_verdict"``; a **prose** line keeps ``result_ref``
+      empty and records ``coords_ok`` so "has a coordinate" is never read as
+      "has a conclusion" (§P1-1);
+    * ``[AT]`` → ``type="at_verdict"``; a conclusion without a coordinate stays
+      a conclusion with an unreadable state, never folded into ``blocked``.
+
+    An unknown marker is **not** mapped: the answer is ``type=""`` plus an
+    ``unknown_marker`` reference carrying the count-worthy fields and a
+    ``first_line_sha1`` instead of the text (§C.3).
+
+    Nothing here writes, rewrites or upgrades: the caller reads the envelope and
+    the comment stays exactly as it was (§C.4).
+    """
+    from . import markers
+
+    line = markers.first_line(body)
+    if not thread:
+        from . import issuekey
+
+        thread = issuekey.thread_key(repo, issue)
+    base = dict(repo=repo, issue=issue, cid=cid, from_role=from_role,
+                project=project, created_at=created_at, thread=thread,
+                thread_scope=thread_scope)
+    delivery = markers.parse_delivery(body)
+    if delivery:
+        env = build(**base, type="delivery")
+        env["marker"] = delivery["marker"]
+        env["claimed_name"] = delivery["name"]
+        return env
+    review = markers.parse_review(body)
+    if review:
+        env = build(**base, type="review")
+        env["result_ref"] = ({"kind": "review", "verdict": review["verdict"]}
+                             if review.get("verdict") else {})
+        return env
+    task = _task_prefix_re().match(line) if line else None
+    if task:
+        # ``result_ref`` stays empty: a task book declares a prefix, it answers
+        # nothing (§C.2 note 1).
+        return build(**base, type="pm_task")
+    pm = markers.parse_pm_verdict(body)
+    if pm:
+        env = build(**base, type="pm_verdict")
+        env["result_ref"] = _verdict_ref(pm)
+        env["coords_ok"] = bool(pm.get("coords_ok"))
+        env["source"] = pm.get("source") or ""
+        return env
+    at = markers.parse_at_verdict(body)
+    if at:
+        env = build(**base, type="at_verdict")
+        env["result_ref"] = _verdict_ref(at)
+        env["coords_ok"] = bool(at.get("coords_ok"))
+        env["source"] = at.get("source") or ""
+        return env
+    if _looks_like_marker(line):
+        env = build(**base, type="")
+        env["result_ref"] = {}
+        return env
+    return build(**base, type="note")
+
+
+def _verdict_ref(parsed: dict) -> dict:
+    """A ``result_ref`` only when a **structured** marker decided the state.
+
+    ``source="prose"`` keeps the ref empty on purpose: the word was seen, not
+    declared, and promoting it to a conclusion is the upgrade §C.4 rule 4
+    forbids (§P1-1).
+    """
+    if not parsed.get("structured") or not parsed.get("state"):
+        return {}
+    return {"kind": "verdict", "state": parsed["state"]}
+
+
+def unknown_marker_event(body: str, *, repo: str, issue, cid, at: str = "") -> dict:
+    """The event an unrecognised first-line marker leaves (§C.3).
+
+    Three fields and no text: the count aggregates by ``type``, ``comment_id``
+    points back at the comment, ``first_line_sha1`` lets an operator match
+    duplicates without the line ever reaching a log.
+    """
+    return {"type": "envelope.unknown", "at": at or _now(), "repo": str(repo or ""),
+            "issue": int(issue) if str(issue).isdigit() else issue,
+            "comment_id": int(cid), "first_line_sha1": first_line_sha1(body)}
