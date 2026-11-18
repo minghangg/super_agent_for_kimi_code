@@ -151,8 +151,12 @@ class Chain(unittest.TestCase):
         self.addCleanup(lambda: dw.configure(saved))
         dw_state = self.root / "dw"
         dw_state.mkdir(parents=True, exist_ok=True)
+        # The recipient is the supervisor (#72: the bare ``pm-<project>`` key is
+        # no longer a leg). The bare key stays in the roster on purpose - this
+        # test must still go out with it present.
         (dw_state / "sessions.json").write_text(json.dumps({
             "pm-n": {"id": "session_00000000-0000-4000-8000-000000000001"},
+            "supervisor": {"id": "session_00000000-0000-4000-8000-000000000002"},
         }), encoding="utf-8")
         dw.configure(replace(saved, state_root=dw_state,
                              workspace_root=self.root,
