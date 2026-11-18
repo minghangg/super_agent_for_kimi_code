@@ -103,16 +103,21 @@ def get(path: str, caller: str, timeout: float = 3.0, quiet_404: bool = True):
 
 # --------------------------------------------------------------------- 读动作
 def status(sid: str, caller: str = "status", cache_file: Path | None = None) -> dict | None:
-    """会话状态（bus 优先）。bus 拿不到上下文时返回 None，交调用方直连。
+    """会话状态（bus 优先）。bus 拿不到**可判的**上下文时返回 None，交调用方直连。
 
     ``cache_file`` 透传给直连侧的 ``direct.status``：谁知道缓存路径谁传。
     不传＝行为不变（仍走 ``{"_degraded": "no_cache_file"}`` 那条可见的降级）。
+
+    命中条件必须同时要求 ``ctx_state == "live"``：只有数字没有时效，等于把一个
+    过期值当现值用（#94）。stale 不让它冒充命中，是为了让调用方走直连，由直连
+    重新读 wire 并按 ``age_s`` 判可判性，而不是停在 bus 这一层。
     """
     if mode() != "direct":
         d = get(f"/state/{sid}", caller)
         if d and d.get("ok"):
             st = dict(d.get("status") or {})
-            if st.get("context_tokens") is not None:
+            if (st.get("context_tokens") is not None
+                    and st.get("ctx_state") == "live"):
                 h = health() or {}
                 meta = d.get("_meta") or {}
                 age = meta.get("age_s")
@@ -121,7 +126,8 @@ def status(sid: str, caller: str = "status", cache_file: Path | None = None) -> 
                                  f"boot={h.get('boot_id') or '?'}"
                                  + (",gap" if meta.get("gap") else "") + ")")
                 return st
-            note_degraded(caller, f"{sid} 无 context_tokens")
+            note_degraded(caller, f"{sid} 无可用 ctx"
+                                  f"(ctx_state={st.get('ctx_state') or 'none'})")
         elif mode() == "bus":
             return None                 # bus 模式下不偷偷直连
     if mode() == "bus":
