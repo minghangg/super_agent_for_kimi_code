@@ -167,15 +167,17 @@ class Chain(unittest.TestCase):
                "pm_key": "pm-n", "pm_sid": "", "kind": "comment",
                "evidence": "cid:5001", "ledger_line": 1,
                "detected_ts": 1_000_000.0, "dl_id": "dl-5001"}
-        first = dw.enqueue_delivery(st, rec, dry=True, now=1_000_000.0,
-                                    no_cooldown=True, no_merge=True)
-        replay = dw.enqueue_delivery(st, rec, dry=True, now=1_000_001.0,
-                                     no_cooldown=True, no_merge=True)
+        # ISS-83: a second delivery inside the burst window is merged into the
+        # summary, so the "different evidence, different delivery" case is put
+        # outside that window (and both forms are now ``cid:``; ``ledger:`` no
+        # longer dispatches at all under E-2b).
+        first = dw.enqueue_delivery(st, rec, dry=True, now=1_000_000.0)
+        replay = dw.enqueue_delivery(st, rec, dry=True, now=1_000_001.0)
         self.assertEqual((first, replay), (1, 0))
         # A different evidence form on the same issue is a different delivery.
-        other = {**rec, "evidence": "ledger:5001", "dl_id": "dl-l5001"}
-        third = dw.enqueue_delivery(st, other, dry=True, now=1_000_002.0,
-                                    no_cooldown=True, no_merge=True)
+        other = {**rec, "evidence": "cid:5002", "dl_id": "dl-l5001"}
+        third = dw.enqueue_delivery(st, other, dry=True,
+                                    now=1_000_000.0 + dw.DELIVERY_BURST_WINDOW_S + 1)
         self.assertEqual(third, 1)
 
 

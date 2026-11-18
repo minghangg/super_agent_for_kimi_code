@@ -109,12 +109,13 @@ class BothDeliveriesGoOut(unittest.TestCase):
             {"pm-n": {"id": "session_00000000-0000-4000-8000-000000000001"}}),
             encoding="utf-8")
         st = dw.load_delivery_state()
-        first = dw.enqueue_delivery(st, _rec("cid:57"), dry=True, now=1.0,
-                                    no_cooldown=True, no_merge=True)
-        replay = dw.enqueue_delivery(st, _rec("cid:57"), dry=True, now=2.0,
-                                     no_cooldown=True, no_merge=True)
-        other = dw.enqueue_delivery(st, _rec("ledger:57"), dry=True, now=3.0,
-                                    no_cooldown=True, no_merge=True)
+        # The second delivery lands **outside** the burst window (ISS-83): inside it,
+        # a second delivery is merged into the day's summary on purpose, so a
+        # same-instant second send says nothing about the dedup key.
+        first = dw.enqueue_delivery(st, _rec("cid:57"), dry=True, now=1.0)
+        replay = dw.enqueue_delivery(st, _rec("cid:57"), dry=True, now=2.0)
+        other = dw.enqueue_delivery(st, _rec("cid:57b"), dry=True,
+                                    now=1.0 + dw.DELIVERY_BURST_WINDOW_S + 1)
         self.assertEqual((first, replay, other), (1, 0, 1))
         self.assertEqual(len(st.get("seen") or {}), 2)
 

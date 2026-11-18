@@ -3,7 +3,7 @@
 The original workbench script coupled its state machine to a private repo root,
 a local event daemon, a session client and a set of fixed runtime files. The
 package port must take all of those as explicit injections, must never silently
-reach production, and must keep the original 22-case self-test green.
+reach production, and must keep the self-test green (30 cases after ISS-83 added 7).
 
 Run: ``python -m pytest tests/test_decide_watch.py -q``
 """
@@ -287,11 +287,11 @@ class Behaviour(Fixture):
         self.assertEqual(list(self.ws.glob("**/*")), [])
         self.assertEqual(self.sends, [])
 
-    def test_package_default_self_test_is_23_of_23(self):
+    def test_package_default_self_test_is_30_of_30(self):
         with contextlib.redirect_stdout(io.StringIO()) as out:
             rc = dw.self_test()
         self.assertEqual(rc, 0, out.getvalue())
-        self.assertIn("--self-test: A–T＋V＋SM 23/23 通过", out.getvalue())
+        self.assertIn("--self-test: A–T＋V＋SM 30/30 通过", out.getvalue())
         self.assertEqual(self.sends, [])
         self.assertEqual(self.injections, [])
 
