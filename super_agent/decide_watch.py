@@ -2297,7 +2297,7 @@ def delivery_group(rec: dict) -> str:
 
 def enqueue_delivery(st: dict, rec: dict, *, dry: bool, now: float,
                      no_cooldown: bool = False, no_merge: bool = False,
-                     force_send: bool = False, breaker_off: bool = False) -> int:
+                     breaker_off: bool = False) -> int:
     """一条交付进投递决策。返回本轮**实际发送**条数（0 或 1）。
 
     三层结构（ISS-83）：① 证据去重 → ② 同单当日第 1 条立即发、其后 W 秒内的
@@ -2308,13 +2308,15 @@ def enqueue_delivery(st: dict, rec: dict, *, dry: bool, now: float,
     可关），但 lwa shim 的两处包装与三个 safkc 测试仍按位置传它们。留着不分支，
     免得调用方 ``TypeError``；两个开关都不再有行为。
 
-    ``force_send`` 是**唯一**的强制发出口：三处抑制（熔断、当日超限、窗内合并）
-    全部跳过。它取代旧名 ``breaker_off``——那个名字只说得出第一处，第三处因此
-    在 ISS-83 的改稿里漏了旁路（窗内新 cid 被并入汇总，17 秒内两次熔断放行只
-    发出一条）。旧名保留为**别名**，见下面第一行。
+    ``breaker_off`` 是**唯一**的强制发出口（历史名，语义＝强制立即发送）：三处
+    抑制（熔断、当日超限、窗内合并）全部跳过。入参名不改——lwa shim 的两处包装
+    按名传它（用户令：lwa 封存），改名会 ``TypeError``。语义在该名字里说不全，
+    故入口处折成本地 ``force_send``，下面三处抑制与内部转发一律用这个局部名。
+    禁止新增第二个布尔旁路（如 ``skip_window``／``force``）：两条并存必然有一条
+    被漏改，ISS-83 P0-1 就是第三处抑制没跟着改。
     """
-    # 旧名，ISS-83 后废弃，下个单删（lwa shim 仍按名传它，删则 TypeError）
-    force_send = force_send or breaker_off
+    # `breaker_off` 只在本行作为入参被读；其后一律用局部名表达同一件事。
+    force_send = breaker_off
     key = delivery_group(rec)
     # The dedup key keeps the **whole** evidence, prefix included: ``cid:57``
     # and ``ledger:57`` are two deliveries of one issue, and a key that dropped
@@ -2367,22 +2369,20 @@ def enqueue_delivery(st: dict, rec: dict, *, dry: bool, now: float,
 
 
 # 未包装的实现本体（ISS-83 退修）。lwa 的 shim 会把 `enqueue_delivery` 在**内存里**
-# 换成按旧名转发的包装（`setattr` 到本模块全局），签名里没有 `force_send`。
-# 自检要用新名直接验语义时走这个引用：它在导入时绑定，不随全局改名而变。
-# 生产路径不受影响——包装只是加护栏，最终仍调用本体。
+# 换成加护栏的包装（`setattr` 到本模块全局）。自检要验不改写过的语义时走这个引用：
+# 它在导入时绑定，不随全局改名而变。生产路径不受影响——包装只是加护栏，最终仍调用本体。
 _ENQUEUE_IMPL = enqueue_delivery
 
 
 def scan_deliveries(st: dict, *, dry: bool, now: float, force_replay: bool = False,
                     no_cooldown: bool = False, no_merge: bool = False,
-                    force_send: bool = False, breaker_off: bool = False) -> int:
+                    breaker_off: bool = False) -> int:
     """增量读台账，产出/发送「交付」提醒。返回本轮**实际发送**条数。
 
-    ``force_send`` 原样透传给 ``enqueue_delivery``；``breaker_off`` 是它的旧名
-    （ISS-83 后废弃，下个单删），只为 lwa shim 的按名调用留一条路。
+    ``breaker_off`` 是唯一的强制开关（历史名，语义＝强制立即发送），原样转给
+    ``enqueue_delivery``——那里才折成局部 ``force_send``。本函数只做透传，不另起
+    第二个名字：lwa shim 的包装按名转发 ``breaker_off``，改名即 ``TypeError``。
     """
-    # 旧名，ISS-83 后废弃，下个单删（lwa shim 仍按名传它，删则 TypeError）
-    force_send = force_send or breaker_off
     p = _delivery_paths()["ledger"]
     if not p.is_file():
         return 0
@@ -2495,12 +2495,11 @@ def scan_deliveries(st: dict, *, dry: bool, now: float, force_replay: bool = Fal
             "kind": "comment", "evidence": evidence, "ledger_line": line_no,
             "detected_ts": now, "dl_id": f"dl-{line_no}",
         }
-        # 转发用**旧名**：调用链上可能套着外部包装（`_guard_enqueue_delivery` 的
-        # 签名不在本仓，本单禁改），它按名转发 `breaker_off`。本模块那行别名把它折成
-        # `force_send`，语义仍是「三处抑制全跳过」。
-        # 下一个单把包装改名后，这里改回 `force_send=force_send` 并删别名。
+        # 转发用**入参名**：调用链上可能套着外部包装（`_guard_enqueue_delivery` 的
+        # 签名不在本仓，本单禁改），它按名转发 `breaker_off`。这里传原值即可——
+        # 本模块入口那一行把它折成 `force_send`，语义仍是「三处抑制全跳过」。
         sent += enqueue_delivery(st, rec, dry=dry, now=now, no_cooldown=no_cooldown,
-                                 no_merge=no_merge, breaker_off=force_send)
+                                 no_merge=no_merge, breaker_off=breaker_off)
     return sent
 
 
@@ -3868,9 +3867,9 @@ def self_test() -> int:
         check("Y-新", y_ok, f"first={y1} flush={y_texts} second={y2} "
                             f"last_nudge={'保留' if st.get('last_nudge') else '空'}")
 
-        # ---------- FS（ISS-83 P0-1）：`force_send` 是唯一强制发出口，三处抑制全跳过
-        # 窗内（首条 +5s）给 `force_send=True` ⇒ 立即发；不给 ⇒ 并入汇总。
-        # 旧写法只在前两处有 `breaker_off` 旁路，第三处 `_window_open` 没有 ⇒ 窗内
+        # ---------- FS（ISS-83 P0-1）：唯一的强制开关是三处抑制全跳过
+        # 窗内（首条 +5s）给 `breaker_off=True` ⇒ 立即发；不给 ⇒ 并入汇总。
+        # 旧写法只在前两处有旁路，第三处 `_window_open` 没有 ⇒ 窗内
         # 新 cid 被并进汇总（生产实测：13:47:13 与 13:47:30 相隔 17 秒两次熔断放行，
         # 旧代码两次都紧跟一条【收单】，新代码只发出一条）。
         t0 = datetime(2026, 6, 1, 12, 0, 0).timestamp()
@@ -3883,16 +3882,16 @@ def self_test() -> int:
         fs_2 = _ENQUEUE_IMPL(st, _selftest_rec(999, "cid:fs-2", t0), dry=True, now=t0 + 5)
         merged_2 = int((st.get("stats") or {}).get("merged") or 0)
         fs_3 = _ENQUEUE_IMPL(st, _selftest_rec(999, "cid:fs-3", t0), dry=True,
-                                now=t0 + 6, force_send=True)
+                                now=t0 + 6, breaker_off=True)
         merged_3 = int((st.get("stats") or {}).get("merged") or 0)
         fs_4 = _ENQUEUE_IMPL(st, _selftest_rec(999, "cid:fs-4", t0), dry=True,
-                                now=t0 + 7, breaker_off=True)     # 旧名别名
+                                now=t0 + 7, breaker_off=True)
         check("FS", fs_1 == 1 and fs_2 == 0 and merged_2 == 1 and fs_3 == 1
               and merged_3 == 1 and fs_4 == 1,
               f"first={fs_1} window={fs_2}(merged={merged_2}) "
-              f"force={fs_3}(merged={merged_3}) alias={fs_4}")
+              f"force={fs_3}(merged={merged_3}) again={fs_4}")
 
-        # ---------- FS-BR（QA 原靶）：3 发 → 熔断 → 21 秒后新 cid，`force_send` ⇒ 发 1 条
+        # ---------- FS-BR（QA 原靶）：3 发 → 熔断 → 21 秒后新 cid，给了强制开关 ⇒ 发 1 条
         # 两个 cid 必须不同：同一 evidence 会先被精确键去重（返回 0 且不记 `dedup_skips`），
         # 那样「plain=0」证明的是去重而不是熔断，判据就废了。
         # 同时钉住「force 不污染熔断态」：熔断记录原样保留（date/count/enabled 不变），
@@ -3912,7 +3911,7 @@ def self_test() -> int:
                                  now=t0 + 21)
         br_after_plain = dict((st.get("breakers") or {}).get(key) or {})
         forced = _ENQUEUE_IMPL(st, _selftest_rec(999, "cid:fsbr-forced", t0), dry=True,
-                                  now=t0 + 21, force_send=True)
+                                  now=t0 + 21, breaker_off=True)
         br_after_force = dict((st.get("breakers") or {}).get(key) or {})
         check("FS-BR", br_before.get("enabled") is False and plain == 0 and forced == 1
               and br_after_plain == br_before and br_after_force == br_before,
