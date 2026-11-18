@@ -1935,7 +1935,14 @@ def _bind_name(repo: str, issue) -> tuple[str, str]:
 
 
 def _load_alarm_module():
-    """Load the injected alarm recipient module; never import a workbench module."""
+    """Load the injected alarm recipient module; never import a workbench module.
+
+    **停用（#72）**：本函数的唯一调用点是①/③级收件人降级腿，该两腿已删
+    ⇒ 生产路径不再执行它。保留是因为 `DecideWatchConfig.alarm_module`／
+    `alarm_state_file` 是注入面（lwa 薄壳按名传 `alarm_state_file`），
+    删字段会 `TypeError`。再次接线前先想清楚：收件人只有 supervisor 一级，
+    这一点不许回退（见 `resolve_recipients`）。
+    """
     cfg = _cfg()
     mod = cfg.alarm_module or alarm_mod
     if hasattr(mod, "configure"):
@@ -1946,9 +1953,9 @@ def _load_alarm_module():
     return mod
 
 def recipients(env: dict | None, resolve=None) -> list[tuple[str, str]]:
-    """收件人入口：有 ``to_role`` 走它，没有就回落到四级链（#92 §P0-1b）。
+    """收件人入口：有 ``to_role`` 走它，没有就回落到 ``resolve_recipients``（#92 §P0-1b）。
 
-    **本单只摆这一层，``to_role`` 路径不实现**（归 #72）。但它在**投递路径上**
+    **``to_role`` 路径仍不实现**（归 #72 之后的单 A）。但它在**投递路径上**
     真实执行：``_send_delivery`` 每条交付都先过这里，所以下面三条判据在生产可达。
 
     * ``recipients(None) == resolve_recipients("")``；
@@ -1956,18 +1963,19 @@ def recipients(env: dict | None, resolve=None) -> list[tuple[str, str]]:
     * ``recipients({"to_role": ["pm"]}, resolve=…)`` 真的走 ``resolve``。
 
     第二个参数是**收件人解析器**，签名 ``fn(env) -> [(name, sid)]``；缺省 ``None``
-    时由本函数自己按 ``env["repo"]`` 走四级链，所以 ``to_role`` 有值而无人解析时
-    返回空列表，**不**降级成广播——一个解析不了的收件人必须静默失败，不许变成
-    「发给所有人」。
+    时由本函数自己按 ``env["repo"]`` 走 ``resolve_recipients``（#72 之后只有
+    supervisor 一级），所以 ``to_role`` 有值而无人解析时返回空列表，**不**降级成
+    广播——一个解析不了的收件人必须静默失败，不许变成「发给所有人」。
 
     为什么先摆而不用：``to_role`` 的收件来源依赖「``pm`` 可绑定」，而
     ``gh_issue.py`` 的 ``--bind-role`` 闭集是 ``{qa, worker, at}``，现网
     ``issue_sessions.json`` 里 ``pm`` 槽位 0 个 ⇒ 前置未成立。扩闭集属 #74／#87
     的权限边界，须 supervisor 裁定。
 
-    ``f"pm-{proj}"`` 的四处下刀点（本单**只标注、不改行为**）：
-    ``decide_watch.py:1921``（查找 ① 级）、``:2284``／``:2288``（进投递载荷）、
-    ``brief.py:230``（brief projects 过滤，现网命中 0 条＝哑过滤）。
+    ``f"pm-{proj}"`` 的**残余两处**（#72 之后）：``scan_deliveries`` 与
+    ``_selftest_rec`` 把 ``pm_key``／``pm_sid`` 写进**投递载荷**。它们不参与
+    收件人解析——收件人只由 ``resolve_recipients`` 的 supervisor 一级决定。
+    ``brief.py:230`` 的过滤已改用 ``sessionkeys.scoped_by``，同一批（#72）。
     """
     env = env if isinstance(env, dict) else {}
     if env.get("to_role"):
@@ -1976,32 +1984,22 @@ def recipients(env: dict | None, resolve=None) -> list[tuple[str, str]]:
 
 
 def resolve_recipients(repo: str) -> list[tuple[str, str]]:
-    """收件人（四级降级链，**每一级都真的能发出去**）。
+    """收件人：**只有** `supervisor` 一级（#72 删掉了①级裸键与③级降级腿）。
 
-    ① `pm-<project>` ⇒ ② `supervisor` ⇒ ③ `supervisor_alarm.live_pm_sids()` 的全部活 `pm-*`
-    ⇒ ④ 返回空（调用方落 `delivery_undelivered.log` 并由本进程每轮重试，不是死信）。
+    解析不到就返回空，调用方落 `delivery_undelivered.log` 并由本进程每轮重试
+    （不是死信）。**不**回落到任何 `pm-*`：一条投给「恰好撞上的别的 pm」的回执
+    比不投更坏——2026-11-16 之前「PM 收单、supervisor 零收」那一段的成因，正是
+    ①级 `pm-<project>` 裸键排在前面被 `_send_delivery` 命中即 `break`。
+
+    ``repo`` 不参与解析，保留参数是为了与 `recipients()` 的适配层、以及 lwa
+    薄壳的 `_guard_resolve_recipients(repo)` 包装签名一致。
     """
     db = _sessions()
     out: list[tuple[str, str]] = []
-    proj = _project_of_repo(repo)
-    # #72 落地点（本单不改行为）：① 级应改为「该 thread 的显式 pm 绑定」。
-    # 现网 `pm-<project>` 裸键命中 0 条（真实键都带随机尾），且同项目 5 个 pm 键
-    # 并存 ⇒ 「最新键」不等于「本单的 pm」。改这里必须同步 :2284／:2288 与
-    # brief.py:230，否则投递帧的收件人与实际收件人不一致。
-    pm_key = f"pm-{proj}" if proj else ""
-    sid = _sid_of(db, pm_key) if pm_key else ""
-    if sid:
-        out.append((pm_key, gate_rewrite(sid, pm_key)))
     key = _cfg().supervisor_key
     rsid = _sid_of(db, key)
     if rsid:
         out.append((key, gate_rewrite(rsid, key)))
-    if not out:
-        try:
-            supervisor_alarm = _load_alarm_module()
-            out.extend((n, gate_rewrite(s, n)) for n, s in supervisor_alarm.live_pm_sids())
-        except Exception as exc:  # noqa: BLE001
-            delivery_log(f"[降级] supervisor_alarm 收件人逻辑不可用：{type(exc).__name__}: {exc}")
     return out
 
 
@@ -2169,8 +2167,9 @@ def _send_delivery(st: dict, rec: dict, dry: bool, now: float) -> int:
     key = delivery_group(rec)
     text = render_delivery_text(rec)
     # The recipients shell is on the delivery path (#92 §P0-1b): every send
-    # goes through ``recipients()``, which answers the four-level chain today
-    # and takes ``to_role`` the day #72 lands. The resolver is an adapter, not
+    # goes through ``recipients()``, which answers ``resolve_recipients`` - the
+    # supervisor only, since #72 removed the bare-key and broadcast legs - and
+    # takes ``to_role`` the day that path lands. The resolver is an adapter, not
     # ``resolve_recipients`` itself - that takes a repo string, so passing it
     # directly would raise ``TypeError`` and be read as "nobody to send to".
     targets = recipients(rec, lambda env: resolve_recipients(
@@ -2484,10 +2483,13 @@ def scan_deliveries(st: dict, *, dry: bool, now: float, force_replay: bool = Fal
         evidence = note
         worker_name, worker_sid = _bind_name(repo, issue)
         proj = _project_of_repo(repo)
-        # #72 落地点（本单不改行为）：这两行把 pm 收件人**写进投递载荷**
-        # （`_send_delivery` 把它注入 `DELIVERY_EVENT`）。改 :1921 而漏掉这里，
-        # 会让帧里的收件人与实际收件人不一致。
-        pm_sid = _sid_of(_sessions(), f"pm-{proj}") if proj else ""
+        # `pm_sid` 是**死字段**（#72 已按 QA P1-① 处置）：它只随 `rec` 进
+        # `DELIVERY_EVENT`，而该事件在 safkc 内除定义外**消费方为 0**，所以
+        # 解析它不产生任何行为。值与 `pm_key` 同源（`f"pm-{proj}"` 裸键），
+        # ①级删掉后**不再查**——留空串保持载荷形状，消费方将来接上也不会
+        # 拿到一个「看起来像真收件人」的 sid。真要写它，须等单 A 的
+        # `resolve_delivery_targets` 给出权威来源。
+        pm_sid = ""
         rec = {
             "v": 1, "project": proj, "repo": repo, "issue": issue,
             "worker_name": worker_name, "worker_session": worker_sid,
@@ -3152,7 +3154,12 @@ DELIVERY_SELFTEST_SRC = r'''
 
 
 def _self_fixture(root: Path) -> dict:
-    """造一个干净靶场：ledger 副本 + sessions + issue_sessions。"""
+    """造一个干净靶场：ledger 副本 + sessions + issue_sessions。
+
+    `wanted` 里的 `pm-<project>` **裸键保留是有意的**（#72）：①级查找删掉之后，
+    它不再参与收件人解析 —— 保留它 + S 段断言「收件人只有 supervisor」，
+    才能证明「裸键存在也不生效」这条回归防线。删掉这个夹具反而让 S 变弱。
+    """
     import shutil
     root.mkdir(parents=True, exist_ok=True)
     cfg = _cfg()
@@ -3590,9 +3597,23 @@ def self_test() -> int:
             if source is None:
                 raise RuntimeError("未注入自检夹具 sessions，拒绝读生产状态")
             shutil.copyfile(source, root / "sessions.json")
+            sess = json.loads((root / "sessions.json").read_text(encoding="utf-8"))
+            # **断言来源在 #72 变了，这里是新口径**。改前 S 只验「sid 被换成假值」，
+            # 而那时假值可能来自①级裸键；①级删掉后必须证明两件事同时成立——
+            # ① 裸键**就摆在** sessions.json 里且值是真 sid（否则这条断言空转）；
+            # ② 收件人名单**仍然只有** supervisor（裸键在也不生效）。
+            # 裸键在这里现造，不依赖夹具自带：lwa 的 fixture_sessions 是**真**
+            # sessions.json（里面没有 `pm-<本项目>` 裸键），靠夹具会给出一条空转的绿。
+            bare = "pm-" + _project_of_repo("owner/neutral_project")
+            sess[bare] = {"id": "session_00000000-1111-2222-3333-444444444444"}
+            (root / "sessions.json").write_text(json.dumps(sess, ensure_ascii=False),
+                                               encoding="utf-8")
             recips = resolve_recipients("owner/neutral_project")
+            names = [n for n, _s in recips]
+            bare_present = _sid_of(sess, bare) != ""
+            only_supervisor = names == [_cfg().supervisor_key]
             all_fake = bool(recips) and all(s.startswith(DELIVERY_FAKE_PREFIX) for _n, s in recips)
-            fake_rewrite_ok = all_fake
+            fake_rewrite_ok = bare_present and only_supervisor and all_fake
             # 关掉内存 sink，强制走**真实的闸路径**（fixture ⇒ 只写 sink，不 spawn）
             DELIVERY_SINK = None
             spawned = []
@@ -3617,7 +3638,8 @@ def self_test() -> int:
                 os.environ.pop(k, None)
             _self_fixture(root)                       # 恢复假 sessions
         check("S", fake_rewrite_ok and sent_ok and sink_lines >= 1 and not spawned_sess,
-              f"fake={fake_rewrite_ok} sink_lines={sink_lines} notify={sent_ok} spawned={len(spawned_sess)}")
+              f"bare_present={bare_present} only_supervisor={only_supervisor} "
+              f"sink_lines={sink_lines} notify={sent_ok} spawned={len(spawned_sess)}")
 
         # ---------- T（V1 补修）：state 缺 `offset` 键 ＋ 台账 5 行 ok=true
         # ⇒ **必须重建基线、发 0 条**（不许回放 5 条）。
