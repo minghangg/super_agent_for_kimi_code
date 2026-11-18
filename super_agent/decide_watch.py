@@ -2129,11 +2129,36 @@ def _prune(st: dict, now: float) -> None:
     st["seen"] = {k: v for k, v in seen.items() if float(v or 0) >= cutoff}
 
 
+def delivery_group(rec: dict) -> str:
+    """冷却／日额／熔断／摘要的**分组**键：``repo#issue``。
+
+    分组是**按单**的，这是既有设计：同单当日第 2 次起合并进摘要（``_summary_add``）、
+    冷却窗 ``DELIVERY_COOLDOWN_S``、单日上限与熔断都以「一张单」为单位计数
+    （自检 N 就是照这个口径写的：熔断键 ``owner/x#999`` 只停该单）。
+    把 ``evidence`` 并进这个键会让「同单第二条交付」绕过冷却与日额，
+    等于废掉限流 —— 那不是 #83 的病灶。
+
+    **#83 的病灶在去重键**，不在分组键，见 :func:`delivery_identity`。
+    """
+    return f"{rec['repo']}#{rec['issue']}"
+
+
+def delivery_identity(rec: dict) -> str:
+    """去重（``seen``）键：同一条交付重放同键，不同交付不同键。
+
+    必须保留**完整** ``evidence``（含 ``cid:``／``ledger:`` 前缀）。只取冒号后半段
+    会让同号的两条不同证据撞成一个键（``cid:57`` 与 ``ledger:57`` 都变
+    ``o/n#92#57``）⇒ 第二条被当成重放**静默丢弃**，既不发也不进摘要，
+    ``dedup_skips`` 悄悄 +1 —— 这才是 #83 病灶（#92 §P0-1a）。
+    """
+    return f"{rec['repo']}#{rec['issue']}:{rec['evidence']}"
+
+
 def enqueue_delivery(st: dict, rec: dict, *, dry: bool, now: float,
                      no_cooldown: bool = False, no_merge: bool = False,
                      breaker_off: bool = False) -> int:
-    key = f"{rec['repo']}#{rec['issue']}"
-    skey = f"{key}#{rec['evidence']}"
+    key = delivery_group(rec)
+    skey = delivery_identity(rec)
     stats_inc(st, "hits", now=now)
     if skey in (st.get("seen") or {}):
         stats_inc(st, "dedup_skips", now=now)
@@ -3186,6 +3211,30 @@ def self_test() -> int:
         s2 = enqueue_delivery(st, r_other, dry=True, now=now)
         check("N", s1 == 0 and s2 == 1, f"blocked={s1} other={s2}")
 
+        # ---------- V：同单同号、不同证据形态的两条交付必须都发得出去
+        # `cid:57` 与 `ledger:57` 只差前缀。去重键若退化成
+        # `split(':',1)[-1]`，两条撞成同一个键 ⇒ 第二条被当重放静默丢弃
+        # ⇒ #83 病灶复发（ISS-92 §P0-1a）。
+        now = time.time()
+        _fresh(root, [])
+        DELIVERY_SINK = []
+        st = load_delivery_state()
+        st["baseline_established"] = True
+        base = {"v": 1, "project": "neutral_project",
+                "repo": "owner/neutral_project", "issue": 57,
+                "worker_name": "w", "worker_session": "", "pm_key": "pm-x",
+                "pm_sid": "", "kind": "comment", "ledger_line": 57,
+                "detected_ts": now}
+        ra = {**base, "evidence": "cid:57", "dl_id": "dl-v1"}
+        rb = {**base, "evidence": "ledger:57", "dl_id": "dl-v2"}
+        v1 = enqueue_delivery(st, ra, dry=True, now=now, no_cooldown=True,
+                              no_merge=True)
+        v2 = enqueue_delivery(st, rb, dry=True, now=now, no_cooldown=True,
+                              no_merge=True)
+        distinct = delivery_identity(ra) != delivery_identity(rb)
+        check("V", v1 == 1 and v2 == 1 and distinct,
+              f"cid={v1} ledger={v2} distinct={distinct}")
+
         # ---------- O：跨日自动解除熔断并写日志
         now = time.time()
         _fresh(root, [])
@@ -3355,11 +3404,11 @@ def self_test() -> int:
         os.environ.pop("DELIVERY_NO_INJECT", None)
 
     passed = sum(1 for _t, ok, _d in results if ok)
-    total = 22          # A–T ＋ GATE ＋ T（V1）＋ SM（#18 --send-mode）
+    total = 23          # A–T ＋ V（#92 去重键）＋ GATE ＋ SM（#18 --send-mode）
     for tag, ok, detail in results:
         print(f"[self-test] {tag} {'通过' if ok else '失败'}" + (f"（{detail}）" if detail else ""))
     elapsed = time.time() - started
-    print(f"--self-test: A–T＋SM {passed}/{total} 通过 · 耗时 {elapsed:.1f}s")
+    print(f"--self-test: A–T＋V＋SM {passed}/{total} 通过 · 耗时 {elapsed:.1f}s")
     if elapsed > 30:
         print("[self-test] 超时（预算 30s）", file=sys.stderr)
         return EXIT_SELFTEST_FAILED
