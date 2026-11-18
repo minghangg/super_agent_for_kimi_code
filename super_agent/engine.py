@@ -77,14 +77,22 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import (at_serve, github_source, health, issuekey, markers, needs,
-               session_events, sessionkeys)
+from . import (at_serve, envelope, github_source, health, issuekey, markers,
+               needs, session_events, sessionkeys)
 from . import assignments as asg_mod
 from .allowlist import ProjectAllowlist
 from .store import Store, action_id
 
 OBSERVE = "observe"
 
+#: ``_triage`` state → envelope type (``envelope.TYPES``, #92 §A.1).
+#: ``ignored``/``needs_person`` have no envelope type of their own: the message
+#: that produced them already carried one (a task book is ``pm_task``, a
+#: ``[blocked]`` note is ``escalation``), so the map falls back to the first
+#: line. ``unknown`` is deliberately absent - ``""`` is what the refusal logs.
+_ENVELOPE_TYPES = {"delivery": "delivery", "review": "review",
+                   "pm_verdict": "pm_verdict", "pm_task": "pm_task",
+                   "at_verdict": "at_verdict", "note": "note"}
 # Where a ``[QA]`` verdict may find the assignment it judges. Each extra state
 # is an **exit** the verdict has to be able to reach, not a looser reading of
 # one:
@@ -558,6 +566,125 @@ class Engine:
         if escalated:
             return "needs_person", f"marker {escalated!r}"
         return "logged", ""
+
+    def _envelope(self, thread: str, comment: dict, state: str) -> dict:
+        """The message's envelope, built from the whitelist - **not from its body**.
+
+        This is the production entry point for :mod:`super_agent.envelope`
+        (#92 §A.4／§D.3). It runs once per triaged comment, inside the round,
+        and returns the snapshot that :meth:`_record_envelope` logs.
+
+        ``from_role`` comes from :meth:`_verified_role`, which asks the four
+        session-key whitelists. **The body is never read for identity**: a
+        comment that writes ``[WK:<somebody else's key>]`` names that key in
+        ``claimed_name`` and still gets ``from_role=""``, because the whitelist
+        said no (§D.2). That is the failure ``DELIVERY_RE``'s
+        ``([^\\]\\n]{1,64})`` admits and this line refuses.
+
+        A ``type`` the engine did not recognise (``logged`` with a bracketed
+        first line) maps to ``""``, which :func:`envelope.validate` refuses; the
+        caller logs ``envelope.unknown`` instead of pretending it read it.
+
+        Nothing here writes: the envelope is a runtime snapshot, never a second
+        source of truth (§C.4).
+        """
+        body = str(comment.get("body") or "")
+        repo, issue = issuekey.split_key(thread)
+        bare = issuekey.is_legacy(thread)          # ``"42"``: no repo configured
+        env = envelope.legacy_map(
+            body, repo=repo, issue=issue if issue is not None else 0,
+            cid=int(comment.get("id") or 0),
+            thread="" if bare else thread,
+            thread_scope="none" if bare else "issue",
+            from_role=self._verified_role(thread, comment))
+        if bare:
+            # A legacy numeric thread names no repository, so it has no
+            # ``owner/repo#N`` to validate against. It is still an issue-shaped
+            # message, so it carries the coordinate in ``project`` rather than
+            # pretending ``thread`` can hold a bare number (§附).
+            env["project"] = self._project_for(issue) or ""
+        # ``legacy_map`` answers from the first line; the engine's own verdict
+        # wins where the two differ, because the engine is what routes. A
+        # ``logged`` line that opens with a bracketed marker is the one shape
+        # the map must not call "note": it is an unknown marker (§C.3).
+        if state == "logged" and envelope.looks_like_marker(
+                markers.first_line(body)):
+            env["type"] = ""
+        elif env.get("type") == "note" and state not in ("logged", ""):
+            env["type"] = _ENVELOPE_TYPES.get(state, env["type"])
+        return env
+
+    def _verified_role(self, thread: str, comment: dict) -> str:
+        """``from_role`` from the whitelists, or ``""`` when unverified.
+
+        Four bindings, and their agreement is the answer: a comment cannot be a
+        QA and a PM at once. A delivery is checked against the thread's worker
+        binding (``issue_sessions.json[thread]["worker"]``), the same record the
+        dispatch wrote; a comment that was never bound is ``""``, which is a
+        meaning - "unverified" - and never falls back to the marker letter
+        (#92 §D.2), because that fallback would let a forged ``[WK:…]`` certify
+        itself.
+        """
+        claimed = str(comment.get("session_key") or "")
+        for verified in (self._pm_verified(thread, comment),
+                         self._review_verified(thread, comment),
+                         self._at_verified(thread, comment),
+                         self._delivery_verified(thread, comment)):
+            if verified:
+                return envelope.from_role_of(claimed, "", verified=True)
+        return ""
+
+    def _delivery_verified(self, thread: str, comment: dict) -> bool:
+        """Is this comment from the worker bound to this thread?
+
+        ``issue_sessions.json`` is written by ``gh_issue.py bind --bind-role
+        worker``, which names the session - so the comparison is name-to-name
+        against the comment's own ``<!-- session: … -->`` line, never against
+        the text of its first line. No binding answers ``False``: an unbound
+        thread is not a licence to trust whatever marker happens to be there.
+        """
+        entry = self._issue_session_entry(thread).get("worker")
+        if not isinstance(entry, dict):
+            return False
+        bound = str(entry.get("name") or "")
+        claimed = str(comment.get("session_key") or "")
+        return bool(bound and claimed and claimed == bound)
+
+    def _record_envelope(self, thread: str, comment: dict, state: str) -> None:
+        """Log the envelope, or the refusal that stopped it - one event either way.
+
+        A refusal is **visible**, which is the whole point: before this, a
+        malformed message was indistinguishable from a healthy one
+        (#92 §A.5 反例 2／3). The event carries no body and no ``claimed_name``
+        - a key name in a log is still a credential (RULES §37).
+        """
+        env = self._envelope(thread, comment, state)
+        if not str(env.get("type") or ""):
+            marker = env.get("unknown_marker") or {}
+            repo, issue = issuekey.split_key(thread)
+            self.store.log_event({
+                "type": "envelope.unknown", "at": _now(), "repo": repo,
+                "issue": issue if issue is not None else 0,
+                "comment_id": int(comment.get("id") or 0),
+                # Comes from the envelope the map built, so the line is hashed
+                # once and the body is never re-read here (#92 P2-1).
+                "first_line_sha1": marker.get("first_line_sha1")
+                or envelope.first_line_sha1(str(comment.get("body") or "")),
+            })
+            return
+        ok, reason = envelope.validate(env)
+        if not ok:
+            self.store.log_event(envelope.rejected_event(env, reason))
+            return
+        self.store.log_event({
+            "type": "envelope.built", "at": env.get("created_at"),
+            "message_id": env["message_id"], "kind": env["type"],
+            "thread": env["thread"], "thread_scope": env["thread_scope"],
+            "from_role": env["from_role"], "assignment_id": env["assignment_id"],
+            "comment_id": (env.get("payload_ref") or {}).get("cid"),
+            "receipt_required": env["receipt_required"],
+            "steer_required": env["steer_required"],
+        })
 
     def _escalation_marker(self, body: str, *, first_line_only: bool = True) -> str:
         """The first configured escalation marker, or ``""``.
@@ -4315,6 +4442,11 @@ class Engine:
             self.store.log_event({"type": "comment.processed", "at": _now(),
                                   "issue": issue, "comment_id": cid, "state": state,
                                   "reason": reason})
+            # The envelope is built here, on the production path, from the
+            # whitelist result - never from the body (#92 §A.4／§D.3). A refusal
+            # or an unknown marker logs its own event; either way this runs once
+            # per triaged comment, inside the round.
+            self._record_envelope(key, comment, state)
             if state == "delivery":
                 state, reason = self._on_delivery(index, key, issue, comment,
                                                   delivery, summary)

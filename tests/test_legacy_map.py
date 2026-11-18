@@ -103,6 +103,24 @@ class UnknownMarkers(unittest.TestCase):
         self.assertEqual(env["type"], "")
         self.assertEqual(env["result_ref"], {})
 
+    def test_the_envelope_carries_its_own_unknown_marker(self):
+        # P2-1: the reference lives on the envelope, so a caller wiring the
+        # event does not re-open the body to build it.
+        env = envelope.legacy_map(self.BODY, repo="o/n", issue=92, cid=11)
+        marker = env.get("unknown_marker")
+        self.assertIsNotNone(marker)
+        self.assertEqual(marker["kind"], "unknown_marker")
+        self.assertEqual(marker["comment_id"], 11)
+        self.assertEqual(marker["first_line_sha1"], envelope.first_line_sha1(self.BODY))
+        self.assertNotIn("pm-secret", repr(marker))
+
+    def test_a_known_marker_carries_no_unknown_reference(self):
+        for body in ("[WK:x] 交付", "[QA] 通过", "普通讨论"):
+            with self.subTest(body=body):
+                self.assertNotIn("unknown_marker",
+                                 envelope.legacy_map(body, repo="o/n", issue=92,
+                                                     cid=1))
+
     def test_the_event_carries_a_sha1_and_no_text(self):
         event = envelope.unknown_marker_event(self.BODY, repo="o/n", issue=92,
                                               cid=11)

@@ -282,11 +282,12 @@ def _task_prefix_re():
     return TASK_PREFIX_RE
 
 
-def _looks_like_marker(line: str) -> bool:
+def looks_like_marker(line: str) -> bool:
     """Does the first line open with *any* bracketed marker?
 
-    Bracketed and colon-led, half- or full-width, case-insensitive: the shape a
-    tool writes. Prose that merely starts with a word is not a marker.
+    Bracketed, half- or full-width, case-insensitive: the shape a tool writes.
+    Prose that merely starts with a word is not a marker. The engine uses this
+    to tell "an unknown marker" from "ordinary discussion" (#92 §C.3).
     """
     if not line:
         return False
@@ -297,6 +298,11 @@ def _looks_like_marker(line: str) -> bool:
     if close < 0:
         close = head.find("］")
     return close > 1
+
+
+def _looks_like_marker(line: str) -> bool:
+    """Backwards-compatible private alias of :func:`looks_like_marker`."""
+    return looks_like_marker(line)
 
 
 def legacy_map(body: str, *, repo: str, issue, cid, from_role: str = "",
@@ -367,6 +373,13 @@ def legacy_map(body: str, *, repo: str, issue, cid, from_role: str = "",
     if _looks_like_marker(line):
         env = build(**base, type="")
         env["result_ref"] = {}
+        # The count-and-reference record belongs to the envelope it describes,
+        # so the caller does not have to re-open the body to build it (#92 P2-1).
+        env["unknown_marker"] = {
+            "kind": "unknown_marker",
+            "first_line_sha1": first_line_sha1(body),
+            "comment_id": int(cid),
+        }
         return env
     return build(**base, type="note")
 
