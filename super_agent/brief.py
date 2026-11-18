@@ -227,6 +227,9 @@ def _projects_items(cfg: dict, *, target: str, project: str | None,
         return [Item("projects", PRIORITY_SKELETON, f"未知（{err}）")], problems
     keys = sorted(k for k in data if isinstance(k, str) and k.startswith("pm-"))
     if target == "pm" and project:
+        # #72 落地点（本单不改行为）：现网真实键都带随机尾，`k == f"pm-<项目>"`
+        # 命中 0 条 ⇒ 这行是哑过滤。改它要与 decide_watch 的 :1921／:2284／:2288
+        # 同批进行，否则三处口径分叉。
         keys = [k for k in keys if k == f"pm-{project}"]
     for key in keys[:limit]:
         entry = data.get(key) or {}

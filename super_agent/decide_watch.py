@@ -1909,6 +1909,32 @@ def _load_alarm_module():
                       sess_script=cfg.session_script)
     return mod
 
+def recipients(env: dict | None, resolve=None) -> list[tuple[str, str]]:
+    """收件人入口：有 ``to_role`` 走它，没有就回落到四级链（#92 §P0-1b）。
+
+    **本单只摆这一层，``to_role`` 路径不实现**（归 #72）。判据是签名不是装饰：
+
+    * ``recipients(None) == resolve_recipients("o/n")`` —— 现状行为一字不变；
+    * ``recipients({"repo": "o/n", "to_role": []})`` 同上（空列表＝广播，不是指定）；
+    * ``recipients({"to_role": ["pm"]}, resolve=…)`` 真的走 ``resolve``。
+
+    为什么先摆而不用：``to_role`` 的收件来源依赖「``pm`` 可绑定」，而
+    ``gh_issue.py`` 的 ``--bind-role`` 闭集是 ``{qa, worker, at}``，现网
+    ``issue_sessions.json`` 里 ``pm`` 槽位 0 个 ⇒ 前置未成立。扩闭集属 #74／#87
+    的权限边界，须 supervisor 裁定，本单不越权。
+
+    ``f"pm-{proj}"`` 的四处下刀点（本单**只标注、不改行为**）：
+    ``decide_watch.py:1921``（查找 ① 级）、``:2284``／``:2288``（进投递载荷）、
+    ``brief.py:230``（brief projects 过滤，现网命中 0 条＝哑过滤）。#72 落地时四处
+    必须同改：只改 ``:1921`` 会让投递帧的收件人与实际收件人不一致
+    （``_send_delivery`` 把 ``pm_key``／``pm_sid`` 一起注入 ``DELIVERY_EVENT``）。
+    """
+    env = env if isinstance(env, dict) else {}
+    if env.get("to_role"):
+        return resolve(env) if resolve else []
+    return resolve_recipients(str(env.get("repo") or ""))
+
+
 def resolve_recipients(repo: str) -> list[tuple[str, str]]:
     """收件人（四级降级链，**每一级都真的能发出去**）。
 
@@ -1918,6 +1944,10 @@ def resolve_recipients(repo: str) -> list[tuple[str, str]]:
     db = _sessions()
     out: list[tuple[str, str]] = []
     proj = _project_of_repo(repo)
+    # #72 落地点（本单不改行为）：① 级应改为「该 thread 的显式 pm 绑定」。
+    # 现网 `pm-<project>` 裸键命中 0 条（真实键都带随机尾），且同项目 5 个 pm 键
+    # 并存 ⇒ 「最新键」不等于「本单的 pm」。改这里必须同步 :2284／:2288 与
+    # brief.py:230，否则投递帧的收件人与实际收件人不一致。
     pm_key = f"pm-{proj}" if proj else ""
     sid = _sid_of(db, pm_key) if pm_key else ""
     if sid:
@@ -2306,6 +2336,9 @@ def scan_deliveries(st: dict, *, dry: bool, now: float, force_replay: bool = Fal
         evidence = note if note.startswith("cid:") else f"ledger:{line_no}"
         worker_name, worker_sid = _bind_name(repo, issue)
         proj = _project_of_repo(repo)
+        # #72 落地点（本单不改行为）：这两行把 pm 收件人**写进投递载荷**
+        # （`_send_delivery` 把它注入 `DELIVERY_EVENT`）。改 :1921 而漏掉这里，
+        # 会让帧里的收件人与实际收件人不一致。
         pm_sid = _sid_of(_sessions(), f"pm-{proj}") if proj else ""
         rec = {
             "v": 1, "project": proj, "repo": repo, "issue": issue,
