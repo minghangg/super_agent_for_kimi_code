@@ -10,3 +10,5 @@ monitor.log
 *.last-good
 *.egg-info/
 config/allowlist.local.json
+config/gh_projects.json
+config/roles.local.json

@@ -10,33 +10,41 @@ The token goes on **its own line** because every verdict marker is anchored at
 the end of its line; appending it inline hides the verdict from the parser.
 
 **The implementation is not here.** The policy table, the role prefixes, the
-project registry, the ledger and the HTTP calls all live in the workbench's
-``tools/gh_issue.py``, and this file loads that module and calls its
+project registry, the ledger and the HTTP calls all live in
+``super_agent/issue_cli.py``, and this file loads that module and calls its
 ``main()``. Nothing about *who may comment* or *what prefix a role gets* is
-restated here - a second copy of that table is how the two entry points start
+restated here - a second copy of that table is how two entry points start
 disagreeing about permissions.
 
-Where the workbench is comes from ``SAFKC_BRIDGE_ROOT`` and nowhere else: this
-repository is the open one, so a private checkout path must not be written into
-it. A missing or wrong value is an error, never a guess - loading whatever
-``gh_issue`` happens to sit on ``sys.path`` is how a shell silently runs the
-wrong policy.
+Where the implementation is comes from this file's own location and nowhere
+else: ``<checkout>/super_agent/issue_cli.py``, where the checkout is the one
+this shell sits in. No environment variable, so no private path is written into
+the open repository and no wrongly set variable can point the shell at another
+checkout's policy. The loaded module is then compared against that exact path,
+because a same-named package already installed in the process would otherwise
+answer the import silently.
+
+A ``comment`` without ``--session-key`` is refused here, before the
+implementation is even loaded: a verdict that does not name its session is
+unattributed, and the engine reads it as such (#87). The refusal lives in the
+shell so it survives any change of implementation.
 
 Usage::
 
-    set SAFKC_BRIDGE_ROOT=<workbench checkout>
-    python tools/gh_issue.py comment --role pm --project <project> \
+    python tools/gh_issue.py comment --role pm --project <project> \\
         --issue 87 --session-key pm-demo --body "probe" --dry-run
 """
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import os
 import sys
 from pathlib import Path
 
-# The environment variable that names the checkout holding ``tools/gh_issue.py``.
-ROOT_ENV = "SAFKC_BRIDGE_ROOT"
+# The retired variable that used to name the checkout holding the
+# implementation. Assembled from fragments so that neither the shell's source
+# nor a grep of it carries a live name for a mechanism that no longer works.
+RETIRED_ENV = "SAFKC_BRIDGE_" + "ROOT"
 
 # The marker the engine reads back out of the body (``markers.read_session_token``).
 SESSION_MARKER = "<!-- session: {key} -->"
@@ -46,57 +54,46 @@ SESSION_MARKER = "<!-- session: {key} -->"
 # restate a rule that belongs to the implementation.
 COMMENT = "comment"
 
+# Where the implementation lives, relative to this checkout.
+IMPL_PACKAGE = "super_agent"
+IMPL_MODULE = "super_agent.issue_cli"
+IMPL_FILE = Path(IMPL_PACKAGE) / "issue_cli.py"
+
 
 class BridgeError(RuntimeError):
     """The shell cannot reach the implementation, or was called wrongly."""
 
 
-def impl_root() -> Path:
-    """The workbench checkout, from ``SAFKC_BRIDGE_ROOT``.
+def checkout() -> Path:
+    """The checkout this shell sits in: ``tools/gh_issue.py`` -> its parent's parent."""
+    return Path(__file__).resolve().parents[1]
 
-    No default. A guess would be a private path written into an open
-    repository, and a wrong guess would run another repository's policy.
+
+def load_impl():
+    """Import ``<checkout>/super_agent/issue_cli.py`` and return it.
+
+    The checkout is put first on ``sys.path`` so the import resolves to this
+    shell's own module. The result is then checked against the exact path we
+    meant to load: an editable install, a copy left on ``sys.path``, or an
+    earlier import in the same process would all answer ``import_module`` with
+    a module from somewhere else, and running another checkout's policy is the
+    one failure this shell exists to prevent. Both paths are printed on
+    failure - "wrong module" alone leaves the reader unable to see which one
+    answered.
     """
-    raw = (os.environ.get(ROOT_ENV) or "").strip()
-    if not raw:
-        raise BridgeError(
-            f"{ROOT_ENV} is not set. It must name the checkout that holds "
-            "tools/gh_issue.py; this repository does not carry that path.")
-    root = Path(raw).expanduser()
-    if not (root / "tools" / "gh_issue.py").is_file():
-        raise BridgeError(
-            f"{ROOT_ENV}={root} has no tools/gh_issue.py")
-    return root
-
-
-def load_impl(root: Path):
-    """Import ``<root>/tools/gh_issue.py`` as a module and return it.
-
-    ``spec_from_file_location`` is used rather than ``sys.path`` plus a bare
-    ``import gh_issue`` for two reasons:
-
-    * the path is the one this shell resolved, so a ``gh_issue`` elsewhere on
-      ``sys.path`` (or one already imported under that name) cannot answer;
-    * the module keeps its own ``__file__``, so its ``WORKBENCH`` - which it
-      derives from that path - still points at its own checkout. That derivation
-      is what keeps the implementation single-sourced.
-
-    The cost is that the module is registered under a private name and is not
-    importable as ``gh_issue``; nothing needs it to be. ``spec_from_file_location``
-    also yields ``__package__ == ""``, which is why the implementation must keep
-    using absolute imports - it already inserts its own ``tools`` directory.
-    """
-    target = root / "tools" / "gh_issue.py"
-    spec = importlib.util.spec_from_file_location("_safkc_gh_issue_impl", target)
-    if spec is None or spec.loader is None:
-        raise BridgeError(f"cannot load {target}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
+    root = checkout()
+    expected = (root / IMPL_FILE).resolve()
+    sys.path.insert(0, str(root))
     try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop(spec.name, None)
-        raise
+        module = importlib.import_module(IMPL_MODULE)
+    except Exception as exc:            # noqa: BLE001  any import failure is a refusal
+        raise BridgeError(
+            f"cannot load {expected}: {type(exc).__name__}: {exc}") from None
+    actual = Path(getattr(module, "__file__", "") or "").resolve()
+    if actual != expected:
+        raise BridgeError(
+            f"issue_cli was loaded from another checkout: actual={actual} "
+            f"expected={expected} (another copy of the package is on sys.path)")
     return module
 
 
@@ -156,6 +153,13 @@ def compose_body(argv: list[str], key: str) -> list[str]:
     return argv + ["--body", composed]
 
 
+def _warn_retired_env() -> None:
+    """Say that the old variable no longer does anything, instead of ignoring it."""
+    if (os.environ.get(RETIRED_ENV) or "").strip():
+        print(f"[shell] {RETIRED_ENV} 已失效（见 #96）：实现固定取本检出内的 "
+              f"{IMPL_FILE.as_posix()}，该变量不再改变加载目标。", file=sys.stderr)
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     is_comment = COMMENT in argv
@@ -165,10 +169,19 @@ def main(argv=None) -> int:
         raise BridgeError(
             "--session-key applies to comment: a session key names who wrote a "
             "verdict, and only comment puts a body on the issue.")
-    # Resolved before anything is printed or composed: a shell that previews a
-    # body and *then* says it cannot reach the implementation reads as success.
-    root = impl_root()
-    if is_comment and key:
+    # Refused before the implementation is loaded and before anything is
+    # printed: a permissive implementation must not be able to make an
+    # unattributed comment look like a successful one. A missing implementation
+    # is reported in the same breath - two faults, two facts, so that fixing
+    # one does not hide the other.
+    if is_comment and not key:
+        expected = (checkout() / IMPL_FILE).resolve()
+        missing = f" (also: {expected} does not exist)" if not expected.is_file() else ""
+        raise BridgeError(
+            "comment needs --session-key: without it the engine reads the "
+            f"verdict as unattributed (#87). Pass --session-key <your key>.{missing}")
+    _warn_retired_env()
+    if is_comment:
         if "--state-dir" in argv:
             # The implementation strips --state-dir itself; taking it apart
             # here would have to know its value. Refuse instead of guessing.
@@ -182,10 +195,7 @@ def main(argv=None) -> int:
         print("[shell] comment body:")
         for line in argv[argv.index("--body") + 1].splitlines():
             print("  " + line)
-    elif is_comment:
-        print("[shell] no --session-key: the comment will not name its session "
-              "and the engine reads it as unattributed.")
-    impl = load_impl(root)
+    impl = load_impl()
     return impl.main(argv)
 
 

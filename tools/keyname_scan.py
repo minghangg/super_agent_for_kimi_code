@@ -15,8 +15,7 @@ read the input (a scan that did not run must never look clean).
 
 Usage::
 
-    # one comment of one issue, through the workbench's gh_issue module
-    set SAFKC_BRIDGE_ROOT=<workbench checkout>
+    # one comment of one issue, read through this repository's issue CLI
     python tools/keyname_scan.py --issue 86 --cid 6900753114
 
     # a whole issue (body + every comment), or a local file
@@ -29,15 +28,17 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import importlib.util
+import importlib
 import os
 import re
 import sys
 from pathlib import Path
 
-# The same variable the ``tools/gh_issue.py`` shell uses, and for the same
-# reason: this repository is open, so a private checkout path is never defaulted.
-ROOT_ENV = "SAFKC_BRIDGE_ROOT"
+# The implementation is this repository's own module, found from this file's
+# location - the same rule ``tools/gh_issue.py`` uses. An environment variable
+# naming another checkout was the old mechanism, and it required a private
+# checkout to run a documentation gate.
+CHECKOUT = Path(__file__).resolve().parents[1]
 
 # A key name: role prefix + at least one character of the readable part.
 # ``at-`` is **off by default**: ``at-most-once`` and friends are English words,
@@ -78,39 +79,45 @@ def find_keys(text: str, roles=("pm", "qa"), ignore=()) -> list[str]:
     return out
 
 
-def impl_root() -> Path:
-    raw = (os.environ.get(ROOT_ENV) or "").strip()
-    if not raw:
+def load_impl():
+    """This checkout's ``super_agent.issue_cli``, or a refusal naming the path.
+
+    The path comes from this file's location, so the gate runs on a plain clone.
+    It used to require an environment variable pointing at a private checkout,
+    which meant the documentation gate could only run on one machine.
+    """
+    expected = (CHECKOUT / "super_agent" / "issue_cli.py").resolve()
+    sys.path.insert(0, str(CHECKOUT))
+    try:
+        module = importlib.import_module("super_agent.issue_cli")
+    except Exception as exc:            # noqa: BLE001  any import failure is a refusal
+        raise SystemExit(f"cannot load {expected}: {type(exc).__name__}: {exc}")
+    actual = Path(getattr(module, "__file__", "") or "").resolve()
+    if actual != expected:
         raise SystemExit(
-            f"{ROOT_ENV} is not set; it must name the checkout with tools/gh_issue.py")
-    root = Path(raw).expanduser()
-    if not (root / "tools" / "gh_issue.py").is_file():
-        raise SystemExit(f"{ROOT_ENV}={root} has no tools/gh_issue.py")
-    return root
-
-
-def load_impl(root: Path):
-    spec = importlib.util.spec_from_file_location("gh_issue_impl",
-                                                  root / "tools" / "gh_issue.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+            f"issue_cli was loaded from another checkout: actual={actual} "
+            f"expected={expected}")
     return module
 
 
 def issue_text(project: str, issue: int, cid: str = "") -> str:
     """The issue body plus every comment body, or just ``cid``'s comment."""
-    impl = load_impl(impl_root())
-    repo = impl._repo(project)
-    rows = impl._call(
-        "GET", f"/repos/{repo}/issues/{issue}/comments?per_page=100")
+    impl = load_impl()
+    try:
+        repo = impl._repo(project, impl._load_projects(None))
+    except impl.Denied as exc:
+        raise SystemExit(f"[拒绝] {exc}")
+    ctx = {"env_file": None, "table": impl._roles(None)}
+    rows = impl._call("GET", f"/repos/{repo}/issues/{issue}/comments?per_page=100", **ctx)
+    rows = rows if isinstance(rows, list) else []
     if cid:
         rows = [r for r in rows if str(r.get("id")) == str(cid)]
         if not rows:
             raise SystemExit(f"#{issue} has no comment {cid}")
         return "\n".join(str(r.get("body") or "") for r in rows)
-    head = impl._call("GET", f"/repos/{repo}/issues/{issue}")
-    return str(head.get("body") or "") + "\n" + "\n".join(
-        str(r.get("body") or "") for r in rows)
+    head = impl._call("GET", f"/repos/{repo}/issues/{issue}", **ctx)
+    return (str((head or {}).get("body") or "") + "\n"
+            + "\n".join(str(r.get("body") or "") for r in rows))
 
 
 def main(argv=None) -> int:

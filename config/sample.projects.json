@@ -1,0 +1,10 @@
+{
+  "_comment": "项目表 SAMPLE。真部署请复制到 config/gh_projects.json（未跟踪，.gitignore 已含），填真实 owner/repo；或用 --projects-file / $SAFKC_PROJECTS_FILE 指向你的私有路径。",
+
+  "_comment_结构": "projects 的键＝--project 的短名（大小写不敏感，按小写匹配）；值＝owner/name。**没有内置默认表**：公开仓不能写真实仓名，空表时所有 --project 都会被拒（rc=3）。",
+
+  "_comment_与_allowlist_的关系": "这里是「短名 → 仓」的映射，只给 CLI 用。引擎用的是 config/allowlist.json（跟踪）＋ config/allowlist.local.json（未跟踪 overlay），两者按 repo 反查对应，不要求短名相同。issue_cli create 建单后会自动把单号写进 overlay，见 allowlist.sync_issues()。",
+  "projects": {
+    "example-project": "placeholder/example-project"
+  }
+}

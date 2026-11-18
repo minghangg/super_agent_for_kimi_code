@@ -1,0 +1,19 @@
+{
+  "_comment": "角色覆盖表 SAMPLE。真部署请复制到 config/roles.local.json（未跟踪，.gitignore 已含）。**只写结构，不写任何真实角色名**：公开仓不能存私有角色名的字面量（隐私门禁会红）。",
+
+  "_comment_结构": "roles 的键＝角色符号（pm/qa/worker/scout/steward/auditor/reviewer/analyst/planner/supervisor）。每项可选三个字段：aliases（--role 也接受的其它写法）、prefix（评论里的显示前缀，含方括号内那段）、delivery_prefix（交付前缀，名是必要的；null＝该角色不产交付）。",
+
+  "_comment_supervisor": "supervisor 的 prefix 默认 supervisor，且**必须留在引擎接受集 [PM]|[supervisor] 内**：集外前缀会让它的裁决行被读成 unreadable（issue_cli 加载时打 WARN）。aliases 是唯一能让你用本地习惯写法的地方。",
+
+  "_comment_优先级": "config/roles.local.json > $SAFKC_SUPERVISOR_ALIASES（逗号分隔）> 内置 9 个通用角色默认。三者都没有时，通用角色照常可用，别名一律 rc=3 并指向本文件。",
+
+  "_comment_固定会话": "可选键 fixed_session_keys（精确键名列表）与 fixed_session_prefixes（键名前缀列表）：关单归档时这些一律跳过。不给则用内置默认（steward/qa/scout/auditor/planner/reviewer/supervisor ＋ pm-/at-）。",
+  "roles": {
+    "supervisor": {
+      "aliases": ["<your-supervisor-spelling>"],
+      "prefix": "supervisor",
+      "delivery_prefix": null
+    }
+  },
+  "user_agent": "safkc-issue-cli/0.1"
+}
