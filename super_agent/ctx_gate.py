@@ -40,6 +40,7 @@ import inspect
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -152,9 +153,40 @@ def session_kind(sid: str, sessions_path: Path | None = None) -> tuple[str, str]
     return "one-shot", ""
 
 
-def usage_of(st: dict | None) -> float | None:
-    """Extract the ctx ratio (0..1); return None when it cannot be found."""
-    if not isinstance(st, dict):
+_WARN_SEEN: dict = {}
+WARN_WINDOW_S = 60.0
+
+
+def _warn_no_state(caller: str) -> None:
+    """One line per caller per 60 s: the gate runs in loops, not once.
+
+    The dedup key is the **caller string**, not a stack position: `stack()[1]`
+    reports `gate` for every consumer that reaches `usage_of` through it, so a
+    stack-based key collapses all of them into one bogus location.
+    """
+    now = time.time()
+    if now - _WARN_SEEN.get(caller, 0.0) < WARN_WINDOW_S:
+        return
+    _WARN_SEEN[caller] = now
+    print(f"[ctx-gate] usage_of: status 无 ctx_state，按 absent 处理（caller={caller}）",
+          file=sys.stderr)
+
+
+def usage_of(st: dict | None, caller: str = "unknown") -> float | None:
+    """Extract the ctx ratio (0..1); `None` when it **cannot be judged**.
+
+    The top guard is the point of #94: a number that is old, or whose window is
+    unknown, must not be read as "this session is at 30%". Only `live` may be
+    judged; `stale` and `absent` and *no state at all* all return `None`, so the
+    gate degrades to `allow-unknown` instead of refusing on a stale figure.
+
+    A status without `ctx_state` counts as `absent` - it means the producer has
+    not been upgraded (or is the bus cache, which carries no value time), and
+    treating that as `live` is exactly the old wrong answer.
+    """
+    if not isinstance(st, dict) or st.get("ctx_state") != "live":
+        if isinstance(st, dict) and "ctx_state" not in st:
+            _warn_no_state(caller)
         return None
     u = st.get("context_usage")
     if isinstance(u, (int, float)) and u >= 0:
@@ -269,7 +301,7 @@ def gate(sid: str, *, force: bool = False, operator: str = "",
     except Exception as exc:  # noqa: BLE001  status lookup failure means "unknown"
         if not quiet:
             print(f"[ctx-gate] 取状态失败（{type(exc).__name__}: {exc}）", file=sys.stderr)
-    u = usage_of(st)
+    u = usage_of(st, caller="ctx_gate.gate")
     kind, key = session_kind(sid, cfg.sessions_path)
     v, code, msg = verdict(u, kind, force, sid=sid,
                            sessions_path=(cfg.sessions_path if cfg else None))
@@ -367,10 +399,36 @@ def self_test() -> int:
           and _is_fixed_key("qa-lwa-ISS-9") and _is_fixed_key(_joined("re", "ed") + "_1030"))
     check("一次性键不命中白名单", not _is_fixed_key("wk-paid-mail-20261101")
           and not _is_fixed_key("qa-ISS-19") and not _is_fixed_key("kimi"))
-    check("usage 直取", usage_of({"context_usage": 0.63}) == 0.63)
-    check("usage 由 tokens/cap 算", abs((usage_of({"context_tokens": 630, "max_context_tokens": 1000}) or 0) - 0.63) < 1e-9)
-    check("usage 取不到返回 None", usage_of({}) is None and usage_of(None) is None)
-    check("空 status 不算 0%", usage_of({"status": {}}) is None)
+    # 自测要能被脚本当纯文本读：先占住去重键，免得「无 ctx_state」那条断言
+    # 把一条设计内的 WARN 打到 stderr（WARN 本身行为不变，只是这里已记过）。
+    _WARN_SEEN["self_test"] = time.time()
+    check("usage 直取", usage_of({"ctx_state": "live", "context_usage": 0.63},
+                                 caller="self_test") == 0.63)
+    check("usage 由 tokens/cap 算",
+          abs((usage_of({"ctx_state": "live", "context_tokens": 630,
+                         "max_context_tokens": 1000}, caller="self_test") or 0)
+              - 0.63) < 1e-9)
+    check("usage 取不到返回 None",
+          usage_of({}, caller="self_test") is None
+          and usage_of(None, caller="self_test") is None)
+    check("空 status 不算 0%",
+          usage_of({"ctx_state": "live", "status": {}}, caller="self_test") is None)
+    # #94 顶部守卫：stale 与 absent 都不可判，无字段也算 absent。
+    check("stale 不可判（诱饵数字不算）",
+          usage_of({"ctx_state": "stale", "context_usage": 0.42,
+                    "context_tokens": 297329, "max_context_tokens": 1000000},
+                   caller="self_test") is None)
+    check("stale 只留 tokens/cap 也不可判",
+          usage_of({"ctx_state": "stale", "context_tokens": 297329,
+                    "max_context_tokens": 1000000}, caller="self_test") is None)
+    check("absent 不可判",
+          usage_of({"ctx_state": "absent", "context_tokens": 5,
+                    "max_context_tokens": 10}, caller="self_test") is None)
+    check("无 ctx_state 按 absent",
+          usage_of({"context_usage": 0.63}, caller="self_test") is None)
+    check("live 正常判线",
+          usage_of({"ctx_state": "live", "context_tokens": 297329,
+                    "max_context_tokens": 1000000}, caller="self_test") == 0.297329)
 
     # The gate must call the injected provider, not read a state endpoint itself.
     gate_src = inspect.getsource(gate)

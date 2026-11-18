@@ -76,7 +76,7 @@ class DecisionMatrix(Fixture):
         # The count is assertions inside ctx_gate.self_test(); it is a literal on
         # purpose - see this file's Neutrality tests for why ctx_gate must not
         # read another repo's sources. Bump this number when you add a check.
-        self.assertIn("--self-test: 30/30 通过", out.getvalue())
+        self.assertIn("--self-test: 35/35 通过", out.getvalue())
 
     def test_thresholds_and_force(self):
         cases = [
@@ -113,8 +113,8 @@ class DecisionMatrix(Fixture):
         self.assertIn("ctx 未知", msg)
         self.assertIn("[ctx-gate] PASS", err)
         self.assertEqual(self.lines()[-1]["note"].count("unknown=true"), 1)
-        (v2, code2, _), err2, _ = self.run_gate(value={"context_usage": 0.93},
-                                                force=True)
+        (v2, code2, _), err2, _ = self.run_gate(
+            value={"ctx_state": "live", "context_usage": 0.93}, force=True)
         self.assertEqual((v2, code2), ("hard-cap", 6))
         self.assertIn("BLOCK", err2)
         self.assertNotIn("--force 已越过门禁", err2)
@@ -133,11 +133,11 @@ class DecisionMatrix(Fixture):
 
     def test_key_name_drives_kind_decision_end_to_end(self):
         (v_long, code_long, _), _, _ = self.run_gate(
-            sid="sid-long", value={"context_usage": 0.63})
+            sid="sid-long", value={"ctx_state": "live", "context_usage": 0.63})
         (v_one, code_one, _), _, _ = self.run_gate(
-            sid="sid-one", value={"context_usage": 0.34})
+            sid="sid-one", value={"ctx_state": "live", "context_usage": 0.34})
         (v_one_spent, code_one_spent, _), _, _ = self.run_gate(
-            sid="sid-one", value={"context_usage": 0.63})
+            sid="sid-one", value={"ctx_state": "live", "context_usage": 0.63})
         self.assertEqual((v_long, code_long), ("refuse-60", 4))
         self.assertEqual((v_one, code_one), ("allow", 0))
         self.assertEqual((v_one_spent, code_one_spent), ("refuse-35", 8))
@@ -145,14 +145,48 @@ class DecisionMatrix(Fixture):
 
 class Injection(Fixture):
     def test_provider_three_states_allow_refuse_unknown(self):
-        for value, expect in (({"context_usage": 0.10}, ("allow", 0)),
-                              ({"context_tokens": 780, "max_context_tokens": 1000},
-                               ("refuse-75", 5)),
+        for value, expect in (({"ctx_state": "live", "context_usage": 0.10},
+                               ("allow", 0)),
+                              ({"ctx_state": "live", "context_tokens": 780,
+                                "max_context_tokens": 1000}, ("refuse-75", 5)),
                               (None, ("allow-unknown", 0))):
             with self.subTest(value=value):
                 (v, code, _), _, calls = self.run_gate(value=value)
                 self.assertEqual((v, code), expect)
                 self.assertEqual(calls, ["sid-long"])
+
+    def test_stale_and_absent_are_not_judged(self):
+        """#94: an old number, or a missing state, must degrade to unknown."""
+        for value in ({"ctx_state": "stale", "context_usage": 0.42,
+                       "context_tokens": 297329, "max_context_tokens": 1000000},
+                      {"ctx_state": "stale", "context_tokens": 297329,
+                       "max_context_tokens": 1000000},
+                      {"ctx_state": "absent", "context_tokens": 5,
+                       "max_context_tokens": 10}):
+            with self.subTest(value=value):
+                (v, code, msg), _, _ = self.run_gate(value=value)
+                self.assertEqual((v, code), ("allow-unknown", 0))
+                self.assertIn("ctx 未知", msg)
+
+    def test_missing_ctx_state_warns_once_per_caller(self):
+        """No `ctx_state` is `absent` **and** says so, keyed by caller string."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            ctx_gate.usage_of({"context_usage": 0.42}, caller="probe.a")
+            ctx_gate.usage_of({"context_usage": 0.42}, caller="probe.a")
+            ctx_gate.usage_of({"context_usage": 0.42}, caller="probe.b")
+        lines = [ln for ln in err.getvalue().splitlines() if "usage_of" in ln]
+        self.assertEqual(len(lines), 2, err.getvalue())
+        self.assertIn("caller=probe.a", lines[0])
+        self.assertIn("caller=probe.b", lines[1])
+
+    def test_usage_of_never_reads_the_raw_carrier(self):
+        """`context_tokens_raw` is not a judging input: only the named fields are."""
+        st = {"ctx_state": "live", "context_tokens_raw": 297329,
+              "max_context_tokens": 1000000}
+        self.assertIsNone(ctx_gate.usage_of(st, caller="probe.raw"))
+        st["context_tokens"] = 297329
+        self.assertAlmostEqual(ctx_gate.usage_of(st, caller="probe.raw"), 0.297329)
 
     def test_provider_exception_is_unknown_and_visible(self):
         def broken(sid):
@@ -190,7 +224,7 @@ class Injection(Fixture):
         self.assertEqual(self.lines(), [])
 
     def test_configure_sets_all_three_defaults_and_gate_accepts_them(self):
-        status, calls = self.provider({"context_usage": 0.10})
+        status, calls = self.provider({"ctx_state": "live", "context_usage": 0.10})
         cfg = ctx_gate.configure(status_provider=status,
                                  sessions_path=self.sessions,
                                  ledger_path=self.ledger)
@@ -206,14 +240,16 @@ class Injection(Fixture):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             v, code, _ = ctx_gate.gate(
-                "sid-long", status_provider=lambda sid: {"context_usage": 0.10},
+                "sid-long",
+                status_provider=lambda sid: {"ctx_state": "live",
+                                             "context_usage": 0.10},
                 sessions_path=self.sessions, ledger_path=bad_ledger)
         self.assertEqual((v, code), ("allow", 0))
         self.assertIn("ledger 写入失败（不阻断）", err.getvalue())
 
     def test_dry_ledger_skips_write_but_keeps_decision(self):
-        (v, code, _), _, _ = self.run_gate(value={"context_usage": 0.63},
-                                          dry_ledger=True)
+        (v, code, _), _, _ = self.run_gate(
+            value={"ctx_state": "live", "context_usage": 0.63}, dry_ledger=True)
         self.assertEqual((v, code), ("refuse-60", 4))
         self.assertEqual(self.lines(), [])
 
@@ -226,7 +262,8 @@ class SessionsTable(Fixture):
         self.write_raw("{not-json")
         self.assertEqual(ctx_gate.session_kind("sid-long", self.sessions),
                          ("one-shot", ""))
-        (v, code, _), _, _ = self.run_gate(value={"context_usage": 0.63})
+        (v, code, _), _, _ = self.run_gate(
+            value={"ctx_state": "live", "context_usage": 0.63})
         self.assertEqual((v, code), ("refuse-35", 8))
 
     def test_non_object_top_level_is_one_shot(self):
@@ -251,7 +288,8 @@ class CliMapping(Fixture):
             from super_agent import ctx_gate
             ctx_gate.configure(
                 status_provider=lambda sid: (
-                    {"context_usage": float(sys.argv[1])} if sys.argv[1] != "none" else None),
+                    {"ctx_state": "live", "context_usage": float(sys.argv[1])}
+                    if sys.argv[1] != "none" else None),
                 sessions_path=sys.argv[2], ledger_path=sys.argv[3])
             raise SystemExit(ctx_gate.main(%r))
         """) % (list(args),)
@@ -274,7 +312,8 @@ class CliMapping(Fixture):
                     from super_agent import ctx_gate
                     ctx_gate.configure(
                         status_provider=lambda sid: (
-                            {"context_usage": float(sys.argv[1])}
+                            {"ctx_state": "live",
+                             "context_usage": float(sys.argv[1])}
                             if sys.argv[1] != "none" else None),
                         sessions_path=sys.argv[2], ledger_path=sys.argv[3])
                     raise SystemExit(ctx_gate.main(%r))
@@ -306,7 +345,7 @@ class CliMapping(Fixture):
             cwd=str(ROOT), capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         # Literal on purpose: bump it when you add a check to ctx_gate.self_test().
-        self.assertIn("--self-test: 30/30 通过", proc.stdout)
+        self.assertIn("--self-test: 35/35 通过", proc.stdout)
 
 
 class Neutrality(unittest.TestCase):
