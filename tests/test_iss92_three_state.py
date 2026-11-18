@@ -47,18 +47,25 @@ class Carrier(unittest.TestCase):
         return self.store.load_index()["assignments"]["a1"]["status"]
 
     # 反例 1：只写传输层 journal，业务层一个字节都不许动。
+    #   **同根**：journal 与 index.json 放同一个 state 根（生产布局）。分开放
+    #   会让「accepted 漏进业务层」的变异无法被捕获——那是本单第一轮的缺口
+    #   （QA 把变异写进 `_journal_put` 并同根后，状态确实变成 completed，
+    #   而分根的测试仍 8 passed）。
     def test_1_accepted_never_becomes_completed(self):
         from super_agent import wss_bus as bus_mod
 
-        with tempfile.TemporaryDirectory() as jd:
-            old = bus_mod.STATE.journal
-            bus_mod.STATE.journal = bus_mod.Journal(Path(jd) / "j.jsonl")
-            try:
-                bus_mod._journal_put("rid-1", "send", "session_x",
-                                     {"prompt_id": "p1"})
-                self.assertIsNotNone(bus_mod.STATE.journal.get("rid-1"))
-            finally:
-                bus_mod.STATE.journal = old
+        old = bus_mod.STATE.journal
+        bus_mod.STATE.journal = bus_mod.Journal(self.root / "wss_bus_journal.jsonl")
+        try:
+            bus_mod._journal_put("rid-1", "send", "session_x",
+                                 {"prompt_id": "p1"})
+            self.assertIsNotNone(bus_mod.STATE.journal.get("rid-1"))
+            # Same root, one level apart: the journal sits beside index.json.
+            self.assertEqual(self.root, self.store.root)
+            self.assertTrue((self.root / "wss_bus_journal.jsonl").is_file())
+            self.assertTrue((self.root / "index.json").is_file())
+        finally:
+            bus_mod.STATE.journal = old
         self.assertEqual(self._status(), "waiting_release")
         self.assertNotEqual(self._status(), "completed")
 
