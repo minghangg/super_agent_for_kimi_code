@@ -113,14 +113,17 @@ class CachePath(unittest.TestCase):
 
     ``BASE`` follows whoever owns the package, so a default of
     ``BASE/state/kimi_ws_cache.json`` silently reads an empty file after the
-    move. Omitting ``cache_file`` must therefore return ``{}`` **and** warn.
+    move. Omitting ``cache_file`` must therefore miss **visibly** (#92 §F.1):
+    the answer carries ``_degraded`` instead of a bare ``{}`` that every caller
+    reads as "the session has no data anywhere".
     """
 
-    def test_omitted_cache_file_returns_empty_and_warns(self):
+    def test_omitted_cache_file_misses_visibly_and_warns(self):
         from super_agent import direct
 
         with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertEqual(direct.cached("iss25-probe"), {})
+            self.assertEqual(direct.cached("iss25-probe"),
+                             {"_degraded": "no_cache_file"})
         msg = err.getvalue()
         self.assertIn("cache_file", msg)
         self.assertIn("跳过", msg)
@@ -135,7 +138,8 @@ class CachePath(unittest.TestCase):
                            encoding="utf-8")
             rec = direct.cached("sid-1", cache_file=tmp)
             self.assertEqual(rec.get("status"), {"busy": True})
-            self.assertEqual(direct.cached("missing", cache_file=tmp), {})
+            self.assertEqual(direct.cached("missing", cache_file=tmp),
+                             {"_degraded": "missing"})
         finally:
             tmp.unlink(missing_ok=True)
             tmp.parent.rmdir()

@@ -2040,7 +2040,10 @@ def announce_upstream() -> str:
     line = f"上游解析：port={PORT} source={src} ws_url={url} degraded={degraded}{note}"
     LAST_ANNOUNCE["ws_url"] = str(url)
     LAST_ANNOUNCE["note"] = note
-    print(line, flush=True)
+    # Same rule as ``note_degraded``: a startup notice is not data. It goes to
+    # stderr so a consumer that reads stdout as a stream cannot inherit it
+    # (#92 §F.6).
+    print(line, file=sys.stderr, flush=True)
     return line
 
 
@@ -2888,9 +2891,27 @@ def bus_post(path: str, body: dict, timeout: float = 20.0, port: int | None = No
 
 
 def note_degraded(why: str = "") -> None:
-    """Count one degradation (log only — no request; the dead "pretend down" code is gone)."""
+    """Count one degradation and say so on **stderr**, never on stdout (#92 §F.6).
+
+    ``log()`` still writes stdout because it is the daemon's own console line.
+    A degradation notice is different: it is runtime health noise emitted while
+    a *consumer* is reading a data stream, so it must not land in that stream.
+    ``python tools/sess.py status <sid> | jq`` broke on exactly this line -
+    ``json.loads`` answered ``Extra data`` (#92 §P1-3).
+
+    The file record is kept, so the degradation is still in ``wss_bus.log``.
+    """
     STATE.degraded_calls += 1
-    log(f"degraded: {why}")
+    line = f"{datetime.now().strftime('%m-%d %H:%M:%S')} wss_bus: degraded: {why}"
+    print(line, file=sys.stderr, flush=True)
+    try:
+        root = current_state_root()
+        p = root / "wss_bus.log"
+        root.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except (OSError, RuntimeError):
+        pass
 
 
 # --------------------------------------------------------------------- self-test

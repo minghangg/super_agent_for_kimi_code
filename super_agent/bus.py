@@ -102,8 +102,12 @@ def get(path: str, caller: str, timeout: float = 3.0, quiet_404: bool = True):
 
 
 # --------------------------------------------------------------------- 读动作
-def status(sid: str, caller: str = "status") -> dict | None:
-    """会话状态（bus 优先）。bus 拿不到上下文时返回 None，交调用方直连。"""
+def status(sid: str, caller: str = "status", cache_file: Path | None = None) -> dict | None:
+    """会话状态（bus 优先）。bus 拿不到上下文时返回 None，交调用方直连。
+
+    ``cache_file`` 透传给直连侧的 ``direct.status``：谁知道缓存路径谁传。
+    不传＝行为不变（仍走 ``{"_degraded": "no_cache_file"}`` 那条可见的降级）。
+    """
     if mode() != "direct":
         d = get(f"/state/{sid}", caller)
         if d and d.get("ok"):
@@ -122,7 +126,7 @@ def status(sid: str, caller: str = "status") -> dict | None:
             return None                 # bus 模式下不偷偷直连
     if mode() == "bus":
         return None
-    d2 = K.status(sid) or {}
+    d2 = K.status(sid, cache_file=cache_file) or {}
     if not d2 or d2.get("_err"):
         return None
     d2["_source"] = f"direct({d2.get('_source') or '?'})"

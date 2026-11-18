@@ -313,9 +313,21 @@ def _send_ws(frame: dict, timeout: float = 8.0) -> dict:
 
 # --------------------------------------------------------------------- 读
 def cached(sid: str, max_age: float = 90.0, cache_file: Path | None = None) -> dict:
-    """读 `kimi_ws_cache.py` 落的缓存；过期/不存在返回 {}。
+    """Read the cache the daemon writes; a miss **says why** instead of ``{}``.
 
-    注意：daemon 有**自己的** state-dir 缓存，不要拿这份冒充实时。
+    The daemon has **its own** state-dir cache, so this is never live data - and
+    this module no longer guesses where that cache is: the caller knows its own
+    ``BASE``, so it passes the path (#92 §F.1).
+
+    Three misses, three answers, all carrying ``_degraded``:
+
+    * ``no_cache_file`` - nobody said where the cache is;
+    * ``missing`` - the path does not exist or does not parse;
+    * ``stale`` - the record is older than ``max_age``, with ``ts`` attached.
+
+    A bare ``{}`` used to mean all three, and every consumer read it as "no
+    data available anywhere" - invisible, un-machine-checkable, and impossible
+    to tell from a healthy session with an empty record (#92 §F.1 route ③).
     """
     import time as _time
 
@@ -323,16 +335,17 @@ def cached(sid: str, max_age: float = 90.0, cache_file: Path | None = None) -> d
     if path is None:
         print("direct.cached: 未指定 cache_file，跳过读缓存（缓存位于调用方 state 目录；"
               "本模块已迁移，不再推断默认路径）", file=sys.stderr)
-        return {}
+        return {"_degraded": "no_cache_file"}
     try:
         d = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {}
+        return {"_degraded": "missing"}
     rec = (d.get("sessions") or {}).get(sid) or {}
     if not isinstance(rec, dict) or not rec:
-        return {}
-    if max_age and _time.time() - int(rec.get("ts") or 0) > max_age:
-        return {}
+        return {"_degraded": "missing"}
+    ts = int(rec.get("ts") or 0)
+    if max_age and _time.time() - ts > max_age:
+        return {"_degraded": "stale", "ts": ts}
     return rec
 
 
@@ -362,8 +375,12 @@ def status_template() -> dict:
     return {k: None for k in STATUS_KEYS}
 
 
-def status(sid: str) -> dict:
-    """会话运行状态。旧代走 `/status`；新代 = `/sessions/{id}` + WS agent/usage。"""
+def status(sid: str, cache_file: Path | None = None) -> dict:
+    """会话运行状态。旧代走 `/status`；新代 = `/sessions/{id}` + WS agent/usage。
+
+    ``cache_file`` is threaded down to the cache read, because the caller is the
+    only part that knows where its state directory is (#92 §F.2 F-3).
+    """
     info = session_info(sid)
     out: dict = status_template()          # 键集恒定，值可为 None
     if isinstance(info, dict) and "_err" not in info:
@@ -403,7 +420,7 @@ def status(sid: str) -> dict:
         out["_source"] = "ws:agent+usage"
         return out
 
-    rec = cached(sid, max_age=180)
+    rec = cached(sid, max_age=180, cache_file=cache_file)
     st_rec = rec.get("status") if isinstance(rec.get("status"), dict) else {}
     if st_rec:
         out.update({k: v for k, v in st_rec.items() if v is not None})
@@ -411,7 +428,9 @@ def status(sid: str) -> dict:
         return out
 
     out["_source"] = (f"degraded(sessions/{{id}}; ws:{wsres.get('err') or 'no frame'}; "
-                      f"cache:miss)")
+                      f"cache:{rec.get('_degraded') or 'miss'})")
+    if rec.get("_degraded"):
+        out["_degraded"] = rec["_degraded"]
     return out
 
 
@@ -445,7 +464,7 @@ def has_pending(sid: str, info: dict | None = None) -> bool:
     return bool(d) and d.get("pending_interaction") not in (None, "none", "")
 
 
-def pending_interactions(sid: str) -> list:
+def pending_interactions(sid: str, cache_file: Path | None = None) -> list:
     """待批交互。旧代 `/snapshot`；新代 WS `interaction` 帧 + 缓存。"""
     if not is_new():
         st, payload = get(f"/api/v1/sessions/{sid}/snapshot", timeout=10)
@@ -482,7 +501,7 @@ def pending_interactions(sid: str) -> list:
                     "action": req.get("action") or json.dumps(req, ensure_ascii=False)[:200],
                     "kind": p.get("kind") or "approval",
                     "raw": p})
-    rec = cached(sid, max_age=180)
+    rec = cached(sid, max_age=180, cache_file=cache_file)
     for it in (rec.get("pending") or []):
         aid = it.get("approval_id") if isinstance(it, dict) else None
         if aid and aid not in seen:
@@ -495,7 +514,7 @@ def pending_interactions(sid: str) -> list:
     return out
 
 
-def tasks(sid: str) -> list:
+def tasks(sid: str, cache_file: Path | None = None) -> list:
     """后台任务列表。旧代 REST；新代 WS `task.list` + 缓存。"""
     if not is_new():
         st, payload = get(f"/api/v1/sessions/{sid}/tasks", timeout=10)
@@ -517,7 +536,7 @@ def tasks(sid: str) -> list:
                     table[it["task_id"]] = norm_task(it)
         elif t == "task" and f.get("task_id"):
             table[f["task_id"]] = norm_task(f)
-    rec = cached(sid, max_age=300)
+    rec = cached(sid, max_age=300, cache_file=cache_file)
     for tid, it in ((rec.get("tasks") or {}) if isinstance(rec, dict) else {}).items():
         if tid in table or not isinstance(it, dict):
             continue
