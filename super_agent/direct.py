@@ -25,7 +25,10 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -269,7 +272,8 @@ def _ws_status(sid: str, timeout: float = 2.0) -> dict:
         elif t == "task.list":
             out["tasks"] = f.get("tasks") or []
     if not out["err"] and not out["agent"] and not out["usage"]:
-        out["err"] = "no agent/usage frame (subscribe_v2 需要 transcript={main:turn})"
+        out["err"] = ("no agent/usage frame (subscribe_v2 已带 transcript={main:turn}，"
+                      "服务端未推送 agent/usage 帧)")
     return out
 
 
@@ -358,6 +362,202 @@ def session_info(sid: str) -> dict:
     return {"_err": f"http={st} {str(payload)[:120]}", "_source": "rest"}
 
 
+# --------------------------------------------------------------------- 上下文可判性
+# 一个数字能不能拿去判线，取决于它有多旧、窗口知不知道。这两件事原来都不在
+# 返回值里，于是 47 天前的旧值被当成现值判 60% 交接线（#94）。本段补三件事：
+# 值产生时刻（`value_ts`）、年龄（`age_s`）、可判性（`ctx_state`）。
+#
+# `ctx_state` 三值，只读语义：
+#   live   —— 有值、`age_s <= CTX_STALE_S`、窗口已知 ⇒ 可判
+#   stale  —— 有值但过期 ⇒ 数字仍由 `context_tokens_raw` 承载，判据字段不可判
+#   absent —— 无值（含 sid 不存在、wire 无记录、窗口未知）
+CTX_STALE_S = 300
+WIRE_BLOCK = 64 * 1024
+
+_MODEL_SECTION = re.compile(r'^\[models\.(?:"([^"]+)"|([A-Za-z0-9_\-]+))\]', re.M)
+_MODEL_MAX = re.compile(r'^max_context_size\s*=\s*(\d+)', re.M)
+_MODEL_INNER = re.compile(r'^model\s*=\s*"([^"]*)"', re.M)
+
+_WINDOWS_CACHE: dict = {}
+
+
+def _wire_root() -> Path:
+    """wire 根：`SESS_WIRE_ROOT`（隔离自测）> `kimi_paths.sessions_dir()`。"""
+    raw = (os.environ.get("SESS_WIRE_ROOT") or "").strip()
+    return Path(os.path.expanduser(raw)) if raw else kimi_paths.sessions_dir()
+
+
+def _wire_files(sid: str) -> list:
+    try:
+        return list(_wire_root().glob(f"*/{sid}/agents/main/wire.jsonl"))
+    except OSError:
+        return []
+
+
+def _iter_wire_records(path: Path, block: int = WIRE_BLOCK):
+    """Yield parsed records newest-first, reading tail-out in ``block`` chunks.
+
+    A line straddles a block boundary: its head sits in the older chunk. The
+    head-less fragment of the newer chunk is carried over and glued back, so no
+    line is lost and none is parsed twice.
+    """
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            pos, pending = size, b""
+            while pos > 0:
+                step = min(block, pos)
+                pos -= step
+                fh.seek(pos)
+                data = fh.read(step) + pending
+                lines = data.split(b"\n")
+                if pos > 0:
+                    pending = lines[0]
+                    body = lines[1:]
+                else:
+                    pending, body = b"", lines
+                for raw in reversed(body):
+                    if not raw.strip():
+                        continue
+                    try:
+                        rec = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if isinstance(rec, dict):
+                        yield rec
+    except OSError:
+        return
+
+
+def _model_windows(config_file: Path | None = None) -> dict:
+    """`[models.*]` 段 → {键名: 窗口, 段内 model 名: 窗口}。
+
+    `config.toml` 有 4 个**不带引号**的段（`[models.cb-hy4-preview]` 之类），
+    只匹配引号段会漏，故两条分支都要。Python 3.10 无 `tomllib`，用 20 行正则
+    代替第三个依赖；取不到就是取不到，不填默认窗口。
+    """
+    path = Path(config_file) if config_file is not None else kimi_paths.config_file()
+    try:
+        stamp = path.stat().st_mtime
+    except OSError:
+        return {}
+    key = (str(path), stamp)
+    cached = _WINDOWS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    out: dict = {}
+    marks = [(m.start(), m.group(1) or m.group(2))
+             for m in _MODEL_SECTION.finditer(text)]
+    for idx, (start, name) in enumerate(marks):
+        end = marks[idx + 1][0] if idx + 1 < len(marks) else len(text)
+        body = text[start:end]
+        got = _MODEL_MAX.search(body)
+        if not got:
+            continue
+        cap = int(got.group(1))
+        out.setdefault(name, cap)
+        inner = _MODEL_INNER.search(body)
+        if inner and inner.group(1):
+            out.setdefault(inner.group(1), cap)
+    _WINDOWS_CACHE.clear()
+    _WINDOWS_CACHE[key] = out
+    return out
+
+
+def _window_of(model: str) -> int | None:
+    if not model:
+        return None
+    return _model_windows().get(model)
+
+
+def _ctx_from_usage(usage: dict) -> int:
+    """一轮的真实上下文：四加数。漏 `output` 会把占用算低（#94 已核 39/87）。"""
+    return sum(int(usage.get(k) or 0) for k in
+               ("inputOther", "inputCacheRead", "inputCacheCreation", "output"))
+
+
+def wire_ctx(sid: str) -> dict:
+    """从该会话 wire 尾部取上下文，并给出可判性。
+
+    只认末条 `type=="usage.record" and usageScope=="turn"`：`session` 级记录是
+    全会话累计，取值会偏大。`usage.record.time` 是**毫秒**。
+
+    第 5 条路（`token_counting.turn_recorded`）只在第 4 条无可用记录时使用；
+    **不许**用它把一个已判 `stale` 的第 4 条值洗新——旧值换个来源还是旧值。
+    两条都无 ⇒ `absent`。
+    """
+    now = time.time()
+    hits = _wire_files(sid)
+    if not hits:
+        return {"ctx_state": "absent", "value_ts": None, "age_s": None,
+                "context_tokens_raw": None, "max_context_tokens": None,
+                "_source": "wire:no_file"}
+
+    try:
+        path = max(hits, key=lambda p: p.stat().st_mtime)
+    except OSError:
+        path = hits[0]
+
+    turn_usage = None
+    fallback = None
+    model_hint = ""
+    scanned_whole = True
+    for rec in _iter_wire_records(path):
+        kind = rec.get("type") or ""
+        if kind == "usage.record":
+            if not model_hint:
+                # 模型是会话级事实，不是值：用它定窗口不会把旧值洗新。
+                model_hint = rec.get("model") or ""
+            if rec.get("usageScope") == "turn":
+                turn_usage = rec
+                scanned_whole = False      # 命中即停，没读到文件头
+                break
+        elif kind == "token_counting.turn_recorded" and fallback is None:
+            fallback = rec
+
+    scan = "full" if scanned_whole else "tail"
+    if turn_usage is not None:
+        usage = turn_usage.get("usage") or {}
+        total = _ctx_from_usage(usage if isinstance(usage, dict) else {})
+        value_ts = float(turn_usage.get("time") or 0) / 1000.0
+        route = "usage.record"
+        model = turn_usage.get("model") or ""
+        cap = _window_of(model)
+        raw = total
+    elif fallback is not None:
+        raw = int(fallback.get("tokens") or 0)
+        value_ts = float(fallback.get("time") or 0) / 1000.0
+        route = "turn_recorded"
+        # 该记录不带模型名，窗口只能取本会话最近一条 usage.record 的模型；
+        # 取不到就是不知道，不填默认值。
+        model, cap = model_hint, _window_of(model_hint)
+    else:
+        return {"ctx_state": "absent", "value_ts": None, "age_s": None,
+                "context_tokens_raw": None, "max_context_tokens": None,
+                "_source": f"wire:no_record(scan={scan})"}
+
+    if not value_ts:
+        return {"ctx_state": "absent", "value_ts": None, "age_s": None,
+                "context_tokens_raw": None, "max_context_tokens": None,
+                "_source": f"wire:{route}(no_time, scan={scan})"}
+
+    age = int(now - value_ts)
+    window = f"window={cap}" if cap else "window=unknown"
+    if cap is None:
+        state = "absent"          # 无窗口 ⇒ 占用率算不出，值仍由 _raw 承载
+    elif age > CTX_STALE_S:
+        state = "stale"
+    else:
+        state = "live"
+    return {"ctx_state": state, "value_ts": int(value_ts), "age_s": age,
+            "context_tokens_raw": raw, "max_context_tokens": cap,
+            "_source": f"wire({route},age={age}s,{window},scan={scan})"}
+
+
 # status 的**键集契约**：bus 与 direct 两条路必须返回完全相同的键集合。
 # 2026-11-06 步 2 返工 P0-2：daemon 侧原样透出 rec["status"]，而该 dict 只在
 # 对应帧推过之后才有键 ⇒ 安静会话缺 archived/main_turn_active 等。定义在这里，
@@ -367,7 +567,15 @@ STATUS_KEYS = (
     "archived", "model", "thinking_level", "permission", "plan_mode",
     "swarm_mode", "tower_mode", "context_tokens", "max_context_tokens",
     "context_usage", "agent_status",
+    # 可判性三键（#94）：不进模板就会被 `_norm_status` 丢掉，bus 路径于是恒无
+    # `ctx_state`，一旦 WS 修好就 WARN 刷屏。
+    "ctx_state", "value_ts", "age_s",
 )
+
+# 判据之外的原始值：**不进 STATUS_KEYS**。它经过 `json.dumps` 要看得见（只读属性
+# 会全丢），所以是普通 dict 键；「非判据」由 `ctx_gate.usage_of()` 不读它保证，
+# 并有两个自测断言钉住（`direct` 侧查它不进模板，`ctx_gate` 侧查守卫先看状态）。
+NON_JUDGE_KEYS = ("context_tokens_raw",)
 
 
 def status_template() -> dict:
@@ -375,11 +583,41 @@ def status_template() -> dict:
     return {k: None for k in STATUS_KEYS}
 
 
+def _apply_ctx(out: dict, ctx: dict) -> dict:
+    """把 wire 侧的上下文结论落到 status 上，判据字段与原始值分开。
+
+    `ctx_state != "live"` 时判据三字段一起置 None（纵深防御）：只清
+    `context_usage` 不够，`context_tokens`／`max_context_tokens` 还在，
+    `usage_of()` 的第二分支会立刻把一个过期值复活成占用率。
+    原值不丢，改由 `context_tokens_raw` 承载。
+    """
+    state = ctx.get("ctx_state") or "absent"
+    out["ctx_state"] = state
+    out["value_ts"] = ctx.get("value_ts")
+    out["age_s"] = ctx.get("age_s")
+    out["context_tokens_raw"] = ctx.get("context_tokens_raw")
+    cap = ctx.get("max_context_tokens")
+    if state == "live":
+        tok = ctx.get("context_tokens_raw")
+        out["context_tokens"] = tok
+        out["max_context_tokens"] = cap
+        out["context_usage"] = (tok / cap) if (isinstance(tok, (int, float))
+                                               and isinstance(cap, int) and cap) else None
+    else:
+        out["context_tokens"] = None
+        out["max_context_tokens"] = None
+        out["context_usage"] = None
+    return out
+
+
 def status(sid: str, cache_file: Path | None = None) -> dict:
     """会话运行状态。旧代走 `/status`；新代 = `/sessions/{id}` + WS agent/usage。
 
     ``cache_file`` is threaded down to the cache read, because the caller is the
     only part that knows where its state directory is (#92 §F.2 F-3).
+
+    上下文的**可判性**（#94）：每条出口都要给 `ctx_state`／`value_ts`／`age_s`，
+    否则「有没有值」与「值还能不能用来判线」又被混成同一件事。
     """
     info = session_info(sid)
     out: dict = status_template()          # 键集恒定，值可为 None
@@ -391,12 +629,26 @@ def status(sid: str, cache_file: Path | None = None) -> dict:
             "last_turn_reason": info.get("last_turn_reason"),
             "archived": info.get("archived"),
         })
+    elif isinstance(info, dict) and "40401" in str(info.get("_err") or ""):
+        # sid 不存在：无值，不是「读坏了」。判据要给 absent，不能落到 none(...)。
+        out["ctx_state"] = "absent"
+        out["_source"] = "absent(http=40401)"
+        return out
 
     if not is_new():
         st, payload = get(f"/api/v1/sessions/{sid}/status", timeout=10)
         d = data_of(payload)
         if st == 200 and isinstance(d, dict) and code_of(payload) in (0, None):
             d.setdefault("_source", "rest:/status")
+            # 旧代没有值时刻，只能按「刚取到」算；窗口与占比齐备才算 live。
+            tok, cap = d.get("context_tokens"), d.get("max_context_tokens")
+            if isinstance(tok, (int, float)) and isinstance(cap, int) and cap:
+                d["ctx_state"] = "live"
+                d["value_ts"] = int(time.time())
+                d["age_s"] = 0
+                d["context_tokens_raw"] = tok
+            else:
+                d["ctx_state"] = "absent"
             return d
 
     wsres = _ws_status(sid)
@@ -411,10 +663,14 @@ def status(sid: str, cache_file: Path | None = None) -> dict:
             "plan_mode": agent.get("plan_mode"),
             "swarm_mode": agent.get("swarm_mode"),
             "tower_mode": agent.get("tower_mode"),
-            "context_tokens": tok,
-            "max_context_tokens": cap,
-            "context_usage": (tok / cap) if (isinstance(tok, int) and isinstance(cap, int) and cap) else None,
         })
+        if isinstance(tok, (int, float)) and isinstance(cap, int) and cap:
+            # 帧刚到：值就是此刻的，窗口由帧给出。
+            _apply_ctx(out, {"ctx_state": "live", "value_ts": int(time.time()),
+                             "age_s": 0, "context_tokens_raw": tok,
+                             "max_context_tokens": cap})
+        else:
+            _apply_ctx(out, wire_ctx(sid))     # 帧里没数字 ⇒ 退到 wire，不假装有值
         if agent.get("status"):
             out["agent_status"] = agent["status"]
         out["_source"] = "ws:agent+usage"
@@ -423,12 +679,27 @@ def status(sid: str, cache_file: Path | None = None) -> dict:
     rec = cached(sid, max_age=180, cache_file=cache_file)
     st_rec = rec.get("status") if isinstance(rec.get("status"), dict) else {}
     if st_rec:
-        out.update({k: v for k, v in st_rec.items() if v is not None})
-        out["_source"] = f"ws_cache(age={int(__import__('time').time()) - int(rec.get('ts') or 0)}s)"
+        out.update({k: v for k, v in st_rec.items() if v is not None
+                    and k not in NON_JUDGE_KEYS})
+        # 缓存记录没有值时刻，`ts` 是「最后一次被碰」而不是「值产生时」，
+        # 拿它当 `value_ts` 会把旧值洗新 —— 正是 #94 的病。故一律另算；
+        # wire 也说不出可判性时，缓存里的判据数字一并清掉（原值留在 `_raw`）。
+        wire = wire_ctx(sid)
+        _apply_ctx(out, wire)
+        if wire.get("ctx_state") == "absent":
+            out["context_tokens_raw"] = st_rec.get("context_tokens")
+        out["_source"] = f"ws_cache(age={int(time.time()) - int(rec.get('ts') or 0)}s)"
+        return out
+
+    wire = wire_ctx(sid)
+    _apply_ctx(out, wire)
+    if wire.get("ctx_state") != "absent":
+        out["_source"] = f"direct({wire.get('_source') or 'wire'})"
         return out
 
     out["_source"] = (f"degraded(sessions/{{id}}; ws:{wsres.get('err') or 'no frame'}; "
-                      f"cache:{rec.get('_degraded') or 'miss'})")
+                      f"cache:{rec.get('_degraded') or 'miss'}; "
+                      f"wire:{wire.get('_source') or 'none'})")
     if rec.get("_degraded"):
         out["_degraded"] = rec["_degraded"]
     return out
