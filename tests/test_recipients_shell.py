@@ -15,7 +15,7 @@ from super_agent import decide_watch as dw
 
 
 class Fallback(unittest.TestCase):
-    """With no ``to_role`` the four-level chain answers exactly as before."""
+    """With no ``to_role`` the plain chain answers (supervisor only since #72)."""
 
     def test_none_and_no_role_fall_back_to_the_chain(self):
         calls = []
@@ -87,8 +87,13 @@ class OnTheDeliveryPath(unittest.TestCase):
                              event_source=lambda: [],
                              heartbeat=lambda *a, **k: None,
                              send_transport=lambda *a, **k: True))
+        # #72: the delivery target is the supervisor. Before #72 this fixture had
+        # only a bare ``pm-demo`` key - it passed because the bare key was leg
+        # ①, which is the defect #72 removes. Keeping it would now mean "nobody
+        # to send to" (empty resolver ⇒ undelivered, sent=0).
         (tmp / "sessions.json").write_text(json.dumps(
-            {"pm-demo": {"id": "session_00000000-0000-4000-8000-000000000001"}}),
+            {"pm-demo": {"id": "session_00000000-0000-4000-8000-000000000001"},
+             "supervisor": {"id": "session_00000000-0000-4000-8000-000000000002"}}),
             encoding="utf-8")
         rec = {"v": 1, "project": "demo", "repo": "acme/demo", "issue": 1,
                "worker_name": "wk", "worker_session": "", "pm_key": "pm-demo",
@@ -117,31 +122,80 @@ class OnTheDeliveryPath(unittest.TestCase):
         self.assertNotIn("resolve_recipients(rec[", src)
 
 
-class TheFourSitesAreMarked(unittest.TestCase):
-    """§P0-1b: the four ``f"pm-{proj}"`` sites carry the #72 marker."""
+class TheChainIsTheSupervisorOnly(unittest.TestCase):
+    """#72: the bare-key leg and the broadcast leg are gone; supervisor is it.
 
-    def test_decide_watch_marks_three_sites(self):
+    Before #72 this class was ``TheFourSitesAreMarked`` and asserted the bare
+    ``pm-<project>`` lookup **must still be there**. That was the marking of an
+    unfinished job, not a behaviour worth keeping - the test had to change with
+    the code or it would have blocked the fix it was written for.
+    """
+
+    def _configure(self, tmp, sessions):
+        import json
+        from dataclasses import replace
+        from pathlib import Path
+
+        tmp = Path(tmp)
+        saved = dw._cfg()
+        self.addCleanup(lambda: dw.configure(saved))
+        dw.configure(replace(saved, state_root=tmp, workspace_root=tmp,
+                             sessions_path=tmp / "sessions.json"))
+        (tmp / "sessions.json").write_text(json.dumps(sessions), encoding="utf-8")
+
+    def test_a_bare_pm_key_does_not_become_a_recipient(self):
+        # The whole point of #72's part 2: a bare ``pm-<project>`` key sitting in
+        # sessions.json must not win the delivery. It used to be appended first,
+        # and ``_send_delivery`` breaks on the first target it can send.
+        import tempfile
+
+        self._configure(tempfile.mkdtemp(), {
+            "pm-demo": {"id": "session_pm_demo"},
+            "supervisor": {"id": "session_sup"},
+        })
+        self.assertEqual(dw.resolve_recipients("acme/demo"),
+                         [("supervisor", "session_sup")])
+
+    def test_nothing_resolves_to_empty_not_to_a_broadcast(self):
+        # Part 1: with the supervisor missing there is no third leg that spills
+        # the delivery to whatever ``pm-*`` happens to be alive. Empty means the
+        # caller records it as undelivered and retries.
+        import tempfile
+
+        self._configure(tempfile.mkdtemp(), {
+            "pm-demo": {"id": "session_pm_demo"},
+            "pm-other-1a2b3c4d": {"id": "session_pm_other"},
+        })
+        self.assertEqual(dw.resolve_recipients("acme/demo"), [])
+
+    def test_the_resolver_carries_no_level_docs_and_no_alarm_leg(self):
+        import inspect
+
+        src = inspect.getsource(dw.resolve_recipients)
+        self.assertNotIn('pm_key = f"pm-{proj}"', src)
+        self.assertNotIn("live_pm_sids", src)
+
+    def test_the_module_no_longer_mentions_the_broadcast_leg(self):
         import inspect
 
         src = inspect.getsource(dw)
-        self.assertEqual(src.count("#72 落地点"), 2)
-        # ...and the payload site is the one that injects pm_key/pm_sid.
+        self.assertNotIn("live_pm_sids", src)
+        # ...but the payload sites that name ``pm_key`` for the event body stay:
+        # they are data, not recipient resolution.
         self.assertIn("pm_key", inspect.getsource(dw._send_delivery))
 
-    def test_brief_marks_its_site(self):
+    def test_brief_scopes_by_the_shared_predicate(self):
+        # brief.py:230 was a dumb filter (``k == f"pm-<project>"``) that matched
+        # nothing live; #72 part 3 routes it through the same ``scoped_by`` the
+        # engine uses, so a rotated key is listed instead of "无".
         import inspect
 
         from super_agent import brief
 
-        self.assertIn("#72 落地点", inspect.getsource(brief))
-
-    def test_behaviour_is_unchanged(self):
-        # A comment must not rename the key: the chain still looks for the bare
-        # ``pm-<project>`` until #72 changes it.
-        import inspect
-
-        self.assertIn('pm_key = f"pm-{proj}" if proj else ""',
-                      inspect.getsource(dw.resolve_recipients))
+        src = inspect.getsource(brief._projects_items)
+        self.assertIn('sessionkeys.scoped_by(k, "pm", project)', src)
+        # The old dumb filter, as an assignment: a comment may still quote it.
+        self.assertNotIn('keys = [k for k in keys if k == f"pm-{project}"]', src)
 
 
 if __name__ == "__main__":

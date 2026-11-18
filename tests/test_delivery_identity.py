@@ -105,8 +105,12 @@ class BothDeliveriesGoOut(unittest.TestCase):
                              event_source=lambda: [],
                              heartbeat=lambda *a, **k: None,
                              send_transport=lambda *a, **k: True))
+        # The recipient is the supervisor (#72: the bare ``pm-<project>`` key is
+        # no longer a leg). The bare key stays in the roster on purpose - this
+        # test must still go out with it present.
         (tmp / "sessions.json").write_text(json.dumps(
-            {"pm-n": {"id": "session_00000000-0000-4000-8000-000000000001"}}),
+            {"pm-n": {"id": "session_00000000-0000-4000-8000-000000000001"},
+             "supervisor": {"id": "session_00000000-0000-4000-8000-000000000002"}}),
             encoding="utf-8")
         st = dw.load_delivery_state()
         # The second delivery lands **outside** the burst window (ISS-83): inside it,
