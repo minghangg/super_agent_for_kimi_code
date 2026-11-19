@@ -78,7 +78,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import (at_serve, envelope, github_source, health, issuekey, markers,
-               needs, session_events, sessionkeys)
+               needs, session_events, session_ledger, sessionkeys)
 from . import assignments as asg_mod
 from .allowlist import ProjectAllowlist
 from .store import Store, action_id
@@ -128,13 +128,11 @@ TASK_PREFIX_RE = re.compile(
 
 # A full session id: ``session_`` + a UUID. Anything shorter is a *truncated*
 # id, and a truncated id can never be delivered to - the server answers 40401
-# for it. This repository is public and must not import the private workbench,
-# so the regex exists here as a second copy by necessity; its docstring
-# counterpart is ``tools/sess_events.py:FULL_SID_RE`` in the workbench, and the
-# two must change together (ISS-74).
-SID_RE = re.compile(
-    r"^session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-    re.IGNORECASE)
+# for it. The one copy lives in :mod:`super_agent.session_ledger`
+# (``FULL_SID_RE``); this module reuses it instead of holding a second regex, so
+# the shape cannot drift. Import direction is safe: ``session_ledger`` imports
+# ``session_events``, and neither imports this module.
+SID_RE = session_ledger.FULL_SID_RE
 
 
 
