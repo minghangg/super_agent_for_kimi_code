@@ -61,8 +61,10 @@ class ChainResolution(unittest.TestCase):
         self.assertEqual(got, root / "events.jsonl")
 
     def test_checkout_beside_cwd_is_not_a_source(self):
-        """The old level: a checkout next to the working directory, file present."""
-        beside = self.tmp / session_events.LWA_DIRNAME / "state"
+        """A checkout beside the working directory is not a source, with or
+        without a stream file in it. ``legacy_checkout`` is a literal: the
+        property is "no directory name is guessed", so the name must not matter."""
+        beside = self.tmp / "legacy_checkout" / "state"
         beside.mkdir(parents=True)
         (beside / session_events.EVENTS_NAME).write_text("", encoding="utf-8")
         os.chdir(self.tmp)

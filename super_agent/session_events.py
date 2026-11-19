@@ -43,16 +43,6 @@ EVENTS_NAME = "events.jsonl"
 ENV_STATE_DIR = "SESS_EVENTS_STATE_DIR"
 ENV_LWA_STATE = "LWA_STATE_DIR"
 
-
-def _joined(*parts: str) -> str:
-    """Assemble private names from fragments (the privacy gate greps whole words)."""
-    return "".join(parts)
-
-
-# Workbench checkout directory name, and its session console entry point.
-LWA_DIRNAME = _joined("Lai", "ke_work_with_", "agent")
-SESS_CONSOLE = "sess.py"
-
 # Event types this module understands. An unknown type is carried through as a
 # no-op instead of failing: a newer writer must never break an older reader.
 CREATED = "session.created"
