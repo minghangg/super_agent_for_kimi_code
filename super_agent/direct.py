@@ -177,17 +177,26 @@ def ping_reply(frame: dict) -> dict | None:
 
     **这条不写下来必再踩**：不回 pong 时服务端约 20 秒后以 close 1001 踢连接，
     表现是「WS 循环正常结束、日志无异常」，极难定位（2026-11-06 实测 5 次重连）。
+
+    2.6 的 ping 是裸的 ``{"type":"ping"}``（无 payload.nonce），pong 也只回
+    ``{"type":"pong"}``；2.5.x 带 nonce 并原样回传。有 nonce 就带，没有就不带。
     """
     if (frame.get("type") or "") != "ping":
         return None
     nonce = (frame.get("payload") or {}).get("nonce") or ""
-    return {"type": "pong", "payload": {"nonce": nonce}}
+    if nonce:
+        return {"type": "pong", "payload": {"nonce": nonce}}
+    return {"type": "pong"}
 
 
 class WSProbe:
-    """一次性 WS 探针：连上 → hello → subscribe_v2 → 收帧 → 关。
+    """一次性 WS 探针：连上 → subscribe → 收帧 → 关。
 
-    **订阅必须带 `transcript={"main":"turn"}`**，否则服务端只 ack 不推初始状态。
+    **2.6 协议（实测 2.6.2）**：帧是平铺的，命令带 `request_id`，应答是
+    `{"type":"response","request_id",code}`；订阅命令叫 `subscribe`，参数是
+    `agent_ids` 数组。2.5.x 的 `client_hello` + `subscribe_v2` + `transcript`
+    对象在 2.6 上**完全无回应**（连 hello 都不回），这是 #94 之后整条 WS 路径
+    静默失效的根因。两条都保留：老服务端仍回 `ack`。
     """
 
     def __init__(self, sid: str, timeout: float = 2.0, transcript: str = TRANSCRIPT_GRADE):
@@ -205,12 +214,10 @@ class WSProbe:
         try:
             with connect(_ws_url(), open_timeout=max(3.0, self.timeout),
                          additional_headers={"Authorization": f"Bearer {token()}"}) as ws:
-                ws.send(json.dumps({"type": "client_hello", "id": uuid.uuid4().hex,
-                                    "payload": {"client_id": "kimi-direct-probe"}}))
+                # 2.6：平铺帧 + subscribe + agent_ids 数组
                 ws.send(json.dumps({
-                    "type": "subscribe_v2", "id": uuid.uuid4().hex,
-                    "payload": {"session_id": self.sid,
-                                "transcript": {AGENT: self.transcript}},
+                    "type": "subscribe", "request_id": uuid.uuid4().hex,
+                    "session_id": self.sid, "agent_ids": [AGENT],
                 }))
                 for _ in range(max(1, budget)):
                     try:
@@ -260,7 +267,7 @@ def flat(msg: dict) -> dict:
 
 
 def _ws_status(sid: str, timeout: float = 2.0) -> dict:
-    frames, err = WSProbe(sid, timeout=timeout).collect(want=("agent", "usage"), budget=12)
+    frames, err = WSProbe(sid, timeout=timeout).collect(want=("agent", "context"), budget=12)
     out: dict = {"agent": {}, "usage": {}, "tasks": [], "err": err}
     for msg in frames:
         t = msg.get("type") or ""
@@ -269,11 +276,15 @@ def _ws_status(sid: str, timeout: float = 2.0) -> dict:
             out["agent"] = f
         elif t == "usage":
             out["usage"] = f
+        elif t == "context":
+            # 2.6 把上下文从 `usage` 拆成独立的 `context` 帧，字段名不变
+            # （context_tokens / max_context_tokens），只是帧名换了。
+            out["usage"] = f
         elif t == "task.list":
             out["tasks"] = f.get("tasks") or []
     if not out["err"] and not out["agent"] and not out["usage"]:
-        out["err"] = ("no agent/usage frame (subscribe_v2 已带 transcript={main:turn}，"
-                      "服务端未推送 agent/usage 帧)")
+        out["err"] = ("no agent/context frame (subscribe 已带 agent_ids=[main]，"
+                      "服务端未推送 agent/context 帧)")
     return out
 
 

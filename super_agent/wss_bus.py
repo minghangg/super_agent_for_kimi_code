@@ -636,7 +636,9 @@ def absorb(msg: dict) -> dict | None:
             "agent_status": f.get("status"),
             "busy": f.get("status") == "running",
         })
-    elif t == "usage":
+    elif t in ("usage", "context"):
+        # 2.6 把上下文从 `usage` 拆成独立的 `context` 帧，字段名不变
+        # （context_tokens / max_context_tokens），只是帧名换了。两个都认。
         tok, cap = f.get("context_tokens"), f.get("max_context_tokens")
         rec["status"].update({
             "context_tokens": tok, "max_context_tokens": cap,
@@ -735,18 +737,25 @@ def _rotate_events() -> None:
 
 # --------------------------------------------------------------------- subscribe
 async def _subscribe(ws, sid: str) -> str:
-    """Send a subscribe frame and return the ack id the caller keys off."""
+    """Send a subscribe frame and return the request id the caller keys off.
+
+    2.6 协议（实测 2.6.2）：帧平铺、命令带 `request_id`、应答是
+    `{"type":"response","request_id",code}`。2.5.x 的 `subscribe_v2` +
+    `transcript` 对象在 2.6 上被静默忽略（不报错、不回应），订阅于是永远
+    停在 "pending ack"、`subscribed=0`、`ready=false` —— 这是整条 WS 路径
+    失效的根因。
+    """
     ack_id = uuid.uuid4().hex
     await ws.send_json({
-        "type": "subscribe_v2", "id": ack_id,
-        "payload": {"session_id": sid, "transcript": {AGENT: TRANSCRIPT_GRADE}},
+        "type": "subscribe", "request_id": ack_id,
+        "session_id": sid, "agent_ids": [AGENT],
     })
     return ack_id
 
 
 async def _handshake(ws) -> None:
-    await ws.send_json({"type": "client_hello", "id": uuid.uuid4().hex,
-                        "payload": {"client_id": "wss-bus"}})
+    # 2.6 不需要 client_hello：服务端只要求回应 ping。发它无害（不认识的
+    # 帧类型会被忽略），但不发可以少一次往返，也让日志里少一条无回应的帧。
     wanted = _targets()
     STATE.subscribed = {}                 # rebuilt after every reconnect
     for sid in wanted:
@@ -756,16 +765,25 @@ async def _handshake(ws) -> None:
 
 
 def _mark_ack(frame: dict) -> None:
-    """Handle subscribe_v2 ack: success flips ok=True, failure records why."""
-    if frame.get("type") not in ("ack", "error"):
+    """Handle the subscribe reply: success flips ok=True, failure records why.
+
+    2.6 的应答是 ``{"type":"response","request_id",code}``；2.5.x 是
+    ``{"type":"ack"|"error","id",code}``。两者都认，因为服务端版本随机器
+    而变，而这段代码要在两代上都不撒谎。
+    """
+    t = frame.get("type") or ""
+    if t not in ("ack", "error", "response"):
         return
-    rid = frame.get("id") or ""
+    rid = frame.get("id") or frame.get("request_id") or ""
     code = frame.get("code")
     p = frame.get("payload") or {}
     for sid, rec in STATE.subscribed.items():
         if rec.get("ack_id") != rid:
             continue
         if code not in (0, None):
+            # 2.6 的失败码是具体的：40401 会话不存在、40930/40931/40932
+            # 无法打开（40932 = 被其他客户端更新）。它们都不是"订阅面坏"，
+            # 而是"这一个会话此刻打不开"，所以只标这一条，不牵连全局。
             rec.update(ok=False, reason=f"code={code} {frame.get('msg') or ''}".strip(),
                        ts=time.time())
         else:
@@ -2112,7 +2130,7 @@ async def producer() -> None:
                                 continue
                             if t in ("pong", "server_hello"):
                                 continue
-                            if t in ("ack", "error"):
+                            if t in ("ack", "error", "response"):
                                 _mark_ack(frame)
                                 continue
                             ev = absorb(frame)
@@ -2362,8 +2380,8 @@ def _send_unsubscribe(sid: str) -> None:
     loop = WS_REF.get("loop")
     if ws is None or loop is None:
         return
-    frame = {"type": "unsubscribe_v2", "id": uuid.uuid4().hex,
-             "payload": {"session_id": sid}}
+    frame = {"type": "unsubscribe", "request_id": uuid.uuid4().hex,
+             "session_id": sid}
     try:
         asyncio.run_coroutine_threadsafe(ws.send_json(frame), loop)
     except Exception:  # noqa: BLE001  best effort: a failed frame costs us nothing
@@ -4030,7 +4048,7 @@ async def _once(wait: float) -> int:
                         continue
                     if t in ("pong", "server_hello"):
                         continue
-                    if t in ("ack", "error"):
+                    if t in ("ack", "error", "response"):
                         _mark_ack(frame)
                         continue
                     types[t] = types.get(t, 0) + 1
