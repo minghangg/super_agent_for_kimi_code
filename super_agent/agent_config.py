@@ -34,10 +34,20 @@ package and keeps the tests offline.
 Note on ``paths.state_dir``: it is injected as both ``state_dir`` and
 ``engine.session_state_dir`` so that the ledger and the engine share one root.
 When it is not configured the derived fallback is ``config.DEFAULTS["state_dir"]``
-(``data``), which is a **known degradation**, not a fix: the close guard reads
+(``data``) **resolved against this checkout**, so the two keys stay equal and
+the value does not move with the process working directory. That absolute path
+is still a **known degradation**, not a fix: the close guard reads
 ``<workbench>/state/ledger.jsonl`` and cannot see a ledger written under
-``data/``. Point ``paths.state_dir`` at that workbench's ``state/`` to make the
-two the same file.
+``<checkout>/data/``. Point ``paths.state_dir`` at that workbench's ``state/``
+to make the two the same file.
+
+Note on ``github.allowlist_file``: it has **no** default here. This module is
+the private layer, and a public placeholder path is not a private fact -- when
+it was used as a default, :func:`overrides` overwrote a ``--config`` file's own
+``engine.project_allowlist`` on every run (a deep merge puts overrides last),
+which silently replaced a deployment's project table with the shipped one. When
+nothing configures it, :func:`overrides` injects nothing and the caller's own
+fallback decides (``cli._repo_allowlist``, ``issue_cli._allowlist_path``).
 """
 from __future__ import annotations
 
@@ -74,7 +84,9 @@ DEFAULTS = {
     "github.projects_file": "",
     "github.token_env": "GITHUB_TOKEN",
     "github.token_file": str(CHECKOUT / "auth" / "github.env"),
-    "github.allowlist_file": str(CHECKOUT / "config" / "allowlist.json"),
+    # No default for ``github.allowlist_file``: see the module docstring. A
+    # placeholder path here would outrank a deployment's own ``--config``.
+    "github.allowlist_file": "",
     "paths.state_dir": "",
     "paths.sessions_dir": "",
     "quota.config_file": "",
@@ -264,12 +276,19 @@ def overrides() -> dict:
     not configured. That derivation is the **only** fallback in the package:
     ``session_ledger.root()`` and ``session_events`` add none, because a second
     one is how two answers start disagreeing about the same file.
+
+    The derived value is **absolute** -- ``<checkout>/data`` -- not the bare
+    ``"data"`` relative path it used to be. A relative value is resolved against
+    whatever the process's working directory happens to be, so the same command
+    run from the checkout and from the workbench wrote two different ledgers,
+    and the close guard read neither of the two it expected (P0-1, #98 fix 1).
     """
     from . import config as config_mod
 
     out: dict = {}
     state = state_dir()
-    session_root = state or str(config_mod.DEFAULTS.get("state_dir") or "")
+    session_root = state or str(
+        (CHECKOUT / str(config_mod.DEFAULTS.get("state_dir") or "data")).resolve())
     if state:
         out["state_dir"] = state
     engine: dict = {}
