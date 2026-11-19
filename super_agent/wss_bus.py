@@ -624,6 +624,11 @@ def absorb(msg: dict) -> dict | None:
     t = (msg.get("type") or "").strip()
     f = _flat(msg)
     sid = f.get("session_id") or f.get("sid") or ""
+    if not sid and t == "session":
+        # 2.7 的 session 帧是整对象快照：sid 在 `session.id` 里，不在顶层。
+        _ses = f.get("session")
+        if isinstance(_ses, dict):
+            sid = str(_ses.get("id") or "")
     if not t or not sid:
         return None
     rec = STATE.session(sid)
@@ -648,6 +653,24 @@ def absorb(msg: dict) -> dict | None:
         # 值时刻只在这里刷新：`ts`/`event_ts` 对**任何**帧都刷新（见本函数
         # 末尾），拿它们算 age 会把旧 tokens 洗成"刚刚"（#94 的病）。
         rec["value_ts"] = int(time.time())
+    elif t == "session":
+        # session 帧是**整对象快照**，不是增量：服务端没给的键就是没有，不许保留
+        # 旧值（否则一条 created 帧能把 archived 洗回 False）。
+        # 2.7 把 `busy`/`main_turn_active` 换成了 `activity` 三态，旧键从它派生；
+        # `activity` 缺失时两个旧键置 None（不许 None 冒充 False）。
+        # asyncapi.json 的 `session_event.payload.session` 确实带这些字段
+        # （activity: idle|turn|background），这是接上正式字段，不是凭空加键。
+        ses = f.get("session")
+        if isinstance(ses, dict) and ses:
+            act = ses.get("activity")
+            rec["status"].update({
+                "activity": act,
+                "last_turn_outcome": ses.get("last_turn_outcome"),
+                "pending_interaction": ses.get("pending_interaction"),
+                "archived": ses.get("archived"),
+                "busy": (act != "idle") if act is not None else None,
+                "main_turn_active": (act == "turn") if act is not None else None,
+            })
     elif t in ("event.session.work_changed", "session.work_changed"):
         rec["status"].update({
             "busy": f.get("busy"), "main_turn_active": f.get("main_turn_active"),
@@ -912,11 +935,16 @@ async def _watch_new_sessions(ws) -> None:
                 info = await asyncio.to_thread(K.session_info, sid)
                 if isinstance(info, dict) and "_err" not in info:
                     r = STATE.session(sid)
+                    # 2.7 的 REST 补帧口与 `absorb()` 的 session 分支同口径：
+                    # 旧键从 `activity` 派生，缺 `activity` 则留 None（ISS-103 P0-2）。
+                    act = info.get("activity")
                     r["status"].update({
-                        "busy": info.get("busy"),
-                        "main_turn_active": info.get("main_turn_active"),
+                        "activity": act,
+                        "last_turn_outcome": info.get("last_turn_outcome"),
+                        "busy": (act != "idle") if act is not None else None,
+                        "main_turn_active": (act == "turn") if act is not None else None,
                         "pending_interaction": info.get("pending_interaction"),
-                        "last_turn_reason": info.get("last_turn_reason"),
+                        "archived": info.get("archived"),
                     })
                     r["snapshot_ts"] = int(time.time())
                     r["ts"] = int(time.time())

@@ -27,6 +27,7 @@ See README.md for the full contract and the provenance of every step.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -214,6 +215,25 @@ def stop_guard(marker: str, progress_dir: str) -> str:
 
 class DispatchError(RuntimeError):
     """Raised for any unrecoverable failure in the dispatch pipeline."""
+
+
+class NeedsPerson(Exception):
+    """派单停在「必须有人答」的交互上（2.7 的 `question` 交互）。
+
+    为什么不是 `DispatchError` 的子类：两者的处置方向相反。超时/失败是「这单
+    没成」，人看一眼就能重派；`needs_person` 是「这单在等人答，答案会污染任务
+    书」。混成一个异常，上层就只能把「在等人」当失败处理，于是又回到「超时即
+    失败」的老病（ISS-103 P0-1.4）。
+
+    退出码 3，与 `wait_session` 的既有 3 同一档语义（「结论不确定，别看 rc 判
+    成败」）。
+    """
+
+    def __init__(self, detail: str, interaction_id: str = "", kind: str = "question") -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.interaction_id = interaction_id
+        self.kind = kind
 
 
 def _dev_quota():
@@ -599,9 +619,15 @@ def reuse_session(base: str, token: str, sid: str) -> str:
                   file=sys.stderr)
     # 2026-10-31：会话在忙时派第二个 turn 会排队/串味。这里**只警告不阻断**
     # （有些调用方确实要排队），要硬打断用 `python -m super_agent.console abort <sid>`。
-    if info.get("busy"):
-        print(f"[dispatch] WARNING: session {sid} 正在忙（busy=true）；"
+    # 2.7 没有 `busy` 键（读完恒 None ⇒ 告警永不触发），真源是 `activity` 三态：
+    # `turn` 才会与本单排队；`background` 只是后台任务在跑，主轮空着。
+    act = info.get("activity")
+    if act == "turn":
+        print(f"[dispatch] WARNING: session {sid} 正有 turn 在跑（activity=turn）；"
               f"本单会排队。要打断请先 python -m super_agent.console abort {sid}")
+    elif act == "background":
+        print(f"[dispatch] WARNING: session {sid} 有后台任务在跑（activity=background）；"
+              f"主轮空闲，本单可直接开始")
     return str(info.get("title") or sid)
 
 
@@ -837,10 +863,210 @@ def apply_profile(base: str, token: str, sid: str, agent_config: dict) -> dict:
     return data.get("agent_config", {})
 
 
-def submit_prompt(base: str, token: str, sid: str, text: str) -> str:
-    body = {"content": [{"type": "text", "text": text}]}
-    data = unwrap(http_post(f"{base}/api/v1/sessions/{sid}/prompts", token, body), "submit prompt")
-    return data.get("prompt_id", "")
+def submit_prompt(base: str, token: str, sid: str, text: str,
+                  prompt_id: str = "") -> tuple[str, str]:
+    """投一轮消息。返回 `(prompt_id, status)`；status ∈ running|queued|blocked|failed。
+
+    `prompt_id` 是本单的幂等键（KAP §3.C.2）：同一 `prompt_id` 重投，服务端回
+    `40927 conflict` 而不产生第二轮。`40927` 说明「这一轮已经投过了」，调用方
+    应当直接进 `:wait`，**不许**当成失败重投——重投正是重复跑一轮的来源。
+
+    `status=queued` 是**合法**回执（会话正忙时新轮排队），它不是「已开始」，
+    调用方必须走 `await_turn_start` 等到 `ordinal` 增长（ISS-103 P0-5）。
+    """
+    body: dict = {"content": [{"type": "text", "text": text}]}
+    if prompt_id:
+        body["prompt_id"] = prompt_id
+    payload = http_post(f"{base}/api/v1/sessions/{sid}/prompts", token, body)
+    if payload.get("code") == 40927:
+        return prompt_id, "running"          # 已投过：幂等命中，按「在跑」处理
+    data = unwrap(payload, "submit prompt")
+    st = str(data.get("status") or "")
+    return str(data.get("prompt_id") or ""), st
+
+
+def prompt_ref(issue: str, round_no: int, text: str) -> str:
+    """幂等键 `{单号}-{轮次}-{内容哈希前8}`（KAP §3.C.2 的 `prompt_id`）。"""
+    digest = hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:8]
+    return f"{issue or 'adhoc'}-{int(round_no)}-{digest}"
+
+
+def current_ordinal(base: str, token: str, sid: str) -> int:
+    """提交**之前**取基线序号。空会话（还没有 turn）返回 -1。
+
+    必须在 `submit_prompt` 之前调用：提交后再取，很可能已经拿到新轮的序号，
+    栅栏于是立刻放行，等于没有栅栏。
+    """
+    d = unwrap(http_get(f"{base}/api/v1/sessions/{sid}/agents/main/turns?page_size=1",
+                        token), "read turns")
+    turns = d.get("turns") or []
+    if not turns:
+        return -1
+    return int(turns[0].get("ordinal") or -1)
+
+
+def await_turn_start(base: str, token: str, sid: str, prev_ordinal: int,
+                     expect_prompt_id: str = "", deadline_s: float = 60.0) -> int:
+    """提交后确认**新**一轮真的开始，返回新 turn 的 ordinal。
+
+    唯一判据是 `ordinal > prev_ordinal`（ISS-103 P0-5）。**不许**加旁路：
+
+      · `turn.status == "running"` —— 对正在跑的会话派单时，最新 turn 本就是
+        上一轮且 `status=running`，第一条就放行，于是 `:wait` 在上一轮结束时
+        收尾，返回上一轮的答案（看着像成功，比超时更坏）；
+      · `session.activity == "turn"` —— 同理，与「新轮是否排上队」无关。
+
+    `status=queued` 时本函数会一直等到该轮真正落地，这正是它存在的意义。
+    """
+    until = time.time() + deadline_s
+    while time.time() < until:
+        d = unwrap(http_get(f"{base}/api/v1/sessions/{sid}/agents/main/turns?page_size=2",
+                            token), "read turns")
+        for t in (d.get("turns") or []):
+            if int(t.get("ordinal") or -1) > prev_ordinal:
+                return int(t["ordinal"])
+        time.sleep(0.5)
+    raise DispatchError(
+        f"round did not start within {deadline_s:.0f}s (session {sid}); "
+        f"prev_ordinal={prev_ordinal} prompt_id={expect_prompt_id!r}"
+        f" —— 派单未生效（不是超时），请查服务端 status/queued 状态")
+
+
+def _decision_for(permission_mode: str) -> str:
+    """`permission-mode` → approval 决策。**未知取值一律 rejected**（fail closed）。
+
+    全仓没有 `PERMISSION_MODE` 这个全局符号，实有的是 `main()` 的
+    `args.permission_mode`；在这里读全局会在实现时直接 `NameError`，异常被兜底
+    吃掉后每条 approval 都落 `rejected` —— 静默错答比卡住更难查。
+    """
+    m = (permission_mode or "").strip().lower()
+    if m in ("auto", "yolo"):
+        return "approved"
+    return "rejected"
+
+
+def _auto_answer(base: str, token: str, sid: str, item: dict,
+                 permission_mode: str) -> dict:
+    """按 kind 应答一条待批交互。返回决策，供调用方记账。
+
+    `question` 不猜：记 `NeedsPerson` 并停。猜测会污染任务书，而 dismiss 会让
+    会话带着错的假设继续产出交付物，两者都比停下更贵。
+    """
+    iid = str(item.get("interaction_id") or "")
+    kind = str(item.get("kind") or "approval")
+    if kind != "approval":
+        raise NeedsPerson(
+            f"pending {kind} {iid}: {(item.get('request') or {}).get('questions') or []}",
+            interaction_id=iid, kind=kind)
+    decision = _decision_for(permission_mode)
+    body = {"kind": "approval", "decision": decision}
+    payload = http_post(f"{base}/api/v1/sessions/{sid}/interactions/{iid}",
+                        token, body, timeout=30)
+    code = payload.get("code")
+    if code in (40404, 41001):
+        # 交互已被别处处理／已过期：**不算派单失败**，回到 `:wait` 即可。
+        return {"interaction_id": iid, "kind": kind, "decision": decision,
+                "outcome": None, "code": code, "note": "interaction gone"}
+    data = unwrap(payload, "answer interaction")
+    return {"interaction_id": iid, "kind": kind, "decision": decision,
+            "outcome": data.get("outcome"), "code": code}
+
+
+def wait_rounds(base: str, token: str, sid: str, timeout: float, prompt_id: str = "",
+                permission_mode: str = "", on_interaction=None) -> dict:
+    """KAP §3.C.3 的 `:wait` 循环。返回 `{outcome, timed_out, interactions_seen}`。
+
+    判据只有两条：`timed_out is False` 且 `activity != "turn"`。用
+    `activity != "idle"` 会让 background 任务永远拦着收尾（KAP 逐字要求 `!== "turn"`）。
+
+    `pending_interactions` 非空时**当场应答**（ISS-103 P0-1.4）：这是「修好 busy
+    读法也仍然超时」的另一半——遇 approval/question 无人应答，`activity` 会一直
+    停在 `turn`，`timed_out` 恒真，一路卡到 timeout。
+    """
+    deadline = time.time() + timeout
+    seen: list = []
+    while True:
+        budget = max(0, min(15000, int((deadline - time.time()) * 1000)))
+        if budget <= 0:
+            raise DispatchError(f"timed out after {timeout:.0f}s waiting for session {sid}"
+                                f"（仍在 turn，非交互阻塞）")
+        data = unwrap(http_post(f"{base}/api/v1/sessions/{sid}:wait", token,
+                                {"timeout_ms": budget}, timeout=budget / 1000 + 20),
+                      "session wait")
+        ses = data.get("session") or {}
+        pending = data.get("pending_interactions") or []
+        if pending:
+            seen.extend(pending)
+            for it in pending:
+                if on_interaction is not None:
+                    on_interaction(it)
+                else:
+                    _auto_answer(base, token, sid, it, permission_mode)
+            continue                          # 应答完立刻回 `:wait`，不干等
+        if bool(data.get("timed_out")) is False and ses.get("activity") != "turn":
+            return {"outcome": ses.get("last_turn_outcome"), "timed_out": False,
+                    "activity": ses.get("activity"), "interactions_seen": seen}
+
+
+def run_turn(base: str, token: str, sid: str, text: str, timeout: float,
+             permission_mode: str = "", quiet: bool = False,
+             prompt_id: str = "") -> str:
+    """投一轮并等到它结束，返回该轮的 assistant 回答。
+
+    顺序是 `ordinal 基线 → 提交 → 栅栏 → :wait 循环 → 读 turns`（方案 §5.1）。
+    基线必须在提交前取，否则栅栏形同虚设——所以这里**不提供**覆盖基线的参数：
+    能传一个假基线，就等于能把 P0-5 的栅栏整个绕过。
+    """
+    prev = current_ordinal(base, token, sid)
+    pid, status = submit_prompt(base, token, sid, text, prompt_id)
+    if status in ("blocked", "failed"):
+        raise DispatchError(f"prompt not accepted: status={status!r} (session {sid})")
+    new_ord = await_turn_start(base, token, sid, prev, expect_prompt_id=pid,
+                               deadline_s=min(120.0, max(30.0, timeout)))
+    res = wait_rounds(base, token, sid, timeout, prompt_id=pid,
+                      permission_mode=permission_mode)
+    if not quiet:
+        print(f"[dispatch] turn ended ordinal={new_ord} "
+              f"outcome={res.get('outcome') or 'unknown'} "
+              f"activity={res.get('activity') or '?'} "
+              f"interactions={len(res.get('interactions_seen') or [])}")
+    if res.get("outcome") == "failed":
+        raise DispatchError(f"turn ended with outcome=failed (session {sid})")
+    # `interrupted` 是本轮被 cancel/steer 收尾，属正常可交付（旧代的 cancelled 同理）。
+    return fetch_final_answer(base, token, sid)
+
+
+def fetch_final_answer(base: str, token: str, sid: str) -> str:
+    """最后一轮里最后一条 `assistant_message` 的正文。取不到返回空串（不是 404）。
+
+    `turns` 默认**新→旧**，`items` 是**旧→新**（与已消失的 `/messages` 相反），
+    所以两层都要 `reversed` —— 少一层就会拿回第一轮的答复。
+    """
+    d = unwrap(http_get(f"{base}/api/v1/sessions/{sid}/agents/main/turns?page_size=5",
+                        token), "fetch turns")
+    for turn in reversed(d.get("turns") or []):
+        for item in reversed(turn.get("items") or []):
+            if not isinstance(item, dict) or item.get("type") != "assistant_message":
+                continue
+            text = str(item.get("text") or "").strip()
+            if text:
+                return text
+    return ""
+
+
+def pending_interactions(base: str, token: str, sid: str) -> list[dict]:
+    """待批交互（2.7 的 `/interactions` 一个端点，旧代 `/approvals`+`/questions` 已合并）。"""
+    d = unwrap(http_get(f"{base}/api/v1/sessions/{sid}/interactions", token),
+               "list interactions")
+    return [{"interaction_id": it.get("interaction_id"), "kind": it.get("kind"),
+             "request": it.get("request") or {}}
+            for it in (d.get("items") or []) if isinstance(it, dict)]
+
+
+def check_pending_interactions(base: str, token: str, sid: str) -> list[str]:
+    """还剩哪些待批交互（只报 kind，供收尾时提示）。空列表表示已清。"""
+    return [str(it.get("kind") or "unknown")
+            for it in pending_interactions(base, token, sid)]
 
 
 def model_self_name(base: str, token: str, model: str, task: str, cwd: str) -> str:
@@ -854,82 +1080,19 @@ def model_self_name(base: str, token: str, model: str, task: str, cwd: str) -> s
     try:
         sid = create_session(base, token, cwd, title="")
         apply_profile(base, token, sid, {"model": model, "permission_mode": "yolo"})
-        submit_prompt(base, token, sid, instruction)
-        text = poll_result(base, token, sid, timeout=90, quiet=True)
+        # 这个会话是用 `permission_mode="yolo"` 建的（上一行），所以应答走 yolo：
+        # 不许在这里读 argv，命名会话与调用方的 permission-mode 无关。
+        text = run_turn(base, token, sid, instruction, timeout=90, quiet=True,
+                        permission_mode="yolo")
         name = slugify(text.splitlines()[0] if text else "", limit=40)
         if name and re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", name):
             print(f"[dispatch] named by {model}: {name}")
             return name
-    except DispatchError as exc:
+    except (DispatchError, NeedsPerson) as exc:
         print(f"[dispatch] naming model unavailable ({exc}); using slug")
     fallback = slugify(task)
     print(f"[dispatch] named by slug: {fallback}")
     return fallback
-
-
-def poll_result(
-    base: str, token: str, sid: str, timeout: float, quiet: bool = False, interval: float = 2.0
-) -> str:
-    """Wait for the turn to end, then return the last assistant text."""
-    deadline = time.time() + timeout
-    reason = ""
-    status: dict = {}
-    while time.time() < deadline:
-        status = unwrap(http_get(f"{base}/api/v1/sessions/{sid}", token), "session status")
-        idle = not status.get("main_turn_active") and not status.get("busy")
-        # last_turn_reason is only populated once the turn is truly over; an
-        # assistant message can appear mid-turn, so it alone is not a stop signal.
-        if idle and status.get("last_turn_reason"):
-            reason = status["last_turn_reason"]
-            break
-        time.sleep(interval)
-    else:
-        raise DispatchError(f"timed out after {timeout:.0f}s waiting for session {sid}")
-
-    if not quiet:
-        usage = status.get("usage") or {}
-        print(
-            f"[dispatch] turn ended reason={reason or 'unknown'} "
-            f"tokens_in={usage.get('input_tokens', 0)} tokens_out={usage.get('output_tokens', 0)}"
-        )
-        if reason and reason != "completed":
-            raise DispatchError(f"turn ended with reason={reason} (session {sid})")
-    return fetch_final_answer(base, token, sid)
-
-
-def fetch_final_answer(base: str, token: str, sid: str) -> str:
-    items = unwrap(
-        http_get(f"{base}/api/v1/sessions/{sid}/messages?role=assistant&page_size=100", token),
-        "fetch messages",
-    ).get("items", [])
-    # Messages come back NEWEST-FIRST (verified 2026-10-15), so the latest
-    # assistant reply is items[0]. Taking items[-1] would return the oldest one.
-    for item in items:
-        parts = [c.get("text", "") for c in item.get("content", []) if isinstance(c, dict)]
-        joined = "".join(parts).strip()
-        if joined:
-            return joined
-    return ""
-
-
-def check_pending_interactions(base: str, token: str, sid: str) -> list[str]:
-    """Return any pending approval/question kinds. Empty list means clear.
-
-    These two endpoints are the ones to inspect when a dispatch hangs: an
-    unattended run can stall waiting for a human decision. See README.
-    """
-    pending: list[str] = []
-    for kind in ("approvals", "questions"):
-        try:
-            data = unwrap(
-                http_get(f"{base}/api/v1/sessions/{sid}/{kind}?status=pending", token),
-                f"list {kind}",
-            )
-        except DispatchError:
-            continue
-        if data.get("items"):
-            pending.append(kind)
-    return pending
 
 
 def activate_session(base: str, token: str, sid: str, timeout: float,
@@ -944,8 +1107,8 @@ def activate_session(base: str, token: str, sid: str, timeout: float,
     name: a verdict carries that key, and nothing else in the conversation
     knows which key this session holds.
     """
-    submit_prompt(base, token, sid, warmup_prompt(charter, name))
-    poll_result(base, token, sid, timeout=min(timeout, 120), quiet=True)
+    run_turn(base, token, sid, warmup_prompt(charter, name),
+             timeout=min(timeout, 120), quiet=True, permission_mode="yolo")
     print("[dispatch] activated (warm-up turn completed)")
     return True
 
@@ -1054,6 +1217,14 @@ def main(argv: list[str] | None = None) -> int:
         help="only print the session's latest assistant message (no new prompt)",
     )
     parser.add_argument(
+        "--round-no", type=int, default=1,
+        help="本单第几轮派单（幂等键 prompt_id 的一段，默认 1）",
+    )
+    parser.add_argument(
+        "--issue", default="",
+        help="单号，仅用于拼幂等键 prompt_id（默认 adhoc）",
+    )
+    parser.add_argument(
         "--skip-quota-gate", action="store_true",
         help="ISS-40 诊断用：跳过派单前算力配额闸（正常派单不用）",
     )
@@ -1143,15 +1314,18 @@ def main(argv: list[str] | None = None) -> int:
     # 守卫句成了每份任务书的纯噪音。不再追加；--stop-marker/--no-stop-guard 保留为兼容 no-op，
     # STOP 文件机制仍在（工具脚本可用），但不再是流程要求，也不自动写进任务书。
     task_text = args.task
-    submit_prompt(base, token, sid, task_text)
+    pidemp = prompt_ref(args.issue, args.round_no, task_text)
     if args.detach:
+        submit_prompt(base, token, sid, task_text, pidemp)
         print(f"[dispatch] detached: session id {sid} (name={name})，未等待回答")
         print(f"[dispatch] 收答案：dispatch.py --session {sid} --task \"只回结论\"")
         if args.json:
             print(json.dumps({"session_id": sid, "name": name, "detached": True,
-                              "model": model, "effort": effort}, ensure_ascii=False))
+                              "model": model, "effort": effort,
+                              "prompt_id": pidemp}, ensure_ascii=False))
         return 0
-    answer = poll_result(base, token, sid, timeout=args.timeout)
+    answer = run_turn(base, token, sid, task_text, timeout=args.timeout,
+                      permission_mode=args.permission_mode, prompt_id=pidemp)
 
     pending = check_pending_interactions(base, token, sid)
     if pending:
@@ -1209,6 +1383,13 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
+    except NeedsPerson as err:
+        # 退出码 3＝「在等人答，结论不确定」，别当失败重派（`wait_session` 同档）。
+        # 打印 `needs_person` ＋ interaction_id，供引擎直接记 `index.needs_person`。
+        print(f"[dispatch] needs_person kind={err.kind} "
+              f"interaction_id={err.interaction_id or '(unknown)'}", file=sys.stderr)
+        print(f"[dispatch] {err.detail}", file=sys.stderr)
+        sys.exit(3)
     except DispatchError as err:
         print(f"[dispatch] ERROR: {err}", file=sys.stderr)
         sys.exit(1)

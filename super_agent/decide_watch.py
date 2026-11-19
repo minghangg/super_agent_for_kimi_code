@@ -1205,6 +1205,17 @@ def probe_liveness(sid: str) -> tuple[str, str]:
     （`sess.py stop` 或 API archive），不能当正常收尾放过——否则「真杀一个
     bound worker ⇒ 恰好一帧」这条验收就不成立了。关单时 `gh_issue.close` 会归档
     本单 worker/QA，所以关单前必须先解绑（`_bound_sids` 里没有就不再看护）。
+
+    **2.7（ISS-103 §1.4③）：判据是 `activity` 三态，不再是 `busy` 布尔。**
+    `busy` 已从会话对象消失 ⇒ 旧写法落到末行恒 `unknown`，而 `unknown` 既不算死
+    也不算活 ⇒ 「真杀一个 bound worker ⇒ 恰好一帧」不再成立（在岗巡查整体失效）。
+    三态映射：`turn` → busy；`background` → busy（主轮之外的活也算在跑）；
+    `idle` → 再按 `pending_interaction`／`archived` 细分，两者都为假才算真 idle。
+
+    ⚠ 这处经 import 转发壳**同时影响 lwa 值守腿**（`tools/decide_watch.py` 转发
+    本模块的 `main`）：lwa 文件 0 字节改动，但死亡判定会开始真的触发，历史上被
+    `unknown` 漏掉的死 worker 会有一批「迟到」的 `liveness_lost` 帧。回滚单点：
+    把本函数的 `activity` 分支改回读 `busy`（即回到恒 `unknown`），无需动 lwa。
     """
     try:
         exists, detail = _probe_session(sid)
@@ -1214,6 +1225,20 @@ def probe_liveness(sid: str) -> tuple[str, str]:
         return LIVENESS_UNKNOWN, "探针无法判定（exists=None）"
     if exists is False:
         return LIVENESS_IDLE, "会话不存在（probe=False）"
+    act = detail.get("activity") if isinstance(detail, dict) else None
+    if act is not None:
+        if act in ("turn", "background"):
+            return LIVENESS_BUSY, "" if act == "turn" else "activity=background"
+        pending = detail.get("pending_interaction")
+        if pending is not None and str(pending).strip().lower() not in ("", "none",
+                                                                       "null", "false"):
+            return LIVENESS_UNKNOWN, f"等人工交互（pending_interaction={pending}）"
+        if detail.get("archived"):
+            # 归档仍是 idle（#69 验收把 archive 当「真杀」），但**要带 why**：
+            # 首轮播种只豁免「活着且空闲」的正常收尾，不能把归档一起放过。
+            return LIVENESS_IDLE, "会话已归档（archived=True）"
+        return LIVENESS_IDLE, ""
+    # 兼容层：2.7 之前的服务端仍有 `busy`。两边都没有 ⇒ 不判，宁 unknown 不误报。
     busy = detail.get("busy") if isinstance(detail, dict) else None
     if busy is True:
         return LIVENESS_BUSY, ""
@@ -1223,11 +1248,9 @@ def probe_liveness(sid: str) -> tuple[str, str]:
                                                                        "null", "false"):
             return LIVENESS_UNKNOWN, f"等人工交互（pending_interaction={pending}）"
         if isinstance(detail, dict) and detail.get("archived"):
-            # 归档仍是 idle（#69 验收把 archive 当「真杀」），但**要带 why**：
-            # 首轮播种只豁免「活着且空闲」的正常收尾，不能把归档一起放过。
             return LIVENESS_IDLE, "会话已归档（archived=True）"
         return LIVENESS_IDLE, ""
-    return LIVENESS_UNKNOWN, "会话对象无 busy 字段"
+    return LIVENESS_UNKNOWN, "会话对象既无 activity 也无 busy 字段"
 
 
 def _bound_sids() -> dict:

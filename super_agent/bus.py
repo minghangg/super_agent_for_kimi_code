@@ -250,9 +250,15 @@ def list_envelopes(caller: str = "sess.list") -> list | None:
             continue
         sid = it.get("id") or ""
         busy = it.get("busy")
+        if busy is None and it.get("activity"):
+            # 2.7 列表项没有 `busy` 键（服务端已按查询条件筛过），按 `activity`
+            # 派生，语义与 `direct.status` 一致（background 也算忙）。
+            busy = it["activity"] != "idle"
         if sid in live:
             st = (live[sid] or {}).get("status") or {}
             if st.get("busy") is not None:
+                # 方向：**只有真值才覆盖**。daemon 的帧更新更近，但一个 None 不许
+                # 把列表项派生的真值抹掉——抹掉之后消费方会把「不知道」当「空闲」。
                 busy = st["busy"]
         out.append({"id": sid, "title": it.get("title"), "busy": busy,
                     "archived": it.get("archived"), "_src": note})

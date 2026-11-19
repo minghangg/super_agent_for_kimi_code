@@ -41,6 +41,16 @@ def _status(base: str, token: str, sid: str) -> dict:
     return D.unwrap(D.http_get(f"{base}/api/v1/sessions/{sid}", token), "status")
 
 
+def _is_idle(st: dict) -> bool:
+    """会话是否真的空着。判据是 `activity` 三态（ISS-103 P0-1.1）。
+
+    旧写法查 `busy`／`main_turn_active`，2.7 两者都没有 ⇒ 恒 `None` ⇒ `not None`
+    为真 ⇒ **一个正在跑的会话会被判成「已经空了」**，于是 `stop` 直接返回 0 而
+    什么都没停。`activity` 缺失时**不判空**（宁可多发一次 abort，不可漏停）。
+    """
+    return st.get("activity") == "idle"
+
+
 def _running_prompt_id(base: str, token: str, sid: str) -> str:
     data = D.unwrap(
         D.http_get(f"{base}/api/v1/sessions/{sid}/prompts?page_size=20", token), "prompts")
@@ -107,8 +117,9 @@ def main() -> int:
     token = D.read_token()
     base = D.discover_base(token, None)
     st = _status(base, token, sid)
-    if not st.get("busy") and not st.get("main_turn_active"):
-        print(f"[stop] already idle (last_turn_reason={st.get('last_turn_reason')})")
+    if _is_idle(st):
+        print(f"[stop] already idle (activity={st.get('activity')}, "
+              f"last_turn_outcome={st.get('last_turn_outcome')})")
         return 0
 
     prompt_id = _running_prompt_id(base, token, sid)
@@ -121,8 +132,9 @@ def main() -> int:
     deadline = time.time() + wait
     while time.time() < deadline:
         st = _status(base, token, sid)
-        if not st.get("busy") and not st.get("main_turn_active"):
-            print(f"[stop] idle now, last_turn_reason={st.get('last_turn_reason')}")
+        if _is_idle(st):
+            print(f"[stop] idle now, activity={st.get('activity')} "
+                  f"last_turn_outcome={st.get('last_turn_outcome')}")
             return 0
         time.sleep(2)
     print(f"[stop] still busy after {wait:.0f}s")

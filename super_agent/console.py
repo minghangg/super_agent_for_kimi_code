@@ -164,7 +164,13 @@ def cmd_list(args):
     for it in items or []:
         if not isinstance(it, dict):
             continue
-        if "--busy" in args and not it.get("busy"):
+        # 2.7 的列表项**没有 `busy` 键**（服务端已按 `?busy=true` 筛过），本地再按
+        # `it.get("busy")` 过滤会把每一项都 `continue` 掉 ⇒ 静默返回空表。
+        # 本地只做 `activity` 派生，且只在服务端没筛过时才有意义。
+        busy_val = it.get("busy")
+        if busy_val is None and it.get("activity"):
+            busy_val = it["activity"] != "idle"
+        if "--busy" in args and not busy_val:
             continue
         if "--archived" in args and not it.get("archived"):
             continue
@@ -173,7 +179,7 @@ def cmd_list(args):
         # 终端仍是 80 列：id 列吃满 44 位，标题按剩余宽度压，busy= 结尾对右。
         sid = str(it.get("id") or "")
         title = " ".join(str(it.get("title") or "").split())
-        tail = f"busy={it.get('busy')}"
+        tail = f"busy={busy_val}"
         sid_col = max(SID_COL, len(sid))
         room = max(MIN_TITLE_COL, LIST_COLS - sid_col - 1 - _width(tail))
         title = _clip(title, room)
@@ -546,21 +552,25 @@ def cmd_stop(args):
 
     src = kimi_api.source()
 
-    # 1) 取消主 turn
-    ok, _d, _via = BUSD.ctl(
-        "abort", sid, caller="sess.py stop",
-        direct_fn=lambda: kimi_api.abort_prompt_session(sid))
-    code = _d.get("code") if isinstance(_d, dict) else None
-    print(f"[1/3] turn:abort aborted={ok} code={code}  [{src}]")
+    # 1) 取消主 turn。2.7（ISS-103 P0-1.5）：`:abort` 已返 40001，正解是 `:cancel`。
+    # 这一步**只停 turn、不动后台任务**（`include_background=False`），后台任务留给
+    # 第 2 步逐个停——这样「谁还活着」在第 3 步复查里仍然看得见。`abort_session`
+    # 写死 `include_background=True`，表达不了这个次序；daemon 的 `abort` 动词也只
+    # 透传无参的 `abort_session`。所以这一步直连，是 `cancel_session` 的独立调用点，
+    # 不是给它包一层壳（ISS-103 P1-b 要求的「不许有函数无人调用」）。
+    ok, code = kimi_api.cancel_session(sid, include_background=False)
+    print(f"[1/3] turn:cancel cancelled={ok} code={code}  [{src}]")
     if not ok:
-        print(f"      警告：abort 未受理（code={code}），继续尝试停任务")
+        print(f"      警告：cancel 未受理（code={code}），继续尝试停任务")
 
-    # 2) 循环：**每轮都补 aborted** ＋ 停 running 任务
+    # 2) 循环：**每轮都补 cancel** ＋ 停 running 任务
     #
-    # 2026-11-06（2.5.2 实测）：只 abort 一次不够。排队中的 prompt 会被服务端
-    # 接着取出来跑（abort 返回 True 后，active_prompt 立刻换成下一个 pid），
-    # 于是 busy 一直不转 false、`stop` 空转到超时。所以每轮都要重新取
-    # active prompt 再 abort 一次，直到 busy=false。
+    # 2026-11-06（2.5.2 实测）：只停一次不够。排队中的 prompt 会被服务端
+    # 接着取出来跑（停掉后 active_prompt 立刻换成下一个 pid），于是状态一直
+    # 不转 idle、`stop` 空转到超时。所以每轮都要重新取 active prompt 再停一次。
+    #
+    # 2.7（ISS-103 P0-1.5）：`prompts/{pid}:abort` 仍在（40401 只表示 prompt 不在），
+    # 但发一条 `:cancel` 能一次覆盖「当前轮＋排队中的下一轮」，比逐个 pid 更稳。
     deadline = time.time() + timeout
     killed = set()
     round_no = 0
@@ -569,14 +579,12 @@ def cmd_stop(args):
         round_no += 1
         pid_now = kimi_api.active_prompt(sid)
         if pid_now:
-            ok3, d3, _v3 = BUSD.ctl(
-                "abort", sid, caller="sess.py stop-loop",
-                payload={"pid": pid_now},
-                direct_fn=lambda pp=pid_now: kimi_api.abort_prompt(sid, pp))
-            code3 = d3.get("code") if isinstance(d3, dict) else None
+            ok3, code3 = kimi_api.cancel_session(sid, include_background=False)
+            if not ok3:
+                ok3, code3 = kimi_api.abort_prompt(sid, pid_now)
             if ok3:
                 aborts += 1
-                print(f"[2/3] abort#{aborts} {pid_now[:16]}… ok code={code3}")
+                print(f"[2/3] cancel#{aborts} {pid_now[:16]}… ok code={code3}")
         running = [t for t in kimi_api.tasks(sid) if t.get("status") == "running"]
         if running:
             for t in running:
@@ -590,21 +598,24 @@ def cmd_stop(args):
                     direct_fn=lambda t=tid: kimi_api.cancel_task(sid, t))
                 print(f"[2/3] stop {tid} bg={bg} -> ok={ok2}")
                 killed.add(tid)
-        # 2026-11-05：工具停掉后 busy 要 5–15 秒才转 false，不能一见 running 空就退出
+        # 2026-11-05：工具停掉后状态要 5–15 秒才转 idle，不能一见 running 空就退出。
+        # 2.7（ISS-103 P0-1.2）：`busy` 键已消失 ⇒ `busy_now is False` **永不成立**，
+        # 循环只能靠「running 为空」退出，等于靠巧合。改判 `activity`，缺键时不判空。
         info = kimi_api.session_info(sid)
-        busy_now = info.get("busy") if isinstance(info, dict) else None
-        if not running and busy_now is False:
+        act_now = info.get("activity") if isinstance(info, dict) else None
+        if not running and act_now == "idle":
             break
         time.sleep(2)
 
     # 3) 复查
     info = kimi_api.session_info(sid)
-    busy = info.get("busy") if isinstance(info, dict) else None
-    main_active = info.get("main_turn_active") if isinstance(info, dict) else None
+    act = info.get("activity") if isinstance(info, dict) else None
     left = [t for t in kimi_api.tasks(sid) if t.get("status") == "running"]
-    print(f"[3/3] busy={busy} main_turn_active={main_active} running_left={len(left)} "
-          f"（停任务 {len(killed)} 个，abort {aborts} 次，{round_no} 轮）")
-    if busy is False and not left:
+    print(f"[3/3] activity={act} last_turn_outcome="
+          f"{info.get('last_turn_outcome') if isinstance(info, dict) else None} "
+          f"running_left={len(left)} "
+          f"（停任务 {len(killed)} 个，cancel {aborts} 次，{round_no} 轮）")
+    if act is not None and act != "turn" and not left:
         print("STOP-OK 已停净")
         return 0
     for t in left[:5]:

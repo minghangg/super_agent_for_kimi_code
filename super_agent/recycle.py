@@ -125,8 +125,14 @@ def _cmd_status(sid: str) -> int:
         print(f"        busy=? 直连不可用：{info['_err']}")
         rc = 1
     else:
-        print(f"        busy={info.get('busy')} main_turn_active="
-              f"{info.get('main_turn_active')} archived={info.get('archived')!r}")
+        # 2.7（ISS-103 P0-1.2）：`busy`/`main_turn_active` 已从会话对象消失，直读
+        # 恒 None。真源是 `activity` 三态；旧键仍打出来，是因为它由 `direct.status`
+        # 派生，调用方（和人）看的是同一口径。
+        act = info.get("activity")
+        busy = (act != "idle") if act is not None else None
+        main_active = (act == "turn") if act is not None else None
+        print(f"        activity={act} busy={busy} main_turn_active={main_active} "
+              f"archived={info.get('archived')!r}")
     if archived == "yes" and info.get("archived") is not True:
         print("        不一致：本地判据说已归档，服务端 GET 说不是 —— 勿假定安全")
         rc = 1

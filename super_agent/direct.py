@@ -576,6 +576,12 @@ STATUS_KEYS = (
     "archived", "model", "thinking_level", "permission", "plan_mode",
     "swarm_mode", "tower_mode", "context_tokens", "max_context_tokens",
     "context_usage", "agent_status",
+    # 2.7 的两个真源（ISS-103 P0-1.3）：`busy`/`main_turn_active` 已从服务端消失，
+    # 它们**从 `activity` 派生**；`activity` 缺失时两个旧键保持 None（不许 None
+    # 冒充 False —— 那是「把不知道读成空闲」）。`last_turn_outcome` 取代已消失的
+    # `last_turn_reason`，但**不让它冒充**：旧值是 completed/cancelled/failed，
+    # 新值把 cancelled 改叫 interrupted，直接顶班会让旧消费方误判。
+    "activity", "last_turn_outcome",
     # 可判性三键（#94）：不进模板就会被 `_norm_status` 丢掉，bus 路径于是恒无
     # `ctx_state`，一旦 WS 修好就 WARN 刷屏。
     "ctx_state", "value_ts", "age_s",
@@ -631,13 +637,25 @@ def status(sid: str, cache_file: Path | None = None) -> dict:
     info = session_info(sid)
     out: dict = status_template()          # 键集恒定，值可为 None
     if isinstance(info, dict) and "_err" not in info:
+        act = info.get("activity")
         out.update({
-            "busy": info.get("busy"),
-            "main_turn_active": info.get("main_turn_active"),
+            "activity": act,
             "pending_interaction": info.get("pending_interaction"),
-            "last_turn_reason": info.get("last_turn_reason"),
             "archived": info.get("archived"),
+            "last_turn_outcome": info.get("last_turn_outcome"),
         })
+        # 旧键不删（`recycle`／`monitor`／`bus`／`console` 六处都在读），改为从
+        # `activity` **派生**。`activity` 缺失 ⇒ 两个键保持 None：消费方必须显式
+        # 处理三态，不许把「不知道」读成「空闲」。
+        #   busy            = activity != "idle"（background 也算忙，与旧 busy 语义等价）
+        #   main_turn_active = activity == "turn"（**不等价**：background 时旧字段为
+        #                     False、新字段是 "background"，这是唯一一处语义差）
+        if act is not None:
+            out["busy"] = act != "idle"
+            out["main_turn_active"] = act == "turn"
+        # last_turn_reason：2.7 无来源，保持 None。不用 `last_turn_outcome` 顶班：
+        # 取值集合变过（cancelled → interrupted），顶班会让旧消费方误判。
+
     elif isinstance(info, dict) and "40401" in str(info.get("_err") or ""):
         # sid 不存在：无值，不是「读坏了」。判据要给 absent，不能落到 none(...)。
         out["ctx_state"] = "absent"
@@ -902,12 +920,31 @@ def abort_prompt(sid: str, pid: str) -> tuple:
     return False, code if code not in (None, 0) else None
 
 
-def abort_session(sid: str) -> tuple:
-    """停当前这一轮，不必先知道 pid。`POST /sessions/{sid}:abort` 2.5.2 仍可用。"""
-    st, payload = post(f"/api/v1/sessions/{sid}:abort", {}, timeout=20)
+def cancel_session(sid: str, include_background: bool = True) -> tuple:
+    """停当前 turn。2.7 用 `:cancel` 取代了 `:abort`（后者实测返 40001）。
+
+    `include_background` 覆盖旧 `cancel_task` 的「连后台任务一起停」语义：
+    `True` 停 turn＋后台任务，`False` **只停 turn**——后者是 `abort_session` 表达
+    不了的（它写死 `True`），也是本函数存在的理由之一（`console stop` 的首步要
+    「只停 turn，任务留给下一步逐个停」，好让残留可见）。
+
+    判据是响应体的 `cancelled` 布尔（`openapi` 里 `:cancel` 的 `required`）。
+    """
+    st, payload = post(f"/api/v1/sessions/{sid}:cancel",
+                       {"include_background": include_background}, timeout=20)
     d = data_of(payload) or {}
-    ok = bool(d.get("aborted")) if isinstance(d, dict) else False
-    code = code_of(payload)
+    ok = bool(d.get("cancelled")) if isinstance(d, dict) else False
+    return ok, code_of(payload)
+
+
+def abort_session(sid: str) -> tuple:
+    """尽力停住当前这一轮：先 `:cancel`，失败才按 pid 退 `abort_prompt`。
+
+    为什么保留两层：`:cancel` 是 2.7 的正解，但 2.5/2.6 只有 `:abort`（已 40001）
+    与 `prompts/{pid}:abort`（仍在）。退路留着，是给老服务端的兼容，不是给新服务端
+    兜底——新服务端上第一层就该成立。
+    """
+    ok, code = cancel_session(sid, include_background=True)
     if ok:
         return True, code
     pid = active_prompt(sid)
@@ -917,8 +954,10 @@ def abort_session(sid: str) -> tuple:
 
 
 def cancel_task(sid: str, tid: str, agent_id: str = AGENT) -> tuple:
-    """取消后台任务。旧代 REST `:cancel`；新代 WS `task.stop`（request_id 关联）。"""
+    """取消后台任务。旧代 REST `:cancel`（**死分支**）；新代 WS `task.stop`。"""
     if not is_new():
+        # 死分支：`POST /sessions/{sid}/tasks/{tid}:cancel` 在 2.7 上 ROUTE-GONE
+        # （HTTP 404）。保留是因为 `is_new()` 为假（<2.5）时仍需它；新代永不走这里。
         st, payload = post(f"/api/v1/sessions/{sid}/tasks/{tid}:cancel", {}, timeout=20)
         d = data_of(payload) or {}
         ok = bool(d.get("cancelled")) if isinstance(d, dict) else False
@@ -926,7 +965,9 @@ def cancel_task(sid: str, tid: str, agent_id: str = AGENT) -> tuple:
     msg = _send_ws({"type": "task.stop", "request_id": "", "session_id": sid,
                     "agent_id": agent_id, "task_id": tid})
     if not msg:
-        return False, None
+        # WS 不可达的退路：`:cancel {include_background:true}` 整体覆盖——
+        # 它会把后台任务一起停掉，比「什么都没发生」更接近调用方要的结果。
+        return cancel_session(sid, include_background=True)
     return msg.get("code") == 0, msg.get("code")
 
 
