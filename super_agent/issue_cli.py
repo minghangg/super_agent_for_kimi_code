@@ -52,6 +52,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from . import agent_config
 from . import allowlist as allowlist_mod
 from . import config as config_mod
 from . import role_config as roles_mod
@@ -60,10 +61,8 @@ from . import session_ledger as ledger_mod
 API = "https://api.github.com"
 CHECKOUT = Path(__file__).resolve().parents[1]
 DEFAULT_PROJECTS = CHECKOUT / "config" / "gh_projects.json"
-DEFAULT_ENV_FILE = CHECKOUT / "auth" / "github.env"
 DEFAULT_ALLOWLIST = CHECKOUT / "config" / "allowlist.json"
 DEFAULT_ROLES = CHECKOUT / "config" / "roles.local.json"
-DEFAULT_CONFIG = CHECKOUT / "config" / "engine.json"
 
 PROJECTS_ENV = "SAFKC_PROJECTS_FILE"
 ALLOWLIST_ENV = "SAFKC_ALLOWLIST"
@@ -99,44 +98,75 @@ def _checkout() -> Path:
 
 def _projects_path(arg: str | None = None) -> Path:
     raw = (arg or os.environ.get(PROJECTS_ENV) or "").strip()
+    if not raw:
+        raw = agent_config.projects_file()
     return Path(os.path.expanduser(raw)).resolve() if raw else DEFAULT_PROJECTS
 
 
 def _allowlist_path(arg: str | None = None) -> Path:
     raw = (arg or os.environ.get(ALLOWLIST_ENV) or "").strip()
+    if not raw:
+        raw = agent_config.allowlist_file()
     return Path(os.path.expanduser(raw)).resolve() if raw else DEFAULT_ALLOWLIST
 
 
 def _config_path(arg: str | None = None) -> Path | None:
+    """``$SAFKC_CONFIG`` > an explicit ``--config`` > nothing.
+
+    ``<checkout>/config/engine.json`` is **not** a fallback: a deployment file
+    inside the public checkout is the wrong owner for a private fact (supervisor,
+    cid 7003789336 §二). The session root now arrives through
+    :mod:`super_agent.agent_config` instead, so this function returning ``None``
+    no longer means "the ledger is silently skipped".
+    """
     raw = (arg or os.environ.get(CONFIG_ENV) or "").strip()
     if raw:
         return Path(os.path.expanduser(raw)).resolve()
-    return DEFAULT_CONFIG if DEFAULT_CONFIG.is_file() else None
+    return None
 
 
 def _engine_cfg(arg: str | None = None) -> dict:
-    """The engine block of the deployment config, or ``{}``.
+    """The engine block the session paths are resolved from.
 
-    A broken or absent config is not a fault here: the only key this CLI reads
-    is the archive command, and its absence is a documented degradation.
+    The private root comes from :mod:`super_agent.agent_config` (``paths.state_dir``
+    -> ``engine.session_state_dir``), merged over the public defaults by
+    ``config.load`` -- the one place that validates it. ``$SAFKC_CONFIG``, when
+    set, is read as well, so an explicit deployment file can still win.
+
+    A broken private file raises :class:`agent_config.AgentConfigError`, which
+    the CLI entry turns into rc=2 **with the path printed**; it is never
+    downgraded to "not configured" (that would write a ledger nobody reads).
     """
+    return _full_cfg(arg).get("engine") or {}
+
+
+def _full_cfg(arg: str | None = None) -> dict:
+    """The whole config (defaults <- optional file <- agent_config overrides)."""
     path = _config_path(arg)
-    if path is None:
-        return {}
-    try:
-        return (config_mod.load(path).get("engine") or {})
-    except (config_mod.ConfigError, OSError, ValueError):
-        return {}
+    overrides = agent_config.overrides()
+    return config_mod.load(path, overrides=overrides) if overrides else config_mod.load(path)
 
 
 def _load_projects(arg: str | None = None) -> dict:
+    """The project table. Both layers empty -> rc=3 ``Denied`` (#98 反例 1).
+
+    An inline table in the private file wins over ``projects_file``; when
+    neither is configured the call is refused **with the three ways to supply
+    one** -- running against a built-in empty table would turn every project
+    into "unknown project" and hide the real cause.
+    """
+    inline = agent_config.projects()
+    if inline:
+        return inline
     path = _projects_path(arg)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise Denied(
-            f"项目表未配置：{path}（样例见 config/sample.projects.json；"
-            f"或用 --projects-file / ${PROJECTS_ENV} 指定）") from None
+            f"项目表未配置：{path}。三种给法：① {agent_config.config_path()} 里写 "
+            f"\"github\": {{\"projects\": {{\"<短名>\": \"<owner>/<repo>\"}}}}；"
+            f"② 写 \"github\": {{\"projects_file\": \"<路径>\"}}；"
+            f"③ 给 --projects-file 或 ${PROJECTS_ENV}") from None
     except (OSError, ValueError) as exc:
         raise Denied(f"项目表读不出：{path}：{type(exc).__name__}: {exc}") from None
     projects = (data or {}).get("projects") if isinstance(data, dict) else None
@@ -155,18 +185,30 @@ def _repo(project: str, projects: dict) -> str:
 
 
 def _token(env_file: str | None = None) -> str:
-    tok = (os.environ.get("GITHUB_TOKEN") or "").strip()
+    """The token value, from the env layer or the configured file.
+
+    The variable name and the file both come from ``agent_config``
+    (``github.token_env`` / ``github.token_file``), so a deployment names its own
+    credential source. Nothing here prints a value -- only the source name.
+    """
+    env_name, default_file = agent_config.token_source()
+    tok = (os.environ.get(env_name) or "").strip()
     if tok:
         return tok
-    path = Path(os.path.expanduser(env_file)).resolve() if env_file else DEFAULT_ENV_FILE
+    raw = env_file or default_file
+    if not raw:
+        raise Denied(
+            f"找不到 token：未配置 github.token_file，且 ${env_name} 为空"
+            f"（在 {agent_config.config_path()} 里给 github.token_file）")
+    path = Path(os.path.expanduser(raw)).resolve()
     try:
         with open(path, encoding="utf-8") as fh:
             for line in fh:
-                if line.startswith("GITHUB_TOKEN="):
+                if line.startswith(f"{env_name}="):
                     return line.split("=", 1)[1].strip().strip('"').strip("'")
     except OSError:
         pass
-    raise Denied(f"找不到 GITHUB_TOKEN（环境变量、--env-file 或 {path}）")
+    raise Denied(f"找不到 {env_name}（环境变量、--env-file 或 {path}）")
 
 
 # ------------------------------------------------------------------- roles
@@ -920,8 +962,12 @@ class _Ctx:
     """
 
     def __init__(self, args):
-        self.cfg = _engine_cfg(getattr(args, "config", None))
-        self.engine = self.cfg
+        # config.CTX-HOLD: ``cfg`` is the **whole** config, because the session
+        # helpers (session_ledger / session_events) read ``cfg["engine"]``. Handing
+        # them the engine block silently resolved to "no stream configured", so the
+        # ledger row was dropped while the comment succeeded (#98).
+        self.cfg = _full_cfg(getattr(args, "config", None))
+        self.engine = (self.cfg.get("engine") or {})
         self.roles = _roles(getattr(args, "roles_file", None))
         self.allowlist = _allowlist_path(getattr(args, "allowlist", None))
         self.projects = _load_projects(getattr(args, "projects_file", None))

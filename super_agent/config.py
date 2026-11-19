@@ -38,6 +38,12 @@ DEFAULTS: dict = {
         "source": "none",          # none | fixture | live
         "repo": "",                # owner/name, only for source=live
         "fixture": "",             # path to a JSON fixture, for source=fixture
+        # Project short name -> owner/repo, from the private agent.json (#98).
+        # An inline table wins over ``projects_file``; both empty means the
+        # project face is unconfigured and refuses with rc=3 rather than
+        # running against a built-in table that names real repositories.
+        "projects": {},
+        "projects_file": "",       # path to the untracked project table
         "poll_interval_s": 60,
         "max_issues": 20,
         "max_comments_per_issue": 50,
@@ -90,6 +96,15 @@ DEFAULTS: dict = {
         # A-1 (ISS-57): the contract file a new session reads first.
         # "" = fall back to the inert ping.
         "contract_path": "",
+        # The charter root and the prefix -> charter-file tables (#98). The
+        # public defaults are empty: a private deployment's charter names are
+        # not published here. ``dispatch_cli`` reads the two tables through
+        # ``agent_config``; ``charter_root`` is what the console lookup uses.
+        "charter_root": "",
+        # Where the dispatch console lives (``-m super_agent.dispatch_cli`` by
+        # default). Read by ``dispatch_adapter.build``; declaring it here keeps
+        # it inside ``validate`` instead of sneaking in as an unknown key.
+        "dispatch": {"console": ""},
         # How many held threads one round asks the close reconciliation about.
         # ``waiting_release`` and ``close_reconcile`` are the only states that
         # need it, so the cap bounds a poll loop rather than all assignments.
@@ -193,6 +208,22 @@ def validate(cfg: dict) -> dict:
     console_path = (cfg.get("engine") or {}).get("session_console_path", "")
     if console_path is not None and not isinstance(console_path, str):
         raise ConfigError("engine.session_console_path must be a path string (or empty)")
+    charter_root = (cfg.get("engine") or {}).get("charter_root", "")
+    if charter_root is not None and not isinstance(charter_root, str):
+        raise ConfigError("engine.charter_root must be a path string (or empty)")
+    dispatch_cfg = (cfg.get("engine") or {}).get("dispatch") or {}
+    if not isinstance(dispatch_cfg, dict):
+        raise ConfigError("engine.dispatch must be a mapping")
+    dispatch_console = dispatch_cfg.get("console", "")
+    if dispatch_console is not None and not isinstance(dispatch_console, str):
+        raise ConfigError("engine.dispatch.console must be a path or '-m <module>' string")
+    projects = (cfg.get("github") or {}).get("projects") or {}
+    if not isinstance(projects, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in projects.items()):
+        raise ConfigError("github.projects must be a mapping of project name -> owner/repo")
+    projects_file = (cfg.get("github") or {}).get("projects_file", "")
+    if projects_file is not None and not isinstance(projects_file, str):
+        raise ConfigError("github.projects_file must be a path string (or empty)")
     profiles_path = (cfg.get("engine") or {}).get("model_profiles_path", "")
     if profiles_path is not None and not isinstance(profiles_path, str):
         raise ConfigError("engine.model_profiles_path must be a path string (or empty)")

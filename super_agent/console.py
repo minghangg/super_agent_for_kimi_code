@@ -42,6 +42,7 @@ import time
 from pathlib import Path
 
 from . import api as kimi_api
+from . import config as config_mod
 from . import bus as kimi_bus
 from . import cron_report as CRON
 from . import direct as kimi_direct
@@ -113,8 +114,13 @@ EV_TAKEN_OVER = "session.taken_over"
 
 
 def sessions_file() -> Path:
-    """台账路径走 `sess_events` 的三级解析（隔离运行时读打桩目录）。"""
+    """台账路径走 `sess_events` 的解析（隔离运行时读打桩目录）。"""
     return EV.sessions_path()
+
+
+def bus_cache_file() -> Path:
+    """bus 缓存文件：跟会话根同处（`sessions.json` 的旁边），不另立路径。"""
+    return EV.resolve_root() / "wss_bus_cache.json"
 
 
 def _req(method, path, body=None):
@@ -179,7 +185,7 @@ def cmd_status(args):
     """会话状态。bus 优先，直连降级（结构差异只有 _source 前缀）。"""
     sid = resolve(args[0])
     st = BUSD.status(sid, caller="sess.py status",
-                     cache_file=BASE / "state" / "wss_bus_cache.json")
+                     cache_file=bus_cache_file())
     if st is None:
         st = kimi_api.status(sid)
         if isinstance(st, dict):
@@ -1327,6 +1333,13 @@ def sid_ok_or_explain(arg, allow_short: bool) -> bool:
 
 def main(argv=None):
     argv = EV.apply_state_dir(argv or sys.argv[1:])
+    # #98 反例 5：坏的私有配置必须在**做任何事之前**失败，且打印路径。
+    # 转 rc=2 由本函数统一收口（`agent_config` 抛的是 `config.ConfigError`）。
+    try:
+        EV.resolve_root()
+    except config_mod.ConfigError as exc:
+        print(f"[config] {exc}", file=sys.stderr)
+        return 2
     # ISS-74 B：逃生门两处都认——子命令前（`sess.py --allow-short-sid restore …`）
     # 与子命令后（`sess.py restore … --allow-short-sid`）。
     allow_short = "--allow-short-sid" in argv

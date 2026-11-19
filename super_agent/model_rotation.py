@@ -30,9 +30,31 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STATE = os.path.join(ROOT, "state", "model_rotation.json")
-LEDGER = os.path.join(ROOT, "state", "model_rotation.log")
 PROFILES = os.path.join(ROOT, "config", "model_profiles.json")
+
+
+def _state_root() -> str:
+    """轮换游标与冷却登记所在的根：`paths.state_dir`，未配置则本仓 `state/`。"""
+    from . import agent_config
+    return agent_config.state_dir() or os.path.join(ROOT, "state")
+
+
+def _profiles_path() -> str:
+    """模型画像表：`models.profiles_file`，未配置则本仓 `config/model_profiles.json`。"""
+    from . import agent_config
+    return agent_config.model_profiles_file() or PROFILES
+
+
+def _rotation_file() -> str:
+    return os.path.join(_state_root(), "model_rotation.json")
+
+
+def _rotation_log() -> str:
+    return os.path.join(_state_root(), "model_rotation.log")
+
+
+def _cooldown_file() -> str:
+    return os.path.join(_state_root(), "model_cooldown.json")
 
 # 内置默认：config 缺失/坏掉时行为与本单之前逐字一致。
 # 用户 2026-11-02 定：worker 只用 cdy dsp v4.1 flash（其它模型太耗积分）。
@@ -44,7 +66,7 @@ FALLBACK_PROFILE = {"model": "cb-deepseek-v4.1-flash", "effort": "high", "thinki
 
 # 冷却登记：{"model": "until(YYYY-MM-DDTHH:MM:SS)"}；冷却中的模型自动跳过。
 # 来源＝429 报文里的「预计 ... 重置后恢复」，由 supervisor 或 PM 手工登记。
-COOLDOWN = os.path.join(ROOT, "state", "model_cooldown.json")
+# 具体文件由 `_cooldown_file()` 从 `paths.state_dir` 派生。
 
 
 def warn(msg: str) -> None:
@@ -56,7 +78,7 @@ def _bad(profile: dict) -> bool:
         isinstance(profile.get(k), str) and profile.get(k) for k in ("model", "effort"))
 
 
-def load_profiles(path: str = PROFILES) -> dict:
+def load_profiles(path: str = "") -> dict:
     """Return the parsed config, or ``{}`` when it is missing/invalid.
 
     Validation (ISS-32): ``schema_version`` must be present, ``rotation`` must be
@@ -64,6 +86,7 @@ def load_profiles(path: str = PROFILES) -> dict:
     ``model`` and ``effort``. Anything else is a bad config: keep the built-in
     defaults and warn -- never raise, never change behaviour.
     """
+    path = path or _profiles_path()
     if not os.path.isfile(path):
         return {}
     try:
@@ -116,7 +139,7 @@ def profile_of(cfg: dict, role: str) -> tuple:
 
 def load_cooldown() -> dict:
     try:
-        with open(COOLDOWN, encoding="utf-8") as fh:
+        with open(_cooldown_file(), encoding="utf-8") as fh:
             data = json.load(fh)
         return {k: v for k, v in data.items() if isinstance(v, str)}
     except (OSError, ValueError):
@@ -135,18 +158,19 @@ def cooling(model: str, cooldown: dict) -> bool:
 
 def load_index() -> int:
     try:
-        with open(STATE, encoding="utf-8") as fh:
+        with open(_rotation_file(), encoding="utf-8") as fh:
             return int(json.load(fh).get("index", 0))
     except (OSError, ValueError, TypeError):
         return 0
 
 
 def save_index(index: int) -> None:
-    os.makedirs(os.path.dirname(STATE), exist_ok=True)
-    tmp = STATE + ".tmp"
+    target = _rotation_file()
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    tmp = target + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump({"index": index, "updated": time.strftime("%Y-%m-%dT%H:%M:%S")}, fh, ensure_ascii=False)
-    os.replace(tmp, STATE)
+    os.replace(tmp, target)
 
 
 def main(argv: list[str]) -> int:
@@ -171,8 +195,9 @@ def main(argv: list[str]) -> int:
     if role:
         prof, source = profile_of(cfg, role)
         if note:
-            os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
-            with open(LEDGER, "a", encoding="utf-8") as fh:
+            log = _rotation_log()
+            os.makedirs(os.path.dirname(log), exist_ok=True)
+            with open(log, "a", encoding="utf-8") as fh:
                 fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')}\t{note}\t{prof['model']}\t{prof['effort']}\n")
         if as_json:
             print(json.dumps({"model": prof["model"], "effort": prof["effort"],
@@ -196,8 +221,9 @@ def main(argv: list[str]) -> int:
     if skipped:
         print(f"[i] 跳过冷却中模型：{', '.join(skipped)}", file=sys.stderr)
     if note:
-        os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
-        with open(LEDGER, "a", encoding="utf-8") as fh:
+        log = _rotation_log()
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        with open(log, "a", encoding="utf-8") as fh:
             fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')}\t{note}\t{pick['model']}\t{pick['effort']}\n")
 
     if as_json:

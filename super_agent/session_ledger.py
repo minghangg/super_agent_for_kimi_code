@@ -1,5 +1,11 @@
 """Write side of the session state the issue CLI shares with the engine.
 
+Not the same module as ``sessions_ledger.py`` (the ``sessions.json`` ledger CLI
+copied from the workbench). The two symbol sets do not overlap --
+``sessions_ledger`` has ``cmd_set``/``cmd_archive``/``cmd_retire``, this one has
+``sid_problem``/``root``/``sessions_path`` -- so importing the wrong one fails
+loudly at the call instead of writing in the wrong place.
+
 ``bind`` records which session works on which issue, ``close`` archives those
 sessions, and ``comment`` keeps the ledger row. All three write into the **same
 session root the engine reads**: ``issue_sessions.json`` sits beside
@@ -62,17 +68,30 @@ def sid_problem(sid) -> str:
 
 
 def root(cfg: dict | None = None) -> Path:
-    """The session root, resolved exactly as the engine resolves it."""
+    """The session root, resolved exactly as the engine resolves it.
+
+    ``cfg=None`` means "build the one config the one way": ``agent_config``
+    overrides merged over the public defaults by ``config.load``. A caller that
+    already holds a cfg passes it, and nothing is re-read.
+    """
+    if cfg is None:
+        cfg = _default_cfg()
     try:
         return session_events.resolve_session_root(cfg)
     except session_events.SessionStreamNotConfigured as exc:
         raise SessionLedgerError(
             f"{exc}；CLI 侧四个入口：$SESS_EVENTS_STATE_DIR、$LWA_STATE_DIR、"
-            f"配置 engine.session_state_dir、配置 engine.session_events_path") from None
+            f"配置 engine.session_state_dir、配置 paths.state_dir") from None
+
+
+def _default_cfg() -> dict:
+    from . import agent_config
+    from . import config as config_mod
+    return config_mod.load(overrides=agent_config.overrides())
 
 
 def sessions_path(cfg: dict | None = None) -> Path:
-    return session_events.resolve_sessions_path(cfg)
+    return session_events.resolve_sessions_path(cfg if cfg is not None else _default_cfg())
 
 
 def issue_sessions_path(cfg: dict | None = None) -> Path:

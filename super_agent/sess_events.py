@@ -76,12 +76,15 @@ def check_sid(sid) -> bool:
 
 # ------------------------------------------------------------------ 路径（委托 session_events）
 def _cfg(state_dir=None) -> dict:
-    """把公开配置读成 cfg；`agent_config` 的私有覆盖在 #98 步 4 接上。
+    """The one config, built the one way: ``agent_config`` overrides + ``config.load``.
 
-    本模块**不排优先级**：显式 `--state-dir` 走 `resolve_events_path(explicit=…)`，
-    其余交给 `session_events`。这样 `--state-dir` 只影响它该影响的那一层。
+    The four levels of :func:`session_events.resolve_events_path` stay the only
+    resolution order; this module only supplies the ``cfg`` they read. The
+    explicit ``--state-dir`` is not folded in here -- it goes to
+    ``resolve_events_path(explicit=...)``, which is what that parameter is for.
     """
-    return config_mod.load()
+    from . import agent_config
+    return config_mod.load(overrides=agent_config.overrides())
 
 
 def resolve_root(state_dir=None) -> Path:

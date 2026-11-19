@@ -17,11 +17,15 @@
 
 ## 挂起
 
-- **#36 挂起**：跨平台适配（launchd／systemd、POSIX pidlock、CI matrix），未开工。
-- **#30 挂起**：Requirements Analyst 最小闭环（无 Web、不建会话），与引擎解耦可并行，等开工令。
+- **#36 挂起**：跨平台适配（launchd／systemd、POSIX pidlock、CI matrix），未开工。- **#30 挂起**：Requirements Analyst 最小闭环（无 Web、不建会话），与引擎解耦可并行，等开工令。
 - **#26 已关闭、内容并入 #22**：PM 总线唤醒协议的四类消息已被 milestone 1／milestone 2 吃掉，消息类型表转为 #22 的退役验收清单。
 - **#23 已关闭、内容并入 #43**：M4 三档分级不存在、assist 零外部动作数据；「恒不自动清单」搬进 #43 当硬规则。
 - **#43 挂起**：长期提醒单，不开发不验收，在所有在飞单关闭前保持 open。
+
+## 已知缺腿清单
+
+- **`dispatch_adapter` 的派单动词未实现**：`resolve`／`create-worker`／`create-qa`／`bind`／`send`／`fetch`／`archive`／`reconcile-close` 在本仓 console 里没有对应子命令。`engine.py` 的归档分支要求 `Engine.adapter` 非 None，而 `build_engine()` 不传 adapter，所以该分支今天不可达。缺动词一律报 `unsupported_verb` 并带退出码，**不静默成功、不回退 rc=127**。补齐归后续单。
+- **`reedkit/*.sh` 9 个脚本未迁移**：`atroute`／`rclose`／`rhandoff`／`rhouse`／`rissue`／`rpm`／`rpmlife`／`rrotate`／`rwatch`。其叙述性文本（`echo` 提示、`usage`、注释）需重写才过隐私门禁，属独立扩容，归后续单。本仓只复制了 `pmc.sh`／`pmd.sh` 两条链。
 
 ## 判据
 

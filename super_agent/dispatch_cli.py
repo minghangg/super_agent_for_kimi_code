@@ -36,12 +36,13 @@ import time
 import urllib.error
 import urllib.request
 
+from . import agent_config as agentcfg
+
 DEFAULT_PORTS = (58627, 58628)
 TOKEN_ENV = "KIMI_CODE_SERVER_TOKEN"
 CONFIG_ENV = "KIMI_CODE_CONFIG_FILE"
-# 章程/手册根由 agent_config 的 charter.root 提供（#98）；本文件不再用
-# `__file__` 上溯拼检出路径。`WORKBENCH` 为空串表示"未配置"。
-WORKBENCH = ""
+# 章程/手册根由 agent_config 的 charter.root 提供（#98）。本文件不拼检出路径；
+# `_charter_root()` 是唯一读者，未配置时返回空串（`charter_for()` 据此返回 ""）。
 # Which model names the session when --name is omitted. This is a housekeeping
 # choice, not the work model, so it stays cheap and fixed. Set the env var to ""
 # to fall back to the deterministic slug.
@@ -67,8 +68,8 @@ CONTRACT_REL = os.path.join("rules", "shared", "rules", "session_contract.md")
 
 
 def _charter_root() -> str:
-    """章程/手册根。公开默认空串＝未配置（#98 步 4 由 agent_config 供值）。"""
-    return (WORKBENCH or "").strip()
+    """章程/手册根：`agent_config` 的 `charter.root`（未配置＝空串）。"""
+    return agentcfg.charter_root()
 
 
 def contract_file() -> str:
@@ -215,8 +216,18 @@ class DispatchError(RuntimeError):
 
 
 def _dev_quota():
-    """派单资源配额模块（本包复制件），延迟加载以免拖长 import 链。"""
+    """派单资源配额模块（本包复制件），延迟加载以免拖长 import 链。
+
+    两处私有路径（配置与核锁目录）在加载后按 `agent_config` 的
+    `quota.config_file` / `quota.cores_dir` 注入，未配置则保留模块内的仓内默认。
+    """
     from . import dev_quota as module
+    cfg_file = agentcfg.quota_config()
+    if cfg_file:
+        os.environ.setdefault(module.CONFIG_PATH_ENV, cfg_file)
+    cores = agentcfg.quota_cores_dir()
+    if cores:
+        os.environ.setdefault(module.STATE_CORES_ENV, cores)
     return module
 
 
@@ -861,9 +872,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--task", required=False, default="", help="the task text to send")
     parser.add_argument("--cwd", default=os.getcwd(), help="workspace dir for the session")
     parser.add_argument(
-        "--state-dir", default="",
-        help=("运行态根目录（事件流/台账）。缺省看 SESS_EVENTS_STATE_DIR，"
-              "再缺省 paths.state_dir。自测必须给临时目录，否则写穿生产事件流"),
+        "--state-dir", default=agentcfg.state_dir(),
+        help=("运行态根目录（事件流/台账）。缺省取 paths.state_dir（agent.json），"
+              "再缺省看 SESS_EVENTS_STATE_DIR。自测必须给临时目录，否则写穿生产事件流"),
     )
     parser.add_argument(
         "--stop-marker", default="",

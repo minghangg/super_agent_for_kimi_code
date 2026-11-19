@@ -1,0 +1,198 @@
+"""``agent_config`` is the one loader for private values, and the tests pin that.
+
+Three properties are worth a test, and each one is a rule that cannot be
+checked by reading the module once:
+
+* **absent is not the same as corrupt** -- a missing file is a legitimate fresh
+  clone (empty mapping, rc=0), while a file that exists and cannot be parsed
+  must raise with its path in the message. Collapsing the two would run a
+  deployment on defaults nobody chose.
+* **the override dict feeds ``config.load``, not a second resolution chain** --
+  the value a caller reads is the value ``config.load`` merged, so
+  ``config.validate`` stays the one gate.
+* **one declared root, two readers** -- ``state_dir`` and
+  ``engine.session_state_dir`` resolve to the same directory, so the ledger and
+  the engine cannot disagree about where the session state is.
+
+Every test isolates ``$SAFKC_AGENT_CONFIG`` and restores the cache afterwards:
+the module caches the file it read, and a leaked cache would make the next test
+assert against the previous file.
+
+Run: ``python -m pytest tests/test_agent_config.py -q``
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+from super_agent import agent_config, config, session_events
+
+
+class _Isolated(unittest.TestCase):
+    """Point ``$SAFKC_AGENT_CONFIG`` at a temp file (or at nothing) per test."""
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in (agent_config.ENV_FILE,)}
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        agent_config._reset_cache()
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        agent_config._reset_cache()
+        self._tmp.cleanup()
+
+    def write(self, doc) -> Path:
+        path = self.root / "agent.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        os.environ[agent_config.ENV_FILE] = str(path)
+        agent_config._reset_cache()
+        return path
+
+
+class AbsentConfigTest(_Isolated):
+    """Counter-example 4: no file is not a fault."""
+
+    def test_missing_file_loads_empty(self):
+        os.environ[agent_config.ENV_FILE] = str(self.root / "nope.json")
+        agent_config._reset_cache()
+        self.assertEqual(agent_config.load(), {})
+
+    def test_missing_file_still_injects_a_session_root(self):
+        os.environ[agent_config.ENV_FILE] = str(self.root / "nope.json")
+        agent_config._reset_cache()
+        cfg = config.load(overrides=agent_config.overrides())
+        self.assertTrue(cfg["engine"]["session_state_dir"])
+
+    def test_missing_directory_is_not_an_error(self):
+        os.environ[agent_config.ENV_FILE] = str(self.root / "no" / "such" / "a.json")
+        agent_config._reset_cache()
+        self.assertEqual(agent_config.overrides().get("state_dir", ""), "")
+
+
+class CorruptConfigTest(_Isolated):
+    """Counter-example 5: a broken file refuses, and names itself."""
+
+    def test_bad_json_raises_with_path(self):
+        path = self.root / "agent.json"
+        path.write_text("{bad", encoding="utf-8")
+        os.environ[agent_config.ENV_FILE] = str(path)
+        agent_config._reset_cache()
+        with self.assertRaises(agent_config.AgentConfigError) as caught:
+            agent_config.load()
+        self.assertIn("agent.json", str(caught.exception))
+
+    def test_non_object_document_raises(self):
+        path = self.write([1, 2, 3])
+        with self.assertRaises(agent_config.AgentConfigError) as caught:
+            agent_config.load()
+        self.assertIn(str(path), str(caught.exception))
+
+    def test_the_error_is_a_config_error(self):
+        """The CLI has one handler for ``ConfigError``; a second type would need
+        a second handler at every entry point."""
+        self.assertTrue(issubclass(agent_config.AgentConfigError, config.ConfigError))
+
+
+class OverrideMappingTest(_Isolated):
+    """The declared root reaches both keys through ``config.load``."""
+
+    def test_state_dir_reaches_both_keys(self):
+        target = self.root / "session-root"
+        self.write({"paths": {"state_dir": str(target)}})
+        cfg = config.load(overrides=agent_config.overrides())
+        self.assertEqual(cfg["state_dir"], str(target))
+        self.assertEqual(cfg["engine"]["session_state_dir"], str(target))
+
+    def test_state_root_and_session_root_agree(self):
+        target = self.root / "session-root"
+        self.write({"paths": {"state_dir": str(target)}})
+        cfg = config.load(overrides=agent_config.overrides())
+        self.assertEqual(config.state_root(cfg), session_events.resolve_session_root(cfg))
+
+    def test_inline_projects_win_over_the_file(self):
+        self.write({"github": {"projects": {"demo": "owner/repo"},
+                               "projects_file": str(self.root / "table.json")}})
+        self.assertEqual(agent_config.projects(), {"demo": "owner/repo"})
+
+    def test_only_declared_keys_are_merged(self):
+        """A key ``config`` does not declare would bypass ``validate``."""
+        self.write({"paths": {"state_dir": str(self.root / "s")},
+                    "unknown_section": {"anything": 1}})
+        overrides = agent_config.overrides()
+        self.assertNotIn("unknown_section", overrides)
+        config.load(overrides=overrides)      # validate accepts what we injected
+
+
+class EnvironmentLayerTest(_Isolated):
+    """Environment wins over the file, and the file wins over the default."""
+
+    def test_env_beats_the_file(self):
+        self.write({"paths": {"state_dir": str(self.root / "from-file")}})
+        os.environ["SESS_EVENTS_STATE_DIR"] = str(self.root / "from-env")
+        try:
+            self.assertEqual(agent_config.state_dir(), str(self.root / "from-env"))
+        finally:
+            os.environ.pop("SESS_EVENTS_STATE_DIR", None)
+
+    def test_charter_root_defaults_to_empty(self):
+        os.environ[agent_config.ENV_FILE] = str(self.root / "absent.json")
+        os.environ.pop("SAFKC_CHARTER_ROOT", None)
+        agent_config._reset_cache()
+        self.assertEqual(agent_config.charter_root(), "")
+
+    def test_dispatch_console_default_points_at_this_package(self):
+        os.environ[agent_config.ENV_FILE] = str(self.root / "absent.json")
+        os.environ.pop("SAFKC_DISPATCH_CONSOLE", None)
+        agent_config._reset_cache()
+        self.assertEqual(agent_config.dispatch_console(), "-m super_agent.dispatch_cli")
+
+
+class ConfigDeclarationTest(unittest.TestCase):
+    """P1-1: every mapped key must be declared, or it bypasses ``config.validate``."""
+
+    def test_projects_is_declared(self):
+        self.assertIn("projects", config.DEFAULTS["github"])
+
+    def test_dispatch_console_is_declared(self):
+        self.assertIn("console", config.DEFAULTS["engine"]["dispatch"])
+
+    def test_charter_root_is_declared(self):
+        self.assertIn("charter_root", config.DEFAULTS["engine"])
+
+    def test_a_non_mapping_project_table_is_rejected(self):
+        cfg = config.load()
+        cfg["github"]["projects"] = ["not", "a", "mapping"]
+        with self.assertRaises(config.ConfigError):
+            config.validate(cfg)
+
+    def test_a_non_string_console_is_rejected(self):
+        cfg = config.load()
+        cfg["engine"]["dispatch"]["console"] = 42
+        with self.assertRaises(config.ConfigError):
+            config.validate(cfg)
+
+
+class StaleCacheTest(_Isolated):
+    """A caller that changed the file sees the change only on an explicit refresh."""
+
+    def test_refresh_rereads_the_file(self):
+        self.write({"paths": {"state_dir": "first"}})
+        self.assertEqual(agent_config.state_dir(), "first")
+        path = self.root / "agent.json"
+        path.write_text(json.dumps({"paths": {"state_dir": "second"}}), encoding="utf-8")
+        self.assertEqual(agent_config.state_dir(), "first")        # cached
+        agent_config.load(refresh=True)
+        self.assertEqual(agent_config.state_dir(), "second")
+
+
+if __name__ == "__main__":
+    unittest.main()
