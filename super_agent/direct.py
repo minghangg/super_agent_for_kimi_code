@@ -852,24 +852,39 @@ def send(sid: str, text: str) -> tuple:
 def steer(sid: str, text: str) -> tuple:
     """把一条新指令**并入当前 turn**（等同 Ctrl-S）。返回 (ok, detail)。
 
-    正确编排（QA P0-2，照 `tools/sess.py:210-221`）：
-      1. `POST /sessions/{sid}/prompts` 取**新的** prompt_id；
-      2. `POST /sessions/{sid}/prompts/{pid}:steer`（**带 pid 的路径**）。
-    **禁止**用 `/prompts:steer` 聚合端点——那是错的（上一版 `wss_bus.py:585-587`）。
+    2.6（实测 2.6.2）：``POST /sessions/{sid}/steer`` 一次请求即可，
+    请求体与 ``POST /prompts`` 相同。旧的「先提交取 prompt_id、再
+    ``/prompts/{pid}:steer``」两步法在 2.6 上会失败——提交回执里的 id 是
+    ``msg_`` 前缀，路由按 ``{prompt_id}:{action}`` 解析时把 ``msg_…:steer``
+    当成未知动作，返回 ``40001 unsupported action``。
+
+    先试单请求端点；失败再退回两步法，兼容 2.5.x。
     """
     pid = active_prompt(sid)
     if not pid:
         return False, {"err": "no active turn"}
-    st, payload = post(f"/api/v1/sessions/{sid}/prompts",
+
+    # 2.6：单请求端点
+    st, payload = post(f"/api/v1/sessions/{sid}/steer",
                        {"content": [{"type": "text", "text": text}]})
     d = data_of(payload) or {}
-    new_pid = d.get("prompt_id") or ""
+    if code_of(payload) in (0, None) and isinstance(d, dict) and d.get("prompt_id"):
+        return True, {"prompt_id": d.get("prompt_id"), "active_before": pid,
+                      "steered": True, "via": "sessions/steer",
+                      "http": st, "code": code_of(payload), "raw": d}
+
+    # 2.5.x 退路：先提交取 prompt_id，再按 id steer
+    st1, payload1 = post(f"/api/v1/sessions/{sid}/prompts",
+                         {"content": [{"type": "text", "text": text}]})
+    d1 = data_of(payload1) or {}
+    new_pid = d1.get("prompt_id") or ""
     if not new_pid:
-        return False, {"err": "submit failed", "http": st, "raw": d}
+        return False, {"err": "submit failed", "http": st1, "raw": d1}
     st2, payload2 = post(f"/api/v1/sessions/{sid}/prompts/{new_pid}:steer", {})
     d2 = data_of(payload2) or {}
     ok = bool(d2.get("steered"))
     return ok, {"prompt_id": new_pid, "active_before": pid, "steered": ok,
+                "via": "prompts/{pid}:steer",
                 "http": st2, "code": code_of(payload2), "raw": d2}
 
 
