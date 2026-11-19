@@ -145,9 +145,24 @@ class DispatchAdapter:
 
     # -------------------------------------------------------------- transport
     def _subprocess_runner(self, argv: list[str]) -> tuple[int, str, str]:
+        """Run the console. ``-m <module>`` and a path are both accepted.
+
+        ``dispatch.console`` defaults to ``-m super_agent.dispatch_cli``, i.e.
+        this package, so a deployment without a console file still has one
+        target. When the console is a module there is no file to point at, and
+        treating it as a path made every call fail with a confusing spawn error.
+        """
         if not self.console:
             return 127, "", "no dispatch console configured"
-        done = subprocess.run([sys.executable, self.console, *argv],
+        if self.console.startswith("-m "):
+            parts = self.console.split()
+            module = parts[1] if len(parts) > 1 else ""
+            head = [sys.executable, "-m", module] if module else []
+            if not head:
+                return 127, "", "dispatch console is '-m' with no module name"
+        else:
+            head = [sys.executable, str(Path(self.console).expanduser())]
+        done = subprocess.run([*head, *argv],
                               capture_output=True, text=True,
                               timeout=self.timeout_s)
         return done.returncode, done.stdout or "", done.stderr or ""
@@ -158,6 +173,16 @@ class DispatchAdapter:
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
             return _result(False, "adapter_spawn_failed", error=f"{type(exc).__name__}: {exc}",
                            source=source)
+        if rc == 2 and not (out or "").strip():
+            # The console answered argparse's "unknown subcommand" (rc=2, nothing
+            # on stdout). That is a **missing verb**, not a failed one: reporting
+            # it as ``adapter_rc_nonzero`` hides the fact that the console never
+            # had the command, and a caller cannot tell it from a transport
+            # fault. The verb table is a known gap (docs/STATUS.md).
+            verb = next((a for a in argv if not a.startswith("-")), "")
+            return _result(False, "unsupported_verb",
+                           error=f"dispatch_cli 不支持 {verb}".strip(),
+                           source=source, rc=rc)
         if rc != 0:
             return _result(False, "adapter_rc_nonzero", error=(err or out or "").strip()[:300],
                            source=source, rc=rc)
@@ -272,8 +297,17 @@ class DispatchAdapter:
                            "--assignment", str((assignment or {}).get("id") or "")])
 
     def archive(self, assignment: dict, reason: str) -> dict:
+        """Archive one session. ``assignment`` carries ``id`` and/or ``sid``.
+
+        The engine passes ``{"id": "", "sid": <session>}`` because at archive
+        time there is no assignment id left to name - the session is what is
+        being archived. Reading only ``id`` sent an empty value and the console
+        had nothing to archive, so both keys are accepted, ``sid`` first.
+        """
+        row = assignment or {}
+        target = str(row.get("sid") or row.get("id") or "")
         return self._call(["archive", "--json",
-                           "--assignment", str((assignment or {}).get("id") or ""),
+                           "--assignment", target,
                            "--reason", str(reason or "")])
 
     def reconcile_close(self, thread: dict) -> dict:
@@ -282,11 +316,21 @@ class DispatchAdapter:
 
 
 def build(cfg: dict, *, runner=None) -> DispatchAdapter:
-    """Adapter from config: creation_mode and the console path (if any)."""
+    """Adapter from config: creation_mode and the console target.
+
+    The console comes from ``engine.dispatch.console``; when that is empty the
+    private layer (``agent_config``) is asked, and its own default is
+    ``-m super_agent.dispatch_cli``. An empty answer here would mean "nothing
+    to run", which is why the default is a module of this package rather than a
+    bare path: the adapter must point somewhere that exists.
+    """
     engine_cfg = cfg.get("engine") or {}
     dispatch_cfg = engine_cfg.get("dispatch") or {}
-    console = dispatch_cfg.get("console") or ""
-    if console:
+    console = str(dispatch_cfg.get("console") or "").strip()
+    if not console:
+        from . import agent_config
+        console = agent_config.dispatch_console()
+    if console and not console.startswith("-m "):
         console = str(Path(console).expanduser())
     return DispatchAdapter(console=console,
                            creation_mode=str(engine_cfg.get("creation_mode")
