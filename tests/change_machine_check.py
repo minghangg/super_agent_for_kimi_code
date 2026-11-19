@@ -274,8 +274,12 @@ print("OK" if issue_cli._archive_session(
     results = {}
     for mode in ("inject", "noinject"):
         rc, out = _run([py, "-c", code, mode], outside, env)
-        inside = "super_agent.__init__" in out and out.lower().replace(
-            "/", "\\").find(str(clone).lower()) >= 0
+        # The child prints ``<checkout>/super_agent/__init__.py``; both the
+        # package marker and the clone prefix are required, because a path
+        # outside the clone with the same tail would otherwise pass.
+        flat = out.lower().replace("\\", "/")
+        inside = "super_agent/__init__.py" in flat and str(clone).lower().replace(
+            "\\", "/") in flat
         results[mode] = (rc, out, inside)
     rc_i, out_i, in_i = results["inject"]
     rc_n, out_n, in_n = results["noinject"]
@@ -292,7 +296,7 @@ print("OK" if issue_cli._archive_session(
 GATE8_DRIVER = r'''
 import json, os, sys
 PROJECT = "example-project"
-clone, state, cfg_path, github_base, projects_file = sys.argv[1:6]
+clone, state, cfg_path, github_base, projects_file, creds = sys.argv[1:7]
 sys.path.insert(0, clone)
 
 popen = []
@@ -314,7 +318,8 @@ A = lambda argv: [a for a in argv if "recycle" in a and "archive" in a]
 
 rc = issue_cli.main(["close", "--role", "supervisor", "--project", PROJECT,
                      "--issue", "100", "--config", cfg_path,
-                     "--projects-file", projects_file])
+                     "--projects-file", projects_file,
+                     "--env-file", creds])
 print("RC", rc)
 print("A", len(A(popen)), "B", len(B(popen)))
 print("KEY_KEPT", PROJECT + "#100" in json.load(
@@ -367,13 +372,19 @@ def gate8(gate: Gate, clone: Path, outside: Path, py: str,
                 encoding="utf-8")
             cfg = work / f"cfg_{mode}.json"
             _write_gate8_cfg(cfg, state, tmpl)
+            # A token file rather than $GITHUB_TOKEN: ``github.token_env`` is
+            # itself read through the same env layer, so exporting GITHUB_TOKEN
+            # makes the *value* come back as the variable name. One fake file
+            # keeps this gate about the archive path.
+            creds = work / "creds.env"
+            creds.write_text("GITHUB_TOKEN=stub-token\n", encoding="utf-8")
             env = gate_env(clone, outside, {
                 "KIMI_SERVER": stub.base,
                 "KIMI_CODE_SERVER_PORT": "",
-                "GITHUB_TOKEN": "stub-token",
             })
             rc, out = _run([py, "-c", GATE8_DRIVER, str(clone), str(state),
-                            str(cfg), stub.base, str(projects_file)], outside, env)
+                            str(cfg), stub.base, str(projects_file),
+                            str(creds)], outside, env)
             results[mode] = (rc, out, stub.archive_calls())
     good_rc, good_out, good_calls = results["good"]
     bad_rc, bad_out, bad_calls = results["bad"]
