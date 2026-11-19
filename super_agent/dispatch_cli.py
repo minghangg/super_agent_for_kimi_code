@@ -609,7 +609,7 @@ def reuse_session(base: str, token: str, sid: str) -> str:
     """
     info = unwrap(http_get(f"{base}/api/v1/sessions/{sid}", token), "get session")
     if info.get("archived"):
-        payload = http_post(f"{base}/api/v2/sessions:restore", token, {"ids": [sid]})
+        payload = http_post(f"{base}/api/v1/sessions:restore", token, {"ids": [sid]})
         ok, why = _sess_verdict(200, payload)
         print(f"[dispatch] restored archived session {sid}（{why}）")
         if ok:
@@ -1039,13 +1039,18 @@ def run_turn(base: str, token: str, sid: str, text: str, timeout: float,
 def fetch_final_answer(base: str, token: str, sid: str) -> str:
     """最后一轮里最后一条 `assistant_message` 的正文。取不到返回空串（不是 404）。
 
-    `turns` 默认**新→旧**，`items` 是**旧→新**（与已消失的 `/messages` 相反），
-    所以两层都要 `reversed` —— 少一层就会拿回第一轮的答复。
+    两层顺序**不一样**，少想一层就会拿回错的那一轮：
+      · `turns` 默认**新→旧** ⇒ **按原序**走，第一条命中的就是最新一轮；
+      · `items` 是**旧→新**（与已消失的 `/messages` 相反）⇒ 要 `reversed`，
+        取到的是该轮里最后一条 assistant 消息。
+
+    ⚠ 方案 §3.3 的示意代码对 `turns` 也做了 `reversed`，那会把顺序翻成旧→新、
+    返回**最早**一轮的答案。以本函数为准（有测试钉住）。
     """
     d = unwrap(http_get(f"{base}/api/v1/sessions/{sid}/agents/main/turns?page_size=5",
                         token), "fetch turns")
-    for turn in reversed(d.get("turns") or []):
-        for item in reversed(turn.get("items") or []):
+    for turn in (d.get("turns") or []):                 # 新→旧，按原序
+        for item in reversed(turn.get("items") or []):  # 旧→新，反着取
             if not isinstance(item, dict) or item.get("type") != "assistant_message":
                 continue
             text = str(item.get("text") or "").strip()

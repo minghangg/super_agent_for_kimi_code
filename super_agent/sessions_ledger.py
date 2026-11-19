@@ -301,7 +301,7 @@ def fetch_sessions():
 
 
 def archive_session(session_id: str, *, state_dir=None) -> int:
-    """POST /api/v2/sessions:archive —— 归档一个会话，返回退出码。
+    """POST /api/v1/sessions:archive —— 归档一个会话，返回退出码。
 
     服务端对这个批量端点**恒回外层 `code: 0`**，失败写在 `data.results[]` 里
     （`ok: false` / `succeeded: 0` / `failed: 1`），只认顶层 code 会给失败的
@@ -311,7 +311,7 @@ def archive_session(session_id: str, *, state_dir=None) -> int:
     ISS-100 D2：从 `cmd_archive` 拆出，`cmd_archive` 变薄包装。`recycle archive`
     调本函数后再做第二回读（服务端 `archived`），**不复制归档逻辑**。
     """
-    status, payload = kimi_api.post("/api/v2/sessions:archive",
+    status, payload = kimi_api.post("/api/v1/sessions:archive",
                                     {"ids": [session_id]})
     ok, why = _request_verdict(status, payload)
     if not ok:
@@ -327,7 +327,7 @@ def archive_session(session_id: str, *, state_dir=None) -> int:
 
 
 def cmd_archive(args):
-    """POST /api/v2/sessions:archive —— 归档会话（归档后收不下新 turn）。
+    """POST /api/v1/sessions:archive —— 归档会话（归档后收不下新 turn）。
 
     服务端对这个批量端点**恒回外层 `code: 0`**，失败写在 `data.results[]` 里
     （`ok: false` / `succeeded: 0` / `failed: 1`），只认顶层 code 会给失败的

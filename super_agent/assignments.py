@@ -55,7 +55,7 @@ Rules this module enforces (each one is a test):
   assignment is created and the engine is marked ``degraded`` - fail closed,
   never an empty loop that looks healthy.
 * **Archiving is the one thing the stream cannot be trusted for.** An archive
-  made through ``POST /api/v2/sessions:archive`` writes no ``session.archived``
+  made through ``POST /api/v1/sessions:archive`` writes no ``session.archived``
   row; only the workbench's own ``tools/sess_events.py:emit`` writes that
   event. So the stream's ``archived=False`` means "nobody emitted an archive",
   not "the session is live". The engine asks the server about the *candidate*

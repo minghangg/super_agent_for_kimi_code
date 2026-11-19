@@ -3550,7 +3550,7 @@ class Engine:
         Two sources, in this order, and the answer is cached for the round:
 
         1. the lifecycle stream (``rec["archived"]``) - cheap, but incomplete,
-           because an archive made through ``POST /api/v2/sessions:archive``
+           because an archive made through ``POST /api/v1/sessions:archive``
            writes no ``session.archived`` row (only the workbench's own
            ``tools/sess_events.py:emit`` writes that event);
         2. the server's ``session_info(sid)["archived"]``, asked **once per sid

@@ -156,7 +156,7 @@ def cmd_list(args):
         if "--busy" in args:
             flag = "&busy=true"
         if "--archived" in args:
-            flag += "&archived_only=true"
+            flag += "&archived=true"
         st, payload = _req("GET", f"/api/v1/sessions?page_size=30{flag}")
         items = _data(payload)
         if isinstance(items, dict):
@@ -1134,13 +1134,20 @@ def cmd_simple(args, path, method="POST", key=None):
 def _request_verdict(st, payload) -> tuple[bool, str]:
     """服务端「受理」判据；返回 (是否受理, 走了哪条分支的说明)。
 
-    两种响应形状：
+    三种响应形状：
 
-      · 单动作（`archive`/`takeover`）失败时**信封顶层 `code` 非零**（如 40401）；
-      · v2 批量（`restore` 走 `/api/v2/sessions:restore`）**外层 code 恒为 0**，
-        逐条结果在 `data` 里：`{"code": 0, "data": {"results": [{"ok": false,
-        "error": {"code": …}}], "succeeded": 0, "failed": 1}}`。只认顶层 code
-        就会把「一条都没成功」当成功，于是写出假的 `session.restored`。
+      · 批量（`archive`/`restore`）**外层 code 恒为 0**，逐条结果在 `data` 里：
+        `{"code": 0, "data": {"results": [{"ok": false, "error": {"code": …}}],
+        "succeeded": 0, "failed": 1}}`。只认顶层 code 就会把「一条都没成功」当
+        成功，于是写出假的 `session.restored`。
+      · 单动作（`takeover`/`cancel`）在 `data` 里给一个**布尔结论键**
+        （`taken_over`／`archived`／`restored`／`cancelled`，`openapi` 里是
+        `required`）。失败时也可能外层 code 非零（如 40401）。
+      · **两者都不是 ⇒ 结构漂移，一律判失败。**
+
+    最后那条是 ISS-103 P0-4 的加闸：此前 `results` 不是 list 就落到顶层 `code`
+    分支，于是 `data:{archived:true}`／`data:{}`／`data:None` **今天就在假绿**
+    （三条全返 `(True, '顶层 code=0')`）。不是将来结构漂移才出事，是现在就有。
 
     批量判据（**失败必不记**）：`failed` 必须为 0／缺省，每条 `results[].ok`
     必须为真且无 `error`，成功条数 ≥1；部分成功也判失败（restore 只发一条 id，
@@ -1172,10 +1179,19 @@ def _request_verdict(st, payload) -> tuple[bool, str]:
             return False, (f"批量响应 succeeded={ok_n} "
                            f"failed={failed if failed is not None else 0}")
         return True, f"批量响应 succeeded={ok_n} failed=0"
-    code = payload.get("code")
-    if code in (0, None):
-        return True, f"顶层 code={code}"
-    return False, f"顶层 code={code}"
+    # 单动作：既不是批量、又没有一个可判的布尔 ⇒ 结构漂移，fail closed。
+    single = None
+    if isinstance(body, dict):
+        for key in ("archived", "restored", "cancelled", "taken_over"):
+            if isinstance(body.get(key), bool):
+                single = body[key]
+                break
+    if single is None:
+        return False, (f"响应结构不可判（无 results 也无布尔结论键）: "
+                       f"code={payload.get('code')} data={str(body)[:80]}")
+    if single is not True:
+        return False, f"单动作未受理: data={str(body)[:80]}"
+    return True, f"单动作 ok（data 布尔为真, code={payload.get('code')}）"
 
 
 def _request_ok(st, payload) -> bool:
@@ -1235,8 +1251,9 @@ def cmd_cron(args):
 
     ISS-76 事实：**服务端既无 cron 读接口也无写接口**（`/api/v1/cron`、
     `/api/v1/crons`、`/api/v1/cron/jobs`、`/api/v1/sessions/<sid>/cron` 全 404；
-    `GET /api/v1/sessions/<sid>` 的 data 里没有 cron 字段）。cron 是 Kimi 客户端
-    工具（CronCreate／CronList／CronDelete），只作用于**当前会话**。
+    ISS-103 在 2.7.0 上复核：仍然全 404，`GET /api/v1/sessions/<sid>` 的 data 里
+    依旧没有 cron 字段）；cron 是 Kimi 客户端工具（CronCreate／CronList／
+    CronDelete），只作用于**当前会话**。
 
     所以：
       · `list` 读该会话的 wire 复算 `cron.add − cron.delete`，rc=0；
@@ -1381,14 +1398,16 @@ def main(argv=None):
         "approvals": cmd_approvals,
         "pending": cmd_pending,
         "tasks": cmd_tasks, "cancel-task": cmd_cancel_task, "stop": cmd_stop, "steer": cmd_steer, "messages": cmd_messages,
+        # 死子命令：`GET /sessions/{sid}/snapshot` 在 2.7 是 ROUTE-GONE（HTTP 404）。
+        # 保留只为老服务端；新代请用 `status`（activity 三态）。
         "snapshot": lambda a: cmd_simple(a, "/api/v1/sessions/{sid}/snapshot", "GET"),
         "takeover": lambda a: cmd_lifecycle(a, "/api/v1/sessions/{sid}:takeover",
                                            EV_TAKEN_OVER),
         "archive": lambda a: cmd_lifecycle(a, "/api/v1/sessions/{sid}:archive",
                                           EV_ARCHIVED,
                                           post_hook=CRON.report),
-        # v2 restore 只认 `{"ids": [...]}`；不带 body 会 50001（实测）
-        "restore": lambda a: cmd_lifecycle(a, "/api/v2/sessions:restore",
+        # restore 只认 `{"ids": [...]}`（2.7 合并进 v1，批量形态 `results[]` 不变）
+        "restore": lambda a: cmd_lifecycle(a, "/api/v1/sessions:restore",
                                           EV_RESTORED,
                                           body=lambda sid: {"ids": [sid]}),
         "profile": cmd_profile,

@@ -663,6 +663,8 @@ def status(sid: str, cache_file: Path | None = None) -> dict:
         return out
 
     if not is_new():
+        # 死分支（2.7 ROUTE-GONE，`is_new()` 为真时永不走这里）：旧的 REST `/status`
+        # 已被 `GET /sessions/{sid}` 的 activity/pending_interaction/archived 取代。
         st, payload = get(f"/api/v1/sessions/{sid}/status", timeout=10)
         d = data_of(payload)
         if st == 200 and isinstance(d, dict) and code_of(payload) in (0, None):
@@ -732,6 +734,32 @@ def status(sid: str, cache_file: Path | None = None) -> dict:
     return out
 
 
+def liveness(sid: str) -> str:
+    """冷会话判活（方案 §5.4）：`activity` 不是 busy 就够，得看本轮是否终态。
+
+    KAP 明说「未加载到本进程的会话**始终上报不忙碌**」，所以 `activity=idle`
+    **不等于**「没在跑」，要交叉验证最后一轮：`status=="ended"` 且 `outcome`
+    已填才是真结束（实测 completed／interrupted 都算）。冷会话且无终态 ⇒
+    `unknown`，**不许**当 idle —— 那是「不知道」冒充「空闲」，本单要消灭的病。
+    """
+    st, payload = get(f"/api/v1/sessions/{sid}", timeout=10)
+    d = data_of(payload)
+    if not (st == 200 and isinstance(d, dict) and code_of(payload) in (0, None)):
+        return "unknown"
+    act = d.get("activity")
+    if act in ("turn", "background"):
+        return str(act)
+    st2, payload2 = get(f"/api/v1/sessions/{sid}/agents/main/turns?page_size=1", timeout=10)
+    d2 = data_of(payload2)
+    turns = (d2.get("turns") if isinstance(d2, dict) else None) or []
+    last = turns[0] if turns else {}
+    if not isinstance(last, dict):
+        return "unknown"
+    if last.get("status") == "ended" and last.get("outcome"):
+        return "idle"
+    return "unknown"        # 冷会话且无终态：不知道，不许当空闲
+
+
 def active_prompt(sid: str) -> str:
     """正在跑的那一轮 prompt id；没有则空串。`GET /prompts` 两代都在。"""
     st2, payload2 = get(f"/api/v1/sessions/{sid}/prompts?page_size=10", timeout=10)
@@ -746,6 +774,7 @@ def active_prompt(sid: str) -> str:
             return str(queued[0].get("prompt_id") or queued[0].get("id") or "")
     if is_new():
         return ""
+    # 死分支（2.7 ROUTE-GONE）：旧的 REST `/snapshot`（`in_flight_turn` 形状）。
     st, payload = get(f"/api/v1/sessions/{sid}/snapshot", timeout=10)
     d = data_of(payload) or {}
     turn = (d.get("in_flight_turn") or {}) if isinstance(d, dict) else {}
@@ -763,7 +792,7 @@ def has_pending(sid: str, info: dict | None = None) -> bool:
 
 
 def pending_interactions(sid: str, cache_file: Path | None = None) -> list:
-    """待批交互。旧代 `/snapshot`；新代 WS `interaction` 帧 + 缓存。"""
+    """待批交互。旧代 `/snapshot`（**死分支**，2.7 ROUTE-GONE）；新代 WS `interaction` 帧 + 缓存。"""
     if not is_new():
         st, payload = get(f"/api/v1/sessions/{sid}/snapshot", timeout=10)
         d = data_of(payload) or {}
@@ -813,7 +842,7 @@ def pending_interactions(sid: str, cache_file: Path | None = None) -> list:
 
 
 def tasks(sid: str, cache_file: Path | None = None) -> list:
-    """后台任务列表。旧代 REST；新代 WS `task.list` + 缓存。"""
+    """后台任务列表。旧代 REST（**死分支**，2.7 ROUTE-GONE）；新代 WS `task.list` + 缓存。"""
     if not is_new():
         st, payload = get(f"/api/v1/sessions/{sid}/tasks", timeout=10)
         d = data_of(payload) or {}
@@ -1007,40 +1036,61 @@ def set_profile(sid: str, model: str = "", permission: str = "") -> tuple:
 
 
 def archive_session(sid: str) -> tuple:
-    """真归档（v2）。v1 的 `:archive` 常返 null 不生效。"""
-    st, payload = post("/api/v2/sessions:archive", {"ids": [sid]}, timeout=20)
-    d = data_of(payload) or {}
-    ok = False
-    for r in (d.get("results") or []):
-        if isinstance(r, dict) and r.get("ok"):
-            ok = True
-    return ok, d
+    """批量归档。判据走 `console._request_verdict` 的**同一份实现**。
+
+    2.7 把旧 v2 的 `sessions:archive` 合并进 `/api/v1`，返回结构逐字不变
+    （`results[].ok`／`succeeded`／`failed`），所以判据零改动。
+    这里不再自己写一遍 `results[].ok` 循环：同一个端点的两份判据迟早分叉，
+    分叉方向就是「一边记假事件」（ISS-103 P0-3 的教训）。
+    """
+    from .console import _request_verdict      # noqa: PLC0415  延迟导入避环
+    st, payload = post("/api/v1/sessions:archive", {"ids": [sid]}, timeout=20)
+    ok, _why = _request_verdict(st, payload)
+    return ok, (data_of(payload) or {})
 
 
 def restore_session(sid: str) -> tuple:
-    st, payload = post("/api/v2/sessions:restore", {"ids": [sid]}, timeout=20)
-    return (st == 200), (data_of(payload) or {})
+    """批量 restore。判据与归档**同一份**（`console._request_verdict`）。
+
+    为什么不能 `return (st == 200)`：v1 批量对不存在的 sid 返 HTTP 200 ＋
+    code=0，失败只在 `data.results[].ok=false` 里。只看 HTTP 状态会把「没找到
+    会话」记成「已恢复」，调用方（`wss_bus.ctl` 的 restore 分支）再据此写一条
+    journal —— 正是 ISS-76 那类「一边记假事件」的病。
+    """
+    from .console import _request_verdict      # noqa: PLC0415  只在该分支需要
+    st, payload = post("/api/v1/sessions:restore", {"ids": [sid]}, timeout=20)
+    ok, _why = _request_verdict(st, payload)
+    return ok, (data_of(payload) or {})
 
 
 def takeover_session(sid: str) -> tuple:
+    """接管会话。单动作响应体是 `{taken_over: true}`（`required`），判据同上。"""
+    from .console import _request_verdict      # noqa: PLC0415  只在该分支需要
     st, payload = post(f"/api/v1/sessions/{sid}:takeover", {}, timeout=20)
-    return (st == 200), (data_of(payload) or {})
+    ok, _why = _request_verdict(st, payload)
+    return ok, (data_of(payload) or {})
 
 
 def list_sessions(busy_only: bool = False, archived_only: bool = False,
-                  page_size: int = 50, after_id: str = "") -> tuple:
-    """会话列表（**支持翻页**）。返回 (items, next_after_id, err)。
+                  page_size: int = 50, page_token: str = "") -> tuple:
+    """会话列表（**支持翻页**）。返回 (items, next_page_token, err)。
 
-    QA P1-3：上一版只取 `page_size=50` 一页就完事，会话超过 50 个时会漏。
-    这里按 `after_id` 游标翻页，由调用方循环直到 `next_after_id` 为空。
+    2.7（ISS-103 §1.4①）：翻页游标是 `data.next_page_token`，**`after_id` 已静默
+    失效**——实测带 `after_id` 仍返回首页 4–5 条、`code=0`、无任何告警。旧写法
+    按「本页最后一条 id」自己造游标，于是 `list_all_sessions()` 只拿到一页 50 条，
+    而真实总数是 944：漏页是静默的。
+
+    参数也改名了（旧名仍被接受，但只有新名有文档保证）：
+    `archived_only` → `archived`。实测 `has_more` 与 `next_page_token` 一起给，
+    以 token 为空作终止判据。
     """
     q = f"?page_size={page_size}"
     if busy_only:
         q += "&busy=true"
     if archived_only:
-        q += "&archived_only=true"
-    if after_id:
-        q += f"&after_id={after_id}"
+        q += "&archived=true"
+    if page_token:
+        q += f"&page_token={page_token}"
     st, payload = get(f"/api/v1/sessions{q}", timeout=10)
     if st != 200:
         return [], "", f"http={st}"
@@ -1049,26 +1099,28 @@ def list_sessions(busy_only: bool = False, archived_only: bool = False,
     if isinstance(d, dict):
         items = d.get("items") or d.get("sessions") or []
     items = items if isinstance(items, list) else []
-    nxt = ""
-    if items and isinstance(items[-1], dict):
-        nxt = str(items[-1].get("id") or "")
-    return items, (nxt if len(items) >= page_size else ""), ""
+    nxt = str(d.get("next_page_token") or "") if isinstance(d, dict) else ""
+    return items, nxt, ""
 
 
-def list_all_sessions(page_size: int = 50, max_pages: int = 20) -> tuple:
-    """翻完所有页，按 id 去重。返回 (items, err)。"""
+def list_all_sessions(page_size: int = 50, max_pages: int = 40) -> tuple:
+    """翻完所有页，按 id 去重。返回 (items, err)。
+
+    `max_pages` 40 × 50 = 2000 条，覆盖实测的 944 条还有一倍余量；到顶说明形状
+    又变了，别静默当成「就这么多」。
+    """
     out: dict = {}
-    after = ""
+    token = ""
     for _ in range(max_pages):
-        items, nxt, err = list_sessions(page_size=page_size, after_id=after)
+        items, nxt, err = list_sessions(page_size=page_size, page_token=token)
         if err:
             return list(out.values()), err
         for it in items:
             if isinstance(it, dict) and it.get("id"):
                 out[it["id"]] = it
-        if not nxt or nxt == after:
+        if not nxt or nxt == token:
             break
-        after = nxt
+        token = nxt
     return list(out.values()), ""
 
 
