@@ -304,11 +304,13 @@ sys.path.insert(0, clone)
 
 popen = []
 def hook(event, args):
-    # args[1] is the argv list (args[0] is the executable, None on POSIX-only
-    # paths). Recorded raw: joining it first would be the form that made the
-    # first version's criterion permanently false.
+    # Measured: ``args[1]`` is the command **as one string** on this platform,
+    # not a list. ``list(args[1])`` would therefore record characters and both
+    # criteria below would be permanently 0 -- the exact "criterion is always
+    # false" shape, which stays green-looking and catches nothing.
     if event == "subprocess.Popen":
-        popen.append(list(args[1]))
+        raw = args[1]
+        popen.append(" ".join(raw) if isinstance(raw, (list, tuple)) else str(raw))
 sys.addaudithook(hook)
 
 from super_agent import issue_cli
@@ -318,6 +320,8 @@ issue_cli.API = github_base
 
 B = lambda argv: [a for a in argv if "sessions.py" in a]
 A = lambda argv: [a for a in argv if "recycle" in a and "archive" in a]
+# Each recorded row is the whole command line; A and B filter on substrings of
+# it, so "recycle" and "archive" must appear in one row, not in two.
 
 # ``--state-dir`` and not a config key: ``agent_config.overrides()`` is merged
 # last and derives ``engine.session_state_dir`` from ``paths.state_dir``, so a
