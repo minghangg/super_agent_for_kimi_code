@@ -217,8 +217,25 @@ def _sessions_path() -> Path:
 
 
 def _retired():
-    """Retired-sid store injected by the caller; ``None`` ⇒ fail-closed."""
-    return _cfg().retired_module
+    """Retired-sid store: an explicit injection wins, else this package's module.
+
+    ``missing_injections()`` still lists ``retired_module`` as required: the
+    external host's contract does not change, and "not injected" must stay
+    distinguishable from "ready". What changes is the runtime fallback -- the
+    daemon has a usable implementation in this package, so the four call sites
+    stop printing "退役清单未注入" on a deployment that has one.
+
+    If the import itself fails the answer is still ``None``, which the callers
+    treat as fail-closed (refuse delivery) rather than as an empty list.
+    """
+    injected = _cfg().retired_module
+    if injected is not None:
+        return injected
+    try:
+        from . import retired_sids
+    except Exception:                      # noqa: BLE001  absence stays fail-closed
+        return None
+    return retired_sids
 
 
 # --------------------------------------------------------------------- paths
