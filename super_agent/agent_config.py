@@ -65,6 +65,7 @@ ENV_FILE = "SAFKC_AGENT_CONFIG"
 # first and from the JSON file second; a key not listed here is file-only.
 ENV = {
     "paths.state_dir": "SESS_EVENTS_STATE_DIR",
+    "paths.project_env_dir": "SAFKC_PROJECT_ENV_DIR",
     "paths.sessions_dir": "SESS_WIRE_ROOT",
     "github.projects_file": "SAFKC_PROJECTS_FILE",
     "github.token_env": "GITHUB_TOKEN",
@@ -93,6 +94,7 @@ DEFAULTS = {
     # placeholder path here would outrank a deployment's own ``--config``.
     "github.allowlist_file": "",
     "paths.state_dir": "",
+    "paths.project_env_dir": "",
     "paths.sessions_dir": "",
     "quota.config_file": "",
     "quota.cores_dir": "",
@@ -102,6 +104,10 @@ DEFAULTS = {
     "charter.map": {},
     "roles.prefixes": {},
     "dispatch.console": "-m super_agent.dispatch_cli",
+    # ISS-101: scheduled-task names per autostart part. Empty in the public
+    # floor -- a task name is a deployment fact, and guessing one would register
+    # or verify the wrong task instead of refusing.
+    "autostart.tasks": {},
 }
 
 # ``env`` names for the two GitHub token layers: the variable to read the value
@@ -236,10 +242,25 @@ def state_dir() -> str:
     return str(path.resolve())
 
 
+def project_env_dir() -> str:
+    """The declared project-environment directory, or ``""`` (the caller decides).
+
+    Relative values resolve against **this checkout**, never the working
+    directory -- the same rule as :func:`state_dir` (#98 P0-1). A second anchor
+    for one key family is how two answers start disagreeing.
+    """
+    raw = str(get("paths.project_env_dir") or "").strip()
+    if not raw:
+        return ""
+    path = Path(os.path.expanduser(raw))
+    if not path.is_absolute():
+        path = (CHECKOUT / path)
+    return str(path.resolve())
+
+
 def sessions_dir() -> str:
     raw = str(get("paths.sessions_dir") or "").strip()
     return os.path.expanduser(raw) if raw else ""
-
 
 def quota_config() -> str:
     raw = str(get("quota.config_file") or "").strip()
@@ -296,6 +317,20 @@ def session_archive_cmd() -> str:
     the chain -- where it cannot outrank anyone.
     """
     return str(get("engine.session_archive_cmd") or "").strip()
+
+
+def autostart_tasks() -> dict:
+    """``{part: scheduled task name}`` -- ``{}`` when no layer configures one.
+
+    The public floor is empty on purpose: a task name is a deployment fact, and
+    a made-up name would register or verify a task nobody asked about. Callers
+    treat an empty mapping as "not configured" and refuse (rc=2) rather than
+    guess.
+    """
+    table = get("autostart.tasks") or {}
+    if not isinstance(table, dict):
+        return {}
+    return {str(k): str(v) for k, v in table.items() if str(v).strip()}
 
 
 def overrides() -> dict:
@@ -361,6 +396,7 @@ def describe() -> dict:
         "exists": config_path().is_file(),
         "state_dir": state_dir() or "(未配置，派生 config.DEFAULTS.state_dir)",
         "sessions_dir": sessions_dir() or "(未配置，回落 super_agent.paths)",
+        "project_env_dir": project_env_dir() or "(未配置)",
         "projects": len(projects()),
         "projects_file": projects_file() or "(未配置)",
         "charter_root": charter_root() or "(未配置)",
@@ -375,9 +411,10 @@ def _reset_cache() -> None:
 
 
 __all__ = [
-    "AgentConfigError", "ENV", "DEFAULTS", "allowlist_file", "charter_map",
-    "charter_project_prefixes", "charter_root", "config_path", "describe",
-    "dispatch_console", "get", "load", "model_profiles_file", "overrides",
-    "projects", "projects_file", "quota_config", "quota_cores_dir",
-    "role_prefixes", "sessions_dir", "state_dir", "token_source",
+    "AgentConfigError", "ENV", "DEFAULTS", "allowlist_file", "autostart_tasks",
+    "charter_map", "charter_project_prefixes", "charter_root", "config_path",
+    "describe", "dispatch_console", "get", "load", "model_profiles_file",
+    "overrides", "project_env_dir", "projects", "projects_file", "quota_config",
+    "quota_cores_dir", "role_prefixes", "sessions_dir", "state_dir",
+    "token_source",
 ]

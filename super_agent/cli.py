@@ -506,7 +506,77 @@ def cmd_status(args) -> int:
     return 0
 
 
+def _doctor_project(project: str) -> int:
+    """Print one project's environment document verbatim (ISS-101).
+
+    The file name is the project key itself -- the same token ``gh_projects.json``
+    and dispatch use. Nothing here parses the markdown: the document is the
+    answer, and a schema on top of it would be a second ``config.validate``.
+
+    Exit codes: 0 printed, 1 no such entry (or two candidates), 2 the directory
+    itself is unconfigured or missing -- a configuration fault is a different
+    action from a missing registration, so they do not share a code.
+    """
+    from . import agent_config
+
+    key = str(project or "").strip()
+    if not key:
+        print("doctor --project: 需要项目键（gh_projects.json 的键）", file=sys.stderr)
+        return 2
+    root = agent_config.project_env_dir()
+    if not root:
+        print("project_env_dir 未配置（agent_config: paths.project_env_dir）",
+              file=sys.stderr)
+        return 2
+    base = Path(root)
+    if not base.is_dir():
+        print(f"目录不存在：{base}", file=sys.stderr)
+        print(f"来源：paths.project_env_dir（{agent_config.config_path()}）",
+              file=sys.stderr)
+        return 2
+    # Two separate branches on purpose: "no candidate" is a missing
+    # registration, "several candidates" is an ambiguous one. Taking the first
+    # hit would make the answer depend on ``glob``'s order.
+    exact = [p for p in base.glob("*.md") if p.stem == key]
+    if len(exact) >= 2:
+        names = ", ".join(sorted(p.name for p in exact))
+        print(f"歧义：{base} 下有 {len(exact)} 个候选：{names}", file=sys.stderr)
+        return 1
+    if not exact:
+        print(f"未登记：{key}（目录 {base} 下无 {key}.md）", file=sys.stderr)
+        # A near-miss is reported, never adopted: "looks like" is not "is".
+        near = [p for p in base.glob("*.md")
+                if p.stem.strip().lower().replace("_", "")
+                == key.strip().lower().replace("_", "")]
+        if near:
+            hint = ", ".join(sorted({p.stem.strip() for p in near}))
+            print(f"最接近 {hint}（未自动采用）", file=sys.stderr)
+        return 1
+    path = exact[0]
+    print(f"来源：{path}（paths.project_env_dir 来自 {agent_config.config_path()}）",
+          file=sys.stderr)
+    # Bytes out when the stream has one: the document is printed as stored, so
+    # ``diff`` against the file is empty whatever its line endings (a text-mode
+    # write would translate LF to CRLF on Windows). A redirected StringIO has
+    # no buffer; there the text form is the only option and is exact enough.
+    raw = path.read_bytes()
+    sys.stdout.flush()
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is not None:
+        buffer.write(raw)
+        buffer.flush()
+    else:
+        sys.stdout.write(raw.decode("utf-8-sig", "replace"))
+    return 0
+
+
 def cmd_doctor(args) -> int:
+    project = getattr(args, "project", None)
+    if project is not None:
+        # ISS-101: ``--project`` is a view of doctor, not a new command. It
+        # returns before the engine is built, so it works with no bus, no
+        # source and no network -- the file is the whole answer.
+        return _doctor_project(project)
     cfg, store = _build(args)
     engine = _engine(cfg, store, _bus(cfg),
                       session_api=_session_api(getattr(args, "session_api", None)))
@@ -1058,6 +1128,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_doctor = sub.add_parser("doctor", help="check bus, source, cursor, assignments")
     _add_common(p_doctor, suppress=True)
+    # ISS-101: a read-only view. Name the key and get that project's
+    # environment document; it needs no bus and no source.
+    p_doctor.add_argument("--project", default=None,
+                          help="print one project's environment document "
+                               "(file name = gh_projects.json key)")
     p_doctor.set_defaults(func=cmd_doctor)
 
     p_unblock = sub.add_parser("unblock", help="move one blocked assignment back to working")

@@ -397,5 +397,74 @@ class RelativeStateDirTest(_Isolated):
         self.assertEqual(overrides["engine"]["session_state_dir"], want)
 
 
+class ProjectEnvDirTest(_Isolated):
+    """ISS-101: one more path key, under the same anchoring rule as state_dir.
+
+    Two things are worth pinning. ``project_env_dir`` resolves a relative value
+    against this checkout, not the working directory -- a second anchor for one
+    key family is how two answers start disagreeing (#98 P0-1). And it is
+    absent from ``overrides()`` on purpose: ``config`` declares it, so
+    ``overrides`` injecting it would bypass ``config.validate`` and outrank a
+    ``--config`` file on every run.
+    """
+
+    def test_unset_is_empty(self):
+        os.environ[agent_config.ENV_FILE] = str(self.root / "absent.json")
+        agent_config._reset_cache()
+        self.assertEqual(agent_config.project_env_dir(), "")
+
+    def test_relative_value_anchors_to_the_checkout(self):
+        target = "new_workbench/config/project_env"
+        self.write({"paths": {"project_env_dir": target}})
+        self.assertEqual(agent_config.project_env_dir(),
+                         str((agent_config.CHECKOUT / target).resolve()))
+
+    def test_absolute_value_passes_through(self):
+        target = self.root / "envs"
+        self.write({"paths": {"project_env_dir": str(target)}})
+        self.assertEqual(agent_config.project_env_dir(), str(target.resolve()))
+
+    def test_environment_variable_wins_over_the_file(self):
+        self.write({"paths": {"project_env_dir": str(self.root / "from-file")}})
+        wanted = self.root / "from-env"
+        os.environ["SAFKC_PROJECT_ENV_DIR"] = str(wanted)
+        agent_config._reset_cache()
+        try:
+            self.assertEqual(agent_config.project_env_dir(), str(wanted.resolve()))
+        finally:
+            os.environ.pop("SAFKC_PROJECT_ENV_DIR", None)
+
+    def test_not_injected_by_overrides(self):
+        self.write({"paths": {"project_env_dir": str(self.root / "envs")}})
+        overrides = agent_config.overrides()
+        self.assertNotIn("paths", overrides)
+
+    def test_describe_names_it(self):
+        self.write({"paths": {"project_env_dir": str(self.root / "envs")}})
+        self.assertIn("project_env_dir", agent_config.describe())
+
+
+class AutostartTasksTest(_Isolated):
+    """ISS-101: task names are deployment facts, so the public floor is empty."""
+
+    def test_unset_is_empty(self):
+        os.environ[agent_config.ENV_FILE] = str(self.root / "absent.json")
+        agent_config._reset_cache()
+        self.assertEqual(agent_config.autostart_tasks(), {})
+        self.assertEqual(agent_config.DEFAULTS["autostart.tasks"], {})
+
+    def test_reads_the_private_table(self):
+        self.write({"autostart": {"tasks": {"wss_bus": "KimiWssBus"}}})
+        self.assertEqual(agent_config.autostart_tasks(), {"wss_bus": "KimiWssBus"})
+
+    def test_blank_names_are_dropped(self):
+        self.write({"autostart": {"tasks": {"wss_bus": "  ", "decide_watch": "X"}}})
+        self.assertEqual(agent_config.autostart_tasks(), {"decide_watch": "X"})
+
+    def test_non_mapping_is_empty_not_an_exception(self):
+        self.write({"autostart": {"tasks": ["not", "a", "table"]}})
+        self.assertEqual(agent_config.autostart_tasks(), {})
+
+
 if __name__ == "__main__":
     unittest.main()

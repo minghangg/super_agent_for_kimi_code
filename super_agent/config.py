@@ -29,6 +29,15 @@ DEFAULTS: dict = {
     # Where the pre-migration runtime root is looked for. "" means "the
     # ``state`` sibling of the chosen root" (see ``cli._legacy_root``).
     "legacy_state_dir": "",
+    # ISS-101: path-like keys that are not the state root. A section rather
+    # than loose top-level keys because ``agent_config.overrides()`` maps
+    # ``paths.*`` as one level, and ``validate`` does not reject unknown keys --
+    # an undeclared key would look configured while nothing reads it.
+    # ``project_env_dir`` holds one ``<key>.md`` per project (key =
+    # ``gh_projects.json`` key); nothing parses the markdown.
+    "paths": {
+        "project_env_dir": "",
+    },
     "bus": {
         "host": "127.0.0.1",
         "port": 58800,
@@ -212,6 +221,15 @@ def validate(cfg: dict) -> dict:
     session_dir = (cfg.get("engine") or {}).get("session_state_dir", "")
     if session_dir is not None and not isinstance(session_dir, str):
         raise ConfigError("engine.session_state_dir must be a path string (or empty)")
+    # ISS-101: the declared project-environment directory. Same shape as the
+    # check above -- "" means "not configured", and a non-string is refused
+    # here rather than reaching ``doctor --project`` as a repr.
+    paths_cfg = cfg.get("paths")
+    if paths_cfg is not None and not isinstance(paths_cfg, dict):
+        raise ConfigError("paths must be a mapping")
+    penv = (paths_cfg or {}).get("project_env_dir", "")
+    if penv is not None and not isinstance(penv, str):
+        raise ConfigError("paths.project_env_dir must be a path string (or empty)")
     lwa_root = (cfg.get("engine") or {}).get("lwa_root", "")
     if lwa_root is not None and not isinstance(lwa_root, str):
         raise ConfigError("engine.lwa_root must be a path string (or empty)")
