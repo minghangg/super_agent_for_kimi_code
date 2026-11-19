@@ -12,3 +12,4 @@ monitor.log
 config/allowlist.local.json
 config/gh_projects.json
 config/roles.local.json
+new_workbench/
