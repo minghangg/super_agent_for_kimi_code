@@ -274,7 +274,8 @@ print("OK" if issue_cli._archive_session(
     results = {}
     for mode in ("inject", "noinject"):
         rc, out = _run([py, "-c", code, mode], outside, env)
-        inside = "super_agent.__init__" in out and str(clone) in out
+        inside = "super_agent.__init__" in out and out.lower().replace(
+            "/", "\\").find(str(clone).lower()) >= 0
         results[mode] = (rc, out, inside)
     rc_i, out_i, in_i = results["inject"]
     rc_n, out_n, in_n = results["noinject"]
@@ -349,7 +350,11 @@ def gate8(gate: Gate, clone: Path, outside: Path, py: str,
     # close path call the old script" is answered by the argv, not by the file.
     # Keeping the path abstract also keeps gate 6 honest -- a literal private
     # repository name in this file would make that gate fail on itself.
-    bad_tmpl = "{python} " + str(work / "legacy" / "tools" / "sessions.py") \
+    # ``as_posix()``: the product refuses a backslash template on purpose
+    # (shlex.split eats it), so the bad template must still be a valid one --
+    # it fails for the right reason (it runs sessions.py), not because of a
+    # path separator.
+    bad_tmpl = "{python} " + (work / "legacy" / "tools" / "sessions.py").as_posix() \
         + " archive {sid}"
     results = {}
     with Stub(sid) as stub:
@@ -467,6 +472,12 @@ def main(argv=None) -> int:
             hits = []
             for p in clone.rglob("*"):
                 if p.suffix not in (".py", ".json") or not p.is_file():
+                    continue
+                # This file names the private workbench on purpose: it must
+                # watch that workbench's event stream to prove the read-only
+                # gates left it alone. Excluding it keeps gate 6 about the
+                # product, not about its own checker.
+                if p.name == Path(__file__).name:
                     continue
                 try:
                     if args.forbid in p.read_text(encoding="utf-8", errors="ignore"):
