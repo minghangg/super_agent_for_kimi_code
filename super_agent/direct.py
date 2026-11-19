@@ -307,8 +307,6 @@ def _send_ws(frame: dict, timeout: float = 8.0) -> dict:
     try:
         with connect(_ws_url(), open_timeout=timeout,
                      additional_headers={"Authorization": f"Bearer {token()}"}) as ws:
-            ws.send(json.dumps({"type": "client_hello", "id": uuid.uuid4().hex,
-                                "payload": {"client_id": "kimi-direct-cmd"}}))
             ws.send(json.dumps(frame))
             for _ in range(12):
                 try:
