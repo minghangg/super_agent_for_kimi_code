@@ -855,6 +855,12 @@ def cmd_context(args) -> int:
     return 0
 
 
+def cmd_recycle(args) -> int:
+    """``recycle`` 只是转发：解析只在 ``recycle.main`` 一处（ISS-100 D2）。"""
+    from . import recycle as recycle_mod
+    return recycle_mod.main(list(args.rest or []))
+
+
 def cmd_reporter(args) -> int:
     """First screen "what needs me": three buckets, then a collapsed second screen.
 
@@ -1146,6 +1152,13 @@ def build_parser() -> argparse.ArgumentParser:
                        help="read comment bodies from a fixture file instead of "
                             "GitHub (same shape as context --fixture)")
     p_rep.set_defaults(func=cmd_reporter)
+
+    # ISS-100 D2: `recycle` per-command flags live in `recycle.main` only
+    # (REMAINDER here); `cli.py` does not repeat them.
+    p_recycle = sub.add_parser("recycle",
+                               help="stop/archive/retire/status one session (no delete)")
+    p_recycle.add_argument("rest", nargs=argparse.REMAINDER)
+    p_recycle.set_defaults(func=cmd_recycle)
 
     for sub_parser in (p_once, p_run, p_status, p_doctor, p_unblock, p_resolve,
                        p_replay, p_rec, p_brief, p_ctx, p_rep):

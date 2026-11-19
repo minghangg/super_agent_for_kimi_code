@@ -35,6 +35,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 from . import agent_config as agentcfg
 
@@ -315,14 +316,17 @@ def read_token() -> str:
     return token
 
 
-def _instance_port() -> int | None:
-    """Port from the live kimi-code server instance file, or None.
+def _instance_record() -> dict | None:
+    """Live kimi-code server instance record (``port`` + ``host``), or None.
 
     Kimi Code Desktop binds a **random** port on each start (38370, then 4869,
     observed 2026-11-17) and records it in
     ``~/.kimi-code/server/instances/<id>.json``. ``DEFAULT_PORTS`` alone only
     works for the CLI server. ``super_agent.paths.latest_instance`` already parses
     that file; reuse it instead of duplicating the logic.
+
+    The ``host`` from the file is kept, not replaced by ``127.0.0.1``: the same
+    process tree must agree with ``paths.server_base()``, which honours it.
     """
     try:
         from . import paths as kimi_paths
@@ -332,19 +336,111 @@ def _instance_port() -> int | None:
     if not isinstance(inst, dict):
         return None
     port = inst.get("port")
-    return port if isinstance(port, int) and 1 <= port <= 65535 else None
+    if not (isinstance(port, int) and 1 <= port <= 65535):
+        return None
+    host = inst.get("host")
+    return {"host": host if isinstance(host, str) and host.strip() else "127.0.0.1",
+            "port": port}
 
 
-def candidate_ports(explicit: int | None) -> list[int]:
+def _parse_env_port(raw: str) -> tuple[str, int] | None:
+    """``KIMI_CODE_SERVER_PORT`` → ``(host, port)``; unparsable returns None.
+
+    Two accepted shapes: a bare port number (``15430``) and a full base URL
+    (``http://127.0.0.1:15430``). The URL form keeps its host, so a non-local
+    server can be named here. A URL without a port has nothing to connect to and
+    is rejected the same way as garbage.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        port = int(text)
+        return ("127.0.0.1", port) if 1 <= port <= 65535 else None
+    parts = urlsplit(text)
+    if parts.scheme in ("http", "https") and parts.hostname:
+        port = parts.port
+        if port is not None and 1 <= port <= 65535:
+            return (parts.hostname, port)
+    return None
+
+
+def _candidates(explicit: int | None):
+    """Yield ``(base, warn)`` in the frozen order (ISS-100 D1).
+
+    Priority is fixed and must not be reshuffled:
+
+    1. ``--port`` (local only; a remote host goes through the env URL form)
+    2. ``KIMI_CODE_SERVER_PORT`` — bare port or full base URL
+    3. ``KIMI_SERVER`` — parsed by ``paths.env_base()``, never re-implemented here
+    4. ``latest_instance()`` — host taken from the instance file
+    5. ``DEFAULT_PORTS`` — with a stderr warning on **first use**
+
+    When both env vars are set, ``KIMI_CODE_SERVER_PORT`` wins: it is the
+    dispatch-specific knob, ``KIMI_SERVER`` is the shared client base.
+
+    ``warn`` is a message string for the default-port fallback and ``None``
+    otherwise. It is **not** printed here: the caller prints it when it actually
+    probes a default port, so listing the candidates never produces a warning.
+    """
+    seen: set[str] = set()
+
+    def _fresh(base: str) -> bool:
+        if base in seen:
+            return False
+        seen.add(base)
+        return True
+
     if explicit:
-        return [explicit]
-    env = os.environ.get("KIMI_CODE_SERVER_PORT")
-    ports = [int(env)] if env and env.isdigit() else []
-    inst = _instance_port()                 # Desktop: random port, discover it
-    if inst is not None and inst not in ports:
-        ports.append(inst)
-    ports += [p for p in DEFAULT_PORTS if p not in ports]
-    return ports
+        base = f"http://127.0.0.1:{explicit}"
+        if _fresh(base):
+            yield base, None
+        return
+
+    env_port = (os.environ.get("KIMI_CODE_SERVER_PORT") or "").strip()
+    if env_port:
+        parsed = _parse_env_port(env_port)
+        if parsed is None:
+            print(f"[dispatch] 警告：KIMI_CODE_SERVER_PORT 无法解析"
+                  f"（{env_port[:60]}），已忽略", file=sys.stderr)
+        else:
+            base = f"http://{parsed[0]}:{parsed[1]}"
+            if _fresh(base):
+                yield base, None
+
+    try:
+        from . import paths as kimi_paths
+        env_base = kimi_paths.env_base()
+    except Exception:                       # noqa: BLE001 - absence is normal
+        env_base = None
+    if env_base:
+        base = env_base.rstrip("/")
+        if _fresh(base):
+            yield base, None
+
+    inst = _instance_record()               # Desktop: random port, discover it
+    inst_base = ""
+    if inst is not None:
+        inst_base = f"http://{inst['host']}:{inst['port']}"
+        if _fresh(inst_base):
+            yield inst_base, None
+
+    defaults = [f"http://127.0.0.1:{p}" for p in DEFAULT_PORTS]
+    if not any(b not in seen for b in defaults):
+        return
+    ports = "/".join(str(p) for p in DEFAULT_PORTS)
+    if inst_base:
+        warn = f"[dispatch] 警告：实例端口 {inst['port']} 未响应，回落探测 {ports}"
+    else:
+        warn = f"[dispatch] 警告：实例文件不可用，回落探测 {ports}"
+    for base in defaults:
+        if _fresh(base):
+            yield base, warn
+
+
+def candidate_bases(explicit: int | None) -> list[str]:
+    """Base URLs to try, in the frozen priority order (see ``_candidates``)."""
+    return [base for base, _warn in _candidates(explicit)]
 
 
 def discover_base(token: str, explicit_port: int | None) -> str:
@@ -355,9 +451,15 @@ def discover_base(token: str, explicit_port: int | None) -> str:
     that happens to hold the port (e.g. 8787 answers 302 to anything).
     """
     tried: list[str] = []
-    for port in candidate_ports(explicit_port):
-        base = f"http://127.0.0.1:{port}"
-        if not port_open(port):
+    warned = False
+    for base, warn in _candidates(explicit_port):
+        if warn and not warned:
+            print(warn, file=sys.stderr)
+            warned = True
+        parts = urlsplit(base)
+        host = parts.hostname or "127.0.0.1"
+        port = parts.port
+        if port is None or not port_open(port, host):
             tried.append(f"{base} (closed)")
             continue
         try:
@@ -371,6 +473,7 @@ def discover_base(token: str, explicit_port: int | None) -> str:
             return base
         tried.append(f"{base} (no meta envelope)")
     raise DispatchError(
+        "实例文件不可用且默认端口均 closed，kimi-code server 未运行？\n"
         "no live kimi-code server found. Start one with `kimi web`.\n  tried: "
         + ", ".join(tried)
     )

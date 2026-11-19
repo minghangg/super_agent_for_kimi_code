@@ -300,6 +300,32 @@ def fetch_sessions():
     return payload, None
 
 
+def archive_session(session_id: str, *, state_dir=None) -> int:
+    """POST /api/v2/sessions:archive —— 归档一个会话，返回退出码。
+
+    服务端对这个批量端点**恒回外层 `code: 0`**，失败写在 `data.results[]` 里
+    （`ok: false` / `succeeded: 0` / `failed: 1`），只认顶层 code 会给失败的
+    归档补一条假的 `session.archived`。判据复用 `sess._request_verdict`
+    （**全仓只有这一份**），失败不记事件且返回非零。
+
+    ISS-100 D2：从 `cmd_archive` 拆出，`cmd_archive` 变薄包装。`recycle archive`
+    调本函数后再做第二回读（服务端 `archived`），**不复制归档逻辑**。
+    """
+    status, payload = kimi_api.post("/api/v2/sessions:archive",
+                                    {"ids": [session_id]})
+    ok, why = _request_verdict(status, payload)
+    if not ok:
+        print(f"归档失败: http={status} {why}")
+        return 1
+    if not _emit_soft("session.archived", strict=True, root=state_dir, sid=session_id):
+        print(f"已归档 {session_id[:12]}…（事件未落，见上方告警）")
+        cron_wire.report(session_id)
+        return EXIT_EVENT_LOST
+    print(f"已归档 {session_id[:12]}…")
+    cron_wire.report(session_id)
+    return 0
+
+
 def cmd_archive(args):
     """POST /api/v2/sessions:archive —— 归档会话（归档后收不下新 turn）。
 
@@ -333,20 +359,7 @@ def cmd_archive(args):
 
     **不回滚归档**：服务端归档不可撤销，假装失败会误导调用方以为会话还活着。
     """
-    root = getattr(args, "state_dir", None)
-    status, payload = kimi_api.post("/api/v2/sessions:archive",
-                                    {"ids": [args.session_id]})
-    ok, why = _request_verdict(status, payload)
-    if not ok:
-        print(f"归档失败: http={status} {why}")
-        return 1
-    if not _emit_soft("session.archived", strict=True, root=root, sid=args.session_id):
-        print(f"已归档 {args.session_id[:12]}…（事件未落，见上方告警）")
-        cron_wire.report(args.session_id)
-        return EXIT_EVENT_LOST
-    print(f"已归档 {args.session_id[:12]}…")
-    cron_wire.report(args.session_id)
-    return 0
+    return archive_session(args.session_id, state_dir=getattr(args, "state_dir", None))
 
 
 def cmd_busy(args):

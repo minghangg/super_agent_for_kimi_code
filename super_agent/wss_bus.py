@@ -2336,17 +2336,21 @@ def _retire_sid_safe(sid: str, *, key: str = "", replaced_by: str = "") -> None:
     ``state_dir`` must be explicit: the store's default resolves from a different
     environment variable, while the daemon's isolated root is ``--state-dir``.
     Without it an isolated instance writes the retirement list into production.
+
+    ISS-100 D4: the write plus the read-back lives in
+    ``retired_sids.retire_safe``; this is a 4-line shell so the CLI and the daemon
+    share one implementation.
     """
     mod = _retired()
     if mod is None:
         log("退役清单未注入（retired_module），仅摘订阅、不落盘")
         return
-    try:
-        mod.retire(sid, key=key, replaced_by=replaced_by,
-                   reason="bus unsubscribe", state_dir=str(PATHS.root))
-        STATE.retired_cache = set(mod.load_strict(str(PATHS.root)))
-    except Exception as exc:  # noqa: BLE001
-        log(f"退役清单写入失败（订阅已摘，但重连后会订回来）：{type(exc).__name__}: {exc}")
+    fresh = mod.retire_safe(sid, key=key, replaced_by=replaced_by,
+                            reason="bus unsubscribe", state_dir=str(PATHS.root))
+    if fresh is None:
+        log("退役清单写入失败（订阅已摘，但重连后会订回来）")
+        return
+    STATE.retired_cache = fresh
 
 
 def _send_unsubscribe(sid: str) -> None:

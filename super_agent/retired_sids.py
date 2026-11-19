@@ -209,6 +209,23 @@ def filter_ledger(reg: dict, state_dir=None) -> dict:
     return out
 
 
+def retire_safe(sid: str, *, key: str = "", replaced_by: str = "",
+                reason: str = "bus unsubscribe", state_dir=None) -> set[str] | None:
+    """记一条退役并回读全量集合；写失败返回 ``None``（不抛出）。
+
+    2026-11-19（ISS-100 D4）：从 `wss_bus._retire_sid_safe` 抽出。bus 那条路
+    「订阅已经摘了、写清单失败只能告警」，所以吞异常；CLI（`recycle retire`）
+    走 `retire()` 直接报错。两者写的是同一份 `path()` —— 本函数内部就调
+    `retire()`，不另立第二份写入口。
+    """
+    try:
+        retire(sid, key=key, replaced_by=replaced_by, reason=reason,
+               state_dir=state_dir)
+        return set(load_strict(state_dir))
+    except Exception:  # noqa: BLE001  调用方负责告警；这里只回 None
+        return None
+
+
 def main(argv=None) -> int:
     argv = EV.apply_state_dir(argv or sys.argv[1:])
     if not argv:

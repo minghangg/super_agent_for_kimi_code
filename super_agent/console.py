@@ -818,6 +818,41 @@ def confirm_delivery(sid, prompt_id, timeout, grace=None):
     return ("confirmed", info)
 
 
+def refuse_if_archived(sid, *, retired_reason: str = "", revive: bool = False):
+    """归档闸：已归档会话一律拒投（ISS-76）。返回 ``None`` ＝放行，否则退出码。
+
+    ISS-100 D3：从 `cmd_send` 的 `:872-895` **原样搬出**，`send` 与 `recycle`
+    共用同一份判定，不许各写一份。`send` 的行为与措辞逐字不变。
+
+    `retired_reason` 非空表示退役闸已经命中过：此时两个开关都给，报 4（退役是
+    终态，归档闸同样不放行，只是不必再提）。`revive` 只解归档闸，且**不隐式解
+    归档**——它只打印「先去 restore」并仍然拒绝。
+    """
+    archived, why = archived_state(sid)
+    if retired_reason and archived == "yes" and revive:
+        # 两个开关都给：退役是终态，报 4（归档闸同样不放行，只是不必再提）。
+        print(f"send: 拒绝投递 —— {retired_reason}")
+        print("  退役闸与归档闸都没被绕过（--allow-retired 只解退役，"
+              "--revive 只解归档且不隐式解归档）。")
+        return 4
+    if archived == "yes" and not revive:
+        print(f"send: 拒绝投递 —— 该会话已归档（sid={sid}）：{why}")
+        print("  （归档会话被 send 投达会被服务端隐式解归档，cron 随之复活——ISS-76 根因）")
+        print(f"  要先恢复请显式执行：python -m super_agent.console restore {sid}")
+        return EXIT_ARCHIVED
+    if archived == "yes":
+        # `revive` 是「指向 restore 的拒绝态」，不产生任何恢复动作。
+        print(f"send: 拒绝投递 —— 该会话已归档（sid={sid}）：{why}")
+        print("  --revive 不隐式解归档，本次未投递、未改会话状态。请先：")
+        print(f"    python -m super_agent.console restore {sid}")
+        print("  复核：GET /api/v1/sessions/<sid> 的 archived=false，然后重发本条。")
+        return EXIT_ARCHIVED
+    if archived == "unknown":
+        print(f"send: ⚠ 无法确认归档状态（{why}）——按放行处理；"
+              "若该会话确已归档，本条会重新激活它（ISS-76）", file=sys.stderr)
+    return None
+
+
 def cmd_send(args):
     """给会话投一轮。
 
@@ -871,28 +906,10 @@ def cmd_send(args):
     args = [a for a in args if a != "--allow-retired"]
     # ---- 第 2 闸：服务端 archived（ISS-76，rc=6）---------------------------
     # 与第 1 闸分开写、不合并：`--allow-retired` 不许顺带绕过归档闸。
-    archived, why = archived_state(sid)
-    if retired_reason and archived == "yes" and "--revive" in args:
-        # 两个开关都给：退役是终态，报 4（归档闸同样不放行，只是不必再提）。
-        print(f"send: 拒绝投递 —— {retired_reason}")
-        print("  退役闸与归档闸都没被绕过（--allow-retired 只解退役，"
-              "--revive 只解归档且不隐式解归档）。")
-        return 4
-    if archived == "yes" and "--revive" not in args:
-        print(f"send: 拒绝投递 —— 该会话已归档（sid={sid}）：{why}")
-        print("  （归档会话被 send 投达会被服务端隐式解归档，cron 随之复活——ISS-76 根因）")
-        print(f"  要先恢复请显式执行：python -m super_agent.console restore {sid}")
-        return EXIT_ARCHIVED
-    if archived == "yes":
-        # `--revive` 是「指向 restore 的拒绝态」，不产生任何恢复动作。
-        print(f"send: 拒绝投递 —— 该会话已归档（sid={sid}）：{why}")
-        print("  --revive 不隐式解归档，本次未投递、未改会话状态。请先：")
-        print(f"    python -m super_agent.console restore {sid}")
-        print("  复核：GET /api/v1/sessions/<sid> 的 archived=false，然后重发本条。")
-        return EXIT_ARCHIVED
-    if archived == "unknown":
-        print(f"send: ⚠ 无法确认归档状态（{why}）——按放行处理；"
-              "若该会话确已归档，本条会重新激活它（ISS-76）", file=sys.stderr)
+    refused = refuse_if_archived(sid, retired_reason=retired_reason,
+                                 revive="--revive" in args)
+    if refused is not None:
+        return refused
     args = [a for a in args if a != "--revive"]
     if len(args) > 1 and args[1] == "--body-file":
         path = args[2] if len(args) > 2 else ""

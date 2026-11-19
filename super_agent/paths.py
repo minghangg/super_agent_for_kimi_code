@@ -114,6 +114,14 @@ def _env_base() -> str | None:
     return raw
 
 
+def env_base() -> str | None:
+    """`KIMI_SERVER` 的公开包装：合法 base URL 或 None。
+
+    供 `dispatch_cli` 复用同一份解析（ISS-100 D1）。**不新写第二份 URL 校验**。
+    """
+    return _env_base()
+
+
 def instances_dir() -> Path:
     raw = (os.environ.get(ENV_INSTANCES_DIR) or "").strip()
     if raw:
