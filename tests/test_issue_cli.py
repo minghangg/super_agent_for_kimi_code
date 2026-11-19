@@ -177,10 +177,20 @@ class Close(CliCase):
         self.assertIn("[QA]", err)
 
     def test_a_missing_archive_command_is_reported_not_failed(self):
-        """No archive command: the session stays registered and close succeeds."""
+        """An explicitly empty command: the session stays registered, close
+        succeeds.
+
+        ``""`` has to be written into a config file now. The public default is
+        non-empty since ISS-100 D5, so "nothing configured" no longer means
+        "nothing to run" -- it means "run the default", and this test would
+        otherwise measure the wrong branch and pass by accident.
+        """
         sid = "session_" + "0" * 8 + "-0000-0000-0000-" + "0" * 12
         db = {"demo#7": {"qa": {"session": sid}}}
         (self.state / "issue_sessions.json").write_text(json.dumps(db), encoding="utf-8")
+        cfg = self.root / "no_archive.json"
+        cfg.write_text(json.dumps({"engine": {"session_archive_cmd": ""}}),
+                       encoding="utf-8")
 
         original_qa = issue_cli._has_qa_comment
         original_call = issue_cli._call
@@ -189,7 +199,7 @@ class Close(CliCase):
         try:
             code, out, err = self.run_cli("close", "--role", "supervisor",
                                           "--project", "demo", "--issue", "7",
-                                          *self.base())
+                                          "--config", str(cfg), *self.base())
         finally:
             issue_cli._has_qa_comment = original_qa
             issue_cli._call = original_call
@@ -197,6 +207,13 @@ class Close(CliCase):
         self.assertIn("未配置归档命令", out)
         kept = json.loads((self.state / "issue_sessions.json").read_text("utf-8"))
         self.assertIn("demo#7", kept)
+
+    def test_the_public_default_names_recycle(self):
+        """ISS-100 D5: with nothing configured, close runs this package's
+        ``recycle archive`` -- not another checkout's console script."""
+        from super_agent import config
+        self.assertEqual(config.DEFAULTS["engine"]["session_archive_cmd"],
+                         "{python} -m super_agent.cli recycle archive {sid}")
 
 
 class Binding(CliCase):
