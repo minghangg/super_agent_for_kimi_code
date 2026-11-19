@@ -134,7 +134,10 @@ class Stub:
 
             def do_GET(self):
                 stub.requests.append(("GET", self.path, ""))
-                if self.path.endswith("/comments"):
+                # ``endswith`` would miss the query string the CLI appends
+                # (``/comments?per_page=100``), and a missing ``[QA]`` row makes
+                # ``cmd_close`` refuse before it ever archives.
+                if "/comments" in self.path:
                     return self._send([{"body": "[QA] 归档目标：本单已验"}])
                 if "/api/v1/meta" in self.path:
                     return self._send({"code": 0, "data": {}})
