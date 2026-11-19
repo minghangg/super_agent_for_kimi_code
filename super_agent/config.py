@@ -109,6 +109,16 @@ DEFAULTS: dict = {
         # ``waiting_release`` and ``close_reconcile`` are the only states that
         # need it, so the cap bounds a poll loop rather than all assignments.
         "max_closed_thread_checks": 10,
+        # ISS-100 D5: how ``close`` archives the sessions it bound. One template
+        # for the whole deployment, so the public default names this package and
+        # nothing else: ``{python}`` is ``sys.executable`` (the interpreter that
+        # runs the engine) and ``{sid}`` the session id. Both placeholders are
+        # replaced **after** the command is split, so the template itself must
+        # use forward slashes only -- ``shlex.split`` eats ``D:\x`` as an escape
+        # and argv[0] becomes ``D:x``, a path that fails as FileNotFoundError.
+        # ``""`` disables archiving (the registration is then kept, see
+        # ``issue_cli._archive_session``).
+        "session_archive_cmd": "{python} -m super_agent.cli recycle archive {sid}",
         # Where a shippable verdict goes (ISS-53). ``supervisor_sid`` wins when
         # set; otherwise ``supervisor_keys`` are looked up in ``sessions.json``
         # in order. The default list carries only the public role name: a
@@ -211,6 +221,17 @@ def validate(cfg: dict) -> dict:
     charter_root = (cfg.get("engine") or {}).get("charter_root", "")
     if charter_root is not None and not isinstance(charter_root, str):
         raise ConfigError("engine.charter_root must be a path string (or empty)")
+    archive_cmd = (cfg.get("engine") or {}).get("session_archive_cmd", "")
+    if archive_cmd is not None and not isinstance(archive_cmd, str):
+        raise ConfigError("engine.session_archive_cmd must be a command string (or empty)")
+    # A backslash in the template is a silent wrong path, not a style choice:
+    # ``shlex.split`` treats ``\x`` as an escape, so ``D:\x\python.exe`` becomes
+    # argv[0] ``D:xpython.exe`` and ``subprocess.run`` raises FileNotFoundError
+    # far from the config that caused it. Refusing here names the cause.
+    if isinstance(archive_cmd, str) and "\\" in archive_cmd:
+        raise ConfigError(
+            "engine.session_archive_cmd 不许含反斜杠（shlex.split 会把它当转义，"
+            f"argv[0] 变成错路径）：{archive_cmd!r}；模板只用正斜杠")
     dispatch_cfg = (cfg.get("engine") or {}).get("dispatch") or {}
     if not isinstance(dispatch_cfg, dict):
         raise ConfigError("engine.dispatch must be a mapping")

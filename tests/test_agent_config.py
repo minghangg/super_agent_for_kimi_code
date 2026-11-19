@@ -269,17 +269,132 @@ class ConfigDeclarationTest(unittest.TestCase):
             config.validate(cfg)
 
 
+class ArchiveCommandTest(_Isolated):
+    """ISS-100 D1/D5: the archive command has one priority chain, and the
+    private layer must not outrank a ``--config`` file when it says nothing.
+
+    All three cases mirror ``AllowlistNotInjectedTest``: what matters is **when**
+    the private layer wins, not that it can.
+    """
+
+    def setUp(self):
+        super().setUp()
+        os.environ.pop("SAFKC_ARCHIVE_CMD", None)
+        os.environ[agent_config.ENV_FILE] = str(self.root / "absent.json")
+        agent_config._reset_cache()
+
+    def test_the_public_default_names_this_package(self):
+        self.assertEqual(
+            config.DEFAULTS["engine"]["session_archive_cmd"],
+            "{python} -m super_agent.cli recycle archive {sid}")
+
+    def test_nothing_configured_injects_nothing(self):
+        self.assertEqual(agent_config.session_archive_cmd(), "")
+        self.assertNotIn("session_archive_cmd",
+                         (agent_config.overrides().get("engine") or {}))
+
+    def test_the_config_files_own_value_survives_the_merge(self):
+        own = "{python} -m custom_cli archive {sid}"
+        cfg = config.load(_write_cfg(self.root / "cfg.json", {"engine": {
+            "session_archive_cmd": own}}), agent_config.overrides())
+        self.assertEqual(cfg["engine"]["session_archive_cmd"], own)
+
+    def test_the_private_file_wins_over_the_config_file(self):
+        """Documented priority, not a defect: the private layer is merged last."""
+        own = "{python} -m custom_cli archive {sid}"
+        self.write({"engine": {"session_archive_cmd":
+                               "{python} -m private_cli archive {sid}"}})
+        cfg = config.load(_write_cfg(self.root / "cfg.json", {"engine": {
+            "session_archive_cmd": own}}), agent_config.overrides())
+        self.assertEqual(cfg["engine"]["session_archive_cmd"],
+                         "{python} -m private_cli archive {sid}")
+
+    def test_the_environment_wins_over_the_file(self):
+        self.write({"engine": {"session_archive_cmd":
+                               "{python} -m from_file archive {sid}"}})
+        os.environ["SAFKC_ARCHIVE_CMD"] = "{python} -m from_env archive {sid}"
+        try:
+            self.assertEqual(agent_config.session_archive_cmd(),
+                             "{python} -m from_env archive {sid}")
+        finally:
+            os.environ.pop("SAFKC_ARCHIVE_CMD", None)
+
+    def test_a_backslash_template_is_refused_with_the_reason(self):
+        """A backslash is a silent wrong argv[0]; refusing at load names it."""
+        cfg = config.load()
+        cfg["engine"]["session_archive_cmd"] = "D:\\x\\python.exe -m super_agent.cli"
+        with self.assertRaises(config.ConfigError) as caught:
+            config.validate(cfg)
+        self.assertIn("反斜杠", str(caught.exception))
+
+    def test_a_non_string_command_is_refused(self):
+        cfg = config.load()
+        cfg["engine"]["session_archive_cmd"] = ["python", "-m"]
+        with self.assertRaises(config.ConfigError):
+            config.validate(cfg)
+
+
 class StaleCacheTest(_Isolated):
-    """A caller that changed the file sees the change only on an explicit refresh."""
+    """A caller that changed the file sees the change only on an explicit refresh.
+
+    Absolute paths on purpose: the cache is what this class tests, and a
+    relative fixture would make the assertions depend on ``state_dir()``'s
+    anchor (ISS-100 D3). With absolute values the comparison stays literal, so
+    a broken anchor cannot make a broken cache look right.
+    """
 
     def test_refresh_rereads_the_file(self):
-        self.write({"paths": {"state_dir": "first"}})
-        self.assertEqual(agent_config.state_dir(), "first")
+        a, b = self.root / "first", self.root / "second"
+        self.write({"paths": {"state_dir": str(a)}})
+        self.assertEqual(agent_config.state_dir(), str(a))
         path = self.root / "agent.json"
-        path.write_text(json.dumps({"paths": {"state_dir": "second"}}), encoding="utf-8")
-        self.assertEqual(agent_config.state_dir(), "first")        # cached
+        path.write_text(json.dumps({"paths": {"state_dir": str(b)}}), encoding="utf-8")
+        self.assertEqual(agent_config.state_dir(), str(a))        # cached
         agent_config.load(refresh=True)
-        self.assertEqual(agent_config.state_dir(), "second")
+        self.assertEqual(agent_config.state_dir(), str(b))
+
+
+class RelativeStateDirTest(_Isolated):
+    """ISS-100 D3: a relative value is anchored to the checkout, not to cwd.
+
+    Before the fix ``{"paths": {"state_dir": "state"}}`` came back verbatim, so
+    whoever opened it resolved it against their own working directory: the same
+    command run from the checkout and from somewhere else wrote two different
+    session roots, and the engine read the one nobody had written.
+    """
+
+    def setUp(self):
+        super().setUp()
+        os.environ.pop("SESS_EVENTS_STATE_DIR", None)
+
+    def test_a_relative_value_is_absolute_and_anchored(self):
+        self.write({"paths": {"state_dir": "state"}})
+        got = agent_config.state_dir()
+        self.assertTrue(os.path.isabs(got), got)
+        self.assertEqual(got, str((agent_config.CHECKOUT / "state").resolve()))
+
+    def test_the_environment_layer_is_anchored_the_same_way(self):
+        """Same value shape, same answer -- regardless of which layer said it."""
+        os.environ[agent_config.ENV_FILE] = str(self.root / "absent.json")
+        agent_config._reset_cache()
+        os.environ["SESS_EVENTS_STATE_DIR"] = "rel_dir"
+        try:
+            self.assertEqual(agent_config.state_dir(),
+                             str((agent_config.CHECKOUT / "rel_dir").resolve()))
+        finally:
+            os.environ.pop("SESS_EVENTS_STATE_DIR", None)
+
+    def test_an_absolute_value_passes_through(self):
+        target = self.root / "elsewhere"
+        self.write({"paths": {"state_dir": str(target)}})
+        self.assertEqual(agent_config.state_dir(), str(target.resolve()))
+
+    def test_overrides_hand_the_absolute_form_to_both_keys(self):
+        self.write({"paths": {"state_dir": "state"}})
+        overrides = agent_config.overrides()
+        want = str((agent_config.CHECKOUT / "state").resolve())
+        self.assertEqual(overrides["state_dir"], want)
+        self.assertEqual(overrides["engine"]["session_state_dir"], want)
 
 
 if __name__ == "__main__":

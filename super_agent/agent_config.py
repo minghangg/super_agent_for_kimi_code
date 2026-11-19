@@ -75,6 +75,11 @@ ENV = {
     "charter.root": "SAFKC_CHARTER_ROOT",
     "roles.prefixes": "SAFKC_SUPERVISOR_ALIASES",
     "dispatch.console": "SAFKC_DISPATCH_CONSOLE",
+    # ISS-100 D1: the command ``close`` uses to archive the sessions it bound.
+    # Deliberately absent from ``DEFAULTS`` below: the public default lives in
+    # :mod:`super_agent.config`, and a second copy here would be injected by
+    # :func:`overrides` on every run, outranking a ``--config`` file's own value.
+    "engine.session_archive_cmd": "SAFKC_ARCHIVE_CMD",
 }
 
 # Neutral built-ins. None of these names a real project, account, host path or
@@ -209,9 +214,26 @@ def allowlist_file() -> str:
 
 
 def state_dir() -> str:
-    """The declared session/state root, or ``""`` (the caller decides)."""
+    """The declared session/state root, or ``""`` (the caller decides).
+
+    A relative value -- from any layer, file or environment -- is resolved
+    against **this checkout**, never the process working directory: the same
+    command run from the checkout and from elsewhere used to write two
+    different roots (P0-1 #98, same shape as the derived fallback). An
+    absolute value is passed through unchanged after ``expanduser``.
+
+    Anchoring is by *value shape*, not by which layer answered: "a relative
+    path means relative to this checkout" is a path rule, so ``tmp/x`` from the
+    environment and ``tmp/x`` from the file must name one directory. A caller
+    that wants working-directory semantics passes an absolute path.
+    """
     raw = str(get("paths.state_dir") or "").strip()
-    return os.path.expanduser(raw) if raw else ""
+    if not raw:
+        return ""
+    path = Path(os.path.expanduser(raw))
+    if not path.is_absolute():
+        path = (CHECKOUT / path)
+    return str(path.resolve())
 
 
 def sessions_dir() -> str:
@@ -264,6 +286,18 @@ def dispatch_console() -> str:
     return str(get("dispatch.console") or "").strip()
 
 
+def session_archive_cmd() -> str:
+    """The ``close`` archive command, or ``""`` when no layer configures one.
+
+    Empty means "inject nothing", not "inject the empty string": ``overrides()``
+    is merged **last** in ``config.load``, so an empty entry here would replace a
+    ``--config`` file's own ``engine.session_archive_cmd`` (the same shape as
+    #98 P0-2). The public default stays in ``config.DEFAULTS`` -- the floor of
+    the chain -- where it cannot outrank anyone.
+    """
+    return str(get("engine.session_archive_cmd") or "").strip()
+
+
 def overrides() -> dict:
     """The overrides dict for ``config.load(overrides=...)``.
 
@@ -303,6 +337,9 @@ def overrides() -> dict:
     console = dispatch_console()
     if console:
         engine.setdefault("dispatch", {})["console"] = console
+    archive = session_archive_cmd()
+    if archive:
+        engine["session_archive_cmd"] = archive
     char = charter_root()
     if char:
         engine["charter_root"] = char

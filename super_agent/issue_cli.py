@@ -515,18 +515,37 @@ def _archive_session(sid: str, engine: dict) -> bool | None:
     configured, so nothing was attempted and nothing is claimed.
 
     The command is deployment fact: this repository has no session console and
-    must not name another checkout's script.
+    must not name another checkout's script. The public default
+    (``config.DEFAULTS["engine"]["session_archive_cmd"]``) therefore names
+    **this** package -- ``{python} -m super_agent.cli recycle archive {sid}`` --
+    so a fresh clone plus one private ``agent.json`` can archive without naming
+    any other checkout (ISS-100 D5).
     """
     template = str(engine.get("session_archive_cmd") or "").strip()
     if not template:
         print("  未配置归档命令，登记保留（engine.session_archive_cmd）")
         return None
+    # Both placeholders are replaced **after** the split: ``shlex.split`` would
+    # eat the backslashes in ``sys.executable`` (``D:\x`` -> ``D:x``), and a
+    # token-wise compare keeps the substitution from touching an argument that
+    # merely contains the text ``{python}``. ``{python}`` is the interpreter
+    # running the engine, so the recycle entry point is always importable.
     argv = [part.replace("{sid}", sid) for part in _split_command(template)]
+    argv = [sys.executable if part == "{python}" else part for part in argv]
     if not argv:
         print("  archive 命令为空，登记保留")
         return None
+    # The child must import **this** checkout, not another one. ``sys.executable``
+    # only pins the interpreter: on a machine with this package installed
+    # editable, ``import super_agent`` resolves to the installed checkout no
+    # matter which directory the child runs in (measured, ISS-100 D5). The value
+    # is overwritten, not setdefault-ed: a caller's ``PYTHONPATH`` may name a
+    # different checkout, and that is exactly the case this line must remove.
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(CHECKOUT)
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=30,
+                              env=env)
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"  archive 失败（不阻断关单）：{type(exc).__name__}: {exc}")
         return False
