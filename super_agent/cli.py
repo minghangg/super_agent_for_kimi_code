@@ -94,7 +94,8 @@ def _legacy_root(cfg: dict, root: Path) -> Path:
 
 
 def _build(args) -> tuple[dict, Store]:
-    overrides: dict = {}
+    from . import agent_config
+    overrides: dict = agent_config.overrides()
     if args.mode:
         overrides["mode"] = args.mode
     if args.role:
@@ -910,24 +911,48 @@ def cmd_reporter(args) -> int:
 
 
 def _live_sids(live_file: str | None) -> set[str]:
-    """Live sids from a saved ``sess.py list`` output, or by running it.
+    """Live sids from a saved console list, or by asking this package's console.
 
-    The console lives in the workbench checkout's ``tools/``; its directory name
-    is assembled from fragments in :mod:`session_events` so the privacy gate
-    (which greps the private name) stays green.
+    The console is :mod:`super_agent.console` -- this checkout's own module, run
+    as ``python -m super_agent.console list`` with ``cwd`` set to the checkout so
+    the package is importable. The module form is required, not a preference:
+    running the file by path breaks its relative imports
+    (``ImportError: attempted relative import with no known parent package``).
+
+    ``engine.session_console_path`` (when configured) may name another console,
+    but it is still invoked as a module or an executable that answers ``list``.
     """
     if live_file:
         return session_events.parse_server_list(Path(live_file))
     import subprocess
-    script = Path(__file__).resolve().parent.parent.parent / session_events.LWA_DIRNAME \
-        / "tools" / session_events.SESS_CONSOLE
-    if not script.is_file():
-        raise RuntimeError(f"session console not found: {script.name}")
-    done = subprocess.run([sys.executable, str(script), "list"],
-                          capture_output=True, text=True, timeout=60)
+    checkout = Path(__file__).resolve().parents[1]
+    configured: list[str] = []
+    try:
+        console_cfg = str((_load_config().get("engine") or {}).get(
+            "session_console_path") or "").strip()
+    except Exception:                     # noqa: BLE001  config faults surface elsewhere
+        console_cfg = ""
+    if console_cfg.startswith("-m "):
+        configured = [sys.executable, *console_cfg.split()]
+    elif console_cfg:
+        configured = [sys.executable, console_cfg]
+    console_module = checkout / "super_agent" / "console.py"
+    if not configured and not console_module.is_file():
+        raise RuntimeError("session console not found: super_agent/console.py")
+    argv = configured or [sys.executable, "-m", "super_agent.console", "list"]
+    if configured:
+        argv = argv + ["list"]
+    done = subprocess.run(argv, capture_output=True, text=True, timeout=60, cwd=str(checkout))
     if done.returncode != 0:
-        raise RuntimeError((done.stderr or done.stdout or "sess.py list failed").strip()[:200])
+        raise RuntimeError(
+            (done.stderr or done.stdout or "console list failed").strip()[:200])
     return session_events.parse_sids(done.stdout or "")
+
+
+def _load_config() -> dict:
+    """This package's config, private overrides included (one loader, one gate)."""
+    from . import agent_config
+    return config_mod.load(overrides=agent_config.overrides())
 
 
 # ------------------------------------------------------------------- arguments
