@@ -65,7 +65,18 @@ def health(timeout: float = 2.0) -> dict | None:
     if not h:
         return None
     if not h.get("ready", h.get("ok")):
-        return None
+        # ready=false 表示订阅面空了（subscribed=0），但 /state 仍可能有数据。
+        # 判死会让整条 bus 路径失效、退化为纯 wire 兜底，而 wire 的值往往很旧
+        # （实测 136 个会话里 130 个 age>300s）。
+        #
+        # 放宽的边界：**只在 connected 为真时**放宽。真正的正确性由 status 上的
+        # `ctx_state` 保证（wss_bus 侧按值时刻判 live/stale/absent），所以这里
+        # 放行不会把旧值当现值 —— 那件事由 ctx_state 挡住，不由 ready 挡住。
+        # `_not_ready` 留痕，调用方需要区分"订阅面空了"时仍能看见。
+        if not h.get("connected"):
+            return None
+        h = dict(h)
+        h["_not_ready"] = True
     return h
 
 

@@ -643,6 +643,9 @@ def absorb(msg: dict) -> dict | None:
             "context_usage": (tok / cap) if isinstance(tok, int)
             and isinstance(cap, int) and cap else None,
         })
+        # 值时刻只在这里刷新：`ts`/`event_ts` 对**任何**帧都刷新（见本函数
+        # 末尾），拿它们算 age 会把旧 tokens 洗成"刚刚"（#94 的病）。
+        rec["value_ts"] = int(time.time())
     elif t in ("event.session.work_changed", "session.work_changed"):
         rec["status"].update({
             "busy": f.get("busy"), "main_turn_active": f.get("main_turn_active"),
@@ -2459,6 +2462,31 @@ def make_app():
         if out["pending_interaction"] is None:
             out["pending_interaction"] = "approval" if (rec.get("pending") or {}) else "none"
         out["archived"] = _norm_archived(sid, rec)
+
+        # 可判性三键（#94）：rec["status"] 只有裸数字，没有值时刻。
+        #
+        # value_ts 只在 usage 帧到达时刷新（见 absorb 的 usage 分支）。不用
+        # `event_ts`/`ts`：那两个字段对任何帧都刷新（本模块 absorb 末尾），
+        # 拿它们算 age 会把旧 tokens 洗成"刚刚"，正是 #94 要防的病。
+        #
+        # 没有 value_ts 分两种，答案必须不同：
+        #   · rec 是本进程刚建的（无 event_ts）⇒ 值确实没有时刻，判 absent；
+        #   · rec 来自重启前的老缓存（有 event_ts，但没有 value_ts）⇒ 值曾经
+        #     有过，只是时刻没记。此时退到 `event_ts` 作为**下界**：真实值时刻
+        #     不晚于它，所以 age 只会被低估、不会被打扮成新鲜。低估的后果是
+        #     更早判 stale（保守），而不是把旧值当现值（危险）。
+        if out.get("context_tokens") is not None:
+            vts = int(rec.get("value_ts") or 0)
+            if not vts:
+                vts = int(rec.get("event_ts") or rec.get("ts") or 0)
+            if vts:
+                age = int(time.time()) - vts
+                out["value_ts"] = vts
+                out["age_s"] = age
+                out["ctx_state"] = "live" if age <= K.CTX_STALE_S else "stale"
+            else:
+                # 老记录没有 value_ts ⇒ 判 absent，不许猜
+                out["ctx_state"] = "absent"
         return out
 
     def _meta(rec: dict | None) -> dict:
