@@ -319,10 +319,14 @@ issue_cli.API = github_base
 B = lambda argv: [a for a in argv if "sessions.py" in a]
 A = lambda argv: [a for a in argv if "recycle" in a and "archive" in a]
 
+# ``--state-dir`` and not a config key: ``agent_config.overrides()`` is merged
+# last and derives ``engine.session_state_dir`` from ``paths.state_dir``, so a
+# ``--config`` value for it is silently replaced by the clone's own root. The
+# flag is the top of the resolution chain, which is the only place that wins.
 rc = issue_cli.main(["close", "--role", "supervisor", "--project", PROJECT,
                      "--issue", "100", "--config", cfg_path,
                      "--projects-file", projects_file,
-                     "--env-file", creds])
+                     "--env-file", creds, "--state-dir", state])
 print("RC", rc)
 print("A", len(A(popen)), "B", len(B(popen)))
 print("KEY_KEPT", PROJECT + "#100" in json.load(
@@ -332,7 +336,6 @@ print("KEY_KEPT", PROJECT + "#100" in json.load(
 
 def _write_gate8_cfg(path: Path, state: Path, template: str) -> None:
     path.write_text(json.dumps({"engine": {
-        "session_state_dir": str(state),
         "session_archive_cmd": template}}, ensure_ascii=False), encoding="utf-8")
 
 
