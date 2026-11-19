@@ -156,6 +156,94 @@ class EnvironmentLayerTest(_Isolated):
         self.assertEqual(agent_config.dispatch_console(), "-m super_agent.dispatch_cli")
 
 
+class DerivationTest(_Isolated):
+    """P0-1: the derived fallback is absolute and does not follow ``cwd``.
+
+    The bare relative path ``"data"`` used to be injected as
+    ``engine.session_state_dir``. A relative path is resolved by whoever opens
+    it, so one command run from the checkout and another from the workbench
+    wrote two different ledgers, and the close guard (which reads
+    ``<workbench>/state/ledger.jsonl``) saw neither.
+    """
+
+    def setUp(self):
+        super().setUp()
+        os.environ[agent_config.ENV_FILE] = str(self.root / "absent.json")
+        os.environ.pop("SESS_EVENTS_STATE_DIR", None)
+        agent_config._reset_cache()
+
+    def derived(self) -> str:
+        cfg = config.load(overrides=agent_config.overrides())
+        return cfg["engine"]["session_state_dir"]
+
+    def test_the_derived_root_is_an_absolute_path(self):
+        self.assertTrue(os.path.isabs(self.derived()), self.derived())
+
+    def test_the_derived_root_does_not_move_with_cwd(self):
+        here = Path.cwd()
+        first = self.derived()
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chdir(tmp)
+            try:
+                second = self.derived()
+            finally:
+                os.chdir(here)
+        self.assertEqual(first, second)
+        self.assertEqual(Path(first), Path(first).resolve())
+
+    def test_the_derived_root_is_this_checkouts_data_dir(self):
+        self.assertEqual(Path(self.derived()),
+                         (agent_config.CHECKOUT / config.DEFAULTS["state_dir"]).resolve())
+
+    def test_the_fallback_is_documented_as_a_degradation(self):
+        """The derivation is not a fix: the ledger lands under ``<checkout>/data``
+        and the close guard still cannot see it. Pinned so the docstring cannot
+        quietly start claiming otherwise."""
+        self.assertIn("known degradation", agent_config.__doc__)
+        self.assertIn("cannot see", agent_config.__doc__)
+
+
+class AllowlistNotInjectedTest(_Isolated):
+    """P0-2: with nothing configuring it, no placeholder is injected.
+
+    ``github.allowlist_file`` used to default to the checkout's own
+    ``config/allowlist.json``. Because overrides win in ``config.load``'s deep
+    merge, that placeholder replaced a ``--config`` file's
+    ``engine.project_allowlist`` on every run, and the shipped table then
+    claimed issue 1 for the project it names -- so a thread key that should have
+    stayed bare became ``<owner>/<repo>#1`` (two tests in
+    ``test_needs_person_resolved.py``).
+    """
+
+    def setUp(self):
+        super().setUp()
+        os.environ[agent_config.ENV_FILE] = str(self.root / "absent.json")
+        os.environ.pop("SAFKC_ALLOWLIST", None)
+        agent_config._reset_cache()
+
+    def test_no_allowlist_is_injected_when_nothing_configures_it(self):
+        self.assertEqual(agent_config.allowlist_file(), "")
+        self.assertNotIn("project_allowlist",
+                         (agent_config.overrides().get("engine") or {}))
+
+    def test_a_configured_allowlist_is_injected(self):
+        target = self.root / "allow.json"
+        self.write({"github": {"allowlist_file": str(target)}})
+        self.assertEqual(agent_config.overrides()["engine"]["project_allowlist"],
+                         str(target))
+
+    def test_the_config_files_own_value_survives_the_merge(self):
+        own = self.root / "own.json"
+        cfg = config.load(_write_cfg(self.root / "cfg.json", {"engine": {
+            "project_allowlist": str(own)}}), agent_config.overrides())
+        self.assertEqual(cfg["engine"]["project_allowlist"], str(own))
+
+
+def _write_cfg(path: Path, doc: dict) -> Path:
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    return path
+
+
 class ConfigDeclarationTest(unittest.TestCase):
     """P1-1: every mapped key must be declared, or it bypasses ``config.validate``."""
 
