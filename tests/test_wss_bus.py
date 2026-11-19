@@ -89,6 +89,39 @@ class TestNoPrivateIdentifiers(InjectionFixture):
                          f"导入把老址模块带进了 sys.modules：{sorted(after - before)}")
 
 
+class TestRetiredFallback(InjectionFixture):
+    """#98 8.3: an injection wins; without one, this package's module answers.
+
+    The point of the fallback is that the four delivery-gate call sites stop
+    seeing ``None`` on a deployment that has a retired list. It must not turn a
+    *missing* implementation into an empty one: a failure to import still
+    answers ``None``, which the callers treat as fail-closed.
+    """
+
+    def test_injected_module_wins(self):
+        sentinel = object()
+        wb.configure(wb.WssBusConfig(
+            workspace_root=self.root, state_root=self.state,
+            production_state_root=self.prod, sessions_path=self.state / "sessions.json",
+            probe_session=lambda *a, **k: None, retired_module=sentinel))
+        self.assertIs(wb._retired(), sentinel)
+
+    def test_without_injection_the_package_module_answers(self):
+        from super_agent import retired_sids
+        wb.configure(wb.WssBusConfig(
+            workspace_root=self.root, state_root=self.state,
+            production_state_root=self.prod, sessions_path=self.state / "sessions.json",
+            probe_session=lambda *a, **k: None))
+        self.assertIs(wb._retired(), retired_sids)
+
+    def test_the_fallback_keeps_the_injection_requirement(self):
+        """``missing_injections`` must still name it: the external host's
+        contract does not move because the fallback exists."""
+        wb.configure(wb.WssBusConfig())
+        self.assertIn("retired_module", wb.missing_injections())
+        self.assertEqual(wb.self_check(), 2)
+
+
 class TestInjectionGate(InjectionFixture):
     """An uninjected boundary is an explicit error, never a production guess."""
 
