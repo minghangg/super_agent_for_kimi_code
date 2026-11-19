@@ -1,0 +1,1100 @@
+#!/usr/bin/env python3
+"""Dispatch a task to a local kimi-code session over the local REST API.
+
+Reads the bearer token from $KIMI_CODE_HOME/server.token (default ~/.kimi-code;
+never printed), creates a
+session in the target cwd, configures its agent profile (model / system_prompt /
+permission_mode), submits the prompt, polls until the turn ends, and prints the
+final assistant answer.
+
+The caller may override the provider, the model and the thinking effort
+(--provider / --model / --effort). Without them the house default applies:
+provider `codebuddy`, model `cb-deepseek-v4.1-flash`, effort = that model's
+declared default_effort (user ruling 2026-10-15). Whatever is resolved is
+validated against $KIMI_CODE_HOME/config.toml before anything is dispatched, and an
+unknown value prints the available choices and exits non-zero.
+
+The dispatcher also applies a local development-compute quota gate (issue #40)
+before creating or resuming a session. The gate reads config/dev_quota.json via
+super_agent/dev_quota.py, counts active state/quiet_cores/core-N.lock files, and refuses
+the dispatch when the current quota is full. Refusals print the config path and
+current values on stderr and exit non-zero; no session or network request is made.
+
+API contract verified against a live server on 2026-10-15 (server_version 2.1.1).
+See README.md for the full contract and the provenance of every step.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import socket
+import sys
+import time
+import urllib.error
+import urllib.request
+
+DEFAULT_PORTS = (58627, 58628)
+TOKEN_ENV = "KIMI_CODE_SERVER_TOKEN"
+CONFIG_ENV = "KIMI_CODE_CONFIG_FILE"
+# 章程/手册根由 agent_config 的 charter.root 提供（#98）；本文件不再用
+# `__file__` 上溯拼检出路径。`WORKBENCH` 为空串表示"未配置"。
+WORKBENCH = ""
+# Which model names the session when --name is omitted. This is a housekeeping
+# choice, not the work model, so it stays cheap and fixed. Set the env var to ""
+# to fall back to the deterministic slug.
+DEFAULT_NAMING_MODEL = os.environ.get("KIMI_CODE_NAMING_MODEL", "DeepSeek-new/deepseek-flash")
+
+# Warm-up ping for a freshly created session. Its job is to complete one trivial
+# turn so the session is "activated" before the real task is submitted. The
+# wording must stay inert: an open-ended phrase (e.g. "/warmup") is treated as a
+# real instruction and can make the agent read AGENTS.md and run project sync
+# work for ~50s, polluting the session. This phrasing answers in ~1s with no
+# tool calls. See README "激活".
+WARMUP_PROMPT = (
+    "Reply with exactly: ping. Do not call any tools. "
+    "Do not read files. Do not run commands."
+)
+
+
+# 会话三契约（用户 2026-11-10）：新建会话的第一条消息改为「先读契约文件」，
+# 内容＝思考用英文（ASD-STE100）／输出精准（≤30字一句）／写码前七级检查。
+# 契约文件落在 `charter.root` 下（`rules/shared/rules/session_contract.md`）；
+# 未配置则回退裸 ping。
+CONTRACT_REL = os.path.join("rules", "shared", "rules", "session_contract.md")
+
+
+def _charter_root() -> str:
+    """章程/手册根。公开默认空串＝未配置（#98 步 4 由 agent_config 供值）。"""
+    return (WORKBENCH or "").strip()
+
+
+def contract_file() -> str:
+    root = _charter_root()
+    return os.path.join(root, CONTRACT_REL) if root else ""
+
+
+# 会话名前缀 → 章程文件名（用户 2026-11-16 令：所有角色建会话时都读各自章程）。
+# 判据只看前缀，不看角色字段——名字由 dispatch 自己拼，可预期。
+# 顺序重要：长前缀在前（项目专属前缀先于 `pm`）。
+GENERIC_CHARTER_MAP = (
+    ("wk", "worker.md"),
+    ("qa", "qa.md"),
+    ("pm-", "pm.md"),
+    ("pm", "pm.md"),
+    ("scout", "scout.md"),
+    ("steward", "steward.md"),
+    ("auditor", "auditor.md"),
+    ("reviewer", "reviewer.md"),
+    ("analyst", "_analyst_or_at.md"),
+    ("at-", "_analyst_or_at.md"),
+    ("at", "_analyst_or_at.md"),
+    ("planner", "planner.md"),
+    ("supervisor", "supervisor_state.md"),
+)
+
+# 项目专属前缀（`charter.project_prefixes`）与私有章程文件名（`charter.map`）
+# 只在私有配置里给；公开默认是空表，运行期由 `charter_map()` 合并到通用表之前。
+_PROJECT_PREFIXES: tuple = ()
+_EXTRA_CHARTER_MAP: tuple = ()
+
+
+def set_charter_sources(project_prefixes=None, charter_map=None) -> None:
+    """由 `agent_config` 注入项目专属前缀与私有章程文件名（#98 步 4）。"""
+    global _PROJECT_PREFIXES, _EXTRA_CHARTER_MAP
+    _PROJECT_PREFIXES = tuple((str(k), str(v)) for k, v in (project_prefixes or ()))
+    _EXTRA_CHARTER_MAP = tuple((str(k), str(v)) for k, v in (charter_map or ()))
+
+
+def charter_map() -> tuple:
+    """生效的前缀表：项目专属前缀 → 私有章程 → 通用表。"""
+    return _PROJECT_PREFIXES + _EXTRA_CHARTER_MAP + GENERIC_CHARTER_MAP
+
+
+def charter_for(name: str) -> str:
+    """Charter file a fresh session must read before its first real turn.
+
+    用户 2026-11-16 令：**所有角色**建会话时都读各自章程——只注入
+    ``--persona`` 不够，那是隐式设置，对话里看不见；首条消息显式读一次，
+    才有 ``Read done.`` 回执可核。缺章程返回空串（不阻断，由调用方决定）。
+
+    ``name`` 是会话名：``wk-ISS-87-impl-20261116``／``qa-lwa-ISS-86``／
+    ``pm-<项目>``／``scout-20261116`` 等。根目录取自 `charter.root`，未配置
+    时返回空串（`pmd.sh` 据此 die，不许起无章程会话）。
+    """
+    root = _charter_root()
+    stem = str(name or "").strip()
+    low = stem.lower()
+    for prefix, leaf in charter_map():
+        if low.startswith(prefix):
+            if leaf == "supervisor_state.md":
+                path = os.path.join(root, "handoff", leaf)
+            elif leaf == "_analyst_or_at.md":
+                # at → analyst 改名进行中：analyst.md 存在就用它，否则回退 at.md
+                for cand in ("analyst.md", "at.md"):
+                    cand_path = os.path.join(root, "assistants", cand)
+                    if os.path.isfile(cand_path):
+                        return cand_path
+                return ""
+            else:
+                path = os.path.join(root, "assistants", leaf)
+            return path if os.path.isfile(path) else ""
+    return ""
+
+
+def warmup_prompt(charter: str = "", name: str = "") -> str:
+    """First message of a freshly created session: read contract (+ charter), confirm.
+
+    ``charter`` 非空时一并读——用户 2026-11-16 令：``wk-*`` 读 ``worker.md``，
+    ``qa-*`` 读 ``qa.md``。两处都必须真读到，否则默认测试级别等规则不生效。
+
+    ``name`` 非空时，把**本会话的键名**一并告知：引擎用正文末行
+    ``<!-- session: <键名> -->`` 判定裁决归属，而键名是凭据，只有本会话知道
+    自己是哪把。此前无处可查 ⇒ 裁决一律判 unverified ⇒ release 铃不响
+    （#76／#78／#79／#91 四条 PM verdict 实证）。
+    """
+    try:
+        files = []
+        contract = contract_file()
+        if contract and os.path.isfile(contract):
+            files.append(contract)
+        if charter and os.path.isfile(charter):
+            files.append(charter)
+        if files:
+            posix = [f.replace(os.sep, "/") for f in files]
+            # 权限限定到「那一次 Read」（2026-11-11 修正：原句"Only read X"与
+            # "Do not call any tools"互相矛盾——read 本身就是 tool 调用）。
+            what = posix[0] if len(posix) == 1 else                 " and ".join([posix[0], posix[1]]) if len(posix) == 2 else                 ", ".join(posix[:-1]) + " and " + posix[-1]
+            text = (f"Read {what} with the Read tool. "
+                    "Reply with exactly: Read done. "
+                    "Do not use any other tool. Do not run any command.")
+            if name:
+                text += f" 你的会话键名：{name}（发 comment 时用 --session-key 带上）"
+            return text
+    except OSError:
+        pass
+    if name:
+        return f"{WARMUP_PROMPT} 你的会话键名：{name}"
+    return WARMUP_PROMPT
+
+
+# 停手守卫（2026-10-27）：当初以为派活端无法中止服务端轮次（杀客户端不停、
+# REST 无 abort）—— **2026-10-31 实测已推翻**：`POST /sessions/{id}/prompts/{pid}:abort`
+# 23ms 返回 `{"aborted":true}`（HTTP 恒 200，要看响应体 code）。见
+# `state/evidence/session_control_api_20261031.md`；日常用 `python -m super_agent.console abort <sid>`。
+# 本守卫仍保留：它是**协作式**停手，能保住已读上下文并留下进度档，与硬 abort 互补。
+# 2026-11-01 精简（用户要求）：supervisor 已能强中止（`sess.py abort`），细则不必每份任务书都塞，
+# 一句话即可；细则原文仍在 .kimi/rules/worker_conduct.md §七。
+# 任务书措辞闸（2026-11-01 用户重申：派单一律完全自动，不许开放式问询）。
+# 命中即在派单时打警告：这类措辞会让 worker 中途停下来等人，比 bug 更贵。
+ASK_PATTERNS = ("必要时询问", "必要时问询", "先问我", "等我确认", "等你确认",
+                "授权后再", "需要你批准", "不确定就停")
+# 允许出现的正当用法：明确上升项／生产不可逆写的授权边界（判据式写法）。
+
+
+def lint_task_text(text: str) -> list[str]:
+    return [p for p in ASK_PATTERNS if p in (text or "")]
+
+
+# 已退役（2026-11-09 用户令）：dispatch 不再调用 stop_guard() 追加守卫句；
+# 保留常量与函数仅供外部工具脚本自愿使用。细则退役说明见 worker_conduct.md §七。
+STOP_GUARD = (
+    "\n\n【停手】随时可自查 `test -f {marker} && echo STOP`；命中即停，把进度写进 {progress}，"
+    "并在答复首段说明。细则见 worker_conduct.md §七。"
+)
+
+
+def stop_guard(marker: str, progress_dir: str) -> str:
+    """Render the cooperative stop guard with absolute paths."""
+    return STOP_GUARD.format(marker=marker, progress=progress_dir.rstrip("/\\") + "/PROGRESS_<你的名字>.md")
+
+class DispatchError(RuntimeError):
+    """Raised for any unrecoverable failure in the dispatch pipeline."""
+
+
+def _dev_quota():
+    """派单资源配额模块（本包复制件），延迟加载以免拖长 import 链。"""
+    from . import dev_quota as module
+    return module
+
+
+def quota_gate() -> None:
+    """派单前配额闸（ISS-40）：在跑 heavy 数达到当前时段配额即拒单。
+
+    配额与在跑数都来自 super_agent/dev_quota.py；拒绝时报错带配置路径与当前值，
+    且在读 token／连 server／建会话之前发生，所以不会留下远端副作用。
+    """
+    dq = _dev_quota()
+    config = dq.read_config()
+    quota = dq.current_quota(config, write_back=False)
+    running = dq.running_heavy()
+    limit = int(quota["limit"])
+    if running >= limit:
+        raise DispatchError(dq.quota_error_text(quota, running))
+    print(f"[dispatch] 配额检查通过：在跑 heavy={running}/{limit} "
+          f"配置={quota['config_rel']}（{quota['config_path']}） pinned={quota['pinned_cores']} "
+          f"offpeak={quota['offpeak_extra_cores']} window={quota['window']} "
+          f"窗口内={quota['window_active']} heavy_concurrency={quota['heavy_concurrency']}",
+          flush=True)
+
+
+def _kimi_paths():
+    """家目录解析源（本包 `paths`）；不假设 sys.path，也不改它。"""
+    from . import paths as kimi_paths
+    return kimi_paths
+
+
+def _sess_events():
+    """延迟导入本包 `sess_events`（同上：不假设 sys.path，也不拖 import 链）。"""
+    from . import sess_events
+    return sess_events
+
+
+def _retired_sids():
+    """延迟导入本包 `retired_sids`（ISS-29 退役清单）。"""
+    from . import retired_sids
+    return retired_sids
+
+
+def record_created(sid: str, name: str, *, role: str = "") -> None:
+    """新建会话后记一条 `session.created`（ISS-27）。
+
+    事件写哪由 `sess_events.resolve_root()` 决定（`--state-dir` > `SESS_EVENTS_STATE_DIR`
+    > 声明式根），本文件不另拼路径——否则自测会写穿生产事件流。
+
+    会话名落在 `key` 字段：白名单里没有 `name`（只有 `key`），而「这个 sid 叫什么」
+    正是回放时最需要的一条，所以复用 `key` 而不是为了它扩白名单。
+
+    事件是**旁路记载**：写失败只告警，绝不回滚一个已经建好的远端会话。
+    """
+    fields = {"sid": sid}
+    if name:
+        fields["key"] = name
+    if role:
+        fields["role"] = role
+    try:
+        _sess_events().emit("session.created", **fields)
+    except Exception as exc:  # noqa: BLE001  会话已建好，事件失败不该让派单失败
+        print(f"[dispatch] WARNING: session.created 未落盘（{type(exc).__name__}: {exc}）",
+              file=sys.stderr)
+
+
+def token_path() -> str:
+    """server.token 路径。解析统一走本包 `paths`（issue #7）。
+
+    迁移到 E 盘只需设 `KIMI_CODE_HOME`，本文件不再自己拼 `~/.kimi-code`。
+    """
+    return str(_kimi_paths().token_file())
+
+
+def read_token() -> str:
+    """Read the bearer token from disk. The value must never be logged."""
+    path = token_path()
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            token = fh.read().strip()
+    except OSError as exc:
+        if os.environ.get(TOKEN_ENV):
+            return os.environ[TOKEN_ENV].strip()
+        raise DispatchError(f"cannot read token file {path}: {exc}") from exc
+    if not token:
+        raise DispatchError(f"token file {path} is empty")
+    return token
+
+
+def _instance_port() -> int | None:
+    """Port from the live kimi-code server instance file, or None.
+
+    Kimi Code Desktop binds a **random** port on each start (38370, then 4869,
+    observed 2026-11-17) and records it in
+    ``~/.kimi-code/server/instances/<id>.json``. ``DEFAULT_PORTS`` alone only
+    works for the CLI server. ``super_agent.paths.latest_instance`` already parses
+    that file; reuse it instead of duplicating the logic.
+    """
+    try:
+        from . import paths as kimi_paths
+        inst = kimi_paths.latest_instance()
+    except Exception:                       # noqa: BLE001 - absence is normal
+        return None
+    if not isinstance(inst, dict):
+        return None
+    port = inst.get("port")
+    return port if isinstance(port, int) and 1 <= port <= 65535 else None
+
+
+def candidate_ports(explicit: int | None) -> list[int]:
+    if explicit:
+        return [explicit]
+    env = os.environ.get("KIMI_CODE_SERVER_PORT")
+    ports = [int(env)] if env and env.isdigit() else []
+    inst = _instance_port()                 # Desktop: random port, discover it
+    if inst is not None and inst not in ports:
+        ports.append(inst)
+    ports += [p for p in DEFAULT_PORTS if p not in ports]
+    return ports
+
+
+def discover_base(token: str, explicit_port: int | None) -> str:
+    """Find the live kimi-code server.
+
+    A candidate is accepted only when GET /api/v1/meta returns code 0 under our
+    bearer token. That distinguishes the kimi server from an unrelated service
+    that happens to hold the port (e.g. 8787 answers 302 to anything).
+    """
+    tried: list[str] = []
+    for port in candidate_ports(explicit_port):
+        base = f"http://127.0.0.1:{port}"
+        if not port_open(port):
+            tried.append(f"{base} (closed)")
+            continue
+        try:
+            payload = http_get(f"{base}/api/v1/meta", token, timeout=5)
+        except Exception as exc:  # noqa: BLE001 - any failure means "not our server"
+            tried.append(f"{base} ({type(exc).__name__})")
+            continue
+        if isinstance(payload, dict) and payload.get("code") == 0:
+            data = payload.get("data") or {}
+            print(f"[dispatch] server {base} version={data.get('server_version')}")
+            return base
+        tried.append(f"{base} (no meta envelope)")
+    raise DispatchError(
+        "no live kimi-code server found. Start one with `kimi web`.\n  tried: "
+        + ", ".join(tried)
+    )
+
+
+def port_open(port: int, host: str = "127.0.0.1") -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1.0)
+        return sock.connect_ex((host, port)) == 0
+
+
+def _request(method: str, url: str, token: str, body: dict | None, timeout: float) -> dict:
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            raise DispatchError(f"{method} {url} -> HTTP {exc.code}: {raw[:300]!r}") from exc
+        raise DispatchError(
+            f"{method} {url} -> HTTP {exc.code}: {payload.get('msg')} "
+            f"{json.dumps(payload.get('details'), ensure_ascii=False)}"
+        ) from exc
+    try:
+        return json.loads(raw)
+    except ValueError as exc:
+        raise DispatchError(f"{method} {url} -> non-JSON response: {raw[:300]!r}") from exc
+
+
+def http_get(url: str, token: str, timeout: float = 30) -> dict:
+    return _request("GET", url, token, None, timeout)
+
+
+def http_post(url: str, token: str, body: dict, timeout: float = 60) -> dict:
+    return _request("POST", url, token, body, timeout)
+
+
+def unwrap(payload: dict, what: str) -> dict:
+    if payload.get("code") != 0:
+        raise DispatchError(f"{what} failed: {payload.get('msg')} {payload.get('details')}")
+    return payload.get("data") or {}
+
+
+def slugify(text: str, limit: int = 40) -> str:
+    text = text.strip().splitlines()[0] if text.strip() else "task"
+    text = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "-", text).strip("-")
+    return (text[:limit] or "task").lower()
+
+
+def create_session(base: str, token: str, cwd: str, title: str) -> str:
+    body = {"metadata": {"cwd": cwd}}
+    if title:
+        body["title"] = title
+    data = unwrap(http_post(f"{base}/api/v1/sessions", token, body), "create session")
+    return data["id"]
+
+
+def record_restored(sid: str) -> None:
+    """隐式 restore 之后补记 `session.restored`（ISS-76 P1-2）。
+
+    事件写哪同 `record_created`（`sess_events.resolve_root()` 三级解析）。
+
+    为什么必须写：`reuse_session` 的 restore 是**隐式的**——调用方没有执行过
+    `sess.py restore`。此前这里只 `print` 一行，事件流里看不到它，于是服务端
+    随后 40401 时，本地旁证 `_archived_from_events` 仍读到最后一条
+    `session.archived`，把一个正在使用的会话判成已归档并拒投。这条事件让事件流
+    与真实状态对齐。
+
+    事件仍是**旁路记载**：写失败只告警，不回滚已经恢复好的远端会话。
+    """
+    try:
+        _sess_events().emit("session.restored", sid=sid)
+    except Exception as exc:  # noqa: BLE001  会话已恢复，事件失败不该让派单失败
+        print(f"[dispatch] WARNING: session.restored 未落盘（{type(exc).__name__}: {exc}）",
+              file=sys.stderr)
+
+
+def _sess_verdict(st: int, payload: dict) -> tuple[bool, str]:
+    """受理判据走 `console._request_verdict` 的**同一份实现**（ISS-76 P1-2）。
+
+    为什么不在这里抄一遍：v2 批量端点外层 `code` 恒为 0，逐条结果在
+    `data.results`。这套判据已经踩过一次坑（console 曾据此写出假的
+    `session.restored`），两个副本迟早分叉，分叉的方向就是「一边记假事件」。
+    复用＝只有一处需要维护。
+
+    `http_post` 在 4xx/5xx 抛 `DispatchError`，所以走到这里的状态恒为 200；
+    仍把它传进去，是因为 HTTP 层判据（`st >= 400` 一律拒）属于同一份契约。
+    """
+    from .console import _request_verdict   # noqa: PLC0415  只在该分支需要
+    return _request_verdict(st, payload)
+
+
+def reuse_session(base: str, token: str, sid: str) -> str:
+    """Point the dispatch at an existing session and return its title.
+
+    An archived session is restored first: the prompts endpoint rejects a turn on
+    an archived session, and the failure surfaces only as a missing answer, so the
+    restore is done here rather than left to the caller.
+
+    ISS-76 P1-2: the restore is implicit, so it must also write the same
+    ``session.restored`` event an explicit ``sess.py restore`` writes. Without it
+    the local side-evidence keeps reading the old ``session.archived`` row and
+    refuses a session that is actually in use. A rejected restore writes nothing.
+    """
+    info = unwrap(http_get(f"{base}/api/v1/sessions/{sid}", token), "get session")
+    if info.get("archived"):
+        payload = http_post(f"{base}/api/v2/sessions:restore", token, {"ids": [sid]})
+        ok, why = _sess_verdict(200, payload)
+        print(f"[dispatch] restored archived session {sid}（{why}）")
+        if ok:
+            record_restored(sid)
+        else:
+            print(f"[dispatch] WARNING: restore 未受理，未记 session.restored（{why}）",
+                  file=sys.stderr)
+    # 2026-10-31：会话在忙时派第二个 turn 会排队/串味。这里**只警告不阻断**
+    # （有些调用方确实要排队），要硬打断用 `python -m super_agent.console abort <sid>`。
+    if info.get("busy"):
+        print(f"[dispatch] WARNING: session {sid} 正在忙（busy=true）；"
+              f"本单会排队。要打断请先 python -m super_agent.console abort {sid}")
+    return str(info.get("title") or sid)
+
+
+# --- config catalog: read $KIMI_CODE_HOME/config.toml (never the live server) ----
+#
+# The server's own GET /api/v1/config is NOT used for validation: it caches the
+# config it booted with, so a provider added afterwards (e.g. cdy2Api) is live
+# for new sessions but absent from that response. The on-disk file is the source
+# of truth the server itself reads. api_key values are dropped on load.
+
+
+def config_path() -> str:
+    """config.toml 路径。同上，统一走本包 `paths`。"""
+    return str(_kimi_paths().config_file())
+
+
+def _toml_load(path: str) -> dict:
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    try:
+        import tomllib  # Python >= 3.11
+    except ModuleNotFoundError:  # pragma: no cover - 3.10 fallback
+        try:
+            import tomli as parser  # type: ignore[no-redef]
+        except ModuleNotFoundError:
+            try:
+                import toml as parser  # type: ignore[no-redef]
+            except ModuleNotFoundError as exc:
+                raise DispatchError(
+                    f"cannot parse {path}: no TOML reader available. Use Python >= 3.11, "
+                    f"`pip install tomli`, or point {CONFIG_ENV} at a JSON export."
+                ) from exc
+        try:
+            return parser.loads(raw.decode("utf-8-sig"))  # type: ignore[no-any-return]
+        except Exception as exc:  # noqa: BLE001
+            raise DispatchError(f"cannot parse {path}: {exc}") from exc
+    return tomllib.loads(raw.decode("utf-8-sig"))
+
+
+class Catalog:
+    """Providers and their models, as declared in the kimi-code config file."""
+
+    def __init__(self, providers: dict[str, list[str]], models: dict[str, dict]) -> None:
+        self.providers = providers  # provider name -> [model alias, ...]
+        self.models = models  # alias -> {provider, support_efforts, default_effort}
+
+    @property
+    def aliases(self) -> list[str]:
+        return sorted(self.models)
+
+    def provider_of(self, alias: str) -> str:
+        return self.models.get(alias, {}).get("provider", "")
+
+    def efforts_of(self, alias: str) -> list[str]:
+        return self.models.get(alias, {}).get("support_efforts", [])
+
+    def default_effort_of(self, alias: str) -> str:
+        return self.models.get(alias, {}).get("default_effort", "")
+
+    def render(self) -> str:
+        lines: list[str] = []
+        for name in sorted(self.providers):
+            lines.append(f"  {name}")
+            for alias in self.providers[name]:
+                efforts = self.efforts_of(alias)
+                if efforts:
+                    shown = " / ".join(efforts)
+                    default = self.default_effort_of(alias)
+                    if default:
+                        shown += f"   (default: {default})"
+                    lines.append(f"    --model {alias}    --effort {shown}")
+                else:
+                    lines.append(
+                        f"    --model {alias}    (no support_efforts declared: "
+                        "no thinking effort can be requested)"
+                    )
+            lines.append("")
+        if lines:
+            lines.pop()
+        return "\n".join(lines)
+
+
+def _ctx_gate(sid: str, *, force: bool = False, operator: str = "") -> int:
+    """派单前的 ctx 门禁（issue #12）——子进程跑本包 `ctx_gate`。
+
+    为什么用子进程而不是 import：`ctx_gate` 依赖 `ctx`→`bus`→`direct`，
+    那条链会 import websockets；而本模块是**最底层的派单器**，不该被它拖一起
+    （且同名遮蔽标准库 queue 的坑只在某些 import 顺序下炸）。
+    子进程还顺带保证「门禁挂了不等于派单挂了」——见下面的 except 分支。
+
+    退出码语义：0 放行 / 4 拒-60 / 5 拒-75 / 6 硬顶 / 7 参数错。
+    **门禁自身异常 ⇒ 放行（返回 0）但打印告警**：不能因为门禁坏了就掐断所有派单。
+    """
+    import subprocess
+    cmd = [sys.executable, "-m", "super_agent.ctx_gate", "--id", sid, "--role", "pm"]
+    if force:
+        cmd += ["--force", "--operator", operator or "unknown"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[dispatch] ⚠ ctx 门禁调用失败（{type(exc).__name__}: {exc}），本次放行未检查",
+              file=sys.stderr)
+        return 0
+    err = (r.stderr or "").strip()
+    if err:
+        print(err, file=sys.stderr)
+    return r.returncode
+
+
+def load_catalog(path: str | None = None) -> Catalog:
+    path = path or config_path()
+    if not os.path.isfile(path):
+        raise DispatchError(
+            f"config file not found: {path}. Set {CONFIG_ENV} to point at another one."
+        )
+    doc = _toml_load(path)
+    raw_providers = doc.get("providers") or {}
+    raw_models = doc.get("models") or {}
+    models: dict[str, dict] = {}
+    for alias, entry in raw_models.items():
+        if not isinstance(entry, dict):
+            continue
+        models[alias] = {
+            "provider": str(entry.get("provider") or alias.split("/")[0]),
+            "support_efforts": [str(e) for e in (entry.get("support_efforts") or [])],
+            "default_effort": str(entry.get("default_effort") or ""),
+        }
+    providers: dict[str, list[str]] = {name: [] for name in raw_providers}
+    for alias in sorted(models):
+        entry = models[alias]
+        provider = entry["provider"]
+        # Prefix-only aliases (e.g. `codebuddy/deepseek-v4.1-flash`, whose
+        # provider is `cdy2Api`) are filed under their declared provider, which
+        # is also the only provider field the server actually persists.
+        providers.setdefault(provider, []).append(alias)
+    return Catalog(providers, models)
+
+
+def catalog_choices(catalog: Catalog) -> str:
+    return (
+        f"providers ({len(catalog.providers)}):\n  "
+        + "\n  ".join(sorted(catalog.providers))
+        + f"\n\nprovider -> models ({len(catalog.models)}):\n"
+        + catalog.render()
+    )
+
+
+def provider_error(catalog: Catalog, provider: str) -> DispatchError:
+    known = sorted(catalog.providers)
+    near = [p for p in known if p.lower() == provider.lower()]
+    hint = f" Did you mean `{near[0]}` (case matters)?" if near else ""
+    return DispatchError(
+        f"unknown --provider `{provider}`.{hint}\n\n{catalog_choices(catalog)}"
+    )
+
+
+def model_error(catalog: Catalog, provider: str, model: str) -> DispatchError:
+    tail = f"/{model}"
+    near = [a for a in catalog.aliases if a.lower() == model.lower()]
+    near += [a for a in catalog.aliases if a.lower().endswith(tail.lower()) and a not in near]
+    hint = f" Did you mean `{near[0]}`?" if near else ""
+    return DispatchError(
+        f"unknown --model `{model}` for provider `{provider}`.{hint}\n\n"
+        f"models declared for `{provider}`:\n  "
+        + "\n  ".join(catalog.providers.get(provider) or ["(none declared)"])
+        + f"\n\nall choices:\n{catalog_choices(catalog)}"
+    )
+
+
+def effort_error(catalog: Catalog, model: str, effort: str) -> DispatchError:
+    efforts = catalog.efforts_of(model)
+    if not efforts:
+        detail = (
+            f"model `{model}` declares no support_efforts in the config, so no thinking "
+            "effort can be requested for it. Pick a model that declares some."
+        )
+    else:
+        detail = (
+            f"`{effort}` is not in `{model}`'s support_efforts.\n  --effort "
+            + " / ".join(efforts)
+            + (f"   (default: {catalog.default_effort_of(model)})" if catalog.default_effort_of(model) else "")
+        )
+    return DispatchError(f"unsupported --effort.{chr(10)}  {detail}")
+
+
+def resolve_choice(
+    args: argparse.Namespace, parser: argparse.ArgumentParser, catalog: Catalog
+) -> tuple[str, str, str]:
+    """Resolve --provider / --model / --effort against the config catalog.
+
+    House default (user ruling 2026-10-15): provider `codebuddy`, model
+    `cb-deepseek-v4.1-flash`, effort = that model's declared default_effort. Any
+    of the three can be overridden on the command line; the resolved triple is
+    always printed, so the caller can see which model actually ran.
+
+    A `--model` that does not exist, or that belongs to another provider, still
+    fails loudly and prints the choices — a wrong pair must never run silently on
+    whichever provider the alias happens to map to.
+    """
+    provider, model, effort = args.provider, args.model, args.effort
+    if not provider:
+        provider = "codebuddy"
+    if not model:
+        model = "cb-deepseek-v4.1-flash"
+    if provider not in catalog.providers:
+        raise provider_error(catalog, provider)
+    if model not in catalog.models:
+        raise model_error(catalog, provider, model)
+    if catalog.provider_of(model) != provider:
+        raise DispatchError(
+            f"--model `{model}` belongs to provider `{catalog.provider_of(model)}`, "
+            f"not `{provider}`.\n\nmodels declared for `{provider}`:\n  "
+            + "\n  ".join(catalog.providers.get(provider) or ["(none declared)"])
+        )
+    if not effort:
+        effort = catalog.default_effort_of(model)
+    if effort not in catalog.efforts_of(model):
+        raise effort_error(catalog, model, effort)
+    return provider, model, effort
+
+
+def apply_profile(base: str, token: str, sid: str, agent_config: dict) -> dict:
+    """Model / system_prompt / permission_mode only take effect here.
+
+    Passing agent_config to POST /api/v1/sessions is accepted but silently
+    ignored (verified 2026-10-15): the turn then dies with
+    [model.not_configured] Model not set.
+    """
+    data = unwrap(
+        http_post(f"{base}/api/v1/sessions/{sid}/profile", token, {"agent_config": agent_config}),
+        "update profile",
+    )
+    return data.get("agent_config", {})
+
+
+def submit_prompt(base: str, token: str, sid: str, text: str) -> str:
+    body = {"content": [{"type": "text", "text": text}]}
+    data = unwrap(http_post(f"{base}/api/v1/sessions/{sid}/prompts", token, body), "submit prompt")
+    return data.get("prompt_id", "")
+
+
+def model_self_name(base: str, token: str, model: str, task: str, cwd: str) -> str:
+    """Ask a (cheap) model to name the session. Falls back to a slug on any error."""
+    instruction = (
+        "Name the following agent task session. Reply with ONLY the name: "
+        "2-4 lowercase words joined by hyphens, ASCII letters and digits only, "
+        "no quotes, no punctuation, at most 40 characters.\n\n"
+        f"Task: {task}"
+    )
+    try:
+        sid = create_session(base, token, cwd, title="")
+        apply_profile(base, token, sid, {"model": model, "permission_mode": "yolo"})
+        submit_prompt(base, token, sid, instruction)
+        text = poll_result(base, token, sid, timeout=90, quiet=True)
+        name = slugify(text.splitlines()[0] if text else "", limit=40)
+        if name and re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", name):
+            print(f"[dispatch] named by {model}: {name}")
+            return name
+    except DispatchError as exc:
+        print(f"[dispatch] naming model unavailable ({exc}); using slug")
+    fallback = slugify(task)
+    print(f"[dispatch] named by slug: {fallback}")
+    return fallback
+
+
+def poll_result(
+    base: str, token: str, sid: str, timeout: float, quiet: bool = False, interval: float = 2.0
+) -> str:
+    """Wait for the turn to end, then return the last assistant text."""
+    deadline = time.time() + timeout
+    reason = ""
+    status: dict = {}
+    while time.time() < deadline:
+        status = unwrap(http_get(f"{base}/api/v1/sessions/{sid}", token), "session status")
+        idle = not status.get("main_turn_active") and not status.get("busy")
+        # last_turn_reason is only populated once the turn is truly over; an
+        # assistant message can appear mid-turn, so it alone is not a stop signal.
+        if idle and status.get("last_turn_reason"):
+            reason = status["last_turn_reason"]
+            break
+        time.sleep(interval)
+    else:
+        raise DispatchError(f"timed out after {timeout:.0f}s waiting for session {sid}")
+
+    if not quiet:
+        usage = status.get("usage") or {}
+        print(
+            f"[dispatch] turn ended reason={reason or 'unknown'} "
+            f"tokens_in={usage.get('input_tokens', 0)} tokens_out={usage.get('output_tokens', 0)}"
+        )
+        if reason and reason != "completed":
+            raise DispatchError(f"turn ended with reason={reason} (session {sid})")
+    return fetch_final_answer(base, token, sid)
+
+
+def fetch_final_answer(base: str, token: str, sid: str) -> str:
+    items = unwrap(
+        http_get(f"{base}/api/v1/sessions/{sid}/messages?role=assistant&page_size=100", token),
+        "fetch messages",
+    ).get("items", [])
+    # Messages come back NEWEST-FIRST (verified 2026-10-15), so the latest
+    # assistant reply is items[0]. Taking items[-1] would return the oldest one.
+    for item in items:
+        parts = [c.get("text", "") for c in item.get("content", []) if isinstance(c, dict)]
+        joined = "".join(parts).strip()
+        if joined:
+            return joined
+    return ""
+
+
+def check_pending_interactions(base: str, token: str, sid: str) -> list[str]:
+    """Return any pending approval/question kinds. Empty list means clear.
+
+    These two endpoints are the ones to inspect when a dispatch hangs: an
+    unattended run can stall waiting for a human decision. See README.
+    """
+    pending: list[str] = []
+    for kind in ("approvals", "questions"):
+        try:
+            data = unwrap(
+                http_get(f"{base}/api/v1/sessions/{sid}/{kind}?status=pending", token),
+                f"list {kind}",
+            )
+        except DispatchError:
+            continue
+        if data.get("items"):
+            pending.append(kind)
+    return pending
+
+
+def activate_session(base: str, token: str, sid: str, timeout: float,
+                     charter: str = "", name: str = "") -> bool:
+    """Run one trivial turn so a fresh session is activated before real work.
+
+    Harmless when the session is already warm: it is just another no-op turn, and
+    the real task's answer is read as the newest assistant message, so the ping
+    reply can never be mistaken for the result.
+
+    ``name`` is passed so the first message can tell the session its own key
+    name: a verdict carries that key, and nothing else in the conversation
+    knows which key this session holds.
+    """
+    submit_prompt(base, token, sid, warmup_prompt(charter, name))
+    poll_result(base, token, sid, timeout=min(timeout, 120), quiet=True)
+    print("[dispatch] activated (warm-up turn completed)")
+    return True
+
+
+def guard_token(token: str, text: str) -> None:
+    if token and token in text:
+        raise DispatchError("refusing to emit output: the bearer token value appeared in it")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Dispatch a task to a local kimi-code session and print its answer. "
+            "Defaults to provider `codebuddy` with model `cb-deepseek-v4.1-flash` at "
+            "that model's default_effort; override any of the three on the command line. "
+            "The resolved choice is always printed."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python dispatch.py --task \"1+1=?\"            # house default: codebuddy + cb-deepseek-v4.1-flash\n"
+            "  python dispatch.py --task \"1+1=?\" --provider DeepSeek-new \\\n"
+            "      --model DeepSeek-new/deepseek-flash --effort high        # explicit override\n"
+            "  python dispatch.py --task \"rebuild it\" --session session_15707049-…   # resume a session\n"
+        ),
+    )
+    parser.add_argument("--task", required=False, default="", help="the task text to send")
+    parser.add_argument("--cwd", default=os.getcwd(), help="workspace dir for the session")
+    parser.add_argument(
+        "--state-dir", default="",
+        help=("运行态根目录（事件流/台账）。缺省看 SESS_EVENTS_STATE_DIR，"
+              "再缺省 paths.state_dir。自测必须给临时目录，否则写穿生产事件流"),
+    )
+    parser.add_argument(
+        "--stop-marker", default="",
+        help="absolute path of the cooperative STOP marker (default: <cwd>/.kimi/tools/STOP)",
+    )
+    parser.add_argument(
+        "--no-stop-guard", action="store_true",
+        help="do not append the cooperative STOP-marker guard to the task text",
+    )
+    parser.add_argument(
+        "--session", default="",
+        help=(
+            "resume an existing session id instead of creating one; an archived "
+            "session is restored first and the warm-up turn is skipped"
+        ),
+    )
+    parser.add_argument("--persona", default="", help="system_prompt (persona) for the session")
+    parser.add_argument("--name", default="", help="session name; omit to let a model name it")
+    parser.add_argument(
+        "--permission-mode", default="auto", choices=["manual", "yolo", "auto"],
+        help=("permission mode (default: auto = Never Ask). 注意语义：yolo 是 Ask When Needed"
+              "（风险动作仍会问），auto 才是完全自动"),
+    )
+    parser.add_argument(
+        "--provider", default="",
+        help=(
+            "provider name from the kimi-code config (house default for a NEW "
+            "session: codebuddy). e.g. codebuddy / DeepSeek-new / managed:kimi-code. "
+            "An unknown name prints the choices and exits. "
+            "With --session, omit it to keep the session's current provider."
+        ),
+    )
+    parser.add_argument(
+        "--model", default="",
+        help=(
+            "model alias from the kimi-code config (house default for a NEW "
+            "session: cb-deepseek-v4.1-flash). An unknown alias, or one belonging "
+            "to another provider, prints the choices and exits. "
+            "With --session, omit it to keep the session's current model "
+            "(user ruling 2026-10-31: dispatching must never overwrite the model "
+            "somebody picked by hand)."
+        ),
+    )
+    parser.add_argument(
+        "--effort", default="",
+        help=(
+            "thinking effort (default: the chosen model's declared default_effort). "
+            "Must be one of that model's support_efforts."
+        ),
+    )
+    parser.add_argument("--port", type=int, default=None, help="server port (default: auto-discover)")
+    parser.add_argument("--timeout", type=float, default=600, help="seconds to wait (default 600)")
+    parser.add_argument(
+        "--no-activate", action="store_true",
+        help="skip the warm-up turn that activates a fresh session",
+    )
+    parser.add_argument("--json", action="store_true", help="also print a JSON result block")
+    parser.add_argument(
+        "--ctx-force", action="store_true",
+        help="越过 ctx 门禁（≥90%% 仍拒；issue #12 救场用，会在 ledger 留 forced=true）",
+    )
+    parser.add_argument(
+        "--allow-retired", action="store_true",
+        help="越过退役 sid 清单（ISS-29；默认拒绝给已退役 sid 派单）",
+    )
+    parser.add_argument("--role", default=os.environ.get("AGENT_ROLE", "pm"),
+                        help="记录 ctx-gate 用的角色（默认取 AGENT_ROLE/pm）")
+    parser.add_argument(
+        "--detach", action="store_true",
+        help="submit the prompt and return the session id immediately (do not wait for the answer)",
+    )
+    parser.add_argument(
+        "--fetch", action="store_true",
+        help="only print the session's latest assistant message (no new prompt)",
+    )
+    parser.add_argument(
+        "--skip-quota-gate", action="store_true",
+        help="ISS-40 诊断用：跳过派单前算力配额闸（正常派单不用）",
+    )
+    args = parser.parse_args(argv)
+    hits = lint_task_text(getattr(args, "task", "") or "")
+    if hits:
+        print(f"[dispatch] 警告：任务书含开放式问询措辞 {hits} —— 按规矩应改写成判据或上升项"
+              f"（worker/QA 一律完全自动，不许中途等人）。", file=sys.stderr)
+
+    # --fetch：只取该会话最后一条 assistant 消息，不提交新 prompt（配合 --detach 用）
+    if args.fetch:
+        if not args.session:
+            parser.error("--fetch 需要 --session <id>")
+        token = read_token()
+        base = discover_base(token, args.port)
+        print(fetch_final_answer(base, token, args.session) or "(该会话没有 assistant 消息)")
+        return 0
+    if not args.task:
+        parser.error("--task is required (unless --fetch)")
+    if args.state_dir:
+        _sess_events().apply_state_dir(["--state-dir", args.state_dir])
+
+    # ISS-40：配额闸在 token/server/session 之前；满额直接拒单并带配置路径与当前值。
+    if not getattr(args, "skip_quota_gate", False):
+        quota_gate()
+
+    # Validate the three required choices BEFORE touching the token or the
+    # network, so a missing/invalid choice never creates a session as a side
+    # effect and never depends on a live server being up.
+    # Reusing a session: leave its model/provider/effort alone unless the caller
+    # named one explicitly (user ruling 2026-10-31).
+    catalog = load_catalog()
+    keep_session_model = bool(args.session) and not (args.provider or args.model or args.effort)
+    if keep_session_model:
+        provider, model, effort = "", "", ""
+    else:
+        provider, model, effort = resolve_choice(args, parser, catalog)
+
+    token = read_token()
+    base = discover_base(token, args.port)
+    cwd = os.path.abspath(args.cwd)
+
+    if args.session:
+        sid = args.session
+        # ISS-29：退役 sid 不再接活。归档只摘台账、不拦投喂，这里是投出去前
+        # 的最后一道闸；`--allow-retired` 明确绕过（打印告警，不静默）。
+        retired_reason = _retired_sids().check(sid)
+        if retired_reason and not getattr(args, "allow_retired", False):
+            raise DispatchError(f"拒绝派单：{retired_reason}（确认要派加 --allow-retired）")
+        if retired_reason:
+            print(f"[dispatch] ⚠ 绕过退役清单：{retired_reason}", file=sys.stderr)
+        # issue #12：复用会话派单前先过 ctx 门禁（≥60% 拒、≥75% 强制交接、≥90% 连 --force 也拒）
+        gate_rc = _ctx_gate(sid, force=args.ctx_force, operator=args.role)
+        if gate_rc != 0:
+            raise DispatchError(
+                f"ctx 门禁拒绝派单（rc={gate_rc}）；确认要救场请加 --ctx-force")
+        name = reuse_session(base, token, sid)
+    else:
+        if not os.path.isdir(cwd):
+            raise DispatchError(f"--cwd is not a directory: {cwd}")
+        if args.name:
+            name = args.name
+        else:
+            name = model_self_name(base, token, DEFAULT_NAMING_MODEL, args.task, cwd)
+        sid = create_session(base, token, cwd, title=name)
+        record_created(sid, name)
+    # What lands: POST …/profile persists ONLY `model` as the alias. `provider`
+    # and `effort` are not in the agent_config schema — they are derived server
+    # side from the alias (see README "provider / model / effort 的落地真相").
+    # `provider` is sent anyway because the alias prefix is a naming convention,
+    # not a binding, so the caller's choice is preserved in the request itself.
+    agent_config: dict = {"permission_mode": args.permission_mode}
+    if model:
+        agent_config.update(model=model, provider=provider, thinking=effort)
+    if args.persona:
+        agent_config["system_prompt"] = args.persona
+    applied = apply_profile(base, token, sid, agent_config)
+
+    activated = False
+    if not args.no_activate and not args.session:
+        activated = activate_session(base, token, sid, args.timeout,
+                                     charter=charter_for(name), name=name)
+
+    marker = args.stop_marker or os.path.join(os.path.abspath(cwd), ".kimi", "tools", "STOP")
+    progress_dir = os.path.join(os.path.abspath(cwd), ".kimi", "tools")
+    # 2026-11-09 用户令：STOP 守卫句退役——steer 已能打断当轮（abort/steer 实测成熟），
+    # 守卫句成了每份任务书的纯噪音。不再追加；--stop-marker/--no-stop-guard 保留为兼容 no-op，
+    # STOP 文件机制仍在（工具脚本可用），但不再是流程要求，也不自动写进任务书。
+    task_text = args.task
+    submit_prompt(base, token, sid, task_text)
+    if args.detach:
+        print(f"[dispatch] detached: session id {sid} (name={name})，未等待回答")
+        print(f"[dispatch] 收答案：dispatch.py --session {sid} --task \"只回结论\"")
+        if args.json:
+            print(json.dumps({"session_id": sid, "name": name, "detached": True,
+                              "model": model, "effort": effort}, ensure_ascii=False))
+        return 0
+    answer = poll_result(base, token, sid, timeout=args.timeout)
+
+    pending = check_pending_interactions(base, token, sid)
+    if pending:
+        print(f"[dispatch] WARNING: still pending -> {', '.join(pending)} (session {sid})")
+
+    # 2026-11-14：`--session` 走恢复路径，不跑 warm-up（activated 恒 False），
+    # 但恢复本身会触发服务端加载该会话。原写法谎称 "no (resumed session)"，
+    # 让人看不出这条为什么能成（PM 曾据此误信「须换工具」）。
+    if activated:
+        _activated = "yes (warm-up)"
+    elif args.session:
+        _activated = "no (resumed session; restore still triggers load)"
+    else:
+        _activated = "no (--no-activate)"
+
+    lines = [
+        "",
+        "=" * 60,
+        f"session name : {name}",
+        f"session id   : {sid}",
+        f"cwd          : {cwd}",
+        f"provider     : {provider or '(kept: session unchanged)'} (choice; not echoed by the API)",
+        f"model        : {applied.get('model') or model or '(kept: session unchanged)'}",
+        f"effort       : {effort or '(kept)'} (choice; not echoed by the API)",
+        f"permission   : {applied.get('permission_mode', args.permission_mode)}",
+        f"activated    : {_activated}",
+        "=" * 60,
+        answer,
+        "=" * 60,
+    ]
+    report = "\n".join(lines)
+
+    if args.json:
+        report += "\n" + json.dumps(
+            {
+                "name": name,
+                "session_id": sid,
+                "cwd": cwd,
+                "provider": provider,
+                "model": model,
+                "effort": effort,
+                "model_applied": applied.get("model") or "",
+                "activated": activated,
+                "answer": answer,
+            },
+            ensure_ascii=False,
+        )
+
+    guard_token(token, report)
+    guard_token(token, " ".join(sys.argv))
+    print(report)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except DispatchError as err:
+        print(f"[dispatch] ERROR: {err}", file=sys.stderr)
+        sys.exit(1)
