@@ -43,18 +43,17 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 CHECKOUT = HERE.parent
 
-# Gate 0 state: the md5 double check asserts this file is unchanged by the
-# read-only gates. It is the workbench stream when the workbench exists, and
-# the clone's own stream otherwise -- either way, one fixed file.
-WATCH_NAME = "events.jsonl"
+def md5_state(path: Path) -> tuple[int, str] | None:
+    """``(size, md5)``, or ``None`` when the file does not exist.
 
-
-def md5_state(path: Path) -> tuple[int, str]:
-    """``(size, md5)`` -- the pair Reed fixed, because ``last_seq`` cannot see
-    an appended line that carries no ``seq`` (measured: +60 B, one row, and
-    ``last_seq`` unchanged)."""
-    if not path.exists():
-        return (0, "")
+    ``None`` and ``(0, "")`` must stay different answers: an absent file is
+    "this gate cannot run here" (SKIP, rc=2), not "the file is unchanged".
+    Collapsing them is how the criterion becomes permanently true -- measured
+    before the fix: ``before == after == (0, "")`` on a machine without the
+    watched file, so the assertion below could never fail.
+    """
+    if not path.is_file():
+        return None
     data = path.read_bytes()
     return (len(data), hashlib.md5(data).hexdigest())
 
@@ -433,6 +432,10 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="ISS-100 D7 change-machine check")
     ap.add_argument("--clone", required=True, help="where to build the clone")
     ap.add_argument("--forbid", default="", help="private repo name that must not appear")
+    ap.add_argument("--watch", default="",
+                    help="the event stream the md5 double check guards; "
+                         "default = the clone's own state/events.jsonl. "
+                         "A path that does not exist is SKIP, never a pass")
     ap.add_argument("--with-close", action="store_true",
                     help="also run gate 8 (stub + in-process close)")
     ap.add_argument("--keep", action="store_true", help="keep the clone directory")
@@ -442,7 +445,12 @@ def main(argv=None) -> int:
     clone = Path(args.clone).resolve()
     outside = Path(tempfile.mkdtemp(prefix="cm_outside_"))
     gates: list[Gate] = []
-    watch = Path("D:/github/Laike_work_with_agent/state") / WATCH_NAME
+    # The watched file is **injected**, never hard-coded: a literal host path
+    # here would name a private deployment in a public repository, and it would
+    # also be absent on any other machine. Default = the clone's own stream,
+    # which is what a fresh clone actually has (usually nothing: SKIP).
+    watch = Path(args.watch).resolve() if args.watch \
+        else clone / "state" / "events.jsonl"
     before = md5_state(watch)
 
     try:
@@ -536,10 +544,26 @@ def main(argv=None) -> int:
         except OSError:
             pass
 
-    # Reed's criterion: the read-only gates must not have written the stream.
-    # ``last_seq`` is printed as a note only -- an appended row without ``seq``
-    # leaves it unchanged, so it cannot be the criterion.
-    unchanged = before == after
+    # The double check is its own gate: a read-only script that writes the
+    # stream is a defect even when every command above exited 0.
+    #
+    # An absent file cannot answer the question, so it is SKIP + rc=2, not a
+    # pass. The three states must stay separate: absent (cannot judge), equal
+    # (judged clean), different (judged red, including an appended row that
+    # carries no ``seq`` -- the shape ``last_seq`` cannot see).
+    watch_gate = Gate(9, "md5 双判：只读门禁未写事件流")
+    if before is None or after is None:
+        watch_gate.skipped = True
+        watch_gate.detail = f"SKIP(监视文件不存在：{watch}；换机时属常态，不给绿)"
+    elif before != after:
+        watch_gate.rc = 1
+        watch_gate.detail = (f"before={before} after={after} 不同（含无 seq 行）")
+    else:
+        watch_gate.rc = 0
+        watch_gate.ok = True
+        watch_gate.detail = f"before=after={before}"
+    gates.append(watch_gate)
+
     try:
         sys.path.insert(0, str(CHECKOUT))
         from super_agent.sess_events import last_seq
@@ -554,11 +578,7 @@ def main(argv=None) -> int:
         if not g.ok and not g.skipped:
             for line in g.output.splitlines()[-8:]:
                 print(f"        {line}")
-    print(f"md5 双判 before={before} after={after} 相同={unchanged}  {seq_note}")
-    # The double check is its own gate: a read-only script that writes the
-    # stream is a defect even when every command above exited 0.
-    assert unchanged, ("只读门禁写动了事件流（含无 seq 行，last_seq 抓不到）："
-                       f"{watch} before={before} after={after}")   # 防「只读脚本偷写事件流」
+    print(f"md5 双判 before={before} after={after}  {seq_note}")
 
     skipped = [g for g in gates if g.skipped]
     red = [g for g in gates if not g.ok and not g.skipped]
