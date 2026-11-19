@@ -1039,18 +1039,24 @@ def run_turn(base: str, token: str, sid: str, text: str, timeout: float,
 def fetch_final_answer(base: str, token: str, sid: str) -> str:
     """最后一轮里最后一条 `assistant_message` 的正文。取不到返回空串（不是 404）。
 
-    两层顺序**不一样**，少想一层就会拿回错的那一轮：
-      · `turns` 默认**新→旧** ⇒ **按原序**走，第一条命中的就是最新一轮；
-      · `items` 是**旧→新**（与已消失的 `/messages` 相反）⇒ 要 `reversed`，
-        取到的是该轮里最后一条 assistant 消息。
+    两层顺序（2026-11-20 对着现网 2.7.0 实测复核，见下）：
+      · `turns` 是**旧→新**（openapi 原文「oldest first: the latest page…」；
+        实测 5 个会话 × page_size 1/2/3/5，ordinal 全升序：page_size=5 给
+        `[40,41,42,43,44]`、=1 给 `[44]`）⇒ 要 `reversed`，第一条命中的才是
+        最新一轮。按原序取会返回**最早**一轮（实测 ordinal 39 vs 最新 43），
+        `--fetch` 于是恒读旧答案——比超时更坏，因为它看起来成功。
+      · `items` 也是**旧→新**（同一轮里 assistant_message 按发生顺序排列）⇒
+        同样要 `reversed`，取到的是该轮里最后一条。
 
-    ⚠ 方案 §3.3 的示意代码对 `turns` 也做了 `reversed`，那会把顺序翻成旧→新、
-    返回**最早**一轮的答案。以本函数为准（有测试钉住）。
+    ⚠ 本函数上一版曾按「`turns` 新→旧」把外层 `reversed` 去掉，那是错的
+    （ISS-103 P0-A：QA 实测 + 本轮复核）。别再依据方案 §1.3 那句「默认新→旧」
+    改回去——那句记的是**页**是最新一页（`page_size=1` 只给最新一条），不是
+    页内顺序。
     """
     d = unwrap(http_get(f"{base}/api/v1/sessions/{sid}/agents/main/turns?page_size=5",
                         token), "fetch turns")
-    for turn in (d.get("turns") or []):                 # 新→旧，按原序
-        for item in reversed(turn.get("items") or []):  # 旧→新，反着取
+    for turn in reversed(d.get("turns") or []):          # 旧→新 ⇒ 反着取，最新一轮在前
+        for item in reversed(turn.get("items") or []):   # 旧→新 ⇒ 反着取，最后一条在前
             if not isinstance(item, dict) or item.get("type") != "assistant_message":
                 continue
             text = str(item.get("text") or "").strip()

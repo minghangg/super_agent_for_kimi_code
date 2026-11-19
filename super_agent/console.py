@@ -1180,6 +1180,13 @@ def _request_verdict(st, payload) -> tuple[bool, str]:
                            f"failed={failed if failed is not None else 0}")
         return True, f"批量响应 succeeded={ok_n} failed=0"
     # 单动作：既不是批量、又没有一个可判的布尔 ⇒ 结构漂移，fail closed。
+    #
+    # 先把 code 核掉：走布尔键分支不等于「外层 code 一定为 0」。`{archived:true}`
+    # 配 `code=40001` 是两件事打架的响应，按哪条都不该记成受理——放过去就是
+    # 将来最容易被结构漂移踩中的那种假绿（P1-7）。
+    single_code = payload.get("code")
+    if single_code not in (0, None):
+        return False, f"单动作外层 code={single_code}"
     single = None
     if isinstance(body, dict):
         for key in ("archived", "restored", "cancelled", "taken_over"):

@@ -1094,6 +1094,15 @@ def list_sessions(busy_only: bool = False, archived_only: bool = False,
     st, payload = get(f"/api/v1/sessions{q}", timeout=10)
     if st != 200:
         return [], "", f"http={st}"
+    # 只看 HTTP 状态是不够的：服务端对参数错返 **HTTP 200 + code=40001**
+    # （实测 `page_size=200` → `"page_size must be at most 100"`）。旧写法把它
+    # 当成「成功但一页都没有」，于是调用方读到一个空表 + 空 err ——「不知道」冒充
+    # 「没有」。翻页时这尤其危险：漏页是静默的，而列表类判据（归档闸、在岗巡查）
+    # 都建在它上面。
+    code = code_of(payload)
+    if code not in (0, None):
+        msg = payload.get("msg") if isinstance(payload, dict) else ""
+        return [], "", f"code={code}{f' {msg}' if msg else ''}"
     d = data_of(payload)
     items = d
     if isinstance(d, dict):

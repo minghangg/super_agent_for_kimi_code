@@ -183,22 +183,47 @@ class ColdSessionIsUnknown(unittest.TestCase):
 
 
 class TurnsOrder(unittest.TestCase):
-    """`turns` is newest-first and `items` is oldest-first: both need reversing."""
+    """`turns` and `items` are both oldest-first: both need reversing.
+
+    Verified against 2.7.0 on 2026-11-20 (ISS-103 P0-A): `page_size=5` returns
+    `ordinals [40,41,42,43,44]` and `page_size=1` returns `[44]` -- the page is
+    the newest page, but **inside** a page the order is oldest-first. A mock
+    that hands back `[{6},{5}]` encodes the opposite and pins the bug as an
+    assertion, so the fixtures here are ascending like the wire.
+    """
 
     def test_the_latest_assistant_message_wins(self) -> None:
-        data = {"turns": [
+        data = {"turns": [                                   # oldest first, per wire
+            {"ordinal": 5, "items": [{"type": "assistant_message", "text": "older"}]},
             {"ordinal": 6, "items": [{"type": "user_message", "text": "q2"},
                                      {"type": "assistant_message", "text": "newest"}]},
-            {"ordinal": 5, "items": [{"type": "assistant_message", "text": "older"}]},
         ]}
         with mock.patch.object(D, "http_get", lambda *a, **k: {"code": 0, "data": data}):
             self.assertEqual(D.fetch_final_answer("http://x", "t", SID), "newest")
+
+    def test_the_last_message_inside_the_newest_turn_wins(self) -> None:
+        """`items` is oldest-first too: two assistant messages, take the later one."""
+        data = {"turns": [
+            {"ordinal": 6, "items": [{"type": "assistant_message", "text": "first"},
+                                     {"type": "tool_call", "text": ""},
+                                     {"type": "assistant_message", "text": "last"}]},
+        ]}
+        with mock.patch.object(D, "http_get", lambda *a, **k: {"code": 0, "data": data}):
+            self.assertEqual(D.fetch_final_answer("http://x", "t", SID), "last")
 
     def test_no_assistant_message_returns_empty(self) -> None:
         data = {"turns": [{"ordinal": 6,
                            "items": [{"type": "user_message", "text": "q"}]}]}
         with mock.patch.object(D, "http_get", lambda *a, **k: {"code": 0, "data": data}):
             self.assertEqual(D.fetch_final_answer("http://x", "t", SID), "")
+
+    def test_an_ascending_wire_shape_reads_the_newest_ordinal(self) -> None:
+        """Pin the regression itself: with ascending ordinals the newest must win."""
+        data = {"turns": [{"ordinal": n,
+                           "items": [{"type": "assistant_message", "text": f"turn-{n}"}]}
+                          for n in range(39, 45)]}
+        with mock.patch.object(D, "http_get", lambda *a, **k: {"code": 0, "data": data}):
+            self.assertEqual(D.fetch_final_answer("http://x", "t", SID), "turn-44")
 
 
 if __name__ == "__main__":

@@ -74,6 +74,19 @@ class VerdictGate(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("succeeded=0", why)
 
+    def test_a_single_action_with_a_nonzero_code_is_a_refusal(self) -> None:
+        """P1-7: a boolean verdict key does not excuse a non-zero envelope code."""
+        ok, why = console._request_verdict(200, {"code": 40001,
+                                                 "data": {"archived": True}})
+        self.assertFalse(ok)
+        self.assertIn("code=40001", why)
+
+    def test_the_documented_single_action_shape_still_passes(self) -> None:
+        """QA ruling on deviation 1: `:archive` really does answer `{archived:true}`."""
+        ok, why = console._request_verdict(200, {"code": 0, "data": {"archived": True}})
+        self.assertTrue(ok)
+        self.assertIn("单动作", why)
+
 
 class RestoreVerdict(unittest.TestCase):
     """P0-3: restore must not be judged on the HTTP status alone."""
@@ -181,6 +194,27 @@ class Paging(unittest.TestCase):
             items, err = direct.list_all_sessions(page_size=1)
         self.assertEqual(err, "")
         self.assertEqual(len(items), 1)
+
+    def test_an_error_code_is_an_error_not_an_empty_table(self) -> None:
+        """P1-6: `page_size=200` answers HTTP 200 + code 40001, not an empty list.
+
+        Reporting `(0, '', '')` here is "I don't know" disguised as "there are
+        none" -- and every list-based judge (archive gate, on-duty patrol) sits
+        on top of this call.
+        """
+        payload = {"code": 40001, "msg": "page_size must be at most 100"}
+        with mock.patch.object(direct, "get", lambda *a, **k: (200, payload)):
+            items, _nxt, err = direct.list_sessions(page_size=200)
+        self.assertEqual(items, [])
+        self.assertIn("40001", err)
+        self.assertIn("page_size", err)
+
+    def test_all_sessions_propagates_that_error(self) -> None:
+        payload = {"code": 40001, "msg": "page_size must be at most 100"}
+        with mock.patch.object(direct, "get", lambda *a, **k: (200, payload)):
+            items, err = direct.list_all_sessions(page_size=200)
+        self.assertEqual(items, [])
+        self.assertIn("40001", err)
 
 
 class NoV2Paths(unittest.TestCase):
