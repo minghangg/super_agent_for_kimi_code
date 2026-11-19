@@ -480,6 +480,48 @@ class Delivery(Base):
         self.assertEqual(by_key["wk-probe-1"]["status"], "working",
                          "the other worker's assignment must stay untouched")
 
+    @staticmethod
+    def memory_record(**over):
+        rec = {"id": "asg_1_worker_1", "thread": THREAD, "role": "worker",
+               "sid": "session_w1", "status": "working",
+               "delivery_comment_id": None, "delivery_cids": [],
+               "delivery_marker": "", "tombstone": {}}
+        rec.update(over)
+        return rec
+
+    def test_three_deliveries_are_appended_in_order(self):
+        # Every delivery an assignment received is kept, oldest first: a PM
+        # verdict may name any of them, not only the newest one.
+        rec = self.memory_record()
+        for cid in (9001, 9002, 9003):
+            rec["status"] = "working"
+            self.assertTrue(asg.on_delivery(rec, cid, "wk-probe-1",
+                                            "marker")["changed"])
+        self.assertEqual(asg.assignment_cids(rec), [9001, 9002, 9003],
+                         "arrival order is the fact, never sorted")
+        self.assertEqual(rec["delivery_comment_id"], 9003,
+                         "the single value stays the newest delivery")
+
+    def test_the_same_cid_is_not_appended_twice(self):
+        # A replay of an old delivery is not news: no second copy, no second
+        # waiting_review notice, and the newest marker does not move backwards.
+        rec = self.memory_record()
+        for cid in (9001, 9002, 9003):
+            rec["status"] = "working"
+            asg.on_delivery(rec, cid, "wk-probe-1", "marker")
+        rec["status"] = "waiting_review"
+        moved = asg.on_delivery(rec, 9001, "wk-probe-1", "marker")
+        self.assertFalse(moved["changed"])
+        self.assertEqual(asg.assignment_cids(rec), [9001, 9002, 9003])
+        self.assertEqual(rec["delivery_comment_id"], 9003)
+
+    def test_a_single_delivery_keeps_the_list_at_one(self):
+        rec = self.memory_record()
+        asg.on_delivery(rec, 9001, "wk-probe-1", "marker")
+        self.assertEqual(asg.assignment_cids(rec), [9001])
+        self.assertEqual(rec["delivery_cids"], [9001],
+                         "the history starts at the first delivery")
+
 
 class Notification(Base):
     def test_exactly_one_waiting_review_event_and_attempt(self):
@@ -729,6 +771,76 @@ class Verdicts(unittest.TestCase):
         self.assertTrue(out["changed"])
         self.assertEqual(rec["status"], "working")
         self.assertEqual(rec["qa_verdict"], "reject")
+
+    def test_reopen_appends_the_new_delivery(self):
+        # ``reopen`` writes the same field ``on_delivery`` writes, so it must
+        # append too: one path that overwrites would silently drop the history.
+        rec = self.record(status="close_reconcile", qa_verdict="pass",
+                          review_comment_id=9100, delivery_comment_id=9200,
+                          delivery_cids=[9001, 9200])
+        out = asg.reopen(rec, review_cid=9300, delivery_cid=9400, archived=False)
+        self.assertTrue(out["changed"])
+        self.assertEqual(asg.assignment_cids(rec), [9001, 9200, 9400])
+        self.assertEqual(rec["delivery_comment_id"], 9400)
+
+    def test_legacy_record_reads_as_one_cid(self):
+        # The pre-change shape on disk: no ``delivery_cids`` at all. The
+        # fallback is what makes the existing records readable with no
+        # migration script.
+        legacy = {"id": "asg_1_worker_1", "thread": THREAD, "role": "worker",
+                  "status": "completed", "delivery_comment_id": 9001}
+        self.assertEqual(asg.assignment_cids(legacy), [9001])
+        self.assertEqual(
+            asg.assignment_cids({"id": "asg_1_worker_1", "role": "worker"}),
+            [], "no field and no single value is simply no delivery")
+        # The first natural write merges the old newest value in as item one.
+        merged = dict(legacy)
+        asg._append_delivery(merged, 9200)
+        self.assertEqual(merged["delivery_cids"], [9001, 9200])
+        self.assertEqual(merged["delivery_comment_id"], 9200)
+
+    def test_owners_of_delivery_is_assignment_scoped(self):
+        # A cid is unique per repository, not per thread: the scan must filter
+        # by thread, by role and by "this assignment received it".
+        index = self.owner_index()
+        owners = asg.owners_of_delivery(index, THREAD, 9001)
+        self.assertEqual(sorted(r["id"] for r in owners),
+                         ["asg_1_worker_1", "asg_1_worker_2"])
+        self.assertEqual(asg.owners_of_delivery(index, THREAD, 9999), [])
+        self.assertEqual(
+            [r["id"] for r in asg.owners_of_delivery(index, THREAD, "9002")],
+            ["asg_1_worker_1"], "a string cid is the same cid")
+        self.assertEqual(
+            [r["id"] for r in asg.owners_of_delivery(index, "owner/demo#2", 9001)],
+            ["asg_2_worker_1"], "another thread keeps its own holders")
+
+    def test_newest_delivery_owner_skips_closed_assignments(self):
+        index = self.owner_index()
+        states = ("working", "waiting_review", "close_reconcile")
+        self.assertEqual(
+            asg.newest_delivery_owner(index, THREAD, states)["id"],
+            "asg_1_worker_1", "the closed holder of 9001 is not the newest")
+        self.assertIsNone(
+            asg.newest_delivery_owner(index, THREAD, ("working",)),
+            "no live holder answers None, not 'the closed one will do'")
+
+    @staticmethod
+    def owner_index():
+        return {"assignments": {
+            "asg_1_worker_1": {
+                "id": "asg_1_worker_1", "thread": THREAD, "role": "worker",
+                "status": "waiting_review", "delivery_comment_id": 9002,
+                "delivery_cids": [9001, 9002]},
+            "asg_1_worker_2": {
+                "id": "asg_1_worker_2", "thread": THREAD, "role": "worker",
+                "status": "completed", "delivery_comment_id": 9001},
+            "asg_1_qa_1": {
+                "id": "asg_1_qa_1", "thread": THREAD, "role": "qa",
+                "status": "waiting_review", "delivery_comment_id": 9001},
+            "asg_2_worker_1": {
+                "id": "asg_2_worker_1", "thread": "owner/demo#2",
+                "role": "worker", "status": "waiting_review",
+                "delivery_comment_id": 9001}}}
 
 
 class BlockedExit(unittest.TestCase):

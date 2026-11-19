@@ -119,6 +119,107 @@ def is_active(rec: dict | None) -> bool:
     return bool(rec) and str((rec or {}).get("status") or "") in ACTIVE_STATES
 
 
+def _cid_or_none(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def assignment_cids(rec: dict) -> list[int]:
+    """Every delivery cid this assignment has received, oldest first.
+
+    Present and non-empty -> that list (int-normalised, de-duplicated, order
+    kept). Missing or empty -> ``[delivery_comment_id]`` when that is set, else
+    ``[]``. The fallback is what makes old records readable with no migration.
+
+    This is the only reader of the two fields: a second spelling of
+    ``rec.get("delivery_cids") or [...]`` elsewhere would be a second source of
+    truth for the same question.
+    """
+    rec = rec or {}
+    raw = rec.get("delivery_cids")
+    if isinstance(raw, (list, tuple)):
+        cids: list[int] = []
+        for item in raw:
+            cid = _cid_or_none(item)
+            if cid is not None and cid not in cids:
+                cids.append(cid)
+        if cids:
+            return cids
+    single = _cid_or_none(rec.get("delivery_comment_id"))
+    return [single] if single is not None else []
+
+
+def _append_delivery(assignment: dict, cid) -> list[int]:
+    """Append ``cid`` to the history and make it the single-value "latest".
+
+    Append-only and de-duplicated: arrival order is the fact that says which
+    delivery is newest, so the list is never sorted. The single value stays in
+    step because the sixteen read points that want "the latest delivery" read
+    it (see the delivery-history issue); the list and the single value do not
+    derive from each other.
+    """
+    cid = _cid_or_none(cid)
+    cids = assignment_cids(assignment)
+    if cid is not None and cid not in cids:
+        cids = cids + [cid]
+    assignment["delivery_cids"] = cids
+    if cid is not None:
+        assignment["delivery_comment_id"] = cid
+    return cids
+
+
+def owners_of_delivery(index: dict, thread: str, cid) -> list[dict]:
+    """Worker assignments of ``thread`` whose :func:`assignment_cids` contain ``cid``.
+
+    The **only** implementation of "which assignments received this cid". The
+    ``thread`` filter is not optional: assignments are keyed by id, and a cid is
+    unique per repository, not per thread.
+    """
+    wanted = _cid_or_none(cid)
+    if wanted is None:
+        return []
+    out = []
+    for rec in (index.get("assignments") or {}).values():
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("thread") or "") != thread:
+            continue
+        if str(rec.get("role") or "") != "worker":
+            continue
+        if wanted in assignment_cids(rec):
+            out.append(rec)
+    return out
+
+
+def newest_delivery_owner(index: dict, thread: str, states) -> dict | None:
+    """The worker assignment holding this thread's newest delivery, or ``None``.
+
+    ``states`` is passed in, not restated here: the caller owns the "which
+    states may still be a review subject" question, and a second copy of that
+    tuple in this module would be a second source of truth. A delivery that
+    sits only on closed assignments yields ``None``.
+    """
+    newest = None
+    newest_cid = None
+    for rec in (index.get("assignments") or {}).values():
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("thread") or "") != thread:
+            continue
+        if str(rec.get("role") or "") != "worker":
+            continue
+        if str(rec.get("status") or "") not in states:
+            continue
+        cid = _cid_or_none(rec.get("delivery_comment_id"))
+        if cid is None:
+            continue
+        if newest_cid is None or cid > newest_cid:
+            newest, newest_cid = rec, cid
+    return newest
+
+
 def live_bindings(state: dict, thread: str, issue: int | None = None,
                   archived: set[str] | None = None) -> list[dict]:
     """Sessions currently bound to ``thread`` as a worker/qa participant.
@@ -214,7 +315,8 @@ def sync(index: dict, thread: str, issue, live: list[dict], *,
             "sid": bind["sid"], "session_key": key,
             "input_comment_id": None, "status": "working",
             "attempts": 0, "notification_action_id": "", "notified_at": "",
-            "delivery_comment_id": None, "delivery_marker": "",
+            "delivery_comment_id": None, "delivery_cids": [],
+            "delivery_marker": "",
             "matched_by": "", "created_at": now(), "updated_at": now(),
             "archived_at": "", "tombstone": {},
         }
@@ -284,9 +386,14 @@ def on_delivery(assignment: dict, delivery_cid, name: str,
         gate = blocked_exit(assignment, delivery_cid)
         if not gate["ok"]:
             return {"changed": False, "reason": gate["reason"]}
-    if assignment.get("delivery_comment_id") == delivery_cid:
+    cids = assignment_cids(assignment)
+    cid = _cid_or_none(delivery_cid)
+    # Already-recorded means "this cid is somewhere in the history", not "it
+    # equals the newest one": a replay of c1 after c1,c2,c3 must be a no-op, or
+    # it appends a duplicate and re-sends the waiting_review notice.
+    if cid is None or cid in cids:
         return {"changed": False, "reason": "same delivery already recorded"}
-    assignment["delivery_comment_id"] = delivery_cid
+    _append_delivery(assignment, cid)
     assignment["delivery_marker"] = name
     assignment["matched_by"] = matched_by
     assignment["status"] = "waiting_review"
@@ -686,7 +793,10 @@ def reopen(assignment: dict, *, review_cid=None, delivery_cid=None,
     assignment["status"] = "working"
     assignment["qa_verdict"] = "reject"
     assignment["review_comment_id"] = review_cid
-    assignment["delivery_comment_id"] = delivery_cid
+    # Append, not overwrite: this function writes the same field ``on_delivery``
+    # does, and a second write path that drops the history would be a second
+    # source of truth for "which deliveries has this assignment received".
+    _append_delivery(assignment, delivery_cid)
     assignment["updated_at"] = now()
     return {"changed": True, "status": "working", "reason": "reopened"}
 

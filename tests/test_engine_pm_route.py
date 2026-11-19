@@ -1009,6 +1009,118 @@ class DeclaredDeliveryWins(Base):
                          "one delivery, one release, whichever comment says so")
 
 
+class DeliveryHistory(Base):
+    """A verdict may name **any** delivery its assignment received.
+
+    The history exists so that anchoring the first or the middle delivery of a
+    reworked assignment is not a false "unknown": ``newest_delivery_owner`` says
+    *which* assignment the verdict judges, and ``assignment_cids`` says whether
+    that assignment ever received the named cid. Both together are the tightening
+    this class pins - the old thread-wide union let a cid from one assignment
+    pass under another, and let two live owners of one cid pass silently.
+
+    Run: ``python -m pytest tests/test_engine_pm_route.py -q``
+    """
+
+    def worker(self, aid, *, cids, status="waiting_review", **over):
+        rec = {"id": aid, "thread": THREAD, "issue": 1, "role": "worker",
+               "status": status, "sid": "session_w1",
+               "session_key": "wk-probe-1", "delivery_comment_id": cids[-1],
+               "delivery_cids": list(cids)}
+        rec.update(over)
+        return rec
+
+    def seed(self, engine, *recs):
+        index = engine.store.load_index()
+        index.setdefault("assignments", {}).update(
+            {rec["id"]: rec for rec in recs})
+        engine.store.save_index(index)
+
+    def verdict(self, engine, cid, delivery, state="ready"):
+        self.source.add(cid, f"[PM] 可关单 #1 <!-- verdict: {state} "
+                             f"delivery: {delivery} -->")
+        engine.run_once()
+
+    def test_a_verdict_may_anchor_an_earlier_delivery(self):
+        engine = self.engine()
+        self.deliver()
+        self.seed(engine, self.worker("asg_1_worker_1",
+                                      cids=[9001, 9200, 9300]))
+        self.verdict(engine, 9400, 9001)
+        frames = engine.store.load_index().get("release_frames") or {}
+        self.assertEqual(list(frames), [f"release:{THREAD}:9001"],
+                         "the history makes the first delivery a valid anchor")
+
+    def test_a_verdict_may_anchor_the_middle_delivery(self):
+        engine = self.engine()
+        self.deliver()
+        self.seed(engine, self.worker("asg_1_worker_1",
+                                      cids=[9001, 9200, 9300]))
+        self.verdict(engine, 9400, 9200)
+        frames = engine.store.load_index().get("release_frames") or {}
+        self.assertEqual(list(frames), [f"release:{THREAD}:9200"])
+
+    def test_a_verdict_of_another_assignment_does_not_pass(self):
+        # Two open workers: 9001 belongs to worker_1, but the thread's newest
+        # delivery is worker_2's 9300, so this verdict judges worker_2 and must
+        # not release a delivery worker_2 never received.
+        engine = self.engine()
+        self.deliver()
+        self.seed(engine,
+                  self.worker("asg_1_worker_1", cids=[9001]),
+                  self.worker("asg_1_worker_2", cids=[9300],
+                              sid="session_w2", session_key="wk-probe-2"))
+        self.verdict(engine, 9400, 9001)
+        index = engine.store.load_index()
+        self.assertEqual(index.get("release_frames") or {}, {},
+                         "a delivery of another assignment must not release")
+        rows = self.pm_rows(engine, "pm.verdict[user]")
+        self.assertEqual(len(rows), 1)
+        self.assertIn("another open assignment", str(rows[0].get("detail") or ""))
+        self.assertIn("asg_1_worker_1", str(rows[0].get("detail") or ""))
+        self.assertEqual([r for r in self.rows()
+                          if r["type"] == "pm.delivery_unknown"].__len__(), 1)
+
+    def test_a_verdict_never_received_does_not_pass(self):
+        engine = self.engine()
+        self.deliver()
+        self.seed(engine, self.worker("asg_1_worker_1", cids=[9001]))
+        self.verdict(engine, 9400, 9999)
+        index = engine.store.load_index()
+        self.assertEqual(index.get("release_frames") or {}, {})
+        rows = self.pm_rows(engine, "pm.verdict[user]")
+        self.assertEqual(len(rows), 1)
+        self.assertIn("is not a delivery of this thread",
+                      str(rows[0].get("detail") or ""))
+        logged = [r for r in self.rows() if r["type"] == "pm.delivery_unknown"]
+        self.assertEqual(len(logged), 1)
+
+    def test_two_live_owners_of_one_cid_do_not_pass(self):
+        # Dirty data: the same cid sits in two live assignments (reachable when
+        # a comment is re-read after one assignment completed). The target would
+        # be the newest holder and it *does* hold the cid, so a check that
+        # locates the target first passes it. The active-owner count must come
+        # first, and it must not ring.
+        engine = self.engine()
+        self.deliver()
+        self.seed(engine,
+                  self.worker("asg_1_worker_1", cids=[9001]),
+                  self.worker("asg_1_worker_2", cids=[9001],
+                              sid="session_w2", session_key="wk-probe-1"))
+        self.verdict(engine, 9400, 9001)
+        index = engine.store.load_index()
+        self.assertEqual(index.get("release_frames") or {}, {},
+                         "an ambiguous delivery must never ring")
+        self.assertEqual(self.bus.payloads("event.agent.supervisor"), [])
+        rows = self.pm_rows(engine, "pm.verdict[user]")
+        self.assertEqual(len(rows), 1)
+        self.assertIn("2 live assignments", str(rows[0].get("detail") or ""))
+        logged = [r for r in self.rows() if r["type"] == "pm.delivery_ambiguous"]
+        self.assertEqual(len(logged), 1)
+        self.assertEqual(sorted(logged[0]["owners"]),
+                         ["asg_1_worker_1", "asg_1_worker_2"])
+
+
 class NoSilentOutcome(Base):
     """P1-1: every dispatch path either records the release or leaves a row.
 

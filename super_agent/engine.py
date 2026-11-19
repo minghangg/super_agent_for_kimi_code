@@ -2502,19 +2502,48 @@ class Engine:
             return "needs_person", f"pm verdict: {delivery_error}"
         declared_delivery = verdict.get("delivery")
         if declared_delivery is not None:
-            known = {int(rec.get("delivery_comment_id"))
-                     for rec in (index.get("assignments") or {}).values()
-                     if isinstance(rec, dict)
-                     and str(rec.get("thread") or "") == thread
-                     and str(rec.get("role") or "") == "worker"
-                     and rec.get("delivery_comment_id") is not None}
-            if int(declared_delivery) not in known:
-                detail = (f"delivery #{int(declared_delivery)} is not a delivery "
-                          f"of this thread")
+            wanted = int(declared_delivery)
+            states = REVIEW_TARGET_STATES + ("close_reconcile",)
+            # Dirty data first, and before the target is located: if the target
+            # were found first, two live owners of one cid would let the newest
+            # one pass the ownership check, and ambiguity would be unreachable.
+            owners = asg_mod.owners_of_delivery(index, thread, wanted)
+            live = [rec for rec in owners
+                    if str(rec.get("status") or "") in states]
+            if len(live) > 1:
+                detail = (f"delivery #{wanted} belongs to {len(live)} live "
+                          "assignments: " + ", ".join(str(r.get("id")) for r in live))
+                self.store.log_event({
+                    "type": "pm.delivery_ambiguous", "at": _now(), "thread": thread,
+                    "comment_id": cid, "delivery": wanted,
+                    "owners": [str(r.get("id")) for r in owners]})
+                self._pm_needs_person(index, thread, cid, "pm.verdict[user]",
+                                      detail, verdict)
+                return "needs_person", f"pm verdict: {detail}"
+            owner = asg_mod.newest_delivery_owner(index, thread, states)
+            if owner is None or wanted not in asg_mod.assignment_cids(owner):
+                # At most one live owner is left, so the failure has three
+                # shapes and the wording must say which one happened: "archived"
+                # printed for a live assignment is a contradiction a reader
+                # cannot resolve. A live owner wins the branch even when an
+                # archived one sorts first, for the same reason.
+                if not owners:
+                    detail = (f"delivery #{wanted} is not a delivery "
+                              "of this thread")
+                elif live:
+                    detail = (f"delivery #{wanted} belongs to another open "
+                              f"assignment {live[0].get('id')} "
+                              f"({live[0].get('status')}), which is not this "
+                              "thread's newest delivery")
+                else:
+                    detail = (f"delivery #{wanted} belongs to an archived "
+                              f"assignment {owners[0].get('id')} "
+                              f"({owners[0].get('status')})")
                 self.store.log_event({
                     "type": "pm.delivery_unknown", "at": _now(),
                     "thread": thread, "comment_id": cid,
-                    "delivery": int(declared_delivery)})
+                    "delivery": wanted,
+                    "owners": [str(r.get("id")) for r in owners]})
                 self._pm_needs_person(index, thread, cid, "pm.verdict[user]",
                                       detail, verdict)
                 return "needs_person", f"pm verdict: {detail}"
