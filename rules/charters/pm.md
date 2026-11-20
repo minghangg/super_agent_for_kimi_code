@@ -499,3 +499,18 @@ python tools/<from_项目>/dispatch_session/dispatch.py \
 - `<!-- verdict: ready|blocked|working delivery: <cid> -->` **不能省**：三态靠标记表达，动作词只表达「这是一条裁决」。
 - 缺标记 ⇒ `state=""`（fail-closed，交人看），不会误判成可关单。
 - 旧式 `[PM] 可关单 #<n> <!-- verdict: ... -->` **仍然有效**，两者并存。
+
+## 换血（rotation）
+
+上下文到线时，**你写交接档**；换会话、换键、归档由 <supervisor> 做。全流程见
+`rules/charters/rotation.md`。
+
+**你要做的三件事**：
+
+1. 按 `handoff/_template_handoff.md` 写 `state/asst_handoff/<角色>_<时刻>.md`（10 板块）；
+2. 发一条 `[<你的键名>]-[交接完成]-[<supervisor 键名>]-[<项目键>]`；
+3. 停手。**不要自己建新会话、不要自己改 `sessions.json`**——那是 <supervisor> 的动作。
+
+**判据**：交接档必须能让下一任**不重读源码**就接手。写「当前真实状态」和「怎么判能不能
+继续」，不要只写「已完成 X」。
+
