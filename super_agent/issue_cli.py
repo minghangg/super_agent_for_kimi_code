@@ -305,7 +305,7 @@ def _already_prefixed(body: str, prefix: str) -> bool:
 
 def _prefix(role: str, worker_name: str | None, table: roles_mod.RoleConfig,
             *, do: str = "", notify: str = "", project: str = "",
-            cid: str = "") -> str:
+            cid: str = "", session_key: str = "") -> str:
     """The first-line prefix for this comment.
 
     Two shapes, chosen by whether ``--do`` was given (ISS-99):
@@ -327,12 +327,21 @@ def _prefix(role: str, worker_name: str | None, table: roles_mod.RoleConfig,
             raise Denied(
                 f"--do {action!r} 不在白名单（{len(markers.NOTIFY_ACTIONS)} 个）："
                 f"{'、'.join(markers.NOTIFY_ACTIONS)}")
-        who = worker_name or table.prefix(role)
-        # A bare prefix (``[PM]``) is not a session key; the five-part title needs
-        # the key so the engine can attribute the comment to a session.
-        who = who.strip("[]")
-        if role == "worker" and not worker_name:
-            raise Denied("worker 角色必须给 --worker-name（五段式首段＝会话键名）")
+        # The first segment is a **session key**, never a bare role marker. A
+        # bare `[SC]` carries no name, so the engine cannot attribute the
+        # comment and `parse_delivery` refuses it -- the comment looks correct
+        # and is silently not a delivery. That is exactly the hole #99 closed,
+        # and it reopened here because this branch preferred the role prefix.
+        #
+        # Order: --worker-name (delivery roles) → --session-key (every role) →
+        # refuse. The last step is a refusal, not a fallback to the prefix:
+        # a fallback produces the broken shape silently.
+        who = (worker_name or session_key or "").strip().strip("[]")
+        if not who:
+            raise Denied(
+                "五段式首段必须是会话键名：给 --worker-name（交付角色）或 --session-key。"
+                f"裸角色标记 {table.prefix(role)!r} 不算键名——引擎无法归属，"
+                "parse_delivery 会判它不是交付。")
         if not notify:
             raise Denied("--do 必须配 --notify（不通知写 'No Notify'）")
         if not project:
@@ -666,7 +675,8 @@ def cmd_comment(args, ctx) -> int:
                   do=getattr(args, "do", "") or "",
                   notify=getattr(args, "notify", "") or "",
                   project=project_key,
-                  cid=str(getattr(args, "cid", "") or ""))
+                  cid=str(getattr(args, "cid", "") or ""),
+                  session_key=str(getattr(args, "session_key", "") or ""))
     head = body if _already_prefixed(body, pfx) else f"{pfx} {body}"
     head = head.strip()
     # ISS-99: the session key goes on its own line. Inline would put it inside

@@ -219,6 +219,28 @@ class LegacyShape(Prefix):
         self.assertEqual(issue_cli._prefix("worker", "wk-x", self.table), "[WK:wk-x]")
         self.assertEqual(issue_cli._prefix("qa", None, self.table), "[QA]")
 
+    def test_a_five_part_title_uses_the_session_key_as_who(self):
+        # A bare role marker carries no name, so the engine cannot attribute the
+        # comment and parse_delivery refuses it. The title looks correct and is
+        # silently not a delivery -- the hole #99 closed, reopened once because
+        # this branch preferred the role prefix.
+        head = issue_cli._prefix("scout", None, self.table, do="交接就绪",
+                                 notify="reed", project="lwa",
+                                 session_key="scout-abc12345")
+        self.assertEqual(head, "[scout-abc12345]-[交接就绪]-[reed]-[lwa]")
+        self.assertIsNotNone(markers.parse_five(head))
+
+    def test_a_five_part_title_without_any_key_is_refused(self):
+        with self.assertRaises(issue_cli.Denied) as ctx:
+            issue_cli._prefix("scout", None, self.table, do="交接就绪",
+                              notify="reed", project="lwa")
+        self.assertIn("会话键名", str(ctx.exception))
+
+    def test_a_worker_still_uses_worker_name(self):
+        head = issue_cli._prefix("worker", "wk-x", self.table, do="完工",
+                                 notify="pm", project="lwa")
+        self.assertEqual(head, "[wk-x]-[完工]-[pm]-[lwa]")
+
 
 class EveryAction(unittest.TestCase):
     def test_the_whitelist_has_twelve_actions(self):
