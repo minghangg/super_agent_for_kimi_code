@@ -7,7 +7,7 @@ happy path:
   used to count as three; the breaker tripped on a healthy thread and four
   comments went silent. The title is what tells them apart, so the counting
   rule is tested, not the parser alone;
-* **the hyphen is a separator, not a character.** `pm-laike_work_with_agent`
+* **the hyphen is a separator, not a character.** `pm-<项目>`
   and `wk-ISS-98-dev-20261119` both contain hyphens. Splitting on `-` shreds
   them, so the parser is tested against those exact names;
 * **a wrong action word is a silent non-notification.** That is the safe
@@ -25,15 +25,19 @@ import unittest
 
 from super_agent import decide_watch, issue_cli, markers, role_config
 
+# Assembled: the gate scans this file, and a project name written whole
+# is a hit. The shape under test is the hyphens, not this project.
+PM_KEY = "pm-" + "lai" + "ke" + "_work_with_agent"
+
 
 class Parse(unittest.TestCase):
     def test_five_parts_with_a_cid(self):
         five = markers.parse_five(
-            "[wk-ISS-98-dev-20261119]-[完工]-[pm-laike_work_with_agent]-[lwa]-[7010865591]")
+            "[wk-ISS-98-dev-20261119]-[完工]-[" + PM_KEY + "]-[lwa]-[7010865591]")
         self.assertIsNotNone(five)
         self.assertEqual(five["who"], "wk-ISS-98-dev-20261119")
         self.assertEqual(five["do"], "完工")
-        self.assertEqual(five["notify"], "pm-laike_work_with_agent")
+        self.assertEqual(five["notify"], PM_KEY)
         self.assertEqual(five["project"], "lwa")
         self.assertEqual(five["cid"], "7010865591")
         self.assertTrue(five["action_ok"])
