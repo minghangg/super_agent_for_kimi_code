@@ -375,6 +375,29 @@ class InjectTest(_Base):
             self.assertEqual(task.state, "unparsable", arguments)
             self.assertEqual(proc.state, "unparsable", arguments)
 
+    def test_process_side_accepts_the_shim_name(self) -> None:
+        """`<part>_<suffix>.py` names the same part as `<part>.py` (ISS-102).
+
+        ``parse_script`` learned the shim form when the switch moved the bus to
+        ``wss_bus_safkc.py``; ``_process_side`` did not, so ``--verify`` read a
+        live process whose command line names its file plainly as "命令行里没有
+        绝对 .py 路径". Both sides must accept the same two shapes.
+        """
+        shim = r'"py.exe" D:\wb\tools\wss_bus_safkc.py --daemon'
+        proc = autostart._process_side("wss_bus", [(11568, shim)], injected=True)
+        self.assertEqual(proc.state, "ok", proc.detail)
+        self.assertEqual(proc.value, r"d:\wb\tools\wss_bus_safkc.py")
+
+        direct = r'"py.exe" D:\wb\tools\wss_bus.py --daemon'
+        proc = autostart._process_side("wss_bus", [(11568, direct)], injected=True)
+        self.assertEqual(proc.state, "ok", proc.detail)
+
+    def test_process_side_does_not_claim_another_parts_shim(self) -> None:
+        """A `wss_bus_*` shim is wss_bus; `decide_watch_*` must not become it."""
+        other = r'"py.exe" D:\wb\tools\decide_watch_fast.py'
+        proc = autostart._process_side("wss_bus", [(1, other)], injected=True)
+        self.assertEqual(proc.state, "absent", proc.detail)
+
 
 class RegisterTest(_Base):
     def test_dry_run_prints_and_does_not_apply(self) -> None:

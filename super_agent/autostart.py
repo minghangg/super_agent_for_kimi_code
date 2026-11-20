@@ -577,7 +577,13 @@ def _process_side(part: str, rows: list[tuple[int, str]],
         if why:
             unparsable.append(why)
             continue
-        if Path(path).name.lower() == f"{part}.py":
+        # `<part>.py` is the direct form; `<part>_<suffix>.py` is the shim form
+        # (ISS-102: `wss_bus_safkc.py`). Both name the same part -- the script
+        # side already accepts both (see ``parse_script``), and accepting only
+        # the first here made ``--verify`` report "命令行里没有绝对 .py 路径"
+        # for a process that names its file plainly.
+        stem = Path(path).stem.lower()
+        if stem == part or stem.startswith(f"{part}_"):
             hits.append((pid, path))
     if hits:
         values = {_normalize(p) for _, p in hits}
