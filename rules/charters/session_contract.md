@@ -77,18 +77,33 @@
 **每个人发评论，`--role` 必须是自己。** 不许用别人的角色前缀代替自己，也不许替别人发。
 
 ```bash
-python tools/gh.py comment --role <你自己> --project <项目> --issue <n> \
-  --session-key <你的键名> --body-file <文件>
+
+python tools/gh_issue.py comment --role <你自己> --project <项目> --issue <n> \
+
+  --do <动作> --notify <提醒谁> --session-key <你的键名> --body-file <文件>
+
 ```
 
-| 你的角色 | `--role` | 自动加的前缀 |
+
+
+| 你的角色 | `--role` 取值 | 五段式首段写什么 |
+
 |---|---|---|
-| supervisor | `<本机 supervisor 角色名>` | `<对应前缀>` |
-| PM | `pm` | `[PM]`（交付用 `[PM:TASK]`） |
-| worker | `worker` ＋ `--worker-name <完整会话键名>` | `[WK:<名>]` |
-| QA | `qa` | `[QA]` |
-| scout／steward／auditor／reviewer | 同名 | `[SC]`／`[ST]`／`[AU]`／`[RV]` |
-| analyst | `analyst` | `[AT]` |
+
+| supervisor | `<本机 supervisor 角色名>` | 你的会话键名 |
+
+| PM | `pm` | 你的会话键名（`pm-<项目>-<8位hex>`） |
+
+| worker | `worker` | 你的会话键名（`wk-<任务>-<日期>`） |
+
+| QA | `qa` | 你的会话键名（`qa-<项目>-ISS-<n>`） |
+
+| scout／steward／auditor／reviewer／analyst | 同名 | 你的会话键名 |
+
+
+
+**首行由工具拼装**：给了 `--do` 就拼五段式（§7），没给才退回旧式裸前缀。**新评论一律给 `--do`**——旧式只为 3000+ 条历史评论保留可解析性，不是给你用的。
+
 
 **三条禁令**：
 
@@ -105,3 +120,60 @@ python tools/gh.py comment --role <你自己> --project <项目> --issue <n> \
 **唯一例外**：`bind --role pm` 里的 `--role pm` 是**权限声明**（谁能登记会话归属），不是发评论署名，不属本条范围。
 
 **判据**：`grep -n "comment --role" <你的章程>` 命中的 `--role` 值必须全等于你自己的角色名。
+
+## 7. 评论标题五段式（用户 2026-11-19 令，2026-11-20 落地）
+
+**首行标题必须写成五段**，取代旧的「只看 `[WK:<名>]` 标记」：
+
+```
+[who]-[do]-[notify]-[project]-[cid]
+```
+
+| 段 | 含义 | 取值 |
+|---|---|---|
+| `who` | 谁发的 | **你的会话键名**（`state/sessions.json` 里那一把），不是角色标记 |
+| `do` | 干什么 | 下面 12 个动作之一 |
+| `notify` | 要提醒谁 | 会话键名／`No Notify`／`All Active`／逗号分隔 |
+| `project` | 所属项目 | `gh_projects.json` 的**短键**（`superagent`，不是 `super_agent_for_kimi_code`） |
+| `cid` | 可选：回引上一条评论 | 纯数字 |
+
+### 12 个合法动作（不在表内的**不计数、不通知**）
+
+```
+完工  收口  退回  裁决  告警  派单  接单
+交接要求  交接完成  交接就绪  已归档  调试
+```
+
+### 三条硬判据
+
+1. **`who` 必须是会话键名**。写 `[SC]`／`[PM]` 这类**裸角色标记不算交付**——它不携带名字，会造出匹配不上任何 assignment 的交付（`assignment.unmatched`）。
+2. **`[调试]` 与 `[已归档]` 不通知任何人**。调试探针就是为这个存在的：**不要为了让探针被看见而假装成 `[完工]`**。
+3. **`No Notify` 不影响计数**。配额管的是「收单哨会不会发提醒」，不是评论本身。
+
+### 为什么改
+
+旧口径「首行有 `[WK:<名>]` 就算交付」把 92 字节的探针和 5848 字节的真交付**同等计数**。后果实测过：探针吃满当日配额，真交付被熔断停发。
+
+**结构表达意图，不靠字数猜。**
+
+### 命令
+
+```bash
+python tools/gh_issue.py comment --role <你自己> --project <项目> --issue <n> \
+  --do <动作> --notify <提醒谁> --session-key <你的键名> --body-file <文件>
+```
+
+`--do`／`--notify`／`--session-key` 三者由工具拼成首行；`--cid` 可选。
+工具会校验 `--project` 是否在登记表内，错则列出全部可选短键。
+
+### 三种带结论的评论：动作决定语义
+
+| 你要表达 | 动作 | 还须带什么 |
+|---|---|---|
+| QA 复核结论 | `退回`（判不通过）／`完工`（判通过） | 首行末尾 `<!-- fix_needed: true\|false -->` |
+| PM 裁决 | `裁决` | 首行末尾 `<!-- verdict: ready\|blocked\|working delivery: <cid> -->` ＋ issue 坐标 `#<n>`；**首段必须是 `pm-*` 或 `supervisor-*`** |
+| 交付 | `完工` | 首段是你的会话键名 |
+
+**其余动作（`接单`／`派单`／`交接要求`／`交接完成`／`交接就绪`／`告警`／`收口`／`已归档`／`调试`）不承载结论**——引擎不会把它们读成通过或裁决。
+
+**旧式前缀仍有效**：`[PM] 可关单 #<n> <!-- verdict: ... -->`、`[QA] 结论：通过 <!-- fix_needed: false -->`、`[WK:<名>]` 都还能解析，因为 GitHub 上已有 3000+ 条历史评论是这个形状。**但新评论一律用五段式**——两套并存只为兼容，不是给你选的。

@@ -50,10 +50,10 @@
 1. **接单**：supervisor 派你时会把本次范围与交付要求写进 #<n> 的评论，同时摘除挂起。**你只读该单**，不自己改标签、不改别人 issue。
 2. **交付**：报告全文写成 **#<n> 上的一条评论**，用**你自己的常规身份**发（`--role scout`）：
    ```
-   python tools/gh.py comment --role scout --project <工作台仓> \
+   python tools/gh_issue.py comment --role scout --project <工作台仓> \
      --issue 93 --body-file D:/temp_safkc/<报告名>.md --session-key <你的键名>
    ```
-   - **不要发明特殊前缀。** 交付是报告就用 `--worker-name <任务名>`（引擎记成 `[SC:<任务名>]`）；只是说明就用裸 `[SC]`。**没有 `[WK:scout-analysis]` 这类自定义标记**——那是我 2026-11-18 一度写的绕路办法，已废。
+   - **首段必须是你的会话键名，不要发明特殊标记。** 交付用 `--do 完工`；纯说明用 `--do 调试`（不计数、不通知）。**没有 `[WK:scout-analysis]` 这类自定义标记**——那是 2026-11-18 一度写的绕路办法，已废。
    - 正文含：结论、证据坐标（文件:行号／cid）、偏差项、**未确认项**（写明为什么确认不了）、报告路径（如有）。
    - 同一时刻本地也留一份 `D:/temp_safkc/<报告名>.md`，路径写进评论。
 3. **不要自己恢复挂起**：supervisor 核完报告后自己 `hold`。你若发现范围没做完，**在评论里写清「本条未覆盖什么」**。
@@ -90,9 +90,9 @@
 **★ 只用自己的身份（用户 2026-11-18 令）**：`--role` 只能是 `scout`，不许用其他角色。所有角色共用一个 GitHub token，引擎按作者过滤挡不住冒用。见 `session_contract.md` §6。
 
 1. 写 `D:/temp_safkc/<角色>_ruling_<时刻>.md`，四段正文（见下）。
-2. 自己发评论（脚本自动加 `[SC]` 前缀；**交付**时加 `--worker-name <任务名>`，前缀自动变成 `[SC:<任务名>]`）：
+2. 自己发评论（五段式：`--do <动作> --notify <提醒谁> --session-key <你的键名>`）：
    ```
-   python tools/gh.py comment --role scout   --project <项目> --issue <n> --body-file D:/temp_safkc/scout_ruling_<时刻>.md
+   python tools/gh_issue.py comment --role scout   --project <项目> --issue <n> --body-file D:/temp_safkc/scout_ruling_<时刻>.md
    ```
 3. **不要再走「本地文件＋短令请 PM 代发」那条路**——那条已于 2026-11-16 随评论权下放一并废止；仍请人代发＝多一道转发延迟，且首行会变成 `[PM] [代发:…]`，署名与作者不符。
 
@@ -127,3 +127,14 @@
 ```
 上下文：tokens_in=<N>（≈<P>%）；到 60% 由 <supervisor> 判交接，≥75% 强制交接（自写 state/asst_handoff/scout_<时刻>.md，**10 板块**，模板 `handoff/_template_handoff.md`）。
 ```
+
+## 评论标题五段式（必读）
+
+发 issue 评论时首行写成 `[who]-[do]-[notify]-[project]-[cid]`：`who` 用**你的会话键名**，`do` 取 12 个合法动作之一（`完工`／`收口`／`退回`／`裁决`／`告警`／`派单`／`接单`／`交接要求`／`交接完成`／`交接就绪`／`已归档`／`调试`）。
+
+**全文与判据见 `rules/charters/session_contract.md` §7。** 三条最易错的：
+- 写 `[SC]`／`[PM]` 这类裸角色标记**不算交付**，必须写会话键名；
+- `[调试]` 与 `[已归档]` **不通知任何人**，探针不要伪装成 `完工`；
+- `No Notify` 只表示不叫醒人，**不影响计数**。
+
+**命令**：`--do <动作> --notify <提醒谁> --session-key <你的键名>`，工具拼首行。

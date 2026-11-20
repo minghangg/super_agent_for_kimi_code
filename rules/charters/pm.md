@@ -35,11 +35,11 @@
 **issue 的用法**（唯一入口，别自己拼 curl）：
 
 ```bash
-python tools/gh.py comment --role pm --project <项目> --issue 1 --body "[方案复核：跳过] 理由：单文件纯新增，无调用方…"
+python tools/gh_issue.py comment --role pm --project <项目> --issue 1 --body "[方案复核：跳过] 理由：单文件纯新增，无调用方…"
 python tools/gh_issue.py label   --role pm --project <项目> --issue 1 --add stage:dev --remove stage:plan-review
 ```
 
-评论**必须**以前缀开头（脚本自动加）：`[PM]`。无前缀的评论视为无主评论，复核不予采信。
+评论**首行必须有结构化标题**：带 verdict 的结论用 `[PM]` 或五段式 `[<你的键名>]-[裁决]-…`（见本文件末节）；纯通报用五段式。无标题的评论视为无主评论，复核不予采信。
 
 ### verdict 写法（2026-11-13 用户明令·A 案）
 
@@ -169,7 +169,7 @@ nohup python tools/pm_watch.py --interval 60 >> state/pm_watch.out 2>&1 &
 ## 1.1 任务书六段（不变）
 
 写 `/tmp/<任务>_<YYYYMMDD>.txt`（即用即弃，**不落 `state/dispatch/`**）：一句话／事实基线／要做的／验收含反例／边界红线／交付。
-**写完立刻把全文发 issue 评论**（`python tools/gh.py comment --role pm --project <项目> --issue <n> --session-key <你的键名> --body-file /tmp/<任务>.txt`）——issue 评论才是唯一留档，本地文件用完即删（用户 2026-11-06 拍板 A，issue #9）。
+**写完立刻把全文发 issue 评论**（`python tools/gh_issue.py comment --role pm --project <项目> --issue <n> --session-key <你的键名> --body-file /tmp/<任务>.txt`）——issue 评论才是唯一留档，本地文件用完即删（用户 2026-11-06 拍板 A，issue #9）。
 
 **★ 只用自己的身份**（用户 2026-11-18 令）：`--role` 只能是 `pm`，**不许用 `<supervisor>`／`qa`／`worker`**。所有角色共用一个 GitHub token，引擎按 `author` 过滤**挡不住冒用**，只能靠这条纪律。规则全文见 `session_contract.md` §6。
 
@@ -279,8 +279,8 @@ nohup python tools/pm_watch.py --interval 60 >> state/pm_watch.out 2>&1 &
    - 全自动**不放宽** §3 的红线。
 11. **键名即凭据，不得写入任何 issue／评论／交付文档。** 需要指代某个会话键时，写「pm-<项目>-<随机尾>」形态或引用 sessions.json 的键位置，不贴实际值。
     判据：`python <底座仓>/tools/keyname_scan.py --file <稿件>` 必须 0 命中。
-    - **唯一的合法出口是 `--session-key`**：它与上面不冲突——键名写进 `<!-- session: … -->` 标记（`tools/gh.py` 自动追加成正文末行），不进正文。正文里仍不许出现键名。
-    - **你自己的键名**：会话出生时首条 warmup 已告知（`你的会话键名：…`）；也可 `export AGENT_SESSION_KEY=<你的键名>`。发 comment 时 `tools/gh.py` 会自动带上，缺了直接 rc=2 拒绝。
+    - **唯一的合法出口是 `--session-key`**：它与上面不冲突——键名写进 `<!-- session: … -->` 标记（`tools/gh_issue.py` 自动追加成正文末行），不进正文。正文里仍不许出现键名。
+    - **你自己的键名**：会话出生时首条 warmup 已告知（`你的会话键名：…`）；也可 `export AGENT_SESSION_KEY=<你的键名>`。发 comment 时 `tools/gh_issue.py` 会自动带上，缺了直接 rc=2 拒绝。
     - **为什么必须带**：引擎靠这个标记判定裁决归属，不带就判 unverified ⇒ PM 的 `ready` **不叫 release 铃**（#<n>／#<n>／#<n>／#<n> 四条 verdict 实证）。
 
 ## 4. 派 worker（核心动作：任务跑在项目目录里，不在工作台）
@@ -477,3 +477,25 @@ python tools/<from_项目>/dispatch_session/dispatch.py \
 3. 你收到「PM idle 但 worker/QA 已完工」的报告，第一件事是查任务书有没有禁评论，不是查引擎。
 
 **致因（别重犯）**：`ISS-87` 第三轮 QA 任务书（cid `6919373329`）§六 边界最后一条写「不自己发 issue 评论（结论写 `D:/temp_safkc/ISS-87_qa3_result.md`）」。QA 照做，结论只在本地，issue 无新评论，PM 判「还等着」，两个会话同时 idle。
+
+## 评论标题五段式（必读）
+
+发 issue 评论时首行写成 `[who]-[do]-[notify]-[project]-[cid]`：`who` 用**你的会话键名**，`do` 取 12 个合法动作之一（`完工`／`收口`／`退回`／`裁决`／`告警`／`派单`／`接单`／`交接要求`／`交接完成`／`交接就绪`／`已归档`／`调试`）。
+
+**全文与判据见 `rules/charters/session_contract.md` §7。** 三条最易错的：
+- 写 `[SC]`／`[PM]` 这类裸角色标记**不算交付**，必须写会话键名；
+- `[调试]` 与 `[已归档]` **不通知任何人**，探针不要伪装成 `完工`；
+- `No Notify` 只表示不叫醒人，**不影响计数**。
+
+**命令**：`--do <动作> --notify <提醒谁> --session-key <你的键名>`，工具拼首行。
+
+**PM 用五段式发 verdict 时，动作必须是 `[裁决]`，首段必须是 `pm-*` 或 `supervisor-*`，标记照旧带。**
+
+```
+[pm-<项目>-<8位hex>]-[裁决]-[<提醒谁>]-[<项目短键>] 可关单 #<n> <!-- verdict: ready delivery: <cid> -->
+```
+
+- 动作写 `裁决` ⇒ 引擎按 PM verdict 解析；写 `派单`／`接单`／`交接要求`／`完工` ⇒ **不当作 verdict**（返回 `None`）。
+- `<!-- verdict: ready|blocked|working delivery: <cid> -->` **不能省**：三态靠标记表达，动作词只表达「这是一条裁决」。
+- 缺标记 ⇒ `state=""`（fail-closed，交人看），不会误判成可关单。
+- 旧式 `[PM] 可关单 #<n> <!-- verdict: ... -->` **仍然有效**，两者并存。

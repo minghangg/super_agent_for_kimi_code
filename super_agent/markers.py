@@ -206,6 +206,39 @@ def wants_notify(five: dict | None) -> bool:
     return _norm_notify(five["notify"]) != _norm_notify(NO_NOTIFY)
 
 
+def is_session_key_name(name: str) -> bool:
+    """Is ``name`` a session key (``wk-…``) rather than a bare role prefix?
+
+    A bare prefix carries no name, so a delivery it claims matches no
+    assignment. Both the engine (``_five_leaf``) and the watcher
+    (``decide_watch._is_real_delivery``) ask this question, and they must not
+    answer it differently -- one refusing a line the other counts would let a
+    comment be "not a delivery" for the engine and "spend quota" for the
+    watcher.
+    """
+    upper = str(name or "").strip().upper()
+    return any(upper.startswith(prefix + "-") for prefix in DELIVERY_PREFIXES)
+
+
+#: The roles whose session keys may carry a PM verdict. ``supervisor`` is here
+#: because ``PM_PREFIX_RE`` already accepts ``[supervisor]`` -- the five-part
+#: form must not admit a narrower set than the prefix it replaces.
+VERDICT_KEY_PREFIXES = ("PM", "SUPERVISOR")
+
+
+def _is_pm_or_supervisor_key(name: str) -> bool:
+    """Is ``name`` a session key of a role allowed to declare a verdict?
+
+    A five-part title's first segment is a **session key**, so the spelling is
+    ``pm-<project>-<tail>``. Checking the prefix (rather than the whole name) is
+    what keeps ``[wk-1]-[裁决]-…`` out: a worker that typed one word would
+    otherwise release its own work, and the ``[PM]`` form it replaces never
+    allowed that.
+    """
+    upper = str(name or "").strip().upper()
+    return any(upper.startswith(prefix + "-") for prefix in VERDICT_KEY_PREFIXES)
+
+
 def _five_leaf(five: dict) -> tuple[str, str]:
     """``(marker, name)`` an old-style caller would have seen for this title.
 
@@ -223,15 +256,9 @@ def _five_leaf(five: dict) -> tuple[str, str]:
     action = five["do"]
     if action not in ("完工", "调试"):
         return "", who
-    upper = who.upper()
-    for prefix in DELIVERY_PREFIXES:
-        # ``who`` must be a **session key** (``wk-…``), not the bare role prefix
-        # (``WK``). A bare prefix carries no name, so accepting it would create a
-        # delivery named ``WK`` that matches no assignment -- and the engine
-        # would report ``assignment.unmatched`` for a comment that looked fine.
-        if upper.startswith(prefix + "-"):
-            return prefix, who
-    return "", ""
+    if not is_session_key_name(who):
+        return "", ""
+    return who.upper().split("-", 1)[0], who
 
 
 def parse_delivery(body: str) -> dict | None:
@@ -901,9 +928,35 @@ def parse_pm_verdict(body: str) -> dict | None:
     asks a person to look.
     """
     line = first_line(body)
-    if not line or not PM_PREFIX_RE.match(line):
+    if not line:
         return None
-    text = _strip_prefix(line, PM_PREFIX_RE)
+    five = parse_five(body)
+    if five is not None:
+        # ISS-99: a five-part title carries the verdict too, but only under the
+        # ``裁决`` action. Every other action is not a verdict -- ``[pm-x]-[派单]``
+        # says "I handed out work", and reading it as a state declaration is how
+        # a dispatch title became a false ``pm verdict 'unreadable'``.
+        #
+        # The action word alone is not enough: ``[wk-1]-[裁决]-…`` must not read
+        # as a PM verdict, or a worker could release its own work by typing one
+        # word. The ``who`` segment has to name a PM-or-supervisor session, the
+        # same set the ``[PM]`` prefix admits -- a five-part title must not be
+        # a laxer way in than the form it replaces.
+        #
+        # The marker itself is unchanged: a five-part line still has to carry
+        # ``<!-- verdict: ready|blocked|working delivery: <cid> -->``. Structure
+        # says "this is a verdict"; the marker says *which* verdict, because
+        # ``ready``/``blocked``/``working`` is three-state and no single action
+        # word can express it.
+        if five["do"] != "裁决":
+            return None
+        if not _is_pm_or_supervisor_key(five["who"]):
+            return None
+        text = line
+    elif PM_PREFIX_RE.match(line):
+        text = _strip_prefix(line, PM_PREFIX_RE)
+    else:
+        return None
     declared, token, token_source = read_verdict_token(text)
     prose_state, prose_word, negated = _first_state_hit(text)
     issue, coords_error = _find_coord(text)

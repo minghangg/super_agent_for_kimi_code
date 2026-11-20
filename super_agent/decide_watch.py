@@ -2250,10 +2250,15 @@ def _title_of(note: str) -> str | None:
 def _is_real_delivery(title: str) -> bool:
     """Does this first line claim a delivery that should spend quota?
 
-    Three conditions, all structural (ISS-99):
+    Four conditions, all structural (ISS-99):
 
     * the line parses as a five-part title -- a bare ``[WK:x]`` legacy line has
       no action, so it cannot say "I delivered" on purpose;
+    * ``who`` names a **session key**, not a bare role prefix -- ``[SC]-[完工]-…``
+      carries no name, so the delivery it claims can match no assignment. The
+      engine already refuses such a line (``_five_leaf``); counting it here
+      would spend quota on a reminder nobody can act on, and the two parsers
+      would disagree about the same comment;
     * the action is in the whitelist -- a typo means "no notification", which is
       the safe direction;
     * the action is not ``调试`` -- that one exists precisely so a probe does not
@@ -2267,6 +2272,8 @@ def _is_real_delivery(title: str) -> bool:
     if five is None:
         return False
     if not five.get("action_ok"):
+        return False
+    if not markers.is_session_key_name(five["who"]):
         return False
     return five["do"] not in markers.SILENT_ACTIONS
 

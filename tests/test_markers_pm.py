@@ -381,3 +381,63 @@ def _selftest() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(_selftest())
+
+
+class FivePartTitle(unittest.TestCase):
+    """ISS-99: a five-part title can carry a verdict, under ``裁决`` only.
+
+    The action word says "this is a verdict"; the marker says *which* verdict,
+    because ``ready``/``blocked``/``working`` is three-state and no single action
+    word expresses it. Reading any other action as a state declaration is how a
+    dispatch title became a false ``pm verdict 'unreadable'``.
+    """
+
+    def test_a_ruling_title_carries_the_verdict(self):
+        out = markers.parse_pm_verdict(
+            "[pm-x-abc12345]-[裁决]-[pm-y-def67890]-[lwa] 可关单 #42 "
+            "<!-- verdict: ready delivery: 9300 -->")
+        self.assertIsNotNone(out)
+        self.assertEqual(out["state"], "ready")
+        self.assertEqual(out["issue"], 42)
+        self.assertEqual(out["delivery"], 9300)
+        self.assertTrue(out["coords_ok"])
+
+    def test_a_dispatch_title_is_not_a_verdict(self):
+        for action in ("派单", "接单", "交接要求", "完工"):
+            out = markers.parse_pm_verdict(
+                f"[pm-x-abc12345]-[{action}]-[wk-1]-[lwa] 可关单 #42 "
+                "<!-- verdict: ready delivery: 9300 -->")
+            self.assertIsNone(out, action)
+
+    def test_a_ruling_title_without_the_marker_still_asks_a_person(self):
+        # Structure says "verdict", the marker is missing: the answer is the
+        # fail-closed ``""``, not a release.
+        out = markers.parse_pm_verdict(
+            "[pm-x-abc12345]-[裁决]-[pm-y-def67890]-[lwa] 可关单 #42")
+        self.assertIsNotNone(out)
+        self.assertEqual(out["state"], "")
+        self.assertFalse(out["structured"])
+
+    def test_the_legacy_bracket_form_still_reads(self):
+        out = markers.parse_pm_verdict(
+            "[PM] 可关单 #42 <!-- verdict: ready delivery: 9300 -->")
+        self.assertEqual(out["state"], "ready")
+        self.assertEqual(out["delivery"], 9300)
+
+    def test_only_pm_and_supervisor_keys_declare_a_verdict(self):
+        """A five-part title must not be a laxer way in than `[PM]`.
+
+        `[wk-1]-[裁决]-…` would otherwise let a worker release its own work by
+        typing one word; the prefix it replaces never allowed that.
+        """
+        body = "可关单 #42 <!-- verdict: ready delivery: 9300 -->"
+        for who in ("wk-1", "qa-1", "scout-1", "steward-1", "at-1"):
+            out = markers.parse_pm_verdict(f"[{who}]-[裁决]-[pm-y]-[lwa] {body}")
+            self.assertIsNone(out, who)
+
+    def test_pm_and_supervisor_keys_both_declare(self):
+        body = "可关单 #42 <!-- verdict: ready delivery: 9300 -->"
+        for who in ("pm-x-abc12345", "supervisor-1", "PM-x-abc12345"):
+            out = markers.parse_pm_verdict(f"[{who}]-[裁决]-[pm-y]-[lwa] {body}")
+            self.assertIsNotNone(out, who)
+            self.assertEqual(out["state"], "ready", who)

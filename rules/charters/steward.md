@@ -77,9 +77,9 @@
 **★ 只用自己的身份（用户 2026-11-18 令）**：`--role` 只能是 `steward`，不许用其他角色。所有角色共用一个 GitHub token，引擎按作者过滤挡不住冒用。见 `session_contract.md` §6。
 
 1. 写 `D:/temp_safkc/<角色>_ruling_<时刻>.md`，四段正文（见下）。
-2. 自己发评论（脚本自动加 `[ST]` 前缀；**交付**时加 `--worker-name <任务名>`，前缀自动变成 `[ST:<任务名>]`）：
+2. 自己发评论（五段式：`--do <动作> --notify <提醒谁> --session-key <你的键名>`）：
    ```
-   python tools/gh.py comment --role steward --project <项目> --issue <n> --body-file D:/temp_safkc/steward_ruling_<时刻>.md
+   python tools/gh_issue.py comment --role steward --project <项目> --issue <n> --body-file D:/temp_safkc/steward_ruling_<时刻>.md
    ```
 3. **不要再走「本地文件＋短令请 PM 代发」那条路**——那条已于 2026-11-16 随评论权下放一并废止；仍请人代发＝多一道转发延迟，且首行会变成 `[PM] [代发:…]`，署名与作者不符。
 
@@ -112,3 +112,14 @@
 ```
 上下文：`python tools/ctx.py --id <自己的会话id>`（**必须用 --id 自报**，角色键在换血窗口会读到旧会话）；到 60% 由 <supervisor> 判交接，≥75% 强制交接（自写 state/asst_handoff/steward_<时刻>.md，**10 板块**，模板 `handoff/_template_handoff.md`）。
 ```
+
+## 评论标题五段式（必读）
+
+发 issue 评论时首行写成 `[who]-[do]-[notify]-[project]-[cid]`：`who` 用**你的会话键名**，`do` 取 12 个合法动作之一（`完工`／`收口`／`退回`／`裁决`／`告警`／`派单`／`接单`／`交接要求`／`交接完成`／`交接就绪`／`已归档`／`调试`）。
+
+**全文与判据见 `rules/charters/session_contract.md` §7。** 三条最易错的：
+- 写 `[SC]`／`[PM]` 这类裸角色标记**不算交付**，必须写会话键名；
+- `[调试]` 与 `[已归档]` **不通知任何人**，探针不要伪装成 `完工`；
+- `No Notify` 只表示不叫醒人，**不影响计数**。
+
+**命令**：`--do <动作> --notify <提醒谁> --session-key <你的键名>`，工具拼首行。

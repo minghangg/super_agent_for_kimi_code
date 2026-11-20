@@ -139,7 +139,7 @@ python tools/quiet.py -- python -m pytest <文件> -k "<关键字>" -q
 **完成必须落 commit（用户 2026-11-07 定，硬规矩）**：交付＝代码已 commit（本地即可，push 归 <supervisor>）＋issue [WK:] 评论，缺 commit＝交付不全，PM 拒收——未 commit 的工作树随时会被 reset 类事故毁掉，QA 也据 A0 拒测。commit 粒度：每步一个 commit、message 写清单号。**只 commit 自己改的内容**：禁 `git add -A`／`git add .`；只 `git add <自己的文件>`；commit 前 `git status` 核对暂存区无他人/无主文件，发现别人的在飞内容＝不动、报 PM。并发各写各的，互不收尸。
 
 **完成必须落 issue 评论**（workflow_12steps 已定，2026-11-06 重申为硬规矩）：交付时在对应 issue 直写评论，不经 PM 转述——
-`python tools/gh.py comment --role worker --project <项目> --issue <n> --worker-name <你的完整会话键名> --session-key <同一个键名> --body-file <评论文件>`
+`python tools/gh_issue.py comment --role worker --project <项目> --issue <n> --worker-name <你的完整会话键名> --session-key <同一个键名> --body-file <评论文件>`
 
 **★ 只用自己的身份**（用户 2026-11-18 令）：`--role` 只能是 `worker`，**不许用 `pm`／`qa`／`<supervisor>`**。所有角色共用一个 GitHub token，引擎按 `author` 过滤**挡不住冒用**，只能靠这条纪律。规则全文见 `session_contract.md` §6。
 
@@ -202,3 +202,14 @@ python -c "import json;d=json.load(open('state/sessions.json'));print([k for k,v
 
 > 旧版这里写「到 60% 由 <supervisor> 判交接，≥75% 强制交接（自写交接档）」——**对 `wk-*` 是错的**，
 > 2026-11-07 issue #<n> 已改。长命助手的规则见各自章程。
+
+## 评论标题五段式（必读）
+
+发 issue 评论时首行写成 `[who]-[do]-[notify]-[project]-[cid]`：`who` 用**你的会话键名**，`do` 取 12 个合法动作之一（`完工`／`收口`／`退回`／`裁决`／`告警`／`派单`／`接单`／`交接要求`／`交接完成`／`交接就绪`／`已归档`／`调试`）。
+
+**全文与判据见 `rules/charters/session_contract.md` §7。** 三条最易错的：
+- 写 `[SC]`／`[PM]` 这类裸角色标记**不算交付**，必须写会话键名；
+- `[调试]` 与 `[已归档]` **不通知任何人**，探针不要伪装成 `完工`；
+- `No Notify` 只表示不叫醒人，**不影响计数**。
+
+**命令**：`--do <动作> --notify <提醒谁> --session-key <你的键名>`，工具拼首行。

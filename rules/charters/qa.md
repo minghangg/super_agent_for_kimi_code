@@ -126,11 +126,11 @@ PM 若在派单里改写了 Issue，以 **Issue 原文**为准，并在结论里
 
 ## 4. 结论只有一个格式：P0 表
 
-先写 `/tmp/<iss>_qa_<日期>.md`，再全文发 issue 评论（脚本自动加 `[QA]` 前缀）——**issue 评论才是留档**，本地不留 `state/review/`（issue #9）：
+先写 `/tmp/<iss>_qa_<日期>.md`，再全文发 issue 评论（五段式，见本文件末节）——**issue 评论才是留档**，本地不留 `state/review/`（issue #9）：
 
 ```bash
 # 结论正文先落文件，再发（正文含反引号时**必须**走 --body-file，否则被 shell 吃掉）
-python tools/gh.py comment --role qa --project <项目> --issue <n> \
+python tools/gh_issue.py comment --role qa --project <项目> --issue <n> \
   --session-key <你的键名> --body-file /tmp/<iss>_qa_<日期>.md
 ```
 
@@ -212,3 +212,25 @@ P2（记录）：<n> 条
 - 结论段的口径与 `playbooks/review_checklist.md` §C 一致：`结论：通过 / 有条件通过 / 退回 — 一句话`。**退回**就是 `不通过`／`未通过`／`退回`，三者任选其一，别造第四个词。
 - 首行只放这一句，不要把结论埋在段落中间：引擎**只读第一行**。
 
+## 评论标题五段式（必读）
+
+发 issue 评论时首行写成 `[who]-[do]-[notify]-[project]-[cid]`：`who` 用**你的会话键名**，`do` 取 12 个合法动作之一（`完工`／`收口`／`退回`／`裁决`／`告警`／`派单`／`接单`／`交接要求`／`交接完成`／`交接就绪`／`已归档`／`调试`）。
+
+**全文与判据见 `rules/charters/session_contract.md` §7。** 三条最易错的：
+- 写 `[SC]`／`[PM]` 这类裸角色标记**不算交付**，必须写会话键名；
+- `[调试]` 与 `[已归档]` **不通知任何人**，探针不要伪装成 `完工`；
+- `No Notify` 只表示不叫醒人，**不影响计数**。
+
+**命令**：`--do <动作> --notify <提醒谁> --session-key <你的键名>`，工具拼首行。
+
+**QA 用五段式时，动作就是结论**：
+
+| 动作 | 引擎判成 |
+|---|---|
+| `退回` | 不通过（`verdict=reject`） |
+| `完工` | 通过（`verdict=pass`） |
+| 其余动作 | **不是复核结论**，`parse_review` 返回 `None` |
+
+首行末尾**仍须**带 `<!-- fix_needed: true|false -->`——动作说「通过还是退回」，标记说「还有没有必修项」，两者缺一不可。
+
+旧式 `[QA] 结论：通过 <!-- fix_needed: false -->` 仍有效，但新评论用五段式。
