@@ -71,7 +71,7 @@ python tools/gh_issue.py label   --role pm --project <项目> --issue 1 --add st
 - **派单前先过 ctx 门禁**（issue #<n>）：`python tools/ctx_gate.py --id <sid>`；
   **不要靠助手自报 ctx**（门禁自己查，bus 优先→direct 降级，查不到才放行并告警）。
   阈值：长命助手 ≥60% 拒派／≥75% 强制交接／≥90% 连 `--force` 也拒；
-  一次性 `wk-*` 只在 ≥75% 拦（按例外上报）；`dispatch.py --session` 已内建同一道闸。
+  一次性 `wk-*` 只在 ≥75% 拦（按例外上报）；`dispatch_cli --session` 已内建同一道闸。
 - **QA 不常驻、不复用**：每张 issue 新建一个 QA 会话，命名 `qa-<项目简称>-ISS-<n>`（简称映射：<项目>=yh／<项目>=lm／<项目>=cdy／<项目>=gi／<工作台仓>=lwa；用户 2026-11-05 定，旧会话名不追改）。
   - **【纪律·2026-11-09 <supervisor> 裁定复效】一单一会话，不得跨单复用**：`qa-lwa-ISS-25` 曾连续复核 #<n> 第 6/7/8 件与 #<n>、#<n> 共五单，`ctx` 从 32% 一路涨到 43%，属违规复用。即日起：**每单新开 QA 会话**（`qa-lwa-ISS-<n>`）→ `bind` → 关单时归档 → `sessions.py rm` 删键。**该单验毕即退役**，不得留给下一单。
   - **「一单」按 issue 计（2026-11-14 落字）**：同 issue 多轮（返工/口径变更后续轮）复用同一会话合法；跨 issue 复用才禁。
@@ -233,7 +233,7 @@ nohup python tools/pm_watch.py --interval 60 >> state/pm_watch.out 2>&1 &
 > **正解：不内联。** 老规矩是「内联前先剥反引号」，那是在绕坑，不是修坑。2026-11-17 §1.0 立短令之后，**`--task` 只发短句＋任务书路径**，正文根本不进命令行 ⇒ 反引号不构成风险，`sed` 剥引号那一步可以整段删掉。
 > 本节余下的「若确需内联」条款只在 `--full-task` 的离线场景适用。
 
-**`dispatch.py --task "$(cat 文件)"` 与 `sess.py send` 一样吃反引号**——正文里的 `` ` `` 会被 bash 当**命令替换执行**。2026-11-08 实测后果：任务书里写的文件路径、`git commit`、`gh_issue.py comment`、`git add`、`.gitignore` 全被当命令跑了一遍，并把 8 个文件顺手 `git add` 进暂存区。
+**`dispatch_cli --task "$(cat 文件)"` 与 `sess.py send` 一样吃反引号**——正文里的 `` ` `` 会被 bash 当**命令替换执行**。2026-11-08 实测后果：任务书里写的文件路径、`git commit`、`gh_issue.py comment`、`git add`、`.gitignore` 全被当命令跑了一遍，并把 8 个文件顺手 `git add` 进暂存区。
 **规矩**：
 - 任务书正文**投递前剔除反引号**（用不含反引号的表述，如 `wss_bus.py` 而非 `` `wss_bus.py` ``）；
 - 若发现暂存区被污染：**用 `git restore --staged <单个文件>` 逐个撤销**（只动索引、不碰工作树；不用 `reset`，属破坏性词）；
@@ -289,7 +289,7 @@ nohup python tools/pm_watch.py --interval 60 >> state/pm_watch.out 2>&1 &
 `python tools/ctx_gate.py --id <sid>`——长命助手 ≥60% 拒派（应交接后再派）、≥75% 强制交接、
 ≥90% 硬拒不变；**PM 系（pm-\*）用户 2026-11-14 起 ≥40% 预警／≥50% 拒派**（ctx_gate 按键名自动分线）；
 ≥90% 连 `--force` 也拒；一次性 `wk-*` 只在 ≥75% 拦（按例外上报）。
-`dispatch.py --session` 已内建同一道闸（`--ctx-force` 才可越过，仍受 90% 硬顶）。
+`dispatch_cli --session` 已内建同一道闸（`--ctx-force` 才可越过，仍受 90% 硬顶）。
 **不要靠助手自报 ctx**——门禁自己查（bus 优先、direct 降级），查不到才放行并告警。
 
 | 项 | 规矩 |
@@ -306,24 +306,47 @@ nohup python tools/pm_watch.py --interval 60 >> state/pm_watch.out 2>&1 &
 | 资源 | **任务书必须要求 worker 用 `tools/quiet.py` 跑重活**（单任务 ≤1 逻辑核、BelowNormal），并在验收里贴回读行 `affinity=… priority=…`；**每个任务恒占 1 核**（并行 4 单＝4 核）；**并发重活数**＝北京时间 03:00–07:00 最多 4 个、其余时间 1 个（`quiet.py --core auto` 自领核） |
 
 ```bash
-cd <工作台>
+cd D:/github/super_agent_for_kimi_code
+
+# ── 第一遍：建会话（不带 --no-activate，让 warmup 自动跑）──
 # worker 模型走轮换（避开单模型 4 亿日限流）：先取下一份
-OPTS=$(python tools/pick_worker_model.py --log wk-<任务>-<YYYYMMDD>)
-python tools/<from_项目>/dispatch_session/dispatch.py \
+# 模型轮换仍在工作台（safkc 没有这份表）：
+OPTS=$(python <工作台>/tools/pick_worker_model.py --log wk-<任务>-<YYYYMMDD>)
+python -m super_agent.dispatch_cli \
   --cwd D:/github/<项目> --name wk-<任务>-<YYYYMMDD> \
   $OPTS \
-  --permission-mode auto --timeout 900 --json --detach \
+  --permission-mode auto --timeout 300 --detach \
+  --task ""
+
+# ── 第二遍：发真正的任务书短令（--session 本身不跑 warmup，加 --no-activate 免多余等待）──
+python -m super_agent.dispatch_cli --session <上一步打印的 sid> \
+  --detach --no-activate --timeout 900 \
   --task "#ISS-<n> 实现单：<一句话>。任务书 D:/temp_safkc/ISS-<n>_impl_<YYYYMMDD>.txt（<N> 字节，必须先读它再动手）。级别 L1。"
 ```
 
-**`--task` 只发短令，不内联任务书**（用户 2026-11-16 令，§1.0）。上面第二行是**格式模板**，实际写「issue 号 ＋ 一句话 ＋ 任务书路径 ＋ 级别」，≤5 行。
+**新建会话一律两条命令，不要合成一条（用户 2026-11-20 定，2026-11-20 实测）**：
 
-**不要再写 `--task "$(cat <文件>)"`**——那是 2026-11-16 之前的旧写法，与 §1.0 冲突。它的连带代价：全文内联会吃反引号，于是每次派单前都得 `sed` 剥一遍（§1.3 记的正是这个坑）。**短令根本不需要这个绕法**——§1.3 的正解是「不内联」，不是「内联前先剥一遍」。`pmd.sh` 已按新口径实现（默认短令，`--full-task` 才整份塞入）。
+| 遍 | 带什么 | 跑什么 | 判据 |
+|---|---|---|---|
+| 1 | **不带** `--no-activate` | 自动 warmup：读 `session_contract.md` ＋ 本角色章程 ＋ 告知键名 | wire 出现 `Read done.`，首条消息含两个章程路径 |
+| 2 | `--session` ＋ `--no-activate` | 真正的任务 | 会话开始干活 |
+
+**为什么不能合成一条**：warmup 占掉一轮，`--timeout` 预算被它吃掉，同一命令里的主任务就报 `round did not start within 120s`（日志里同时出现 `activated (warm-up turn completed)` 与这条报错——warmup 成了，主任务没赶上）。分两遍各拿各的预算，两轮都完整。
+
+**第一遍是阻塞的**：`activate_session` 在打印 sid **之前**跑（`dispatch_cli.py:1396`），所以那一步会等 warmup 完成才返回。`--timeout 300` 够用——warmup 内部封顶 `min(timeout, 120)`。等它打印出 `[dispatch] activated (warm-up turn completed)` 与 sid 再走第二遍。
+
+**绝不要用 `--no-activate` 建会话**：它跳过 warmup ⇒ 新 worker 没读过契约与章程，不知道测试级别、交付格式、五段式标题怎么写。**这是「派单成功但对方什么都不会」的静默形态**，比派单失败更贵——你要等到它交出错东西才发现。
+
+**复用会话时**（`--session <已有 id>`）本身就不跑 warmup，加 `--no-activate` 只是省掉多余等待，两者都可以。
+
+**`--task` 只发短令，不内联任务书**（用户 2026-11-16 令，§1.0）。第二遍那条是**格式模板**，实际写「issue 号 ＋ 一句话 ＋ 任务书路径 ＋ 级别」，≤5 行。
+
+**不要再写 `--task "$(cat <文件>)"`**——那是 2026-11-16 之前的旧写法，与 §1.0 冲突。它的连带代价：全文内联会吃反引号，于是每次派单前都得 `sed` 剥一遍（§1.3 记的正是这个坑）。**短令根本不需要这个绕法**——§1.3 的正解是「不内联」，不是「内联前先剥一遍」。
 
 **收答案**（下一轮再做，别在同一轮里等）：
 
 ```bash
-python tools/<from_项目>/dispatch_session/dispatch.py --fetch --session <worker id>
+python -m super_agent.dispatch_cli --fetch --session <worker id>
 ```
 
 `--fetch` 只取该会话最后一条 assistant 消息，不提交新 prompt、不花它的上下文。
@@ -356,7 +379,7 @@ python tools/<from_项目>/dispatch_session/dispatch.py --fetch --session <worke
     等 60–120 秒重查，或发一条消息触发 restore；**持续 404 才算真死**。
     此时 `sess.py abort` 会打印 `ABORT-NOSESSION` 并 **exit 3**（区别于 exit 1 的「无 active prompt」）。
     同一窗口内 `sess.py send` 也会回 40401 并报「未送达」（不重发，at-most-once 正确）：
-    **等 60–120 秒重投即可，不要为此换工具**——`dispatch.py --session` 之所以能成，
+    **等 60–120 秒重投即可，不要为此换工具**——`dispatch_cli --session` 之所以能成，
     只是因为它通常晚于窗口、恢复路径顺带触发了服务端加载，不是它更「正确」。
     自助判据：`KIMI_BUS_MODE=direct python tools/sess.py status <sid>`（绕过 bus 现读端口复验）。
 - **busy=true 但 abort 恒说「没有在跑的 prompt」** ⇒ 疑似**幽灵忙**（busy 真、但服务端无 active prompt），
@@ -368,14 +391,16 @@ python tools/<from_项目>/dispatch_session/dispatch.py --fetch --session <worke
 ### 4.1 送 qa（复核由你派，不用等 <supervisor>）
 
 ```bash
-python tools/<from_项目>/dispatch_session/dispatch.py \
+python -m super_agent.dispatch_cli \
   --session <sid> \
-  --permission-mode auto --timeout 900 --detach \
+  --permission-mode auto --timeout 900 --detach --no-activate \
   --task "#ISS-<n> QA 复核单：只验 <一句话>。任务书 D:/temp_safkc/ISS-<n>_qa_<YYYYMMDD>.txt（必须先读它再动手）。"
 ```
 
 - **复用会话时不带 `--provider/--model/--effort`**（用户 2026-10-31 定）：带一次就把人家手选的模型冲掉了。
   只有**新建会话**才设模型；限流要换模型就单独改 profile（见 §4.2）。
+
+- 复用会话时 `--session` 本身不跑 warmup，加 `--no-activate` 只是省掉多余等待。
 
 - 同样 `--detach`：派完就回，下一轮再用 `--session <qa id> --task "只回结论与 P0 表"` 收。
 

@@ -177,3 +177,28 @@ python -m super_agent.issue_cli comment --role <你自己> --project <项目> --
 **其余动作（`接单`／`派单`／`交接要求`／`交接完成`／`交接就绪`／`告警`／`收口`／`已归档`／`调试`）不承载结论**——引擎不会把它们读成通过或裁决。
 
 **旧式前缀仍有效**：`[PM] 可关单 #<n> <!-- verdict: ... -->`、`[QA] 结论：通过 <!-- fix_needed: false -->`、`[WK:<名>]` 都还能解析，因为 GitHub 上已有 3000+ 条历史评论是这个形状。**但新评论一律用五段式**——两套并存只为兼容，不是给你选的。
+
+## 8. 新建会话＝两条命令（用户 2026-11-20 定）
+
+**谁建会话谁负责 warmup。** 建会话时**不带** `--no-activate`，让工具自动跑 warmup；任务作为第二条命令发。
+
+```bash
+# 第一遍：建会话，自动 warmup（读本契约 + 读角色章程 + 告知你的键名）
+python -m super_agent.dispatch_cli --cwd <工作台> --name <新键> --detach \
+  --timeout 300 --task ""
+
+# 第二遍：发真正的任务
+python -m super_agent.dispatch_cli --session <新sid> --detach --no-activate \
+  --timeout 300 --task "<任务>"
+```
+
+| 遍 | 判据 |
+|---|---|
+| 1 | wire 出现 `Read done.`，首条消息含 `session_contract.md` 与角色章程路径 |
+| 2 | 出现任务的实际输出 |
+
+**为什么不能合成一条**：warmup 占掉一轮，`--timeout` 预算被它吃掉，主任务就报 `round did not start within 120s`（此时 warmup 其实成功了）。
+
+**`--no-activate` 只用于复用会话**（`--session`，本身就不跑 warmup，加它只是省掉多余等待）。**用它建会话 = 新会话没读过契约与章程**，是「派单成功但对方什么都不会」的静默形态。
+
+**换血/轮换**另有一套七步流程，见 `rotation.md` §6.1。
