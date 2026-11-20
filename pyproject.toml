@@ -11,3 +11,10 @@ dependencies = []
 
 [tool.setuptools]
 packages = ["super_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# `backup/` holds dated snapshots of earlier suites, not live tests. Without
+# this, `python -m pytest` from the repo root collects them too and reports
+# 17 failures that belong to history, which buries the one real failure.
+norecursedirs = ["backup", ".git", "node_modules", ".venv", "__pycache__"]

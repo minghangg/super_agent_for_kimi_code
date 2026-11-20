@@ -592,6 +592,9 @@ class PortBinding(unittest.TestCase):
         else:
             self.fail("the first instance never started listening")
 
+        pidfile = Path(self.root) / "atserve" / "atserve.pid"
+        holder_pid = int(pidfile.read_text(encoding="utf-8"))
+
         second = self._spawn()
         rc = second.wait(timeout=60)
         self.assertNotEqual(rc, 0, "a second instance must not exit 0")
@@ -603,8 +606,13 @@ class PortBinding(unittest.TestCase):
             urllib.request.urlopen(
                 f"http://127.0.0.1:{self.port}/q/none", timeout=5)
         self.assertEqual(caught.exception.code, 404)
-        self.assertEqual(int((Path(self.root) / "atserve" / "atserve.pid")
-                             .read_text(encoding="utf-8")), first.pid)
+        # Compare against the pid the holder itself wrote, not ``first.pid``:
+        # on Windows a venv ``python.exe`` is a launcher that re-executes, so
+        # ``Popen.pid`` is the launcher's pid and ``os.getpid()`` inside the
+        # server is the child's. Reading the file first and asserting it did
+        # not change is the property this test is about -- a failed takeover
+        # would have rewritten it with the second process's pid.
+        self.assertEqual(int(pidfile.read_text(encoding="utf-8")), holder_pid)
 
     def test_the_server_refuses_to_reuse_an_address(self):
         # The property behind the process test, stated directly so a future
