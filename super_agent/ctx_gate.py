@@ -20,7 +20,15 @@ With no injection the gate refuses to run with a diagnostic parameter error;
 it never silently reaches a production service. The caller may also set the
 module-level defaults once with `configure(...)`.
 
+The **CLI entry** fills those three from the private `agent.json`
+(`ctx_gate.sessions_file` / `ctx_gate.ledger_file`, else the one session-state
+resolver), and only when that file exists -- a fresh clone still gets the
+refusal. Explicit `configure()` values always win, so the library and the CLI
+entry never overwrite each other. `--no-auto-config` keeps the old
+refuse-unless-injected behaviour.
+
 Usage:
+    python -m super_agent.ctx_gate --id <sid>        # self-injecting CLI
     python -m super_agent.ctx_gate --self-test
     configure(status_provider=..., sessions_path=..., ledger_path=...)
     gate("<sid>")
@@ -445,6 +453,89 @@ def self_test() -> int:
     return 0 if not fails else 1
 
 
+# ------------------------------------------------------------------ 自注入
+# The CLI entry fills the three injections from the private agent config; the
+# library API (`gate`, `verdict`, `usage_of`) stays injection-only and never
+# reads a file on its own. Splitting it this way is the point: a caller that
+# imports this module still gets the refusal, while `python -m
+# super_agent.ctx_gate` is usable without a wrapper script (#104).
+GATE_SESSIONS_KEY = "ctx_gate.sessions_file"
+GATE_LEDGER_KEY = "ctx_gate.ledger_file"
+
+
+def _status_provider():
+    """The production status source: bus first, direct fallback.
+
+    Imported lazily inside the callable: `bus` pulls in `wss_bus`, which pulls
+    in aiohttp. A module-level import would make `import super_agent.ctx_gate`
+    drag that whole chain in, and `dispatch_cli` deliberately runs this gate as
+    a subprocess to keep its own import graph small.
+    """
+    def provider(sid: str):
+        from . import bus
+        return bus.status(sid, caller="ctx_gate")
+    return provider
+
+
+def _declared_paths() -> tuple[str, str]:
+    """`(sessions, ledger)` from the private config; "" when not declared.
+
+    Three layers, most specific first: an explicit `ctx_gate.*` key (so a
+    deployment can point the gate at a workbench whose state root differs from
+    the engine's), then the one resolver that owns session state,
+    `sess_events.sessions_path()`, but **only when a private config exists**.
+
+    That last condition is the safety default, not a formality. `sess_events`
+    has a public derived fallback (`data/`), so resolving it unconditionally
+    would let a fresh clone -- no `agent.json`, nobody's deployment -- reach a
+    live server and log its decisions into the checkout. Verified: without the
+    check, an absent config still answered `PASS … ≈22.3%`.
+    """
+    from . import agent_config
+
+    if not agent_config.config_path().is_file():
+        return "", ""
+    sessions = str(agent_config.get(GATE_SESSIONS_KEY) or "").strip()
+    ledger = str(agent_config.get(GATE_LEDGER_KEY) or "").strip()
+    if sessions and ledger:
+        return sessions, ledger
+    try:
+        from . import sess_events
+        sessions = sessions or str(sess_events.sessions_path())
+        ledger = ledger or str(sess_events.ledger_path())
+    except Exception:  # noqa: BLE001  未配置不是错误，保持空、保持拒绝
+        pass
+    return sessions, ledger
+
+
+def auto_configure() -> list[str]:
+    """Fill the injections from private config; return what is still missing.
+
+    **Only fills gaps.** Anything the caller already passed to `configure()` --
+    a test harness, an embedded caller -- is kept as-is; this function never
+    replaces a value somebody else supplied. That is what lets `main()` be both
+    a library entry and a CLI entry without the two overwriting each other
+    (the first version did, and the CLI mapping tests caught it).
+
+    Returns the missing names **without raising**: an empty list means the gate
+    can run, a non-empty one means the caller gets the same `EXIT_PARAM`
+    refusal it got before this existed. That is the safety default: nothing is
+    invented, and an unconfigured checkout still refuses instead of quietly
+    reaching a production server.
+    """
+    sessions, ledger = _declared_paths()
+    configure(
+        status_provider=(DEFAULT_STATUS_PROVIDER
+                         if DEFAULT_STATUS_PROVIDER is not None
+                         else _status_provider()),
+        sessions_path=(DEFAULT_SESSIONS_PATH if DEFAULT_SESSIONS_PATH is not None
+                       else (sessions or None)),
+        ledger_path=(DEFAULT_LEDGER_PATH if DEFAULT_LEDGER_PATH is not None
+                     else (ledger or None)),
+    )
+    return missing_injections()
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="派单前 ctx 门禁：≥60% 拒派、≥75% 强制交接、≥90% 连 --force 也拒")
@@ -457,10 +548,25 @@ def main(argv=None) -> int:
     ap.add_argument("--role", default=os.environ.get("AGENT_ROLE", "pm"), help="记录用的角色")
     ap.add_argument("--json", action="store_true", help="只输出一行 JSON（供脚本调）")
     ap.add_argument("--self-test", dest="self_test", action="store_true")
+    ap.add_argument("--no-auto-config", dest="no_auto", action="store_true",
+                    help="不读私有配置（自测/对照用：保持未注入即拒绝）")
     args = ap.parse_args(argv)
 
     if args.self_test:
         return self_test()
+
+    # 自注入只在 CLI 入口做，且**只补空缺**：调用方已 `configure()` 过的注入
+    # 一律保留。库用法（测试、嵌入式调用）与命令行用法因此不会互相踩。
+    # `--ctx-force` 不参与这一步：注入成功与否与 force 无关，force 只影响阈值
+    # 判定（≥90% 硬顶仍拒），所以这里不必也不该为它开任何后门。
+    if not args.no_auto and missing_injections():
+        missing = auto_configure()
+        if missing:
+            print(f"[ctx-gate] 配置错误：未注入 {', '.join(missing)}："
+                  f"拒绝静默连生产，请由调用方显式注入"
+                  f"（或在 agent.json 配 {GATE_SESSIONS_KEY} / {GATE_LEDGER_KEY}）",
+                  file=sys.stderr)
+            return EXIT_PARAM
 
     sid = (args.sid or "").strip()
     if not sid and args.name:
