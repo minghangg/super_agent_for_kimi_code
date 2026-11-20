@@ -103,6 +103,7 @@ ENV = {
 #: ``pm-<workbench-name>`` line). ``("pm-", "pm.md")`` covers it, and a private
 #: project name has no business in an open repository.
 DEFAULT_CHARTER_MAP: tuple[tuple[str, str], ...] = (
+    ("supervisor", "supervisor.md"),
     ("planner", "planner.md"),
     ("analyst", "analyst.md"),
     ("reviewer", "reviewer.md"),
