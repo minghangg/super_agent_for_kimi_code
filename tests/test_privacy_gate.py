@@ -68,6 +68,71 @@ class GateSource(unittest.TestCase):
         self.assertEqual(gate.scan_remote(ROOT), [])
 
 
+class RoleNameUnderscore(unittest.TestCase):
+    """ISS-108 end to end: the *gate* must see the underscore form, not just the regex.
+
+    ``test_the_role_name_survives_an_underscore_on_each_side`` proves the pattern
+    matches. That is not the same claim as "the gate catches it": the gate is
+    ``scan_files`` over tracked files, and the defect was that this whole path
+    answered clean. A pattern test would have passed even while the gate missed
+    the file -- the pattern is applied to lines, and the file that mattered was
+    never reported.
+
+    So this class drives the real entry points against a throwaway repository
+    with one tracked file, and it pins the **old** rule as a counter-example:
+    ``\\b`` is shown to miss the same text, which is what makes the fix
+    necessary rather than cosmetic.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        git(self.root, "init", "-q", "-b", "main")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def track(self, name: str, text: str) -> None:
+        (self.root / name).write_text(text, encoding="utf-8")
+        git(self.root, "add", name)
+
+    def test_the_gate_reports_a_private_name_between_underscores(self):
+        private = gate._joined("Re", "ed")
+        self.track("charter.md", f"见 supervisor_{private}_state.md\n")
+        hits = gate.scan_files(self.root)
+        self.assertTrue(any("role name" in h for h in hits), hits)
+
+    def test_the_gate_fails_through_main(self):
+        private = gate._joined("Re", "ed")
+        self.track("charter.md", f"见 supervisor_{private}_state.md\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = gate.main([], root=self.root)
+        self.assertEqual(rc, 1, buf.getvalue())
+        self.assertIn("role name", buf.getvalue())
+
+    def test_the_old_word_boundary_rule_would_miss_it(self):
+        """Counter-example: the pre-ISS-108 rule returns nothing on the same text.
+
+        Without this the fix is unfalsifiable -- any pattern "works" if nobody
+        states what it had to beat. ``\\b`` treats ``_`` as a word character, so
+        both sides of the spelling fail to form a boundary.
+        """
+        private = gate._joined("Re", "ed")
+        old = re.compile(r"\b" + private + r"\b", re.IGNORECASE)
+        for text in (f"supervisor_{private}_state.md",
+                     f"x_{private}_x",
+                     f"session_de114499_{private}"):
+            self.assertIsNone(old.search(text), text)
+            self.assertIsNotNone(gate.PATTERNS["role name"].search(text), text)
+
+    def test_an_ordinary_identifier_stays_green(self):
+        """The other direction: a longer identifier must not be flagged."""
+        private = gate._joined("Re", "ed")
+        self.track("code.py", f"reader = {private}er(path)\n")
+        self.assertEqual(gate.scan_files(self.root), [])
+
+
 class History(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

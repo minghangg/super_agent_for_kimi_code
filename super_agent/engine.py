@@ -4761,9 +4761,7 @@ class Engine:
         created, and the rule it points at could not be opened (ISS-107).
 
         Not a refusal, a report: the session still runs, and the reader is told
-        which pointer is dead. A deployment that ships no charters at all is
-        ``ok`` -- that is a shape, not a fault, same reasoning as
-        :meth:`_check_supervisor_visibility`.
+        which charter is missing or unreadable, or which pointer is dead.
         """
         from . import agent_config as _agent_cfg
         from . import charters

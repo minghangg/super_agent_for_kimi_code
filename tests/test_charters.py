@@ -347,6 +347,13 @@ class CrossReferences(unittest.TestCase):
         """
         self.assertEqual(charters.unresolved_refs("见 `D:/somewhere/rules/x.md`。"), [])
 
+    def test_markdown_and_plain_references_cannot_bypass_the_check(self):
+        for text in ("[规则](rules/shared/rules/gone.md)",
+                     "见 rules/shared/rules/gone.md。"):
+            with self.subTest(text=text):
+                self.assertEqual(charters.unresolved_refs(text),
+                                 ["rules/shared/rules/gone.md"])
+
 
 class DoctorReportsBrokenCharters(unittest.TestCase):
     """``broken_charters`` is what the doctor line reads, so it must go red.
@@ -373,6 +380,15 @@ class DoctorReportsBrokenCharters(unittest.TestCase):
                  mock.patch.object(charters, "leaf_for", return_value="charter.md"):
                 self.assertEqual(charters.broken_charters(["scout-x"]),
                                  {"scout-x": ["rules/shared/rules/gone.md"]})
+
+    def test_a_missing_baseline_cannot_be_skipped_by_doctor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            missing = root / "charter.md"
+            with mock.patch.object(charters, "baseline_root", return_value=root), \
+                 mock.patch.object(charters, "leaf_for", return_value="charter.md"):
+                self.assertEqual(charters.broken_charters(["scout-x"]),
+                                 {"scout-x": [f"{missing} (missing charter)"]})
 
 
 if __name__ == "__main__":
