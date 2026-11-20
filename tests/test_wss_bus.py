@@ -154,44 +154,44 @@ class TestGuardianThreeStates(InjectionFixture):
     def setUp(self):
         super().setUp()
         wb.PATHS = wb.Paths(self.state)
-        self.hb = self.state / wb.GUARDIAN_THRESHOLDS["monitor"][0]
+        self.hb = self.state / wb.GUARDIAN_THRESHOLDS["delivery_watch"][0]
         self.hb.parent.mkdir(parents=True, exist_ok=True)
 
     def test_absent_heartbeat_is_missing(self):
-        self.assertIsNone(wb.read_heartbeat("monitor"))
-        self.assertEqual(wb._guardian_summary()["monitor"]["state"], "missing")
+        self.assertIsNone(wb.read_heartbeat("delivery_watch"))
+        self.assertEqual(wb._guardian_summary()["delivery_watch"]["state"], "missing")
 
     def test_permission_error_is_unknown_not_missing(self):
         self.hb.write_text(json.dumps({"ts": time.time()}), encoding="utf-8")
         original = Path.read_text
 
         def boom(path, *args, **kwargs):
-            if str(path).endswith("monitor.json"):
+            if str(path).endswith("delivery.json"):
                 raise PermissionError(13, "concurrent replace")
             return original(path, *args, **kwargs)
 
         with mock.patch.object(Path, "read_text", boom):
-            raw = wb.read_heartbeat("monitor")
+            raw = wb.read_heartbeat("delivery_watch")
             self.assertEqual(raw, {"_read_error": "PermissionError"})
             summary = wb._guardian_summary()
-        self.assertEqual(summary["monitor"]["state"], "unknown")
-        self.assertEqual(summary["monitor"]["read_error"], "PermissionError")
-        self.assertNotEqual(summary["monitor"]["state"], "missing")
+        self.assertEqual(summary["delivery_watch"]["state"], "unknown")
+        self.assertEqual(summary["delivery_watch"]["read_error"], "PermissionError")
+        self.assertNotEqual(summary["delivery_watch"]["state"], "missing")
 
     def test_bad_json_is_still_missing(self):
         self.hb.write_text("{ NOT JSON", encoding="utf-8")
-        self.assertIsNone(wb.read_heartbeat("monitor"))
+        self.assertIsNone(wb.read_heartbeat("delivery_watch"))
         summary = wb._guardian_summary()
-        self.assertEqual(summary["monitor"]["state"], "missing")
-        self.assertNotIn("read_error", summary["monitor"])
+        self.assertEqual(summary["delivery_watch"]["state"], "missing")
+        self.assertNotIn("read_error", summary["delivery_watch"])
 
     def test_unknown_is_not_delivered_and_takes_no_slot(self):
-        state = {"monitor": {"state": "stale", "ts": 0.0}}
+        state = {"delivery_watch": {"state": "stale", "ts": 0.0}}
         due = wb._guardian_alert_due(
-            {"monitor": {"state": "unknown", "age_s": None, "threshold_s": 300,
+            {"delivery_watch": {"state": "unknown", "age_s": None, "threshold_s": 300,
                          "heartbeat": "hb/x.json", "writer": ""}}, state)
         self.assertEqual(due, [])
-        self.assertNotIn("monitor", state)
+        self.assertNotIn("delivery_watch", state)
 
     def test_dedup_window_and_recovery_reset(self):
         state = {}
@@ -229,11 +229,11 @@ class TestGuardianExtra(InjectionFixture):
         self.assertNotIn("io", wb.guardian_thresholds())
 
     def test_name_clash_keeps_builtin(self):
-        self.extra.write_text(json.dumps({"monitor": {"heartbeat": "hb/x.json",
+        self.extra.write_text(json.dumps({"decide_watch": {"heartbeat": "hb/x.json",
                                                      "threshold_s": 1}}),
                               encoding="utf-8")
-        self.assertEqual(wb.guardian_thresholds()["monitor"],
-                         wb.GUARDIAN_THRESHOLDS["monitor"])
+        self.assertEqual(wb.guardian_thresholds()["decide_watch"],
+                         wb.GUARDIAN_THRESHOLDS["decide_watch"])
 
     def test_valid_registration_applies(self):
         self.extra.write_text(json.dumps({"reporter": {"heartbeat": "hb/rep.json",
@@ -245,7 +245,7 @@ class TestGuardianExtra(InjectionFixture):
     def test_builtin_thresholds_unchanged(self):
         self.assertEqual(wb.GUARDIAN_THRESHOLDS["delivery_watch"][1], 900.0)
         self.assertEqual(wb.GUARDIAN_THRESHOLDS["decide_watch"][1], 900.0)
-        self.assertEqual(wb.GUARDIAN_THRESHOLDS["monitor"][1], 300.0)
+        self.assertEqual(wb.GUARDIAN_THRESHOLDS["delivery_watch"][1], 900.0)
 
 
 class TestIsolationPenetration(InjectionFixture):

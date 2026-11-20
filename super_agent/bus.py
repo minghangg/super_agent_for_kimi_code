@@ -44,10 +44,37 @@ def mode() -> str:
 
 
 # --------------------------------------------------------------------- daemon
+DEFAULT_PORT = 58800
+
+
 def _bus():
-    """延迟导入 wss_bus（它依赖 aiohttp；纯 direct 模式不该被迫加载）。"""
-    import wss_bus
+    """延迟导入 wss_bus（它依赖 aiohttp；纯 direct 模式不该被迫加载）。
+
+    包内相对导入，**不是** `import wss_bus`。裸名靠 `sys.path` 撞运气，两种失败
+    都已实测（ISS-102 §7.2）：
+
+      · 在包内跑（`python -c "import super_agent.bus"`）⇒ `ModuleNotFoundError`，
+        被 `health()` 的 `except` 吞成 `None` ⇒ 全部读侧静默降级到直连；
+      · 在 lwa 目录跑 ⇒ 解析到 `lwa/tools/wss_bus.py`，即**另一份实体**。
+
+    第二种更坏：它看起来「能用」，只是连的不是这一份代码。
+    """
+    from . import wss_bus
     return wss_bus
+
+
+def _port() -> int:
+    """daemon 端口：`WSS_BUS_PORT` 优先，否则 58800。
+
+    与 `bus_client.py:25` 同一个默认值。此前这里没有回落——`PORT` 在纯客户端
+    进程里恒为 0，于是 `bus_health()` 直接 `return None`，即使 daemon 就在
+    58800 上活着。那不是「降级判据」，那是「永远不会连上」。
+    """
+    raw = (os.environ.get("WSS_BUS_PORT") or "").strip()
+    try:
+        return int(raw) if raw else DEFAULT_PORT
+    except ValueError:
+        return DEFAULT_PORT
 
 
 def health(timeout: float = 2.0) -> dict | None:
@@ -59,7 +86,7 @@ def health(timeout: float = 2.0) -> dict | None:
     if mode() == "direct":
         return None
     try:
-        h = _bus().bus_health(timeout=timeout)
+        h = _bus().bus_health(timeout=timeout, port=_port())
     except Exception:  # noqa: BLE001
         return None
     if not h:
@@ -104,7 +131,7 @@ def get(path: str, caller: str, timeout: float = 3.0, quiet_404: bool = True):
         note_degraded(caller, "daemon 不可用或未 ready")
         return None
     try:
-        return _bus().bus_get(path, timeout=timeout)
+        return _bus().bus_get(path, timeout=timeout, port=_port())
     except Exception as exc:  # noqa: BLE001
         code = getattr(exc, "code", None) or getattr(exc, "status", None)
         if not (quiet_404 and code == 404):
@@ -307,7 +334,8 @@ def _control(verb: str, sid: str, caller: str, payload: dict | None = None,
     body = {"sid": sid, "request_id": rid or _new_rid()}
     body.update(payload or {})
     try:
-        return _bus().bus_post(f"/control/{verb}", body, timeout=timeout), "bus"
+        return _bus().bus_post(f"/control/{verb}", body, timeout=timeout,
+                               port=_port()), "bus"
     except Exception as exc:  # noqa: BLE001
         code = getattr(exc, "code", None)
         note_degraded(caller, f"/control/{verb} {type(exc).__name__}")

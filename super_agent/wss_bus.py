@@ -1,6 +1,14 @@
-"""[RULING B 2026-11-09] 编排层裁定工作台私有：现网 daemon 真相在 lwa tools/wss_bus.py
-（私有对象宿主：PM 键/退役表/单路由/guardian 名单）。本模块是完整移植的候选底座版，
-未作为运行入口启用；规则与 skill 的 safkc 迁移另独立项（用户令）。勿把本文件当运行时真相。
+"""[RULING B 2026-11-09 —— 已废止，2026-11-20 由 ISS-102 修订]
+
+原裁定：编排层裁定工作台私有；现网 daemon 真相在 lwa tools/wss_bus.py；
+私有对象宿主（PM 键/退役表/单路由/guardian 名单）留工作台；本模块不启用。
+
+废止理由：用户 2026-11-18 令「只开发 safkc」，事实上已否决上面的结论。
+编排层是通用能力，归 safkc；私有值不再写入本模块，改由调用方经
+`configure(WssBusConfig(...))` 注入（见下方 Injection 段）。退役表、guardian
+外部注册、issue→会话绑定本包均已实现，不再依赖工作台模块。
+
+历史条文仅作沿革保留，**不得**作为「本模块未启用」的依据。
 
  —— the single observation/control plane over Kimi Code.
 
@@ -1354,8 +1362,8 @@ def _watcher_sig(w: dict) -> tuple:
 
 # --------------------------------------------------------------------- guardian
 # Topology (hard requirement): watchdog ← daemon ← scheduler. The daemon is the
-# most reliable process on the machine, so it inspects three **guarded** parties;
-# the monitor is demoted to a guarded party and carries no watchdog duty.
+# most reliable process on the machine, so it inspects the **guarded** parties
+# registered below and carries no watchdog duty itself.
 #
 # Lesson baked in below: an isolated instance must never send real alerts. The
 # isolation gate lives **inside** guardian_check (it does not depend on the caller
@@ -1365,11 +1373,16 @@ def _watcher_sig(w: dict) -> tuple:
 # Each guarded party: its **own** heartbeat file + threshold + single writer.
 # Two parties must never share a file: sharing means one dead party is masked by
 # the other's fresh heartbeat.
+#
+# `monitor` is deliberately absent. The old workbench's monitor was retired on
+# 2026-11-14 and its heartbeat stopped being written, so a built-in entry here
+# would alert on every patrol round, forever, about a process nobody runs. The
+# built-in table wins over external registration, so the entry cannot be removed
+# from `guardian_extra.json` — it has to be removed here (ISS-102 M4).
 GUARDIAN_THRESHOLDS = {
     # name           heartbeat (relative to state root)      threshold  single writer
     "delivery_watch": ("heartbeat/delivery.json", 900.0, "收单哨 delivery_tick"),
     "decide_watch":   ("heartbeat/decide.json",   900.0, "decide_watch 主循环"),
-    "monitor":        ("heartbeat/monitor.json",  300.0, "monitor.py 的 tick（每轮无条件写）"),
 }
 
 GUARDIAN_EXTRA_WRITER = "(外部注册)"
@@ -1553,6 +1566,53 @@ def read_heartbeat(name: str) -> dict | None:
         return None
 
 
+HEARTBEAT_WRITE_BACKOFF = (0.0, 0.02, 0.05, 0.1)   # 0/20/50/100ms, ~170ms total
+HEARTBEAT_WRITEFAIL_PREFIX = "_writefail_"          # `<state_root>/heartbeat/_writefail_<name>.json`
+
+
+def _writefail_path(name: str) -> Path:
+    return current_state_root() / "heartbeat" / f"{HEARTBEAT_WRITEFAIL_PREFIX}{name}.json"
+
+
+def _mark_write_fail(name: str, attempts: int, err: BaseException) -> None:
+    """Terminal-failure marker: **visible** in `/healthz.guardians.<name>.write_fail`.
+
+    Why a file and not just a log line (ISS-102 M5): the daemon's own stderr is
+    not where anyone looks, and a heartbeat that never lands is indistinguishable
+    from a party that is simply idle. The marker turns "silently not written"
+    into a field a caller can assert on, and it is deleted the moment a write
+    succeeds so it cannot outlive the fault.
+    """
+    try:
+        p = _writefail_path(name)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"ts": time.time(),
+                                 "iso": datetime.now().isoformat(timespec="seconds"),
+                                 "attempts": attempts,
+                                 "err": f"{type(err).__name__}: {err}",
+                                 "pid": os.getpid()}, ensure_ascii=False),
+                     encoding="utf-8")
+    except OSError as exc:
+        log(f"guardian: 写 {name} 的写失败标记也没写成（就剩日志这一条线索）：{exc}")
+
+
+def _clear_write_fail(name: str) -> None:
+    try:
+        _writefail_path(name).unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        log(f"guardian: 清 {name} 的写失败标记失败（下次成功会再试）：{exc}")
+
+
+def _read_write_fail(name: str) -> dict | None:
+    """The marker for `/healthz`; ``None`` when the last write succeeded."""
+    try:
+        return json.loads(_writefail_path(name).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 def write_heartbeat(name: str, extra: dict | None = None) -> None:
     """Write a heartbeat (single writer per name, see the third column above).
 
@@ -1560,6 +1620,11 @@ def write_heartbeat(name: str, extra: dict | None = None) -> None:
     **Which root**: ``current_state_root()`` — same source as the read side,
     otherwise an isolated instance writes production and production reads
     production, looking "healthy" on someone else's heartbeat.
+    **Failure is visible** (ISS-102 M5): `os.replace` retries at 0/20/50/100ms;
+    if all four fail, the marker written by `_mark_write_fail` shows up as
+    `/healthz.guardians.<name>.write_fail`, and the next successful write
+    deletes it. The atomic-write semantics are unchanged (tmp + `os.replace`);
+    what changed is that a permanent failure no longer ends as one log line.
     """
     rel = guardian_thresholds().get(name, ("", 0.0, ""))[0]
     if not rel:
@@ -1569,14 +1634,23 @@ def write_heartbeat(name: str, extra: dict | None = None) -> None:
             "pid": os.getpid(), "boot_id": STATE.seq.boot_id, "state_dir": str(root)}
     if extra:
         body.update(extra)
-    try:
-        p = root / rel
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, p)
-    except OSError as exc:
-        log(f"guardian: 写 {name} 心跳失败：{exc}")
+    p = root / rel
+    tmp = p.with_suffix(".json.tmp")
+    last: BaseException | None = None
+    for delay in HEARTBEAT_WRITE_BACKOFF:
+        if delay:
+            time.sleep(delay)
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, p)
+        except OSError as exc:
+            last = exc
+            continue
+        _clear_write_fail(name)
+        return
+    log(f"guardian: 写 {name} 心跳失败（已重试 {len(HEARTBEAT_WRITE_BACKOFF)} 次）：{last}")
+    _mark_write_fail(name, len(HEARTBEAT_WRITE_BACKOFF), last)
 
 
 def current_state_root() -> Path:
@@ -2432,11 +2506,20 @@ def make_app():
     app = web.Application()
 
     def _public_guardians() -> dict:
-        """`/healthz.guardians`: neutral field names, same semantics and states."""
+        """`/healthz.guardians`: neutral field names, same semantics and states.
+
+        ``write_fail`` is added here rather than in ``_guardian_summary``: the
+        summary answers "is this party alive", the marker answers "did our own
+        heartbeat write land". Merging them would let a broken writer look like a
+        dead guarded party.
+        """
         out = {}
         for name, rec in _guardian_summary().items():
             item = dict(rec)
             item["supervisor"] = str(_cfg().supervisor_key or "")
+            wf = _read_write_fail(name)
+            if wf is not None:
+                item["write_fail"] = wf
             out[name] = item
         return out
 
@@ -2766,15 +2849,33 @@ def windowless_python() -> tuple[str, str]:
 
 
 def task_spec() -> dict:
-    """Expected scheduled-task definition — one source for register and verify."""
+    """Expected scheduled-task definition — one source for register and verify.
+
+    ``arguments`` depends on what the target *is*, and getting that wrong is
+    silent: the task registers fine and only fails when it fires at logon.
+
+      · a plain script (the workbench shim, or any file outside this package) ⇒
+        ``"<script>" --daemon``;
+      · this module itself ⇒ ``-m super_agent.wss_bus --daemon`` with the workdir
+        set to the checkout. Running ``python super_agent/wss_bus.py`` fails with
+        "attempted relative import with no known parent package" — it is a module
+        inside a package, not a script (ISS-102 M3).
+
+    The injection decides which branch runs: a caller that sets
+    ``autostart_script`` to its own shim gets the first form, which is what the
+    production switch uses.
+    """
     cfg = _cfg()
     script = Path(cfg.autostart_script) if cfg.autostart_script else Path(__file__).resolve()
     workdir = Path(cfg.autostart_workdir) if cfg.autostart_workdir else script.parent.parent
     exe, note = windowless_python()
+    own = Path(__file__).resolve()
+    as_module = Path(script).resolve() == own
     return {
         "name": AUTOSTART_NAME(),
         "execute": exe,
-        "arguments": '"%s" --daemon' % Path(script).resolve(),
+        "arguments": ("-m super_agent.wss_bus --daemon" if as_module
+                      else '"%s" --daemon' % Path(script).resolve()),
         "workdir": str(Path(workdir).resolve()),
         "script": str(Path(script).resolve()),
         "execute_note": note,
@@ -3439,22 +3540,22 @@ def self_test() -> int:
         globals()["production_state_root"] = lambda: gtmp
         PATHS.mkdir()
         (gtmp / "sessions.json").write_text("{}", encoding="utf-8")
-        _hb_rel = GUARDIAN_THRESHOLDS["monitor"][0]
+        _hb_rel = GUARDIAN_THRESHOLDS["delivery_watch"][0]
         _hb = gtmp / _hb_rel
 
         # ① file genuinely absent ⇒ missing
         check("① 心跳文件缺失判 missing",
-              _guardian_summary()["monitor"]["state"] == "missing",
-              str(_guardian_summary()["monitor"])[:120])
+              _guardian_summary()["delivery_watch"]["state"] == "missing",
+              str(_guardian_summary()["delivery_watch"])[:120])
 
         # ② PermissionError ⇒ unknown, no alert, read_error surfaced
         _hb.parent.mkdir(parents=True, exist_ok=True)
         _hb.write_text(json.dumps({"ts": time.time()}), encoding="utf-8")
-        check("② 新鲜心跳判 ok", _guardian_summary()["monitor"]["state"] == "ok")
+        check("② 新鲜心跳判 ok", _guardian_summary()["delivery_watch"]["state"] == "ok")
         _orig_read = Path.read_text
 
         def _boom(self, *a, **kw):
-            if str(self).endswith("monitor.json"):
+            if str(self).endswith("delivery.json"):
                 raise PermissionError(13, "concurrent replace")
             return _orig_read(self, *a, **kw)
 
@@ -3462,34 +3563,34 @@ def self_test() -> int:
         try:
             s2 = _guardian_summary()
             check("② PermissionError 判 unknown（不是 missing）",
-                  s2["monitor"]["state"] == "unknown", str(s2["monitor"])[:120])
+                  s2["delivery_watch"]["state"] == "unknown", str(s2["delivery_watch"])[:120])
             check("② read_error 落到 /healthz 记录",
-                  s2["monitor"].get("read_error") == "PermissionError",
-                  str(s2["monitor"].get("read_error")))
+                  s2["delivery_watch"].get("read_error") == "PermissionError",
+                  str(s2["delivery_watch"].get("read_error")))
             gs = {}
             due = _guardian_alert_due(s2, gs)
             check("② unknown 不投递",
-                  all(d["name"] != "monitor" or d["state"] != "unknown" for d in due),
+                  all(d["name"] != "delivery_watch" or d["state"] != "unknown" for d in due),
                   str([(d["name"], d["state"]) for d in due]))
-            check("② unknown 不占去重名额", "monitor" not in gs, str(gs))
+            check("② unknown 不占去重名额", "delivery_watch" not in gs, str(gs))
         finally:
             Path.read_text = _orig_read
 
         # ③ bad JSON ⇒ missing (not unknown)
         _hb.write_text("{ NOT JSON", encoding="utf-8")
         s3 = _guardian_summary()
-        check("③ 坏 JSON 判 missing", s3["monitor"]["state"] == "missing",
-              str(s3["monitor"])[:120])
-        check("③ 坏 JSON 不算 read_error", "read_error" not in s3["monitor"])
+        check("③ 坏 JSON 判 missing", s3["delivery_watch"]["state"] == "missing",
+              str(s3["delivery_watch"])[:120])
+        check("③ 坏 JSON 不算 read_error", "read_error" not in s3["delivery_watch"])
 
         # ④ unknown during a real break: no slot consumed, alert still fires after
         _hb.unlink()
-        gs = {"monitor": {"state": "stale", "ts": 0.0}}
-        due = _guardian_alert_due({"monitor": {"state": "unknown", "age_s": None,
+        gs = {"delivery_watch": {"state": "stale", "ts": 0.0}}
+        due = _guardian_alert_due({"delivery_watch": {"state": "unknown", "age_s": None,
                                               "threshold_s": 300, "heartbeat": _hb_rel,
                                               "writer": ""}}, gs)
-        check("④ unknown 期间不投递且清掉旧名额", due == [] and "monitor" not in gs)
-        due2 = _guardian_alert_due({"monitor": {"state": "missing", "age_s": None,
+        check("④ unknown 期间不投递且清掉旧名额", due == [] and "delivery_watch" not in gs)
+        due2 = _guardian_alert_due({"delivery_watch": {"state": "missing", "age_s": None,
                                                "threshold_s": 300, "heartbeat": _hb_rel,
                                                "writer": ""}}, gs)
         check("④ 恢复后同一轮可再报 missing", len(due2) == 1, str(due2)[:80])
@@ -3520,11 +3621,11 @@ def self_test() -> int:
         check("⑥ 单条形状不合 ⇒ 跳过该条",
               "io" not in guardian_thresholds()
               and set(guardian_thresholds()) == set(GUARDIAN_THRESHOLDS))
-        extra.write_text(json.dumps({"monitor": {"heartbeat": "hb/x.json",
+        extra.write_text(json.dumps({"decide_watch": {"heartbeat": "hb/x.json",
                                                  "threshold_s": 1}}), encoding="utf-8")
         _th = guardian_thresholds()
         check("⑥ 同名冲突 ⇒ 内置优先",
-              _th["monitor"] == GUARDIAN_THRESHOLDS["monitor"], str(_th["monitor"]))
+              _th["decide_watch"] == GUARDIAN_THRESHOLDS["decide_watch"], str(_th["decide_watch"]))
         extra.write_text(json.dumps({"reporter": {"heartbeat": "hb/rep.json",
                                                   "threshold_s": 120}}), encoding="utf-8")
         _th2 = guardian_thresholds()
@@ -3534,7 +3635,7 @@ def self_test() -> int:
         check("⑥ 内置三项阈值未被改写",
               all(GUARDIAN_THRESHOLDS[n][1] == v for n, v in
                   (("delivery_watch", 900.0), ("decide_watch", 900.0),
-                   ("monitor", 300.0))))
+                   ("delivery_watch", 900.0))))
         extra.unlink()
 
         # ⑦ isolated state root never writes production
@@ -3680,15 +3781,38 @@ def self_test() -> int:
     try:
         globals()["PATHS"] = Paths(h3)
         globals()["production_state_root"] = lambda: prod3
-        ph = prod3 / GUARDIAN_THRESHOLDS["monitor"][0]
+        ph = prod3 / GUARDIAN_THRESHOLDS["decide_watch"][0]
         ph.parent.mkdir(parents=True, exist_ok=True)
         ph.write_text('{"ts": 1}', encoding="utf-8")
         os.utime(ph, (1_700_000_000, 1_700_000_000))
         _before = ph.stat().st_mtime
-        write_heartbeat("monitor", {"probe": 1})
-        check("心跳写当前根", (h3 / GUARDIAN_THRESHOLDS["monitor"][0]).is_file())
+        write_heartbeat("decide_watch", {"probe": 1})
+        check("心跳写当前根", (h3 / GUARDIAN_THRESHOLDS["decide_watch"][0]).is_file())
         check("心跳不碰生产", ph.stat().st_mtime == _before,
               f"prod_mtime {_before}->{ph.stat().st_mtime}")
+        check("写成功后没有 write_fail 标记", _read_write_fail("decide_watch") is None)
+
+        # 28b) A write that cannot land leaves a VISIBLE marker (ISS-102 M5).
+        # Blocking the write: point the heartbeat at a path whose parent is a
+        # file, so mkdir raises NotADirectoryError on every retry.
+        blocker = h3 / "blocked"
+        blocker.write_text("not a directory", encoding="utf-8")
+        _orig_thresholds = globals()["guardian_thresholds"]
+        globals()["guardian_thresholds"] = lambda: {"decide_watch":
+                                                    ("blocked/hb.json", 900.0, "probe")}
+        try:
+            write_heartbeat("decide_watch", {"probe": 2})
+            _wf = _read_write_fail("decide_watch")
+            check("写失败留下可见标记", isinstance(_wf, dict), str(_wf)[:120])
+            check("标记含 attempts/err/pid",
+                  bool(_wf) and _wf.get("attempts") == len(HEARTBEAT_WRITE_BACKOFF)
+                  and "Error" in str(_wf.get("err"))
+                  and _wf.get("pid") == os.getpid(), str(_wf)[:160])
+        finally:
+            globals()["guardian_thresholds"] = _orig_thresholds
+        # Next successful write clears it: "cannot outlive the fault".
+        write_heartbeat("decide_watch", {"probe": 3})
+        check("写恢复后标记自动清除", _read_write_fail("decide_watch") is None)
     finally:
         globals()["PATHS"] = _saved_paths
         globals()["production_state_root"] = lambda: _saved_prod

@@ -448,9 +448,14 @@ def parse_script(path: Path) -> tuple[dict, str]:
             return {}, (f"启动行里有 {len(targets)} 个 .py，多半目标，无法判定："
                         f"{line.strip()[:90]}（{path}）")
         target = targets[0]
-        name = Path(target).name.lower()
+        stem = Path(target).stem.lower()
         for part in PARTS:
-            if name == f"{part}.py":
+            # `<part>.py` is the direct form; `<part>_<suffix>.py` is the shim
+            # form (ISS-102: `wss_bus_safkc.py` is the injection shell in front
+            # of the safkc module). Both name the same part -- refusing the
+            # second shape made the check report "no start line" for a script
+            # that does start the bus.
+            if stem == part or stem.startswith(f"{part}_"):
                 out[part] = Side("ok", _normalize(target), str(path))
     return out, ""
 
