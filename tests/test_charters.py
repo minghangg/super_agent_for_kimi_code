@@ -89,6 +89,7 @@ class MissingBaseline(unittest.TestCase):
             empty = Path(tmp)
             with mock.patch.object(charters, "baseline_root", return_value=empty), \
                     mock.patch.object(dispatch_cli, "create_session", _boom), \
+                    mock.patch.object(dispatch_cli, "quota_gate", lambda: None), \
                     mock.patch.object(dispatch_cli, "read_token", lambda: "t"), \
                     mock.patch.object(dispatch_cli, "discover_base", lambda *a, **k: "http://x"), \
                     mock.patch.object(dispatch_cli, "load_catalog",
