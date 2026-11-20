@@ -360,6 +360,19 @@ def overrides() -> dict:
         (CHECKOUT / str(config_mod.DEFAULTS.get("state_dir") or "data")).resolve())
     if state:
         out["state_dir"] = state
+    # ``paths`` is a declared section (``config.DEFAULTS["paths"]``), so
+    # mapping it here goes through ``config.validate`` like every other key.
+    # Leaving it out was not harmless: a ``--config`` file's
+    # ``paths.project_env_dir`` was answered by a *different* layer than the
+    # one the user wrote, so the file looked configured while every lookup fell
+    # back to the default (#98 P0-2 shape, one section over).
+    #
+    # Only a value that actually resolves is mapped. An empty entry would
+    # recreate the bug: ``overrides`` is merged **last**, so ``""`` would
+    # replace a ``--config`` file's own value.
+    penv = project_env_dir()
+    if penv:
+        out.setdefault("paths", {})["project_env_dir"] = penv
     engine: dict = {}
     if session_root:
         engine["session_state_dir"] = session_root

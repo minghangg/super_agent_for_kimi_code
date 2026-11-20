@@ -169,6 +169,28 @@ class ConfiguredDirectoryTest(_Base):
         self.assertIn("目录不存在", err)
         self.assertIn("nope", err)
 
+    def test_config_flag_supplies_the_directory(self) -> None:
+        """Decision 2: ``--config`` must win, not fall back to the default.
+
+        Before the fix the private overrides replaced the file's value, so this
+        shape returned rc=1 "unregistered" against a directory nobody named.
+        """
+        other = self.root / "from_config"
+        other.mkdir()
+        (other / "demo.md").write_bytes(b"FROM-CONFIG\n")
+        config_file = self.root / "explicit.json"
+        config_file.write_text(
+            json.dumps({"paths": {"project_env_dir": str(other)}}), encoding="utf-8")
+        # The private layer names a *different*, empty directory.
+        self.configure()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli.main(["--config", str(config_file),
+                           "doctor", "--project", "demo"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.getvalue(), "FROM-CONFIG\n")
+        self.assertIn(str(config_file), err.getvalue())
+
     def test_missing_dir_differs_from_missing_entry(self) -> None:
         """A configuration fault must not read as a missing registration."""
         self.configure({"project_env_dir": str(self.root / "nope")})

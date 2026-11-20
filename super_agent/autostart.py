@@ -546,24 +546,48 @@ def _task_side(row: dict, root: Path | None, script: Path) -> Side:
     return Side("ok", _normalize(path), "直指 .py")
 
 
-def _process_side(part: str, rows: list[tuple[int, str]]) -> Side:
+def _process_side(part: str, rows: list[tuple[int, str]],
+                  injected: bool = False) -> Side:
+    """What the running process starts, or why that cannot be decided.
+
+    A command line that yields zero or two absolute ``.py`` tokens is
+    ``unparsable``, not "no such process": the same rule the task side applies
+    (``_task_side``). Skipping an unparsable line and then reporting
+    ``absent`` ("未运行", rc=21) would blame the wrong thing -- the process is
+    there, its command line is just not one file -- and would disagree with the
+    task side about the same input. One input, one verdict, both sides.
+
+    ``injected`` separates the two sources. A ``--command-line`` line was typed
+    for this part, so any unparsable line is this part's answer. A line read
+    from ``Get-CimInstance`` is filtered only by ``wss_bus|decide_watch``, so it
+    may belong to the *other* part; counting it here would let a broken
+    ``decide_watch`` line mark ``wss_bus`` unparsable.
+    """
+    unparsable: list[str] = []
     hits: list[tuple[int, str]] = []
     for pid, cmd in rows:
+        if not injected and part not in (cmd or "").lower():
+            continue
         path, why = _single_token(cmd)
         if why:
+            unparsable.append(why)
             continue
         if Path(path).name.lower() == f"{part}.py":
             hits.append((pid, path))
-    if not hits:
-        return Side("absent", detail="未运行")
-    values = {_normalize(p) for _, p in hits}
-    if len(values) >= 2:
-        return Side("unparsable", detail=f"{len(hits)} 个进程指向不同文件，无法判定")
-    pid = min(p for p, _ in hits)
-    # pid 0 means the line came from ``--command-line``, which has no process
-    # behind it. Printing "pid 0" would read as a real process with a real id.
-    detail = "" if pid else "注入命令行"
-    return Side("ok", _normalize(hits[0][1]), detail, pid)
+    if hits:
+        values = {_normalize(p) for _, p in hits}
+        if len(values) >= 2:
+            return Side("unparsable",
+                        detail=f"{len(hits)} 个进程指向不同文件，无法判定")
+        pid = min(p for p, _ in hits)
+        # pid 0 means the line came from ``--command-line``, which has no
+        # process behind it. Printing "pid 0" would read as a real process
+        # with a real id.
+        detail = "" if pid else "注入命令行"
+        return Side("ok", _normalize(hits[0][1]), detail, pid)
+    if unparsable:
+        return Side("unparsable", detail=unparsable[0])
+    return Side("absent", detail="未运行")
 
 
 def register_action(root: Path) -> tuple[str, list[str]]:
@@ -652,7 +676,7 @@ def verify(parts: list[str], *, script: Path | None = None,
         if scr is None:
             scr = Side("unparsable" if script_fault else "absent",
                        detail=script_fault or f"脚本里没有 {part}.py 的启动行")
-        proc = _process_side(part, rows)
+        proc = _process_side(part, rows, injected=bool(command_lines))
 
         if task.state == "via_script":
             task_value = scr.value if scr.state == "ok" else ""

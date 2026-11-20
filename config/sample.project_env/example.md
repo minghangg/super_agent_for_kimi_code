@@ -41,7 +41,10 @@
 
 | 部件 | 计划任务 | 启动脚本 | 登记命令 |
 |---|---|---|---|
-| <部件> | <任务名> | <脚本路径> | `python -m super_agent.autostart --register <部件>` |
+| <部件> | <任务名> | <脚本路径> | `python -m super_agent.autostart --register <部件> --apply` |
+
+> `--apply` 才真正写计划任务，需 UAC（管理员身份）。不带 `--apply` 只打印，
+> 永远停在 dry-run —— 注册后的自校也就不会执行。仅真实注册时才加它。
 
 自检：`python -m super_agent.autostart --verify`
 

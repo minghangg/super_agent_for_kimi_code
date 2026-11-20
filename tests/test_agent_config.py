@@ -434,10 +434,29 @@ class ProjectEnvDirTest(_Isolated):
         finally:
             os.environ.pop("SAFKC_PROJECT_ENV_DIR", None)
 
-    def test_not_injected_by_overrides(self):
+    def test_injected_by_overrides_so_config_validate_owns_it(self):
+        """Decision 2: ``paths`` is declared, so it is mapped like any other key.
+
+        Not mapping it left a ``--config`` file's value answered by another
+        layer, so the file looked configured while every lookup used the
+        default. An **unset** key injects nothing -- ``overrides`` merges last,
+        so an empty entry would replace the file's own value.
+        """
         self.write({"paths": {"project_env_dir": str(self.root / "envs")}})
         overrides = agent_config.overrides()
-        self.assertNotIn("paths", overrides)
+        self.assertEqual(Path(overrides["paths"]["project_env_dir"]),
+                         (self.root / "envs").resolve())
+
+    def test_unset_key_injects_nothing(self):
+        os.environ[agent_config.ENV_FILE] = str(self.root / "absent.json")
+        agent_config._reset_cache()
+        self.assertNotIn("paths", agent_config.overrides())
+
+    def test_overrides_value_survives_config_load_and_validate(self):
+        target = self.root / "envs"
+        self.write({"paths": {"project_env_dir": str(target)}})
+        cfg = config.load(overrides=agent_config.overrides())
+        self.assertEqual(cfg["paths"]["project_env_dir"], str(target.resolve()))
 
     def test_describe_names_it(self):
         self.write({"paths": {"project_env_dir": str(self.root / "envs")}})

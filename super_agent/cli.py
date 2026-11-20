@@ -506,12 +506,19 @@ def cmd_status(args) -> int:
     return 0
 
 
-def _doctor_project(project: str) -> int:
+def _doctor_project(project: str, root: str = "", origin: str = "") -> int:
     """Print one project's environment document verbatim (ISS-101).
 
     The file name is the project key itself -- the same token ``gh_projects.json``
     and dispatch use. Nothing here parses the markdown: the document is the
     answer, and a schema on top of it would be a second ``config.validate``.
+
+    ``root`` is the **resolved** directory (``config.load`` already merged the
+    file, the environment and the overrides). Reading it from
+    ``agent_config`` again would bypass ``--config``: a ``--config`` file's
+    ``paths.project_env_dir`` would be ignored and the answer would silently
+    come from a different layer -- the same "looks configured, is not" shape
+    this change exists to remove.
 
     Exit codes: 0 printed, 1 no such entry (or two candidates), 2 the directory
     itself is unconfigured or missing -- a configuration fault is a different
@@ -523,16 +530,14 @@ def _doctor_project(project: str) -> int:
     if not key:
         print("doctor --project: 需要项目键（gh_projects.json 的键）", file=sys.stderr)
         return 2
-    root = agent_config.project_env_dir()
     if not root:
-        print("project_env_dir 未配置（agent_config: paths.project_env_dir）",
-              file=sys.stderr)
+        print("project_env_dir 未配置（paths.project_env_dir：--config / agent.json / "
+              "$SAFKC_PROJECT_ENV_DIR 三处皆空）", file=sys.stderr)
         return 2
     base = Path(root)
     if not base.is_dir():
         print(f"目录不存在：{base}", file=sys.stderr)
-        print(f"来源：paths.project_env_dir（{agent_config.config_path()}）",
-              file=sys.stderr)
+        print(f"来源：paths.project_env_dir（{origin or '配置层'}）", file=sys.stderr)
         return 2
     # Two separate branches on purpose: "no candidate" is a missing
     # registration, "several candidates" is an ambiguous one. Taking the first
@@ -553,7 +558,10 @@ def _doctor_project(project: str) -> int:
             print(f"最接近 {hint}（未自动采用）", file=sys.stderr)
         return 1
     path = exact[0]
-    print(f"来源：{path}（paths.project_env_dir 来自 {agent_config.config_path()}）",
+    # Name the layer that produced the directory, not just the private file:
+    # with ``--config`` the value may have come from there, and a source line
+    # that names the wrong file sends the reader to the wrong place.
+    print(f"来源：{path}（paths.project_env_dir 来自 {origin or '配置层'}）",
           file=sys.stderr)
     # Bytes out when the stream has one: the document is printed as stored, so
     # ``diff`` against the file is empty whatever its line endings (a text-mode
@@ -570,13 +578,68 @@ def _doctor_project(project: str) -> int:
     return 0
 
 
+def _agent_overrides(args) -> dict:
+    """The private layer's overrides, without the engine's CLI flags.
+
+    ``doctor --project`` needs ``paths.project_env_dir`` and nothing else, so
+    it asks for the private overrides exactly the way ``_build`` does and skips
+    the flags that only shape a round (mode/role/source/...).
+    """
+    from . import agent_config
+
+    return agent_config.overrides()
+
+
+def _resolve_path(raw: str) -> str:
+    """A declared path, resolved the one way this package resolves paths.
+
+    Relative values anchor to this checkout, never the working directory --
+    ``state_dir`` / ``project_env_dir`` already do it inside ``agent_config``;
+    a ``--config`` file's value arrives here unresolved, so it gets the same
+    rule rather than a second one.
+    """
+    from . import agent_config
+
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    path = Path(os.path.expanduser(text))
+    if not path.is_absolute():
+        path = agent_config.CHECKOUT / path
+    return str(path.resolve())
+
+
 def cmd_doctor(args) -> int:
     project = getattr(args, "project", None)
     if project is not None:
         # ISS-101: ``--project`` is a view of doctor, not a new command. It
         # returns before the engine is built, so it works with no bus, no
-        # source and no network -- the file is the whole answer.
-        return _doctor_project(project)
+        # source and no network -- the file is the whole answer. The directory
+        # comes from ``config.load`` so ``--config`` and the environment are
+        # merged first; reading ``agent_config`` directly would ignore them.
+        cfg = config_mod.load(getattr(args, "config", None),
+                              _agent_overrides(args))
+        raw = str((cfg.get("paths") or {}).get("project_env_dir") or "").strip()
+        # A ``--config`` file is the layer the operator typed **this run**, so
+        # it outranks the private file. ``config.load`` merges overrides last
+        # (that is right for the engine: the private file is the deployment's
+        # answer), so for this one view the file is re-read on top. Without
+        # this, an explicit ``--config`` silently answered from agent.json --
+        # measured: rc=1 "unregistered" against a directory nobody named.
+        config_file = getattr(args, "config", None)
+        origin = ""
+        if config_file:
+            resolved = Path(os.path.expanduser(str(config_file))).resolve()
+            from . import config as _cfg_mod
+            declared = str(((_cfg_mod._read_json(resolved).get("paths") or {})
+                            .get("project_env_dir") or "")).strip()
+            if declared:
+                raw = declared
+            origin = str(resolved)
+        else:
+            from . import agent_config
+            origin = str(agent_config.config_path())
+        return _doctor_project(project, _resolve_path(raw), origin)
     cfg, store = _build(args)
     engine = _engine(cfg, store, _bus(cfg),
                       session_api=_session_api(getattr(args, "session_api", None)))

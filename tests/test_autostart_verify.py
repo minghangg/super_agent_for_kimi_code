@@ -9,8 +9,10 @@ noticed. These tests pin the check that makes that state visible:
   rc=0 the module produced before (the #87 shape);
 * the comparison unit is the **absolute .py path token**, so two checkouts are
   distinguishable -- a basename is the same string in both;
-* "not exactly one token" is an answer (rc=22), not a gap to fill with the
-  first hit;
+* "not exactly one token" is an answer (rc=22) on **both** sides -- the task's
+  command and the process's. Counting an unparsable process line as "not
+  running" (rc=21) would blame the wrong thing and disagree with the task side
+  about the same input;
 * an absent task is rc=21 ("undecidable"), never "consistent";
 * the workbench root is ``engine.lwa_root`` and nothing else: unconfigured,
   missing directory and missing script are each rc=2 with the reason on stderr.
@@ -328,14 +330,50 @@ class InjectTest(_Base):
         self.assertIn("注入命令行", out)
 
     def test_injected_line_still_goes_through_the_same_parser(self) -> None:
+        """Zero tokens is "cannot decide", never "not running" (decision 1).
+
+        The old code skipped the line and reported ``absent`` -> rc=21, which
+        says "start the process" about a process whose command line simply is
+        not one file. The task side already answered ``unparsable`` for the same
+        input; the two sides now agree.
+        """
         self.configure()
         with mock.patch.object(autostart, "read_task",
                                lambda name: task_row(script=self.script)):
             rc, out, _err = self.run_main([
                 "--verify", "--part", "wss_bus",
                 "--command-line", "pythonw.exe --daemon"])
-        self.assertEqual(rc, 21)
-        self.assertIn("未运行", out)
+        self.assertEqual(rc, 22)
+        self.assertIn("没有绝对", out)
+        self.assertNotIn("未运行", out)
+
+    def test_two_tokens_in_a_process_line_is_rc22(self) -> None:
+        """Two candidate files: "the first hit wins" is the answer we refuse."""
+        self.configure()
+        with mock.patch.object(autostart, "read_task",
+                               lambda name: task_row(script=self.script)):
+            rc, out, _err = self.run_main([
+                "--verify", "--part", "wss_bus",
+                "--command-line",
+                f'{PYW} "D:/a/tools/wss_bus.py" "D:/b/tools/wss_bus.py" --daemon'])
+        self.assertEqual(rc, 22)
+        self.assertIn("多半目标", out)
+
+    def test_both_sides_agree_on_the_same_unparsable_input(self) -> None:
+        """Task side and process side return the same verdict for one input.
+
+        They used to disagree (task 22, process 21) because the process loop
+        swallowed the parse failure. One input, one verdict.
+        """
+        root = self.workbench
+        script = autostart.script_path(root)
+        for arguments in (r"D:/a/wss_bus.py D:/b/wss_bus.py", "-c \"print(1)\""):
+            row = {"found": True, "execute": "py", "arguments": arguments}
+            task = autostart._task_side(row, root, script)
+            proc = autostart._process_side(
+                "wss_bus", [(0, f"py {arguments}")], injected=True)
+            self.assertEqual(task.state, "unparsable", arguments)
+            self.assertEqual(proc.state, "unparsable", arguments)
 
 
 class RegisterTest(_Base):
