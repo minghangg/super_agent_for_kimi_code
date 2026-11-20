@@ -74,6 +74,15 @@ ENV = {
     "quota.cores_dir": "DEV_QUOTA_CORES_DIR",
     "models.profiles_file": "SAFKC_MODEL_PROFILES",
     "charter.root": "SAFKC_CHARTER_ROOT",
+    # ISS-95: the two halves of a charter. The baseline is the general text that
+    # ships with the package; the supplement is this deployment's private
+    # addition. Both are overridable so a test can point them at a temp dir.
+    "charter.baseline_root": "SAFKC_CHARTER_BASELINE",
+    "charter.supplement_root": "SAFKC_CHARTER_SUPPLEMENT",
+    # ISS-95: the session contract ships with the package. A deployment may point
+    # this at its own copy; unset means "use the shipped one", never "use the
+    # workbench's" -- that dependency is what made the package unusable elsewhere.
+    "charter.contract_file": "SAFKC_CHARTER_CONTRACT",
     "roles.prefixes": "SAFKC_SUPERVISOR_ALIASES",
     "dispatch.console": "SAFKC_DISPATCH_CONSOLE",
     # ISS-100 D1: the command ``close`` uses to archive the sessions it bound.
@@ -82,6 +91,32 @@ ENV = {
     # :func:`overrides` on every run, outranking a ``--config`` file's own value.
     "engine.session_archive_cmd": "SAFKC_ARCHIVE_CMD",
 }
+
+#: Built-in session-name prefix → charter file (ISS-95).
+#:
+#: A prefix rule is a **general** fact -- ``wk-`` is a worker, and a worker
+#: reads ``worker.md`` -- so it belongs in the public floor, not in a private
+#: file. ``charter.map`` in ``agent.json`` can add or override entries; the
+#: merged table puts configured entries first.
+#:
+#: Deliberately absent: any entry naming a private project (the old
+#: ``pm-<workbench-name>`` line). ``("pm-", "pm.md")`` covers it, and a private
+#: project name has no business in an open repository.
+DEFAULT_CHARTER_MAP: tuple[tuple[str, str], ...] = (
+    ("planner", "planner.md"),
+    ("analyst", "analyst.md"),
+    ("reviewer", "reviewer.md"),
+    ("auditor", "auditor.md"),
+    ("steward", "steward.md"),
+    ("scout", "scout.md"),
+    ("worker", "worker.md"),
+    ("at-", "analyst.md"),
+    ("at", "analyst.md"),
+    ("qa", "qa.md"),
+    ("pm-", "pm.md"),
+    ("pm", "pm.md"),
+    ("wk", "worker.md"),
+)
 
 # Neutral built-ins. None of these names a real project, account, host path or
 # private role spelling: those belong in the untracked file.
@@ -100,6 +135,8 @@ DEFAULTS = {
     "quota.cores_dir": "",
     "models.profiles_file": "",
     "charter.root": "",
+    "charter.baseline_root": "",
+    "charter.supplement_root": "",
     "charter.project_prefixes": {},
     "charter.map": {},
     "roles.prefixes": {},
@@ -290,10 +327,28 @@ def charter_project_prefixes() -> tuple:
 
 
 def charter_map() -> tuple:
-    table = get("charter.map") or {}
-    if not isinstance(table, dict):
-        return ()
-    return tuple((str(k).lower(), str(v)) for k, v in table.items() if str(v).strip())
+    """``(prefix, leaf)`` pairs, longest prefix first.
+
+    The built-in table is a **floor, not a default to be replaced**: a session
+    name prefix is a general fact (``wk-`` reads ``worker.md``), and a fresh
+    clone that configured nothing must still get its charters. A configured
+    ``charter.map`` is merged **in front** so a deployment can override a
+    prefix or add one, without having to restate the whole table.
+
+    Before ISS-95 this returned only the configured table, which was empty in
+    every deployment -- so ``charter_for()`` answered "" for every session name
+    and warm-up injected no charter at all.
+    """
+    configured = get("charter.map") or {}
+    merged: list[tuple[str, str]] = []
+    if isinstance(configured, dict):
+        merged.extend((str(k).lower(), str(v)) for k, v in configured.items()
+                      if str(v).strip())
+    seen = {k for k, _ in merged}
+    merged.extend((k, v) for k, v in DEFAULT_CHARTER_MAP if k not in seen)
+    # Longest prefix first: ``pm-<project>`` must win over ``pm``.
+    merged.sort(key=lambda kv: len(kv[0]), reverse=True)
+    return tuple(merged)
 
 
 def role_prefixes() -> dict:

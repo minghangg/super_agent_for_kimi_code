@@ -40,6 +40,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from . import agent_config as agentcfg
+from . import charters
 
 DEFAULT_PORTS = (58627, 58628)
 TOKEN_ENV = "KIMI_CODE_SERVER_TOKEN"
@@ -65,9 +66,11 @@ WARMUP_PROMPT = (
 
 # 会话三契约（用户 2026-11-10）：新建会话的第一条消息改为「先读契约文件」，
 # 内容＝思考用英文（ASD-STE100）／输出精准（≤30字一句）／写码前七级检查。
-# 契约文件落在 `charter.root` 下（`rules/shared/rules/session_contract.md`）；
-# 未配置则回退裸 ping。
-CONTRACT_REL = os.path.join("rules", "shared", "rules", "session_contract.md")
+#
+# **本包自带一份**（`rules/charters/session_contract.md`），所以 safkc 不依赖
+# 任何外部仓就能建会话——换机后只要配置对，装好本包即可工作。部署若要换一版
+# 契约，配 `charter.contract_file` 指过去；未配置时用自带的。
+CONTRACT_REL = os.path.join("rules", "charters", "session_contract.md")
 
 
 def _charter_root() -> str:
@@ -76,31 +79,34 @@ def _charter_root() -> str:
 
 
 def contract_file() -> str:
-    root = _charter_root()
-    return os.path.join(root, CONTRACT_REL) if root else ""
+    """The session contract a fresh session must read.
+
+    Order: ``charter.contract_file`` (explicit) → the copy shipped with this
+    package. Never the workbench's: a public package that cannot create a
+    session without a private checkout is not usable on another machine, and
+    that is the whole point of the split (ISS-95).
+
+    Returns ``""`` when neither exists, which the caller treats as "warm up
+    with a bare ping" -- a degraded but working state, not a refusal. The
+    contract shapes how a session writes, not whether it can start; a missing
+    charter is the fatal one.
+    """
+    explicit = str(agentcfg.get("charter.contract_file") or "").strip()
+    if explicit:
+        path = os.path.expanduser(explicit)
+        return path if os.path.isfile(path) else ""
+    shipped = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), CONTRACT_REL)
+    return shipped if os.path.isfile(shipped) else ""
 
 
-# 会话名前缀 → 章程文件名（用户 2026-11-16 令：所有角色建会话时都读各自章程）。
-# 判据只看前缀，不看角色字段——名字由 dispatch 自己拼，可预期。
-# 顺序重要：长前缀在前（项目专属前缀先于 `pm`）。
-GENERIC_CHARTER_MAP = (
-    ("wk", "worker.md"),
-    ("qa", "qa.md"),
-    ("pm-", "pm.md"),
-    ("pm", "pm.md"),
-    ("scout", "scout.md"),
-    ("steward", "steward.md"),
-    ("auditor", "auditor.md"),
-    ("reviewer", "reviewer.md"),
-    ("analyst", "_analyst_or_at.md"),
-    ("at-", "_analyst_or_at.md"),
-    ("at", "_analyst_or_at.md"),
-    ("planner", "planner.md"),
-    ("supervisor", "supervisor_state.md"),
-)
-
+# 会话名前缀 → 章程文件名。**内置表在 `agent_config.DEFAULT_CHARTER_MAP`**
+# （ISS-95）。本文件此前自带一份 `GENERIC_CHARTER_MAP`，与 agent_config 的那份
+# 是两条真源——改一处另一处不生效，且两处都含 `_analyst_or_at.md` 这种需要
+# 双候选探测的特殊叶子名。现在只有一份，且叶子名就是真实文件名。
+#
 # 项目专属前缀（`charter.project_prefixes`）与私有章程文件名（`charter.map`）
-# 只在私有配置里给；公开默认是空表，运行期由 `charter_map()` 合并到通用表之前。
+# 只在私有配置里给；公开默认是空表，运行期由 `charter_map()` 合并到内置表之前。
 _PROJECT_PREFIXES: tuple = ()
 _EXTRA_CHARTER_MAP: tuple = ()
 
@@ -113,46 +119,52 @@ def set_charter_sources(project_prefixes=None, charter_map=None) -> None:
 
 
 def charter_map() -> tuple:
-    """生效的前缀表：项目专属前缀 → 私有章程 → 通用表。"""
-    return _PROJECT_PREFIXES + _EXTRA_CHARTER_MAP + GENERIC_CHARTER_MAP
+    """生效的前缀表：项目专属前缀 → 私有章程 → 内置表。
+
+    内置表在 ``agent_config.DEFAULT_CHARTER_MAP``（ISS-95）。此前本文件自带一份
+    ``GENERIC_CHARTER_MAP``，与 ``agent_config`` 的那份是两条真源——改一处另一处
+    不生效。现在只有一份。
+    """
+    return _PROJECT_PREFIXES + _EXTRA_CHARTER_MAP + agentcfg.charter_map()
 
 
 def charter_for(name: str) -> str:
-    """Charter file a fresh session must read before its first real turn.
+    """Baseline charter for a session name; ``""`` when the map has no hit.
 
-    用户 2026-11-16 令：**所有角色**建会话时都读各自章程——只注入
-    ``--persona`` 不够，那是隐式设置，对话里看不见；首条消息显式读一次，
-    才有 ``Read done.`` 回执可核。缺章程返回空串（不阻断，由调用方决定）。
+    Kept for callers that only need the general charter. New code should use
+    :func:`charter_files`, which also returns the deployment's supplement and
+    raises when the baseline is missing.
 
-    ``name`` 是会话名：``wk-ISS-87-impl-20261116``／``qa-lwa-ISS-86``／
-    ``pm-<项目>``／``scout-20261116`` 等。根目录取自 `charter.root`，未配置
-    时返回空串（`pmd.sh` 据此 die，不许起无章程会话）。
+    **This function still returns "" rather than raising.** That is deliberate
+    for one caller: ``--fetch`` and other read-only paths must not fail because
+    a session name was unusual. Session creation goes through
+    :func:`charter_files` instead, where a missing baseline is fatal (ISS-95).
     """
-    root = _charter_root()
-    stem = str(name or "").strip()
-    low = stem.lower()
-    for prefix, leaf in charter_map():
-        if low.startswith(prefix):
-            if leaf == "supervisor_state.md":
-                path = os.path.join(root, "handoff", leaf)
-            elif leaf == "_analyst_or_at.md":
-                # at → analyst 改名进行中：analyst.md 存在就用它，否则回退 at.md
-                for cand in ("analyst.md", "at.md"):
-                    cand_path = os.path.join(root, "assistants", cand)
-                    if os.path.isfile(cand_path):
-                        return cand_path
-                return ""
-            else:
-                path = os.path.join(root, "assistants", leaf)
-            return path if os.path.isfile(path) else ""
-    return ""
+    leaf = charters.leaf_for(name)
+    if not leaf:
+        return ""
+    path = charters.baseline_root() / leaf
+    return str(path) if path.is_file() else ""
 
 
-def warmup_prompt(charter: str = "", name: str = "") -> str:
-    """First message of a freshly created session: read contract (+ charter), confirm.
+def charter_files(name: str) -> tuple[str, str]:
+    """``(baseline, supplement)`` for a session that is about to be created.
+
+    Raises :class:`charters.CharterMissing` when the baseline is absent. The
+    caller must turn that into a refusal, not a session with no charter.
+    """
+    return charters.charter_files(name)
+
+
+def warmup_prompt(charter: str = "", name: str = "",
+                  supplement: str = "") -> str:
+    """First message of a freshly created session: read contract (+ charters).
 
     ``charter`` 非空时一并读——用户 2026-11-16 令：``wk-*`` 读 ``worker.md``，
     ``qa-*`` 读 ``qa.md``。两处都必须真读到，否则默认测试级别等规则不生效。
+
+    ``supplement``（ISS-95）是本机私有补充，**有则一并读，无则不出现**。它与
+    ``charter`` 是叠加关系，不是二选一：基线永远读，补充按部署情况读。
 
     ``name`` 非空时，把**本会话的键名**一并告知：引擎用正文末行
     ``<!-- session: <键名> -->`` 判定裁决归属，而键名是凭据，只有本会话知道
@@ -166,11 +178,18 @@ def warmup_prompt(charter: str = "", name: str = "") -> str:
             files.append(contract)
         if charter and os.path.isfile(charter):
             files.append(charter)
+        if supplement and os.path.isfile(supplement):
+            files.append(supplement)
         if files:
             posix = [f.replace(os.sep, "/") for f in files]
             # 权限限定到「那一次 Read」（2026-11-11 修正：原句"Only read X"与
             # "Do not call any tools"互相矛盾——read 本身就是 tool 调用）。
-            what = posix[0] if len(posix) == 1 else                 " and ".join([posix[0], posix[1]]) if len(posix) == 2 else                 ", ".join(posix[:-1]) + " and " + posix[-1]
+            if len(posix) == 1:
+                what = posix[0]
+            elif len(posix) == 2:
+                what = f"{posix[0]} and {posix[1]}"
+            else:
+                what = ", ".join(posix[:-1]) + " and " + posix[-1]
             text = (f"Read {what} with the Read tool. "
                     "Reply with exactly: Read done. "
                     "Do not use any other tool. Do not run any command.")
@@ -250,6 +269,15 @@ def stop_guard(marker: str, progress_dir: str) -> str:
 
 class DispatchError(RuntimeError):
     """Raised for any unrecoverable failure in the dispatch pipeline."""
+
+
+#: A session was refused because its baseline charter is missing (ISS-95).
+#:
+#: Separate from the parameter-error code on purpose: the two point at different
+#: repairs. A parameter error says "change your arguments"; this one says "the
+#: charters are not installed", and a caller that sees 7 would go looking in the
+#: wrong place. Same reasoning as #104's ctx-gate refusal, opposite direction.
+EXIT_CHARTER_MISSING = 9
 
 
 class NeedsPerson(Exception):
@@ -1142,7 +1170,8 @@ def model_self_name(base: str, token: str, model: str, task: str, cwd: str) -> s
 
 
 def activate_session(base: str, token: str, sid: str, timeout: float,
-                     charter: str = "", name: str = "") -> bool:
+                     charter: str = "", name: str = "",
+                     supplement: str = "") -> bool:
     """Run one trivial turn so a fresh session is activated before real work.
 
     Harmless when the session is already warm: it is just another no-op turn, and
@@ -1152,8 +1181,11 @@ def activate_session(base: str, token: str, sid: str, timeout: float,
     ``name`` is passed so the first message can tell the session its own key
     name: a verdict carries that key, and nothing else in the conversation
     knows which key this session holds.
+
+    ``supplement`` (ISS-95) is the deployment's private charter addition; it is
+    read **in addition to** ``charter``, never instead of it.
     """
-    run_turn(base, token, sid, warmup_prompt(charter, name),
+    run_turn(base, token, sid, warmup_prompt(charter, name, supplement),
              timeout=min(timeout, 120), quiet=True, permission_mode="yolo")
     print("[dispatch] activated (warm-up turn completed)")
     return True
@@ -1335,6 +1367,17 @@ def main(argv: list[str] | None = None) -> int:
             name = args.name
         else:
             name = model_self_name(base, token, DEFAULT_NAMING_MODEL, args.task, cwd)
+        # ISS-95：章程在建会话**之前**检查。基线缺失时不许建——一个没有章程
+        # 的会话会带着默认测试级别跑完一整轮，而没人看得见（2026-11-16 实证）。
+        # 这一步刻意放在 create_session 之前：先失败，不留孤儿会话。
+        try:
+            _baseline, _supplement = charter_files(name)
+        except charters.CharterMissing as exc:
+            print(f"[dispatch] 拒绝建会话：{exc}", file=sys.stderr)
+            print(f"[dispatch] 章程目录：{charters.baseline_root()}", file=sys.stderr)
+            print("[dispatch] 这是环境错（装规则），不是参数错（改参数）",
+                  file=sys.stderr)
+            return EXIT_CHARTER_MISSING
         sid = create_session(base, token, cwd, title=name)
         record_created(sid, name)
     # What lands: POST …/profile persists ONLY `model` as the alias. `provider`
@@ -1352,7 +1395,8 @@ def main(argv: list[str] | None = None) -> int:
     activated = False
     if not args.no_activate and not args.session:
         activated = activate_session(base, token, sid, args.timeout,
-                                     charter=charter_for(name), name=name)
+                                     charter=_baseline, name=name,
+                                     supplement=_supplement)
 
     marker = args.stop_marker or os.path.join(os.path.abspath(cwd), ".kimi", "tools", "STOP")
     progress_dir = os.path.join(os.path.abspath(cwd), ".kimi", "tools")

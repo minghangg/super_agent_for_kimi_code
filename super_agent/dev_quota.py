@@ -31,7 +31,30 @@ def default_config_path() -> str:
 
 
 def config_path() -> str:
-    return os.environ.get(CONFIG_PATH_ENV) or default_config_path()
+    """Where the quota file lives.
+
+    Three layers, most specific first: the ``DEV_QUOTA_CONFIG`` environment
+    variable, the deployment's ``quota.config_file`` in ``agent_config``, then
+    this checkout's own ``config/dev_quota.json``.
+
+    The middle layer is the one that matters for an open repository: the quota
+    file is generated at runtime, so its default location writes run state into
+    a tracked directory. A deployment points ``quota.config_file`` at an
+    ignored path (``new_workbench/`` in the private workbench) and nothing
+    lands here. Before this, that key had **no consumer at all** -- the file was
+    written into the public checkout on every first run (ISS-95).
+    """
+    env = os.environ.get(CONFIG_PATH_ENV)
+    if env:
+        return env
+    try:
+        from . import agent_config
+        configured = agent_config.quota_config()
+    except Exception:  # noqa: BLE001  配额不该因为配置层坏了而崩
+        configured = ""
+    if configured:
+        return configured
+    return default_config_path()
 
 
 def cores_dir() -> str:

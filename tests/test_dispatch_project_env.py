@@ -155,6 +155,11 @@ class DispatchSuccessPathTest(unittest.TestCase):
             mock.patch.object(D, "read_token", lambda: "fake-token"),
             mock.patch.object(D, "discover_base", lambda t, p: "http://127.0.0.1:1"),
             mock.patch.object(D, "create_session", lambda *a, **k: "session_fake"),
+            # ISS-95: session creation now refuses without a baseline charter.
+            # This test's subject is the project-environment pointer, not the
+            # charter, so it supplies both halves directly.
+            mock.patch.object(D, "charter_files",
+                              lambda n: ("/fake/worker.md", "")),
             mock.patch.object(D, "record_created", lambda *a, **k: None),
             mock.patch.object(D, "apply_profile", lambda *a, **k: {}),
             mock.patch.object(D, "activate_session", lambda *a, **k: None),
