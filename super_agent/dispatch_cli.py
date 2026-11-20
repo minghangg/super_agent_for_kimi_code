@@ -33,6 +33,7 @@ import os
 import re
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -1169,6 +1170,11 @@ def model_self_name(base: str, token: str, model: str, task: str, cwd: str) -> s
     return fallback
 
 
+#: Seconds between two "still running" markers during the warm-up turn.
+#: Named so the test can drive it down instead of sleeping 15 real seconds.
+WARMUP_BEAT_S = 15
+
+
 def activate_session(base: str, token: str, sid: str, timeout: float,
                      charter: str = "", name: str = "",
                      supplement: str = "") -> bool:
@@ -1184,10 +1190,30 @@ def activate_session(base: str, token: str, sid: str, timeout: float,
 
     ``supplement`` (ISS-95) is the deployment's private charter addition; it is
     read **in addition to** ``charter``, never instead of it.
+
+    **Progress is printed while it waits.** The call blocks for as long as the
+    round takes, and with ``--detach`` the caller sees nothing until it returns
+    -- measured 2026-11-21: a PM watched a silent 2m17s and reported the tool as
+    stuck while the warm-up itself had finished in 5 seconds. A marker every
+    15 seconds costs nothing and separates "working" from "hung".
     """
-    run_turn(base, token, sid, warmup_prompt(charter, name, supplement),
-             timeout=min(timeout, 120), quiet=True, permission_mode="yolo")
-    print("[dispatch] activated (warm-up turn completed)")
+    started = time.time()
+    done = threading.Event()
+
+    def tick() -> None:
+        while not done.wait(WARMUP_BEAT_S):
+            print(f"[dispatch] warm-up still running ({time.time() - started:.0f}s)",
+                  file=sys.stderr, flush=True)
+
+    beat = threading.Thread(target=tick, name="warmup-progress", daemon=True)
+    beat.start()
+    try:
+        run_turn(base, token, sid, warmup_prompt(charter, name, supplement),
+                 timeout=min(timeout, 120), quiet=True, permission_mode="yolo")
+    finally:
+        done.set()
+    print(f"[dispatch] activated (warm-up turn completed in "
+          f"{time.time() - started:.1f}s)")
     return True
 
 
@@ -1276,8 +1302,10 @@ def main(argv: list[str] | None = None) -> int:
         help="skip the warm-up turn that activates a fresh session",
     )
     parser.add_argument(
-        "--activate-only", action="store_true",
-        help="create a session, optionally run warm-up, and submit no task",
+        "--create-session", "--activate-only",
+        dest="activate_only", action="store_true",
+        help="只建会话并跑 warm-up，不发任务（= 旧名 --activate-only；"
+             "建完用 --session <id> 发第二条命令）",
     )
     parser.add_argument("--json", action="store_true", help="also print a JSON result block")
     parser.add_argument(
@@ -1324,8 +1352,11 @@ def main(argv: list[str] | None = None) -> int:
         base = discover_base(token, args.port)
         print(fetch_final_answer(base, token, args.session) or "(该会话没有 assistant 消息)")
         return 0
-    if not args.task and not args.activate_only:
-        parser.error("--task is required (unless --fetch or --activate-only)")
+    if not args.task and not args.activate_only and not args.fetch:
+        parser.error(
+            "--task is required (unless --fetch or --activate-only).\n"
+            "  只建会话跑 warm-up、不发任务时用 --activate-only，不必再传一个空格占位；"
+            "  --task \"\" 会被 argparse 当成「没给」，那是参数层的问题，不该由调用方绕。")
     if args.activate_only and args.session:
         parser.error("--activate-only is only valid when creating a session")
     if args.state_dir:

@@ -41,6 +41,22 @@ python -m super_agent.pm_router --packet <packet.json> --event implementation_qa
 
 新会话先 warmup 读契约和角色章程，再用 `--session --no-activate --detach` 发短令。创建后立刻 bind。复用会话前执行 ctx 门禁。
 
+**建会话用 `--create-session`，不要用 `--task ""`（2026-11-21 修）**：
+
+```bash
+# 第一遍：只建会话 + warmup。不传 --task——没有任务就是没有任务。
+python -m super_agent.dispatch_cli --cwd <项目仓> --name <键名> \
+  --create-session --detach --timeout 300
+
+# 第二遍：发短令（--session 不跑 warmup，加 --no-activate 省等待）
+python -m super_agent.dispatch_cli --session <sid> --detach --no-activate \
+  --timeout 300 --task "<短令>"
+```
+
+- `--task ""` 会被 argparse 当成「没给」，直接报 `--task is required`。旧法用单个空格绕过，能跑但会教坏后人。
+- 旧名 `--activate-only` 仍可用，新写的一律用 `--create-session`。
+- **warmup 期间每 15 秒打一行 `warm-up still running (Ns)`，结束打 `activated (… in X.Xs)`。** 看到这两行说明在跑；一行都没有才该怀疑卡住。实测 warmup 本身约 5 秒，别把「外围在等」误判成「工具卡死」。
+
 worker 的 `--cwd` 是项目仓；QA 按部署约定运行，但测试必须在被验项目执行。PM 自己不跑测试。
 
 ## 4. 状态维护

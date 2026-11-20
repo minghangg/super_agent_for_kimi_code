@@ -80,6 +80,17 @@ python -m super_agent.issue_cli comment --role <自己> --project <项目> --iss
 
 手工创建新会话分两步：先 warmup 读契约和角色章程，再用 `--session --no-activate` 发任务。`at start` 封装 AT 的创建、绑定和首个任务。
 
+```bash
+# 第一遍：只建会话 + warmup（不传 --task）
+python -m super_agent.dispatch_cli --cwd <工作台> --name <键名> --create-session --detach --timeout 300
+# 第二遍：发任务
+python -m super_agent.dispatch_cli --session <sid> --detach --no-activate --timeout 300 --task "<任务>"
+```
+
+**不要用 `--task ""` 建会话**：空串是 falsy，argparse 报 `--task is required`。`--create-session` 才是「只要会话、不要任务」的写法；旧名 `--activate-only` 仍可用。
+
+**warmup 会打进度**：每 15 秒一行 `warm-up still running (Ns)`，结束一行 `activated (… in X.Xs)`。见到进度说明在跑，不必重试。
+
 复用会话前执行 ctx 门禁。不要让复用命令覆盖用户手选模型。新会话键必须带可验证随机尾。
 
 ## 8. 等待与异常

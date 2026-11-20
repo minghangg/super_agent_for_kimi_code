@@ -63,3 +63,18 @@ python -m super_agent.requirements approve --role supervisor \
 ## 6. 交接与运维
 
 角色换血按 `rules/charters/rotation.md`。AT 换血必须验证新绑定和答案只回新 sid。运维记录与 scout 固定单保持挂起，工作时才摘挂起。
+
+**建会话永远是两条命令**（2026-11-21 修，`rotation.md` §1 有完整说明）：
+
+```bash
+# 第一遍：只建会话 + warmup。用 --create-session，不传 --task。
+python -m super_agent.dispatch_cli --cwd <工作台> --name <键名> \
+  --create-session --detach --timeout 300
+
+# 第二遍：发任务
+python -m super_agent.dispatch_cli --session <sid> --detach --no-activate \
+  --timeout 300 --task "<任务>"
+```
+
+- **别用 `--task ""`**：空串是 falsy，argparse 报 `--task is required`。旧法用单个空格绕过，现在不必了。
+- **warmup 期间每 15 秒打 `warm-up still running (Ns)`**，结束打 `activated (… in X.Xs)`。有这两行就是在跑；一行都没有才该查卡死。实测 warmup 本身约 5 秒——外围空等不是工具卡住。

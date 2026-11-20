@@ -23,25 +23,30 @@ PM 换血只带 approved 调度包、当前路由阶段和异常队列；新 PM 
 | 0 | **核旧模型，记下来** | 读旧会话 wire 的最后一条 `usage.record.model` | 有值；这是新会话必须沿用的模型 |
 | 1 | 核旧会话占用 | `python -m super_agent.rotation show --key <键>` | `old_ctx` 有值；<60% 时换血收益低，须说明理由 |
 | 2 | 要求对方写交接档 | `python -m super_agent.console send <旧sid> "请按 handoff 模板写交接档"` | 对方回 `[交接完成]` |
-| 3 | 建新会话（**第一遍：建 + warmup**） | `python -m super_agent.dispatch_cli --cwd <工作台> --name <新键> --detach --task ""`（**不带 `--no-activate`**） | 新会话 wire 出现 `Read done.`，首条消息含契约与章程路径 |
+| 3 | 建新会话（**第一遍：建 + warmup**） | `python -m super_agent.dispatch_cli --cwd <工作台> --name <新键> --create-session --detach`（**不传 `--task`，不带 `--no-activate`**） | 期间每 15 秒打一行 `warm-up still running (Ns)`；结束打 `activated (warm-up turn completed in X.Xs)`；新会话 wire 出现 `Read done.` |
 | 3b | **第二遍：发真正的内容** | `python -m super_agent.dispatch_cli --session <新sid> --detach --no-activate --task <任务>` | 任务正常执行 |
 | 4 | **把模型改回第 0 步的值** | `POST /api/v1/sessions/<新sid>/profile` `{"agent_config":{"model":"<第0步的值>"}}`，再发一轮让它生效 | 新会话 wire 的 `usage.record.model` **等于**旧会话的值 |
 | 5 | 换登记 ＋ 归档 | `python -m super_agent.sessions_ledger set <键> <新sid>` 然后 `archive <旧sid>` | `session.rotated` 与 `session.archived` 都落事件流 |
 | 6 | 写记录 | `python -m super_agent.rotation record --key <键> --trigger-reason … --ordered-by … --handoff-doc …` | 记录贴进运维单 |
 
-**新建会话＝两条命令，不是一条（用户 2026-11-20 定）**：warmup 只在 `if not args.no_activate and not args.session` 时跑（`dispatch_cli.py:1396`），所以**建会话时不带 `--no-activate`，复用会话时才带**。
+**新建会话＝两条命令，不是一条（用户 2026-11-20 定）**：warmup 只在 `if not args.no_activate and not args.session` 时跑，所以**建会话时不带 `--no-activate`，复用会话时才带**。
 
 ```bash
-# 第一遍：建会话 + 自动 warmup（读契约 + 读章程 + 告知键名）
-python -m super_agent.dispatch_cli --cwd <工作台> --name <新键> --detach \
-  --timeout 300 --task ""
+# 第一遍：只建会话 + warmup（读契约 + 读章程 + 告知键名）
+# 用 --create-session，不要传 --task：没有任务就是没有任务。
+python -m super_agent.dispatch_cli --cwd <工作台> --name <新键> --create-session \
+  --detach --timeout 300
 
 # 第二遍：发真正的内容（--session 本身就不跑 warmup，加 --no-activate 免掉多余等待）
 python -m super_agent.dispatch_cli --session <新sid> --detach --no-activate \
   --timeout 300 --task "<真正要做的事>"
 ```
 
-**为什么分两遍**：第一遍的 `--task` 内容会被 warmup 挤掉——warmup 占掉一轮，`--timeout` 预算被它吃掉，主任务赶不上就报 `round did not start within 120s`。分两遍后各拿各的预算，两轮都完整。
+**别用 `--task ""` 建会话（2026-11-21 修）**：空字符串在 `if not args.task` 里是 falsy，和「根本没传 `--task`」走同一分支，argparse 直接报 `--task is required`。有人用单个空格绕过去——能跑，但教坏后人。现在用 `--create-session`：它声明「只要会话，不要任务」，空任务合法。旧名 `--activate-only` 仍可用。
+
+**为什么分两遍**：两轮各拿各的 `--timeout` 预算。合成一条时 warmup 占掉一轮，主任务赶不上就报 `round did not start within 120s`，而 warmup 其实成功了。
+
+**warmup 期间会打进度（2026-11-21 加）**：每 15 秒一行 `[dispatch] warm-up still running (Ns)` 到 stderr，结束打 `[dispatch] activated (warm-up turn completed in X.Xs)`。**没有这两行时才该怀疑卡住**——实测一次 warmup 只花 5 秒，而外围空等 2 分 17 秒，静默让「在跑」看起来像「卡死」。
 
 **判据**：
 - 第一遍后 wire 有 `Read done.`，`context.append_message` 首条含 `session_contract.md` 与角色章程路径；
