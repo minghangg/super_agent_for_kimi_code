@@ -84,7 +84,7 @@ class Comments:
     def __init__(self):
         self.rows = []
 
-    def add(self, cid, body, author="at", session_key="at-demo"):
+    def add(self, cid, body, author="at", session_key="at-demo-3f7c1a90"):
         self.rows.append({"id": cid, "issue": 1, "body": body,
                           "author": author, "created_at": "",
                           "session_key": session_key})
@@ -134,11 +134,11 @@ class Base(unittest.TestCase):
         self.sessions_path.write_text(json.dumps({
             "supervisor": {"id": "session_sup"},
             "pm-demo-3f7c1a90": {"id": "session_pm"},
-            "at-demo": {"id": "session_at"},
+            "at-demo-3f7c1a90": {"id": "session_at"},
         }), encoding="utf-8")
         self.issue_sessions = self.events.parent / "issue_sessions.json"
         self.issue_sessions.write_text(json.dumps({
-            THREAD: {"at": {"name": "at-demo", "session": "session_at",
+            THREAD: {"at": {"name": "at-demo-3f7c1a90", "session": "session_at",
                             "issue": 1}}}), encoding="utf-8")
         self.bind()
 
@@ -167,7 +167,7 @@ class Base(unittest.TestCase):
              "role": "pm", "issue": 1},
             {"seq": 7, "at": "2026-11-13T10:00:06+00:00",
              "type": session_events.CREATED, "sid": "session_at",
-             "key": "at-demo"},
+             "key": "at-demo-3f7c1a90"},
             {"seq": 8, "at": "2026-11-13T10:00:07+00:00",
              "type": session_events.BOUND, "sid": "session_at", "key": THREAD,
              "role": "at", "issue": 1},
@@ -390,7 +390,7 @@ class AtMostOnce(Base):
         self.source.add(9100, AT_READY)
         engine.run_once()
         index = engine.store.load_index()
-        event = {"id": 9100, "body": AT_READY, "session_key": "at-demo"}
+        event = {"id": 9100, "body": AT_READY, "session_key": "at-demo-3f7c1a90"}
         engine._on_at_verdict(index, THREAD, 1, event,
                               markers.parse_at_verdict(AT_READY))
         self.assertEqual(len(self.bus.payloads("event.agent.supervisor")), 1,
@@ -429,10 +429,10 @@ class SessionKeys(Base):
     def test_j7_at_keys_are_found_in_both_sources(self):
         engine = self.engine()
         keys = engine._at_session_keys(THREAD)
-        self.assertIn("at-demo", keys)
+        self.assertIn("at-demo-3f7c1a90", keys)
         self.assertIn("session_at", keys)
         self.assertTrue(engine._at_verified("at-x",
-                                            {"session_key": "at-demo"}))
+                                            {"session_key": "at-demo-3f7c1a90"}))
 
     def test_a_non_at_key_is_not_verified(self):
         engine = self.engine()
@@ -529,7 +529,7 @@ class QuestionnaireEndToEnd(Base):
         # Verified by the registered name, but there is no session id to send
         # to: the question is still filed, it simply cannot be answered back.
         self.issue_sessions.write_text(json.dumps({
-            THREAD: {"at": {"name": "at-demo"}}}), encoding="utf-8")
+            THREAD: {"at": {"name": "at-demo-3f7c1a90"}}}), encoding="utf-8")
         self.sessions_path.write_text(json.dumps(
             {"supervisor": {"id": "session_sup"}}), encoding="utf-8")
         engine = self.engine(engine_cfg={"at_question_port": 59999})
@@ -706,13 +706,13 @@ class AtSessionIsThreadLocal(Base):
     def setUp(self):
         super().setUp()
         self.issue_sessions.write_text(json.dumps({
-            THREAD: {"at": {"name": "at-demo", "session": "session_at"}},
-            self.OTHER: {"at": {"name": "at-other", "session": "session_other"}},
+            THREAD: {"at": {"name": "at-demo-3f7c1a90", "session": "session_at"}},
+            self.OTHER: {"at": {"name": "at-other-4c8f1a63", "session": "session_other"}},
         }), encoding="utf-8")
         self.sessions_path.write_text(json.dumps({
             "supervisor": {"id": "session_sup"},
-            "at-aaa-first": {"id": "session_aaa_first"},
-            "at-other": {"id": "session_other"},
+            "at-aaa-first-7d3e9b21": {"id": "session_aaa_first"},
+            "at-other-4c8f1a63": {"id": "session_other"},
         }), encoding="utf-8")
 
     def test_an_unbound_thread_gets_no_global_at_session(self):
@@ -734,14 +734,19 @@ class AtSessionIsThreadLocal(Base):
         # ``at-aaa-first`` key sits in ``sessions.json`` - the old fallback
         # spends it, the fail-closed path leaves the question unanswered.
         self.issue_sessions.write_text(json.dumps({
-            THREAD: {"at": {"name": "at-demo", "session": "session_at"}},
+            THREAD: {"at": {"name": "at-demo-3f7c1a90", "session": "session_at"}},
         }), encoding="utf-8")
         engine = self.engine(engine_cfg={"at_question_port": 59999})
         engine._round_issue = lambda *a, **k: None      # keep the threads off
         index = engine.store.load_index()
         body = "[AT] 有疑问 #9 <!-- verdict: questions -->"
+        # ISS-88: name a key that is actually in `sessions.json`. This test's
+        # subject is the delivery target (`sid` must stay empty for an unbound
+        # thread), not the verification hole, so the key is real and
+        # verification passes; the assertion below is about the sid.
         engine._on_at_verdict(index, "owner/demo#9", 9,
-                              {"id": 9100, "body": body},
+                              {"id": 9100, "body": body,
+                               "session_key": "at-aaa-first-7d3e9b21"},
                               markers.parse_at_verdict(body))
         files = list((self.state / "atserve" / "questions").glob("*.json"))
         self.assertEqual(len(files), 1)
@@ -749,6 +754,96 @@ class AtSessionIsThreadLocal(Base):
         self.assertEqual(record["thread"], "owner/demo#9")
         self.assertEqual(record["sid"], "",
                          "an unbound thread must not borrow another AT")
+
+
+class PrefixParity(unittest.TestCase):
+    """ISS-88: the three role whitelists agree on what a key looks like.
+
+    The three functions were built at different times and drifted: PM and QA
+    required a random tail after #87, AT did not, and AT's no-``session_key``
+    branch answered "some AT exists" where PM answered False. One mechanism
+    with three behaviours is not a rule, it is three coincidences.
+
+    The acceptance shape is the issue's own: keys that merely *start* with the
+    role letters must not match, and ``<role>-<tail>`` keys must.
+    """
+
+    THREAD = "owner/demo#1"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.events = self.root / "lifecycle" / "events.jsonl"
+        self.events.parent.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(self.tmp.cleanup)
+
+    def engine_with(self, names, scopes=("demo",)):
+        (self.events.parent / "sessions.json").write_text(json.dumps(
+            {n: {"id": f"session_{i:08d}-0000-0000-0000-000000000000"}
+             for i, n in enumerate(names)}), encoding="utf-8")
+        (self.events.parent / "issue_sessions.json").write_text("{}", encoding="utf-8")
+        engine = Engine.__new__(Engine)
+        engine.role = ""
+        engine.markers = ()
+        engine._session_stream = lambda: ("live", self.events.parent / "sessions.json")
+        engine._session_state = lambda: {"released": [], "sessions": {}}
+        engine._load_issue_sessions = lambda: {}
+        engine._issue_session_entry = lambda thread: {}
+        engine._thread_scopes = lambda thread: set(scopes)
+        return engine
+
+    def test_a_name_that_only_starts_with_the_role_letters_does_not_match(self):
+        # The issue's own examples: `pmboot`, `qatar`, `atboot`. A prefix that
+        # is two letters long claims all of them.
+        engine = self.engine_with(["pmboot", "qatar", "atboot", "attempt"])
+        self.assertEqual(engine._pm_session_keys(self.THREAD), set())
+        self.assertEqual(engine._qa_session_keys(self.THREAD), set())
+        self.assertEqual(engine._at_session_keys(self.THREAD), set())
+
+    def test_a_bare_role_name_does_not_match(self):
+        engine = self.engine_with(["pm", "qa", "at"])
+        self.assertEqual(engine._pm_session_keys(self.THREAD), set())
+        self.assertEqual(engine._qa_session_keys(self.THREAD), set())
+        self.assertEqual(engine._at_session_keys(self.THREAD), set())
+
+    def test_a_random_tailed_key_matches_its_own_role_only(self):
+        engine = self.engine_with(["pm-demo-3f7c1a90", "qa-demo-3f7c1a90",
+                                   "at-demo-3f7c1a90"])
+        self.assertEqual(engine._pm_session_keys(self.THREAD), {"pm-demo-3f7c1a90"})
+        self.assertEqual(engine._qa_session_keys(self.THREAD), {"qa-demo-3f7c1a90"})
+        self.assertEqual(engine._at_session_keys(self.THREAD), {"at-demo-3f7c1a90"})
+
+    def test_a_guessable_tail_matches_no_role(self):
+        # `-20261116` is date-shaped: it looks like a tail and is guessable.
+        engine = self.engine_with(["pm-demo-20261116", "qa-demo-20261116",
+                                   "at-demo-20261116"])
+        self.assertEqual(engine._pm_session_keys(self.THREAD), set())
+        self.assertEqual(engine._qa_session_keys(self.THREAD), set())
+        self.assertEqual(engine._at_session_keys(self.THREAD), set())
+
+    def test_an_archived_key_matches_no_role(self):
+        # One session, archived: all three routes must skip it. Built by hand
+        # rather than through `engine_with`, because that helper assigns a
+        # distinct id per name and the point here is a shared archived session.
+        names = ["pm-demo-3f7c1a90", "qa-demo-3f7c1a90", "at-demo-3f7c1a90"]
+        (self.events.parent / "sessions.json").write_text(json.dumps(
+            {n: {"id": "session_dead"} for n in names}), encoding="utf-8")
+        engine = self.engine_with([])
+        engine._session_state = lambda: {
+            "released": [], "sessions": {"session_dead": {"archived": True}}}
+        self.assertEqual(engine._pm_session_keys(self.THREAD), set())
+        self.assertEqual(engine._qa_session_keys(self.THREAD), set())
+        self.assertEqual(engine._at_session_keys(self.THREAD), set())
+
+    def test_no_role_verifies_a_comment_that_names_no_key(self):
+        # The #87 shape, now uniform: "the thread has one of these at all" is
+        # not a check. AT was the last route still answering True here.
+        engine = self.engine_with(["pm-demo-3f7c1a90", "qa-demo-3f7c1a90",
+                                   "at-demo-3f7c1a90"])
+        bare = {"id": 1, "body": "x"}
+        self.assertFalse(engine._pm_verified(self.THREAD, bare))
+        self.assertFalse(engine._review_verified(self.THREAD, bare))
+        self.assertFalse(engine._at_verified(self.THREAD, bare))
 
 
 if __name__ == "__main__":

@@ -925,11 +925,23 @@ class Engine:
         The same two sources as the QA and PM checks, unioned so a rotation
         does not lose the check: the ``at`` entry of
         ``issue_sessions.json[thread]`` (``name`` and ``session``), and every
-        ``at-*`` key in ``sessions.json``.
+        ``at-*`` key in ``sessions.json`` **that passes the same two filters
+        the other two roles apply** (ISS-88):
+
+        * a **random tail** (``sessionkeys.has_random_suffix``) - the readable
+          prefix says which role, the tail is what says a key was issued;
+        * **still live** - not released, and its session not archived.
 
         The prefix is ``at-`` and not ``at``: a bare ``at`` prefix also claims
         keys that merely start with those two letters, and this check decides
         whether a questionnaire link is put in front of a person.
+
+        Why the two filters matter here rather than only on the other two
+        routes: this list feeds :meth:`_at_verified`, whose no-``session_key``
+        branch answers "the thread has an AT at all". A guessable or retired
+        ``at-*`` name kept in ``sessions.json`` would make that answer true for
+        a key nobody issued - the same hole #87 closed for PM and QA, left open
+        on this route because that issue scoped itself to those two.
         """
         keys: set[str] = set()
         ledger = self._issue_session_entry(thread)
@@ -945,8 +957,25 @@ class Engine:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             data = {}
-        if isinstance(data, dict):
-            keys.update(str(k) for k in data if str(k).startswith("at-"))
+        if not isinstance(data, dict):
+            return keys
+        state = self._session_state()
+        released = set(state.get("released") or ())
+        sessions = state.get("sessions") or {}
+        for raw_name, item in data.items():
+            name = str(raw_name)
+            if sessionkeys.role_of(name) != "at":
+                continue
+            if not sessionkeys.has_random_suffix(name):
+                # Guessable name: it stays in ``sessions.json``, it stops being
+                # a check. Same rule as the PM and QA routes.
+                continue
+            if name in released:
+                continue
+            sid = str((item or {}).get("id") or "") if isinstance(item, dict) else ""
+            if (sessions.get(sid) or {}).get("archived"):
+                continue
+            keys.add(name)
         return keys
 
     def _at_sid(self, thread: str) -> str:
@@ -981,17 +1010,21 @@ class Engine:
         """Does this comment come from an AT key of this thread?
 
         The same rule as :meth:`_pm_verified`: a named ``session_key`` is
-        checked against the whitelist exactly, and without that field the
-        answer is "the thread has an AT at all". A miss does **not** let the
-        verdict through - a ``questions`` frame puts a link in front of a
-        person and asks them to answer it, so an unattributed one is a phishing
-        shape, not just a loose end.
+        checked against the whitelist exactly, and **without that field the
+        answer is False**.
+
+        It used to answer ``bool(keys)`` - "the thread has an AT at all" - which
+        is true for every comment on a thread that has one, so it could not
+        fail and was not a check (ISS-88; the same defect #87 fixed for PM and
+        QA). A ``questions`` frame puts a link in front of a person and asks
+        them to answer it, so an unattributed one is a phishing shape, not just
+        a loose end: it must not pass on "some AT exists".
         """
         keys = self._at_session_keys(thread)
         claimed = str(comment.get("session_key") or "")
         if claimed:
             return claimed in keys
-        return bool(keys)
+        return False
 
     def _pm_target(self, thread: str, issue: int) -> dict:
         """Where a verdict goes: the project's PM, never a worker."""

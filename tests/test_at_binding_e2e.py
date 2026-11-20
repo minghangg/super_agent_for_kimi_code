@@ -131,9 +131,10 @@ class Comments:
     def __init__(self):
         self.rows = []
 
-    def add(self, cid, body, author="at"):
+    def add(self, cid, body, author="at", session_key=""):
         self.rows.append({"id": cid, "issue": 64, "body": body,
-                          "author": author, "created_at": ""})
+                          "author": author, "created_at": "",
+                          "session_key": session_key})
 
     def issues(self, limit=20):
         return [64]
@@ -207,7 +208,7 @@ class Base(unittest.TestCase):
         self.tmp.cleanup()
 
     # ------------------------------------------------------------ the producer
-    def bind_at(self, session=AT_SID, name="at-e2e", issue=64):
+    def bind_at(self, session=AT_SID, name="at-e2e-8c41d2f7", issue=64):
         """Run the real ``gh_issue.py bind --bind-role at``.
 
         Not a helper that writes JSON - it shells out to the workbench CLI, so
@@ -250,7 +251,7 @@ class Base(unittest.TestCase):
         from super_agent import session_events
         rows = [
             {"seq": 1, "at": "2026-11-13T10:00:00+00:00",
-             "type": session_events.CREATED, "sid": AT_SID, "key": "at-e2e"},
+             "type": session_events.CREATED, "sid": AT_SID, "key": "at-e2e-8c41d2f7"},
             {"seq": 2, "at": "2026-11-13T10:00:01+00:00",
              "type": session_events.BOUND, "sid": AT_SID, "key": THREAD,
              "role": "at", "issue": 64},
@@ -301,7 +302,7 @@ class E2EngineReads(Base):
         self.assertEqual(self.bind_at().returncode, 0)
         path = self.shared / "issue_sessions.json"
         db = json.loads(path.read_text(encoding="utf-8"))
-        db[THREAD] = {"at": {"session": "session_qualified", "name": "at-q"}}
+        db[THREAD] = {"at": {"session": "session_qualified", "name": "at-q-5b92e014"}}
         path.write_text(json.dumps(db), encoding="utf-8")
         engine = self.engine()
         self.assertEqual(engine._at_sid(THREAD), "session_qualified")
@@ -406,10 +407,14 @@ class E5UnboundFailsClosed(Base):
         # filed), but no thread is bound - the sid must stay empty.
         (self.shared / "sessions.json").write_text(json.dumps({
             "supervisor": {"id": "session_sup"},
-            "at-e2e": {"id": AT_SID},
+            "at-e2e-8c41d2f7": {"id": AT_SID},
         }), encoding="utf-8")
         engine = self.engine(engine_cfg={"at_question_port": 59999})
-        self.source.add(9100, QUESTIONS)
+        # ISS-88: an AT verdict must name its session_key. Before this, a
+        # missing key answered "the thread has an AT at all", so the check
+        # could not fail; this test's subject is the delivery target, not that
+        # hole, so it names a real key.
+        self.source.add(9100, QUESTIONS, session_key="at-e2e-8c41d2f7")
         engine.run_once()
         files = list((self.state / "atserve" / "questions").glob("*.json"))
         self.assertEqual(len(files), 1)
