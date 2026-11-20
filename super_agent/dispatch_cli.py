@@ -36,6 +36,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from . import agent_config as agentcfg
@@ -195,6 +196,40 @@ def warmup_prompt(charter: str = "", name: str = "") -> str:
 ASK_PATTERNS = ("必要时询问", "必要时问询", "先问我", "等我确认", "等你确认",
                 "授权后再", "需要你批准", "不确定就停")
 # 允许出现的正当用法：明确上升项／生产不可逆写的授权边界（判据式写法）。
+
+
+def project_env_pointer(cwd: str) -> str:
+    """One pointer line for the project whose directory ``cwd`` names (#101).
+
+    The project key is the **directory basename**, lower-cased -- the same
+    shape as the ``gh_projects.json`` key for every directory that has a
+    matching document. No project table is read: safkc has none, and the one in
+    the workbench is a cross-repo dependency this package does not take.
+
+    The directory itself comes from the one declared source,
+    :func:`agent_config.project_env_dir`, the same value ``doctor --project``
+    uses. This function only answers "is there a document for this key"; it
+    does not build a second path rule. No document (or no configured
+    directory) is a normal state -- a worker dispatched outside a registered
+    project must not be blocked by a missing optional pointer.
+    """
+    try:
+        key = Path(os.path.abspath(cwd)).name.strip().lower()
+    except (OSError, ValueError):
+        return ""
+    if not key:
+        return ""
+    raw = str(agentcfg.project_env_dir() or "").strip()
+    if not raw:
+        return ""
+    base = Path(raw)
+    if not base.is_dir():
+        return ""
+    # Exact stem match, like ``doctor --project``: a near-miss is not a hit.
+    exact = [p for p in base.glob("*.md") if p.stem == key]
+    if len(exact) != 1:
+        return ""
+    return f"项目环境：{key} → {exact[0]}"
 
 
 def lint_task_text(text: str) -> list[str]:
@@ -1325,6 +1360,12 @@ def main(argv: list[str] | None = None) -> int:
     # 守卫句成了每份任务书的纯噪音。不再追加；--stop-marker/--no-stop-guard 保留为兼容 no-op，
     # STOP 文件机制仍在（工具脚本可用），但不再是流程要求，也不自动写进任务书。
     task_text = args.task
+    # #101 关单前必核：本次派单的项目若登记了环境档案，打一行指针到 stderr。
+    # 只走 stderr：--json 的 stdout 是机器读的结果，不能混入一行说明。
+    # 推不出项目键／未登记 ⇒ project_env_pointer 返回 ""，静默放行。
+    pointer = project_env_pointer(cwd)
+    if pointer:
+        print(f"[dispatch] {pointer}", file=sys.stderr)
     pidemp = prompt_ref(args.issue, args.round_no, task_text)
     if args.detach:
         submit_prompt(base, token, sid, task_text, pidemp)
