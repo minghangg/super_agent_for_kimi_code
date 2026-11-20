@@ -122,6 +122,8 @@ python -m super_agent.requirements publish --role analyst --project <项目> \
   --issue <n> --file <需求包.json> --session-key <AT 的 at-... 键名>
 ```
 
+发布成功后命令直接输出 `question_url`，并创建 `<state_root>/atserve/questions/<qid>.json`；重复发布会按 comment_id＋hash 复用同一链接，引擎随后不会另建重复问卷。
+
 用户回答后，AT 收一行：`【AT 答案】#123 r1 已回答；全文：<路径>`。读取该 Markdown，形成下一 revision。还有问题就继续一轮一个问题；没有问题就将 `open_questions` 置空并发布 READY。
 
 ## 5. 用户：打开与回答

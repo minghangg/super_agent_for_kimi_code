@@ -79,6 +79,15 @@ class RequirementQuestions(unittest.TestCase):
         self.assertFalse(at_serve.load(self.root, second)["submitted"])
         self.assertEqual(at_serve.load(self.root, second)["revision"], 2)
 
+    def test_ensure_question_is_idempotent_per_comment_and_hash(self):
+        first = self.create()
+        second = at_serve.ensure_question(
+            root=self.root, thread="owner/demo#1", issue=1, comment_id=100,
+            sid="session_new", question="rewritten display",
+            requirement=self.requirement)
+        self.assertEqual(first, second)
+        self.assertEqual(len(list((self.root / "atserve" / "questions").glob("*.json"))), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,9 +8,11 @@ import sys
 from pathlib import Path
 
 from . import agent_config
+from . import at_serve
 from . import config as config_mod
 from . import issue_cli
 from . import requirements as req
+from . import session_ledger
 
 
 def _root(args) -> Path:
@@ -94,6 +96,30 @@ def cmd_sync(args) -> int:
     return 0
 
 
+def _question_link(args, ctx, repo: str, package: dict, comment_id: int) -> str:
+    database = session_ledger.load_issue_sessions(ctx.cfg)
+    binding_keys = [package["requirement_id"], f"{args.project}#{args.issue}",
+                    f"{repo.rsplit('/', 1)[-1]}#{args.issue}"]
+    binding = {}
+    for key in binding_keys:
+        candidate = database.get(key) or {}
+        at = candidate.get("at") if isinstance(candidate, dict) else {}
+        if isinstance(at, dict) and at.get("session"):
+            binding = at
+            break
+    try:
+        port = int((ctx.cfg.get("engine") or {}).get("at_question_port")
+                   or at_serve.DEFAULT_PORT)
+    except (TypeError, ValueError):
+        port = at_serve.DEFAULT_PORT
+    qid = at_serve.ensure_question(
+        root=_root(args), thread=package["requirement_id"], issue=args.issue,
+        comment_id=comment_id, sid=str(binding.get("session") or ""),
+        question=str(package["open_questions"][0]), requirement=package,
+        binding_keys=binding_keys)
+    return at_serve.url(port, qid)
+
+
 def cmd_publish(args) -> int:
     ctx = _ctx(args)
     role = issue_cli._role(args.role, ctx.roles)
@@ -119,6 +145,9 @@ def cmd_publish(args) -> int:
             raise req.RequirementError(
                 "same revision has different semantics; increment revision")
         print(f"unchanged {rid} r{package['revision']} {old.get('source_ref')}")
+        if package["open_questions"]:
+            print("question_url=" + _question_link(
+                args, ctx, repo, package, int(old["source_comment_id"])))
         req.save_projection(_root(args), projection)
         return 0
     if package["open_questions"]:
@@ -128,7 +157,7 @@ def cmd_publish(args) -> int:
         state, label = "ready", "可派单"
         question = ""
     summary = args.summary or package["objective"]
-    body = (f"{issue_cli._prefix(role, args.worker_name, ctx.roles)} {label} "
+    body = (f"{issue_cli._prefix(role, None, ctx.roles)} {label} "
             f"#{args.issue} <!-- verdict: {state} -->\n"
             f"{summary}\n\n{req.fence(req.PACKAGE_FENCE, package)}")
     if question:
@@ -140,6 +169,9 @@ def cmd_publish(args) -> int:
         return 0
     print(f"published {rid} r{package['revision']} "
           f"hash={package['requirement_hash']} cid={out.get('id')}")
+    if package["open_questions"]:
+        print("question_url=" + _question_link(
+            args, ctx, repo, package, int(out["id"])))
     issue_cli._ledger(role, "comment", repo, args.issue, ctx.cfg,
                       note=f"requirement:r{package['revision']};cid:{out.get('id')}")
     _sync(args, ctx)

@@ -36,7 +36,7 @@ python -m super_agent.requirements publish --role analyst \
   --session-key <你的 at-... 键名>
 ```
 
-引擎生成链接并交 supervisor。你只转链接，不把问卷正文塞进会话。
+命令在评论成功后直接创建/复用问卷并输出 `question_url`。你把该链接交给 supervisor；引擎随后复用同一问题，不重复建链接。不要把问卷正文塞进会话。
 
 ## 3. 用户答案
 

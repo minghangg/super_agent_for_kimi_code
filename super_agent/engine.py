@@ -2223,7 +2223,7 @@ class Engine:
             requirement = verdict.get("_requirement")
             if requirement and requirement.get("open_questions"):
                 question = str(requirement["open_questions"][0])
-            qid = at_serve.create_question(
+            qid = at_serve.ensure_question(
                 root=self.store.root, thread=thread, issue=int(issue),
                 comment_id=int(cid), sid=self._at_sid(thread), question=question,
                 requirement=requirement,

@@ -76,6 +76,22 @@ def create_question(*, root, thread: str, issue: int, comment_id: int,
     return qid
 
 
+def ensure_question(**kwargs) -> str:
+    """Create a question once per comment and requirement hash."""
+    root = kwargs["root"]
+    comment_id = int(kwargs["comment_id"])
+    requirement = kwargs.get("requirement") or {}
+    digest = str(requirement.get("requirement_hash") or "")
+    for path in _dir(root).glob("*.json"):
+        record = load(root, path.stem) or {}
+        if record.get("comment_id") != comment_id:
+            continue
+        if digest and record.get("requirement_hash") != digest:
+            continue
+        return str(record.get("id") or path.stem)
+    return create_question(**kwargs)
+
+
 def url(port: int, qid: str) -> str:
     """The link a ``questions`` frame carries."""
     return f"http://{HOST}:{int(port)}/q/{qid}"
