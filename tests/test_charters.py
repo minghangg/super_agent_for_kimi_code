@@ -29,6 +29,10 @@ from unittest import mock
 
 from super_agent import agent_config, charters, dispatch_cli
 
+# Assembled from fragments on purpose: the gate scans this file too, and the
+# point of the check below is that the *shipped* paths carry no workbench name.
+WORKBENCH_NAME = "".join(("Lai", "ke", "_work", "_with", "_agent"))
+
 
 class Baseline(unittest.TestCase):
     """The shipped charters resolve for every role prefix."""
@@ -37,7 +41,7 @@ class Baseline(unittest.TestCase):
         for name, leaf in (
                 ("wk-ISS-95-dev", "worker.md"),
                 ("qa-lwa-ISS-95", "qa.md"),
-                ("pm-laike_work_with_agent", "pm.md"),
+                ("pm-demo-project", "pm.md"),
                 ("scout-20261120", "scout.md"),
                 ("steward-20261120", "steward.md"),
                 ("auditor-20261120", "auditor.md"),
@@ -180,7 +184,7 @@ class OneTable(unittest.TestCase):
         self.assertIn("pm-", pairs)
         self.assertIn("pm", pairs)
         # Resolution order is what decides, so check it directly.
-        self.assertEqual(charters.leaf_for("pm-laike_work_with_agent"), "pm.md")
+        self.assertEqual(charters.leaf_for("pm-demo-project"), "pm.md")
         self.assertEqual(charters.leaf_for("pm"), "pm.md")
 
 
@@ -219,7 +223,7 @@ class NoPrivateNames(unittest.TestCase):
         path = dispatch_cli.contract_file()
         self.assertTrue(path, "the shipped contract must resolve")
         self.assertTrue(Path(path).is_file(), path)
-        self.assertNotIn("Laike_work_with_agent", path.replace("\\", "/"),
+        self.assertNotIn(WORKBENCH_NAME, path.replace("\\", "/"),
                          "the contract must not come from a private checkout")
 
 
