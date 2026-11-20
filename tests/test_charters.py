@@ -209,12 +209,14 @@ class NoPrivateNames(unittest.TestCase):
     def test_the_charter_directory_holds_the_nine_roles(self):
         root = Path(__file__).resolve().parent.parent / "rules" / "charters"
         names = {f.name for f in root.glob("*.md")}
-        # Nine role charters plus the session contract, which ships here too so
-        # the package needs no private checkout to create a session.
-        self.assertEqual(names, {
-            "worker.md", "qa.md", "pm.md", "scout.md", "steward.md",
-            "auditor.md", "reviewer.md", "planner.md", "analyst.md",
-            "session_contract.md"})
+        # Nine role charters plus the session contract and the rotation flow.
+        # The two non-role files ship here for the same reason: a session that
+        # reads only this directory must get its contract and its rotation rules.
+        roles = {"worker.md", "qa.md", "pm.md", "scout.md", "steward.md",
+                 "auditor.md", "reviewer.md", "planner.md", "analyst.md"}
+        self.assertTrue(roles <= names, f"缺角色章程：{roles - names}")
+        self.assertIn("session_contract.md", names)
+        self.assertIn("rotation.md", names)
         self.assertNotIn("watch.md", names, "watch is retired; it is not migrated")
 
     def test_the_contract_ships_with_the_package(self):

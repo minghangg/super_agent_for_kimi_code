@@ -54,7 +54,7 @@
 
 **完工关单前，这三项逐项给出证据**（命令＋输出），写进交付。
 
-**反例（2026-11-17 实测，注意它属于第二种）**：`safkc/tools/gh_issue.py` 早已实现 `--session-key` 选项，有人传它就追加 `<!-- session: … -->`。**问题不是没人调用这个工具**——全仓 23 处 `comment` 调用都在调它。问题是**那 23 处没有一处传 `--session-key`**，所以 `compose_body` 那个分支在生产中从未执行。结果 `_pm_verified` 恒为 False，release 铃自 #87 起一次没响过，四条 PM verdict 全被判 unverified。**能力写好了三天，等于不存在。**
+**反例（2026-11-17 实测，注意它属于第二种）**：`super_agent/issue_cli.py` 早已实现 `--session-key` 选项，有人传它就追加 `<!-- session: … -->`。**问题不是没人调用这个工具**——全仓 23 处 `comment` 调用都在调它。问题是**那 23 处没有一处传 `--session-key`**，所以 `compose_body` 那个分支在生产中从未执行。结果 `_pm_verified` 恒为 False，release 铃自 #87 起一次没响过，四条 PM verdict 全被判 unverified。**能力写好了三天，等于不存在。**
 
 **判据**：交付里必须能指出「**哪一行、在什么条件下**」会执行到它。只指出「谁 import 了它／谁调了这个工具」不够——要指出**那条分支的运行条件**。
 
@@ -78,7 +78,7 @@
 
 ```bash
 
-python tools/gh_issue.py comment --role <你自己> --project <项目> --issue <n> \
+python -m super_agent.issue_cli comment --role <你自己> --project <项目> --issue <n> \
 
   --do <动作> --notify <提醒谁> --session-key <你的键名> --body-file <文件>
 
@@ -159,7 +159,7 @@ python tools/gh_issue.py comment --role <你自己> --project <项目> --issue <
 ### 命令
 
 ```bash
-python tools/gh_issue.py comment --role <你自己> --project <项目> --issue <n> \
+python -m super_agent.issue_cli comment --role <你自己> --project <项目> --issue <n> \
   --do <动作> --notify <提醒谁> --session-key <你的键名> --body-file <文件>
 ```
 
