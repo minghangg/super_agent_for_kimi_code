@@ -273,6 +273,27 @@ def _is_pm_or_supervisor_key(name: str) -> bool:
     return any(upper.startswith(prefix + "-") for prefix in VERDICT_KEY_PREFIXES)
 
 
+#: Session-key prefixes whose owner may declare a QA review. `qa-` covers both
+#: the standing QA (`qa-lwa-ISS-99`) and per-issue ones; `QA` alone is a role
+#: marker and is rejected by :func:`is_session_key_name`.
+QA_KEY_PREFIXES = ("QA",)
+
+
+def _is_qa_key(name: str) -> bool:
+    """Is ``name`` a QA session key?
+
+    ``完工`` means "I finished my work" for every role, so a five-part title
+    carrying it must be attributed before it can be read as a review verdict.
+    Without this a worker passes its own work by typing one word -- the same
+    hole the PM route closes with ``_is_pm_or_supervisor_key``, and one the
+    ``[QA]`` prefix never had.
+    """
+    if not is_session_key_name(name):
+        return False
+    upper = str(name or "").strip().upper()
+    return any(upper.startswith(prefix + "-") for prefix in QA_KEY_PREFIXES)
+
+
 def _five_leaf(five: dict) -> tuple[str, str]:
     """``(marker, name)`` an old-style caller would have seen for this title.
 
@@ -1267,12 +1288,16 @@ def parse_review(body: str) -> dict | None:
         # comes from the action word instead of the prose. ``退回`` is a reject;
         # ``完工`` is a pass. Every other action is not a review at all -- a
         # ``[qa-x]-[接单]-…`` line says "I took the job", not "I judged it".
-        if five["do"] == "退回":
-            verdict, matched = "reject", "退回"
-        elif five["do"] == "完工":
-            verdict, matched = "pass", "完工"
-        else:
+        #
+        # ``who`` must name a QA session, for the same reason the PM route needs
+        # a ``pm-`` key: ``完工`` is also how every worker reports a delivery, so
+        # without this check a worker could pass its own work by typing one
+        # word. The ``[QA]`` prefix it replaces never let that happen.
+        if five["do"] not in ("退回", "完工"):
             return None
+        if not _is_qa_key(five["who"]):
+            return None
+        verdict, matched = ("reject", "退回") if five["do"] == "退回" else ("pass", "完工")
         fix_needed, fix_matched, fix_structured = read_fix_token(line)
         return {"marker": QA, "verdict": verdict, "matched": matched, "line": line,
                 "fix_needed": fix_needed, "fix_matched": fix_matched,

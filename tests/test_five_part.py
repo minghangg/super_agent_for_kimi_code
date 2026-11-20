@@ -319,3 +319,36 @@ class AcknowledgeIsQuiet(unittest.TestCase):
     def test_a_delivery_still_spends_quota(self):
         self.assertTrue(decide_watch._is_real_delivery(
             "[wk-1]-[完工]-[pm-x]-[lwa]"))
+
+
+class OnlyQaDeclaresAReview(unittest.TestCase):
+    """``完工`` is every role's "I finished"; only a QA key means "passed".
+
+    Before this, any five-part title with ``完工`` parsed as a QA pass, so a
+    worker could pass its own work by typing one word. The ``[QA]`` prefix it
+    replaces never allowed that.
+    """
+
+    def test_a_worker_reporting_a_delivery_is_not_a_review(self):
+        for who in ("wk-1", "scout-20261120-0ca928f3", "pm-x-abc12345",
+                    "steward-1"):
+            body = f"[{who}]-[完工]-[supervisor]-[lwa] 做完了"
+            self.assertIsNone(markers.parse_review(body), who)
+
+    def test_a_qa_key_declares_both_verdicts(self):
+        passed = markers.parse_review("[qa-lwa-ISS-99]-[完工]-[pm-x]-[lwa]")
+        self.assertIsNotNone(passed)
+        self.assertEqual(passed["verdict"], "pass")
+        rejected = markers.parse_review("[qa-lwa-ISS-99]-[退回]-[pm-x]-[lwa]")
+        self.assertIsNotNone(rejected)
+        self.assertEqual(rejected["verdict"], "reject")
+
+    def test_a_bare_qa_marker_is_not_a_review(self):
+        # A role marker carries no session; the delivery check refuses it and so
+        # must this one.
+        self.assertIsNone(markers.parse_review("[QA]-[完工]-[pm-x]-[lwa]"))
+
+    def test_a_delivery_from_a_worker_still_parses_as_a_delivery(self):
+        body = "[wk-1]-[完工]-[pm-x]-[lwa] 做完了"
+        self.assertIsNotNone(markers.parse_delivery(body))
+        self.assertIsNone(markers.parse_review(body))
