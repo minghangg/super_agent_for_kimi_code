@@ -30,6 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import autostart as autostart
+from . import markers
 from . import session_health as health_mod
 from . import paths as kimi_paths
 
@@ -1706,7 +1707,7 @@ DELIVERY_HEARTBEAT_S = 600.0        # 每 10 分钟一行心跳（第一笔只�
 DELIVERY_BURST_WINDOW_S = 300.0     # 首条之后多少秒内的追加合并成一条汇总（红线 ≤300）
 BURST_LIST_MAX = 50                 # 汇总正文最多列 50 个 cid，其余给 ledger 行区间
 DELIVERY_SEEN_DAYS = 7              # 精确键保留窗口
-DELIVERY_MAX_PER_DAY = 3            # 当日 nudge > 3 ⇒ **只停该单**
+DELIVERY_MAX_PER_DAY = 8            # 当日 nudge > 8 ⇒ **只停该单**（ISS-99：3→8）
 DELIVERY_PENDING_MAX = 200          # 已升级的 pending 只保留最近 200 条
 DELIVERY_ESCALATE_S = 3600.0        # 1h 内无 pm 收据 ⇒ 升级
 DELIVERY_PENDING_CHECK_S = 60.0     # 收据/汇总/升级的检查节流
@@ -2227,6 +2228,49 @@ def _append_undelivered(st: dict, rec: dict, now: float) -> None:
         pass
 
 
+def _title_of(note: str) -> str | None:
+    """The comment's first line, carried in the ledger note (ISS-99).
+
+    ``None`` means the row predates the title field. That is **not** the same as
+    an empty title: a row with no title cannot be judged, and judging it anyway
+    is how a probe spends quota. The caller skips it and counts ``no_title``.
+
+    Format written by ``issue_cli.cmd_comment``::
+
+        cid:7012345678;title:[wk-…]-[完工]-[pm]-[lwa]-[701234]
+    """
+    if not note.startswith("cid:"):
+        return None
+    _, sep, rest = note.partition(";title:")
+    if not sep:
+        return None
+    return rest.strip()
+
+
+def _is_real_delivery(title: str) -> bool:
+    """Does this first line claim a delivery that should spend quota?
+
+    Three conditions, all structural (ISS-99):
+
+    * the line parses as a five-part title -- a bare ``[WK:x]`` legacy line has
+      no action, so it cannot say "I delivered" on purpose;
+    * the action is in the whitelist -- a typo means "no notification", which is
+      the safe direction;
+    * the action is not ``调试`` -- that one exists precisely so a probe does not
+      have to pretend to be a delivery.
+
+    ``No Notify`` does **not** disqualify a delivery: a worker may deliver
+    without asking anyone to be paged, and the quota is about the reminder the
+    watcher would send, not about the comment.
+    """
+    five = markers.parse_five(title)
+    if five is None:
+        return False
+    if not five.get("action_ok"):
+        return False
+    return five["do"] not in markers.SILENT_ACTIONS
+
+
 def _ledger_rows() -> list[dict]:
     """全量台账行（供收据判定）；按 (size, mtime) 缓存，避免每分钟读 11MB。"""
     p = _delivery_paths()["ledger"]
@@ -2488,6 +2532,18 @@ def scan_deliveries(st: dict, *, dry: bool, now: float, force_replay: bool = Fal
         # 代价写明：这类交付**没有自动告警，靠人读台账**。
         if not note.startswith("cid:"):
             stats_inc(st, "no_evidence", now=now)
+            continue
+        # ISS-99：**探针只看标题**。台账行带 `title:<首行>` 时，首行必须是五段式
+        # 且动作在白名单、且不是 `[调试]`，才算一次真交付。
+        #
+        # 旧行没有 title 段：按保守方向处理——**不计数**。理由是不计数只让提醒
+        # 少一条（人可读台账），而把探针算成交付会让熔断提前触发、真交付被静默。
+        title = _title_of(note)
+        if title is None:
+            stats_inc(st, "no_title", now=now)
+            continue
+        if not _is_real_delivery(title):
+            stats_inc(st, "probe_skipped", now=now)
             continue
         evidence = note
         worker_name, worker_sid = _bind_name(repo, issue)
@@ -3218,6 +3274,14 @@ def _cid_head_count(ledger: Path) -> int:
                         or not r.get("repo") or r.get("issue") is None
                         or not str(r.get("note") or "").startswith("cid:")):
                     continue
+                # ISS-99: a row only counts when its title claims a delivery. A
+                # legacy row with no title is skipped by the scanner for the
+                # same reason, so this helper must agree -- otherwise the
+                # self-test's expectation and the code under test disagree and
+                # the test proves nothing.
+                _t = _title_of(str(r.get("note") or ""))
+                if _t is None or not _is_real_delivery(_t):
+                    continue
                 seen.add((r.get("repo"), r.get("issue")))
     except OSError:
         pass
@@ -3274,11 +3338,16 @@ def _fresh(root: Path, ledger_lines: list[dict] | None = None,
 
 
 def _worker_row(issue=999, ok=True, **kw):
-    """自检台账行。默认带 `cid:` 证据——E-2b 之后没有 cid 的行**不投递**（只计数
-    `no_evidence`），所以 A–T 里凡是期望「发得出去」的行都必须带证据。"""
+    """自检台账行。
+
+    默认带 `cid:` 证据与 `title:` 首行——E-2b 之后没有 cid 的行不投递，
+    ISS-99 之后没有 title 的行**不计数**。所以 A–T 里凡是期望「发得出去」的行
+    都必须两样都有；只想验「无证据」的用例自己覆盖 `note`。
+    """
     row = {"t": datetime.now().isoformat(timespec="seconds"), "role": "worker",
            "act": "comment", "repo": "owner/neutral_project",
-           "issue": issue, "ok": ok, "note": f"cid:s{issue}"}
+           "issue": issue, "ok": ok,
+           "note": f"cid:s{issue};title:[wk-selftest]-[完工]-[No Notify]-[lwa]"}
     row.update(kw)
     return row
 
@@ -3695,7 +3764,7 @@ def self_test() -> int:
         # ---------- F-4：force_replay 两遍 ⇒ 第一遍重放、第二遍 dedup_skips 增
         env = _fresh(root, [])
         led = Path(env["ledger"])
-        _append(led, _worker_row(999, note="cid:f4"))
+        _append(led, _worker_row(999, note="cid:f4;title:[wk-selftest]-[完工]-[No Notify]-[lwa]"))
         st = load_delivery_state()
         st["baseline_established"] = True
         DELIVERY_SINK = []
@@ -3708,7 +3777,7 @@ def self_test() -> int:
         # ---------- F-5：置 baseline_established=False ⇒ seen 键数**不变**（重建只清半行）
         env = _fresh(root, [])
         led = Path(env["ledger"])
-        _append(led, _worker_row(999, note="cid:f5-keep"))
+        _append(led, _worker_row(999, note="cid:f5-keep;title:[wk-selftest]-[完工]-[No Notify]-[lwa]"))
         st = load_delivery_state()
         st["baseline_established"] = True
         enqueue_delivery(st, _selftest_rec(999, "cid:f5-keep", time.time()), dry=True,
@@ -3752,20 +3821,24 @@ def self_test() -> int:
         extra("C-2", c2_a == 1 and c2_b == 0 and len(DELIVERY_SINK) == 1 and skip_b > skip_a,
               f"first={c2_a} replay={c2_b} sink={len(DELIVERY_SINK)} skips={skip_a}->{skip_b}")
 
-        # ---------- C-3：同单 4 条不同 cid ⇒ 首条立即、2/3 入缓冲、第 4 条熔断
+        # ---------- C-3：同单 N 条不同 cid（N = 阈值+1）⇒ 首条立即、中间入缓冲、
+        # 第 N 条熔断。条数按 DELIVERY_MAX_PER_DAY 算，不写死 4——阈值是配置，
+        # 写死会让改阈值时这条自测静默失真（ISS-99 把 3 改成 8 时正是如此）。
         t0 = datetime(2026, 6, 1, 12, 0, 0).timestamp()
         _fresh(root, [])
         DELIVERY_SINK = []
         st = load_delivery_state()
         st["baseline_established"] = True
         st["stats"] = {"date": _date_of(t0)}
+        _n3 = DELIVERY_MAX_PER_DAY + 1
         c3 = [enqueue_delivery(st, _selftest_rec(999, f"cid:c3-{i}", t0), dry=True,
-                               now=t0 + i * 10) for i in range(4)]
+                               now=t0 + i * 10) for i in range(_n3)]
         br = (st.get("breakers") or {}).get("owner/neutral_project#999") or {}
         buffered = len(((st.get("summaries") or {}).get("owner/neutral_project#999") or {})
                        .get("items") or [])
         flush3 = check_pending(st, dry=True, now=t0 + 301)
-        extra("C-3", c3 == [1, 0, 0, 0] and br.get("count") == 4 and buffered == 2
+        extra("C-3", c3 == [1] + [0] * (len(c3) - 1) and br.get("count") == _n3
+              and buffered == _n3 - 2
               and br.get("enabled") is False and flush3["summaries"] == 1
               and len(DELIVERY_SINK) == 2,
               f"sends={c3} breaker_count={br.get('count')} buffered={buffered} "
@@ -3805,8 +3878,8 @@ def self_test() -> int:
         t0 = datetime(2026, 6, 1, 12, 0, 0).timestamp()
         env = _fresh(root, [])
         led = Path(env["ledger"])
-        _append(led, _worker_row(999, note="cid:f2-mark [WK:wk-selftest-mark]"))
-        _append(led, _worker_row(999, note="cid:f2-plain"))
+        _append(led, _worker_row(999, note="cid:f2-mark [WK:wk-selftest-mark];title:[wk-selftest]-[完工]-[No Notify]-[lwa]"))
+        _append(led, _worker_row(999, note="cid:f2-plain;title:[wk-selftest]-[完工]-[No Notify]-[lwa]"))
         _append(led, _worker_row(999, note=""))
         DELIVERY_SINK = []
         st = load_delivery_state()
@@ -3933,7 +4006,7 @@ def self_test() -> int:
         st = load_delivery_state()
         st["baseline_established"] = True
         st["stats"] = {"date": _date_of(t0)}
-        for i in range(4):
+        for i in range(DELIVERY_MAX_PER_DAY + 1):
             _ENQUEUE_IMPL(st, _selftest_rec(999, f"cid:fsbr-{i}", t0), dry=True,
                              now=t0 + i * 10)
         key = "owner/neutral_project#999"
@@ -3993,7 +4066,7 @@ def self_test() -> int:
 
         # ---------- 回归 8：单条交付立刻 sink=1，正文是【收单】
         env = _fresh(root, [])
-        _append(Path(env["ledger"]), _worker_row(999, note="cid:reg-8"))
+        _append(Path(env["ledger"]), _worker_row(999, note="cid:reg-8;title:[wk-selftest]-[完工]-[No Notify]-[lwa]"))
         DELIVERY_SINK = []
         r = _run_tick(dry=False)
         reg_texts = [r.get("text") or "" for r in DELIVERY_SINK]

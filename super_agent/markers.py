@@ -128,16 +128,135 @@ def first_line(body: str) -> str:
     return ""
 
 
+# ------------------------------------------------------------------ 五段式
+# ISS-99: a first line that says who wrote it, what it did, who to tell, which
+# project, and (optionally) which comment it answers:
+#
+#     [who]-[do]-[notify]-[project]
+#     [who]-[do]-[notify]-[project]-[cid]
+#
+# Split on the **brackets**, never on "-": a session key and a project key both
+# contain hyphens (`wk-ISS-98-dev-20261119`, `pm-<project>`), so `line.split("-")`
+# shreds them. The regex matches segment by segment and lets the separator be
+# whatever sits between two bracketed groups.
+FIVE_RE = re.compile(
+    r"^\s*\[([^\]\n]+)\]\s*-\s*\[([^\]\n]+)\]\s*-\s*\[([^\]\n]+)\]\s*"
+    r"-\s*\[([^\]\n]+)\](?:\s*-\s*\[(\d+)\])?")
+
+#: The twelve actions a five-part title may carry. Anything else is written to
+#: GitHub and logged, but **never notifies** -- a wrong action word is a silent
+#: non-notification, which is the safe direction. A false notification cannot be
+#: taken back; a missing one leaves a row a person can see.
+NOTIFY_ACTIONS = (
+    "完工", "收口", "退回", "裁决", "告警", "派单", "接单",
+    "交接要求", "交接完成", "交接就绪", "已归档", "调试",
+)
+
+#: Actions that are recorded but never notify anyone. `已归档` is a trail entry
+#: (the work is done, nobody has an action), and `调试` exists so a probe does
+#: not have to pretend to be a delivery.
+SILENT_ACTIONS = frozenset({"已归档", "调试"})
+
+NO_NOTIFY = "No Notify"
+
+
+def _norm_notify(value: str) -> str:
+    """``No Notify`` in any spelling -> one token. Everything else is kept."""
+    return re.sub(r"\s+", "", str(value or "")).lower()
+
+
+def parse_five(body: str) -> dict | None:
+    """``{"who","do","notify","project","cid","line","action_ok"}`` or ``None``.
+
+    ``None`` means "the first line is not a five-part title", which is a
+    different answer from "a five-part title whose action is not recognised"
+    (that one comes back with ``action_ok=False`` so the caller can log it).
+
+    ``notify`` is returned as written. Whether it names a live session is the
+    caller's question -- this module does not read the session table.
+    """
+    line = first_line(body)
+    if not line:
+        return None
+    match = FIVE_RE.match(line)
+    if not match:
+        return None
+    who, action, notify, project, cid = ((match.group(i) or "").strip()
+                                         for i in (1, 2, 3, 4, 5))
+    for value in (who, action, notify, project):
+        if not value:
+            return None
+    return {
+        "who": who,
+        "do": action,
+        "notify": notify,
+        "project": project,
+        "cid": cid,
+        "line": line,
+        "action_ok": action in NOTIFY_ACTIONS,
+    }
+
+
+def wants_notify(five: dict | None) -> bool:
+    """Does this title ask anyone to be told? ``False`` when it says No Notify."""
+    if not five or not five.get("action_ok"):
+        return False
+    if five["do"] in SILENT_ACTIONS:
+        return False
+    return _norm_notify(five["notify"]) != _norm_notify(NO_NOTIFY)
+
+
+def _five_leaf(five: dict) -> tuple[str, str]:
+    """``(marker, name)`` an old-style caller would have seen for this title.
+
+    A delivery marker needs a name, and a five-part title's first segment is the
+    session key -- exactly what ``[WK:<name>]`` carried. The action decides which
+    of the old routes this maps to, so the two parsers cannot disagree about a
+    line that carries both shapes.
+
+    ``who`` must start with a delivery prefix. ``[QB]-[完工]-…`` names a session
+    that no role owns, so it yields ``("", "")`` and the caller treats it as
+    "not a delivery" -- the same answer an unknown action gets. Accepting any
+    first segment would let a typo create a delivery that matches no assignment.
+    """
+    who = five["who"]
+    action = five["do"]
+    if action not in ("完工", "调试"):
+        return "", who
+    upper = who.upper()
+    for prefix in DELIVERY_PREFIXES:
+        # ``who`` must be a **session key** (``wk-…``), not the bare role prefix
+        # (``WK``). A bare prefix carries no name, so accepting it would create a
+        # delivery named ``WK`` that matches no assignment -- and the engine
+        # would report ``assignment.unmatched`` for a comment that looked fine.
+        if upper.startswith(prefix + "-"):
+            return prefix, who
+    return "", ""
+
+
 def parse_delivery(body: str) -> dict | None:
     """``{"marker", "name", "line"}`` when the body opens with a delivery marker.
 
     ``marker`` is the **prefix as written** (upper-cased: ``"WK"``, ``"SC"`` …),
     never a fixed value - a caller that reads it must not get ``"WK"`` for an
     ``[SC:…]`` line (#ISS-91).
+
+    A five-part title (ISS-99) is checked first: its first segment is the session
+    key, which is what the old marker carried as a name. Old-style
+    ``[WK:<name>]`` lines still parse, so the 3,000+ comments already on GitHub
+    keep their meaning.
     """
     line = first_line(body)
     if not line:
         return None
+    five = parse_five(body)
+    if five is not None:
+        if five["do"] not in ("完工", "调试"):
+            return None          # a verdict or a dispatch is not a delivery
+        marker, name = _five_leaf(five)
+        if not name:
+            return None
+        return {"marker": marker, "name": name, "line": line, "five": five}
     match = DELIVERY_RE.match(line)
     if not match:
         return None
@@ -1053,7 +1172,25 @@ def parse_review(body: str) -> dict | None:
     ask a person to put the marker in.
     """
     line = first_line(body)
-    if not line or not QA_PREFIX_RE.match(line):
+    if not line:
+        return None
+    five = parse_five(body)
+    if five is not None:
+        # ISS-99: a five-part title replaces the ``[QA]`` prefix, so the verdict
+        # comes from the action word instead of the prose. ``退回`` is a reject;
+        # ``完工`` is a pass. Every other action is not a review at all -- a
+        # ``[qa-x]-[接单]-…`` line says "I took the job", not "I judged it".
+        if five["do"] == "退回":
+            verdict, matched = "reject", "退回"
+        elif five["do"] == "完工":
+            verdict, matched = "pass", "完工"
+        else:
+            return None
+        fix_needed, fix_matched, fix_structured = read_fix_token(line)
+        return {"marker": QA, "verdict": verdict, "matched": matched, "line": line,
+                "fix_needed": fix_needed, "fix_matched": fix_matched,
+                "fix_structured": fix_structured, "five": five}
+    if not QA_PREFIX_RE.match(line):
         return None
     text = _strip_qa_prefix(line)
     fix_needed, fix_matched, fix_structured = read_fix_token(text)

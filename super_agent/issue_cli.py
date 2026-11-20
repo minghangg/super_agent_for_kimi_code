@@ -55,6 +55,7 @@ from pathlib import Path
 from . import agent_config
 from . import allowlist as allowlist_mod
 from . import config as config_mod
+from . import markers
 from . import role_config as roles_mod
 from . import session_ledger as ledger_mod
 
@@ -302,7 +303,44 @@ def _already_prefixed(body: str, prefix: str) -> bool:
     return bool(re.match(re.escape(bare) + r"[:\]]", first, re.I))
 
 
-def _prefix(role: str, worker_name: str | None, table: roles_mod.RoleConfig) -> str:
+def _prefix(role: str, worker_name: str | None, table: roles_mod.RoleConfig,
+            *, do: str = "", notify: str = "", project: str = "",
+            cid: str = "") -> str:
+    """The first-line prefix for this comment.
+
+    Two shapes, chosen by whether ``--do`` was given (ISS-99):
+
+    * **five-part** ``[who]-[do]-[notify]-[project]-[cid]`` -- the caller named
+      an action, so the title says who wrote it, what it did, who to tell and
+      which project. The action is checked against the whitelist here: a typo
+      that reached GitHub would be read as "no notification" by the engine, and
+      the writer would never learn why nobody answered;
+    * **legacy** ``[WK:<name>]`` / ``[QA]`` -- unchanged, because 3,000+ comments
+      already on GitHub carry that shape.
+
+    ``cid`` is optional: not every action answers a comment (``[裁决]`` and
+    ``[已归档]`` do not), so demanding it would make those titles impossible.
+    """
+    if do:
+        action = do.strip()
+        if action not in markers.NOTIFY_ACTIONS:
+            raise Denied(
+                f"--do {action!r} 不在白名单（{len(markers.NOTIFY_ACTIONS)} 个）："
+                f"{'、'.join(markers.NOTIFY_ACTIONS)}")
+        who = worker_name or table.prefix(role)
+        # A bare prefix (``[PM]``) is not a session key; the five-part title needs
+        # the key so the engine can attribute the comment to a session.
+        who = who.strip("[]")
+        if role == "worker" and not worker_name:
+            raise Denied("worker 角色必须给 --worker-name（五段式首段＝会话键名）")
+        if not notify:
+            raise Denied("--do 必须配 --notify（不通知写 'No Notify'）")
+        if not project:
+            raise Denied("--do 必须配 --project-key（gh_projects.json 的键）")
+        head = f"[{who}]-[{action}]-[{notify}]-[{project}]"
+        if cid:
+            head += f"-[{cid}]"
+        return head
     if worker_name is not None:
         delivery = table.delivery_prefix(role)
         if not delivery:
@@ -614,17 +652,51 @@ def cmd_comment(args, ctx) -> int:
             if args.body_file else (args.body or ""))
     if not body.strip():
         raise Denied("评论正文为空")
-    pfx = _prefix(role, args.worker_name, ctx.roles)
+    # ISS-99: the five-part title's project key must exist. A misspelled key is
+    # invisible downstream -- the engine resolves recipients from the project,
+    # so nobody gets told and nothing reports that. `super_agent_for_kimi_code`
+    # is the repository name; the key is `superagent`, which is exactly the
+    # mistake this check catches.
+    project_key = str(getattr(args, "project_key", "") or "").strip()
+    if project_key and project_key.lower() not in (ctx.projects or {}):
+        raise Denied(
+            f"--project-key {project_key!r} 不在项目登记表（{len(ctx.projects or {})} 个键）。"
+            f"可选：{'、'.join(sorted(ctx.projects or {}))}")
+    pfx = _prefix(role, args.worker_name, ctx.roles,
+                  do=getattr(args, "do", "") or "",
+                  notify=getattr(args, "notify", "") or "",
+                  project=project_key,
+                  cid=str(getattr(args, "cid", "") or ""))
     head = body if _already_prefixed(body, pfx) else f"{pfx} {body}"
-    payload = {"body": head.strip()}
+    head = head.strip()
+    # ISS-99: the session key goes on its own line. Inline would put it inside
+    # the verdict's anchored tail and hide the marker from the parser.
+    session_key = str(getattr(args, "session_key", "") or "").strip()
+    if session_key:
+        head += f"\n<!-- session: {session_key} -->"
+    elif role in ("worker", "qa", "at", "scout", "steward", "auditor",
+                  "reviewer", "analyst", "planner"):
+        # Not a refusal: plenty of historical callers omit it and the comment is
+        # still useful. But an unattributed verdict is silently ignored by the
+        # engine, so say so rather than let the writer believe it landed.
+        print(f"  ⚠ 未给 --session-key：引擎无法归属这条 {role} 评论，"
+              f"裁决会被判 unverified。", file=sys.stderr)
+    payload = {"body": head}
     out = _call("POST", f"/repos/{repo}/issues/{args.issue}/comments", payload,
                 dry_run=args.dry_run, **ctx.call)
     if out.get("dry_run"):
         return 0
     print(f"commented #{args.issue} id={out.get('id')}")
     print("  提示：评论不唤醒会话；需唤醒请 dispatch 或依赖收单哨")
-    _ledger(role, "comment", repo, args.issue, ctx.cfg,
-            note=f"cid:{out.get('id')}" if out.get("id") else "")
+    # ISS-99: the ledger carries the **title**, not just the cid. The delivery
+    # watcher decides "is this a real delivery or a probe" from the title, and
+    # until now the ledger had no title to read -- so it could not tell them
+    # apart and every probe spent quota.
+    first = head.splitlines()[0] if head else ""
+    note = f"cid:{out.get('id')}" if out.get("id") else ""
+    if first:
+        note += f";title:{first[:200]}"
+    _ledger(role, "comment", repo, args.issue, ctx.cfg, note=note)
     return 0
 
 
@@ -1065,6 +1137,20 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--body", default="")
     p.add_argument("--body-file")
     p.add_argument("--worker-name")
+    # ISS-99 five-part title. All four of --do/--notify/--project-key are
+    # required together: a title missing one of them says less than the legacy
+    # marker it replaces, and the engine would have to guess.
+    p.add_argument("--do", default="",
+                   help=f"动作（白名单 {len(markers.NOTIFY_ACTIONS)} 个）："
+                        f"{'、'.join(markers.NOTIFY_ACTIONS)}")
+    p.add_argument("--notify", default="",
+                   help="通知谁：'No Notify' / 'All Active' / 会话键名 / 逗号分隔")
+    p.add_argument("--project-key", dest="project_key", default="",
+                   help="gh_projects.json 的项目键（如 lwa、superagent）")
+    p.add_argument("--cid", default="",
+                   help="本条回应的评论 id（可选；裁决/已归档通常没有）")
+    p.add_argument("--session-key", dest="session_key", default="",
+                   help="本会话键名，写成正文末行 <!-- session: … -->")
     p.set_defaults(func=cmd_comment)
 
     p = sub.add_parser("edit", help="改 issue 标题／正文（supervisor）")
