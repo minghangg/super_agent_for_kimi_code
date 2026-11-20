@@ -12,4 +12,12 @@ monitor.log
 config/allowlist.local.json
 config/gh_projects.json
 config/roles.local.json
+
+# 开发算力配额：`dev_quota.py` 按本机核数自检生成并写回，是运行态而非配置事实。
+# 入库只会让别人的 ``pinned_cores`` 覆盖本机真实值——换一台机器就该重新生成一份。
+# 计数按 CPU／RAM 推导（见 `dev_quota.derive`），没有「通用默认」可写：
+# 写死的值在另一台机器上要么过松（压垮机器）要么过紧（白等）。
+# 需要固定配额的部署把 `quota.config_file` 指向自己的私有路径，不走这里。
+config/dev_quota.json
+
 new_workbench/
