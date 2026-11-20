@@ -14,13 +14,39 @@
 
 | 步 | 动作 | 命令（全部 safkc） | 判据 |
 |---|---|---|---|
+| 0 | **核旧模型，记下来** | 读旧会话 wire 的最后一条 `usage.record.model` | 有值；这是新会话必须沿用的模型 |
 | 1 | 核旧会话占用 | `python -m super_agent.rotation show --key <键>` | `old_ctx` 有值；<60% 时换血收益低，须说明理由 |
 | 2 | 要求对方写交接档 | `python -m super_agent.console send <旧sid> "请按 handoff 模板写交接档"` | 对方回 `[交接完成]` |
-| 3 | 建新会话 | `python -m super_agent.dispatch_cli --cwd <工作台> --name <新键> --detach --task <初始化>` | 新会话 warmup 有 `Read done.` 回执 |
-| 4 | 换登记 ＋ 归档 | `python -m super_agent.sessions_ledger set <键> <新sid>` 然后 `archive <旧sid>` | `session.rotated` 与 `session.archived` 都落事件流 |
-| 5 | 写记录 | `python -m super_agent.rotation record --key <键> --trigger-reason … --ordered-by … --handoff-doc …` | 记录贴进运维单 |
+| 3 | 建新会话 | `python -m super_agent.dispatch_cli --cwd <工作台> --name <新键> --detach --no-activate --task <初始化>` | 见下「warmup 必须手工补」 |
+| 3b | **手工补 warmup** | 用 `dispatch_cli.warmup_prompt(<charter>, <新键>)` 生成文本，再 `--session <新sid> --detach --no-activate --task <那段文本>` | 新会话 wire 出现 `Read done.`，且首条消息含契约路径 |
+| 4 | **把模型改回第 0 步的值** | `POST /api/v1/sessions/<新sid>/profile` `{"agent_config":{"model":"<第0步的值>"}}`，再发一轮让它生效 | 新会话 wire 的 `usage.record.model` **等于**旧会话的值 |
+| 5 | 换登记 ＋ 归档 | `python -m super_agent.sessions_ledger set <键> <新sid>` 然后 `archive <旧sid>` | `session.rotated` 与 `session.archived` 都落事件流 |
+| 6 | 写记录 | `python -m super_agent.rotation record --key <键> --trigger-reason … --ordered-by … --handoff-doc …` | 记录贴进运维单 |
 
-**第 4 步的 `set` 会自动发 `session.rotated`**——那是记录的数据来源，不要手工补事件。
+**warmup 必须手工补（2026-11-20 实测）**：warmup 只在 `if not args.no_activate and not args.session` 时自动跑（`dispatch_cli.py:1396`）。换血建新会话**必须带 `--no-activate`**（不带的话实测报 `round did not start within 120s`，主轮也起不来），于是 warmup 被一起跳过——**新会话首条消息里没有契约和章程，等于换血没换到位**。
+
+补法两步：
+
+```bash
+# 1) 生成标准 warmup 文本（读契约 + 读章程 + 告知键名）
+python -c "from super_agent import dispatch_cli as D; \
+  print(D.warmup_prompt('D:/github/super_agent_for_kimi_code/rules/charters/scout.md','scout-<日期>-<尾>'))"
+
+# 2) 作为一条 task 发进去（复用会话时 --session 本身就不跑 warmup）
+python -m super_agent.dispatch_cli --session <新sid> --detach --no-activate --task "<上面那段>"
+```
+
+**判据**：新会话 wire 里出现 `Read done.`，且 `context.append_message` 的首条含 `session_contract.md` 与角色章程路径。
+
+**第 4 步不可省（用户 2026-11-20 令）**：新会话是用默认模型建的，**换血不得改变模型**——用户可能手工给这个角色调过模型，那个选择是长期决定，不是本次换血的副产品。换血只换会话，不换模型。
+
+- 判据写法：换血前后各读一次 `usage.record.model`，**必须相同**。
+- 模型别名以 `GET /api/v1/models` 返回的 `provider/model` 为准；`cdy2Api-intl` 的正确写法是 `cdy2Api-intl/deepseek-v4.1-flash-sg`（**不是**双写 `cdy2Api-intl/cdy2Api-intl/...`，后者报 `40001 not configured`）。
+- `profile` 只改登记，**要发一轮才生效**——不验 wire 等于没改。
+
+**第 5 步的 `set` 会自动发 `session.rotated`**——那是记录的数据来源，不要手工补事件。
+
+**归档事件的顺序**：`rotation.collect` 只认 `session.rotated` **之后**的 `session.archived`。先归档后记账会让 `old_session_archived=false`，必须在 rotated 落盘之后再归档（或补写一条归档事件）。
 
 ## 2. 写记录：9 项自动，4 项人填
 
@@ -106,6 +132,28 @@ python -m super_agent.rotation check --key <键> [--feed-since <归档时刻 epo
 **重建时搬什么**：只搬索引（`state/asst_handoff/rotation_*.md` 的文件列表 ＋ 当前生效记录的 cid 列表），不搬全文——全文在旧单里，链接可达。
 
 **为什么手工不用 cron**：cron 挂在 supervisor 会话上，换血即失效——正是本单在治的病。正文写「上次重建日期」，让忘记可见。
+
+### 6.1 每次换血的七步（用户 2026-11-20 令）
+
+**运维单平时挂着 `stage:on-hold`（引擎不扫）。换血时临时摘掉，靠它的评论通知驱动流程，完成后再挂回去。**
+
+| # | 动作 | 谁 | 命令／判据 |
+|---|---|---|---|
+| 1 | **摘掉 `stage:on-hold`** | supervisor | `python -m super_agent.issue_cli open --issue <运维单>`；核它打印的在飞列表里有这张单 |
+| 2 | **下令** | supervisor | `dispatch_cli --session <旧sid> --ctx-force --task "【换血令】写交接档 …"`；写明「记录发运维单 #N」 |
+| 3 | **对方回复** | 旧任 | 在运维单发一条评论（五段式 `[<旧键>]-[交接就绪]-[<supervisor>]-[<项目>]`），附交接档路径 |
+| 4 | **收到通知** | supervisor | 引擎按评论投帧（这就是摘掉 hold 的目的：**不摘就没有通知，只能靠轮询**） |
+| 5 | **继续工作** | supervisor | 建新会话 → `sessions_ledger set` → 派新会话读交接档 → 归档旧会话 → `rotation record` |
+| 6 | **换血完成** | 新会话 | 在运维单发 `[<新键>]-[交接完成]-[<supervisor>]-[<项目>]` |
+| 7 | **挂回 `stage:on-hold`** | supervisor | `python -m super_agent.issue_cli hold --issue <运维单>`；核它不在在飞列表里 |
+
+**三步不可省，省了就出问题**：
+
+- **省 1（不摘 hold）**：引擎不扫这张单，对方的回复**不会触发任何通知**。supervisor 只能靠 `sleep` 轮询或反复 `grep`——`session_contract.md` §5 明令禁止的做法。
+- **省 2（不写运维单号）**：对方不知道记录发哪里，只能发在别处或本地文件，记录失去唯一真源。
+- **省 7（不挂回）**：这张单一直在飞，引擎每轮都扫它，产生「超时未关」「PM 停摆」类假告警，且下一轮换血前它已被误扫多时。
+
+**判据**：换血结束后跑 `python -m super_agent.issue_cli list --project <项目> | grep <运维单号>`，**必须为空**（挂起单不出现）。
 
 ## 7. 本地缓存
 

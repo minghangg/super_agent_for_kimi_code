@@ -225,15 +225,15 @@ class LegacyShape(Prefix):
         # silently not a delivery -- the hole #99 closed, reopened once because
         # this branch preferred the role prefix.
         head = issue_cli._prefix("scout", None, self.table, do="交接就绪",
-                                 notify="reed", project="lwa",
+                                 notify="pm-x", project="lwa",
                                  session_key="scout-abc12345")
-        self.assertEqual(head, "[scout-abc12345]-[交接就绪]-[reed]-[lwa]")
+        self.assertEqual(head, "[scout-abc12345]-[交接就绪]-[pm-x]-[lwa]")
         self.assertIsNotNone(markers.parse_five(head))
 
     def test_a_five_part_title_without_any_key_is_refused(self):
         with self.assertRaises(issue_cli.Denied) as ctx:
             issue_cli._prefix("scout", None, self.table, do="交接就绪",
-                              notify="reed", project="lwa")
+                              notify="pm-x", project="lwa")
         self.assertIn("会话键名", str(ctx.exception))
 
     def test_a_worker_still_uses_worker_name(self):
