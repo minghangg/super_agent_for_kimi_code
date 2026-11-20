@@ -50,18 +50,25 @@ def _path(root, qid: str) -> Path:
 
 
 def create_question(*, root, thread: str, issue: int, comment_id: int,
-                    sid: str, question: str) -> str:
+                    sid: str, question: str, requirement: dict | None = None,
+                    binding_keys: list[str] | None = None) -> str:
     """File one question and return its id. Needs no running service.
 
-    The id is random rather than sequential: the link is the only thing that
-    distinguishes one question from another on a shared machine, and a guessable
-    one would let a stray browser tab answer somebody else's AT.
+    AT-mode questions carry the exact requirement revision and every binding
+    key that may resolve the current AT. Legacy questions remain readable.
     """
     qid = uuid.uuid4().hex[:12]
     record = {"id": qid, "thread": str(thread), "issue": int(issue),
               "comment_id": int(comment_id), "sid": str(sid or ""),
               "question": str(question or ""), "answer": "",
-              "submitted": False, "created_at": _now()}
+              "status": "pending", "submitted": False, "created_at": _now(),
+              "binding_keys": list(binding_keys or [str(thread)])}
+    if requirement:
+        record.update(requirement_id=requirement.get("requirement_id"),
+                      revision=requirement.get("revision"),
+                      requirement_hash=requirement.get("requirement_hash"),
+                      objective=str(requirement.get("objective") or ""),
+                      interaction=dict(requirement.get("interaction") or {}))
     path = _path(root, qid)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(record, ensure_ascii=False, indent=1,
@@ -97,36 +104,100 @@ def save(root, record: dict) -> None:
 
 
 def answer_text(record: dict) -> str:
-    """What the AT receives. One line of identity, then the answer verbatim."""
-    return (f"【问卷回答】#{int(record.get('issue') or 0)} "
-            f"({record.get('thread') or ''}, cid {record.get('comment_id') or 0})"
-            f"\n{record.get('answer') or ''}")
+    """One short AT notification; the full answer stays in a local document."""
+    return (f"【AT 答案】#{int(record.get('issue') or 0)} "
+            f"r{int(record.get('revision') or 0)} 已回答；"
+            f"全文：{record.get('answer_file') or '(答案文档未生成)'}")
 
 
-def submit(root, qid: str, answer: str, transport) -> tuple[str, str]:
-    """Store the answer, then send it back to the AT.
+def answer_document(root, record: dict) -> Path:
+    path = Path(root) / "atserve" / "answers" / f"{record['id']}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    selected = record.get("choice_labels") or []
+    lines = [
+        f"# AT 问卷回答 · #{int(record.get('issue') or 0)}", "",
+        f"- requirement_id：{record.get('requirement_id') or record.get('thread')}",
+        f"- revision：{record.get('revision') or 0}",
+        f"- requirement_hash：{record.get('requirement_hash') or '(legacy)'}",
+        f"- question_id：{record.get('id')}",
+        f"- answered_at：{record.get('answered_at') or ''}", "",
+        "## 问题", "", str(record.get("question") or ""), "",
+        "## 已选选项", "",
+    ]
+    lines.extend([f"- {label}" for label in selected] or ["- （未选择预置选项）"])
+    lines.extend(["", "## 补充说明", "", str(record.get("answer") or "（无）"), ""])
+    tmp = path.with_suffix(".md.tmp")
+    tmp.write_text("\n".join(lines), encoding="utf-8")
+    os.replace(tmp, path)
+    return path
 
-    ``(outcome, detail)`` where ``outcome`` is one of::
 
-        "submitted"   the transport ran and did not raise
-        "no_sid"      the question carries no AT session to answer
-        "no_transport" no transport was injected - the answer is stored only
-        "failed"      the transport raised; the answer is kept, nothing claims
-                      it arrived
+def stale_reason(record: dict, requirement_resolver=None) -> str:
+    if not record.get("requirement_id"):
+        return ""
+    if requirement_resolver is None:
+        return "服务未接入需求版本校验"
+    try:
+        current = requirement_resolver(str(record.get("requirement_id")))
+    except Exception as exc:  # noqa: BLE001 - fail closed and make it readable
+        return f"需求版本读取失败：{type(exc).__name__}: {exc}"
+    if not current:
+        return "需求包不存在或不可读"
+    if (current.get("revision") != record.get("revision")
+            or current.get("requirement_hash") != record.get("requirement_hash")):
+        return (f"问题属于 r{record.get('revision')}，当前需求已是 "
+                f"r{current.get('revision')}；请使用最新链接")
+    return ""
 
-    The answer is written **before** the send on purpose: a reply that reached
-    the AT and was lost here would leave the AT talking about an answer no file
-    can produce.
-    """
+
+def _latest_sid(record: dict, binding_resolver=None) -> str:
+    if binding_resolver is None:
+        return str(record.get("sid") or "")
+    binding = binding_resolver(record)
+    if isinstance(binding, dict):
+        return str(binding.get("session") or binding.get("sid") or "")
+    return str(binding or "")
+
+
+def submit(root, qid: str, answer: str, transport, *, choices=None,
+           requirement_resolver=None, binding_resolver=None) -> tuple[str, str]:
+    """Validate, write the answer document, then notify the latest AT."""
     record = load(root, qid)
     if record is None:
         return "failed", "question not found"
-    record["answer"] = str(answer or "")
+    stale = stale_reason(record, requirement_resolver)
+    if stale:
+        return "stale", stale
+    if record.get("submitted"):
+        return "already_submitted", "this question was already submitted"
+    interaction = record.get("interaction") or {}
+    options = interaction.get("options") or []
+    by_id = {str(option.get("id")): option for option in options}
+    selected = [str(value) for value in (choices or [])]
+    if len(set(selected)) != len(selected) or any(value not in by_id for value in selected):
+        return "invalid", "选项不存在或重复，请刷新后重试"
+    if interaction.get("choice_mode") != "multiple" and len(selected) > 1:
+        return "invalid", "本题只能选择一个选项"
+    supplement = str(answer or "").strip()
+    if not selected and not supplement:
+        return "invalid", "请选择一个选项，或填写补充说明"
+    if supplement and interaction.get("allow_custom") is False:
+        return "invalid", "本题不允许自由补充，请只选择预置选项"
+    record["sid"] = _latest_sid(record, binding_resolver)
+    record["answer"] = supplement
+    record["choices"] = selected
+    record["choice_labels"] = [str(by_id[value].get("label") or value)
+                               for value in selected]
     record["answered_at"] = _now()
-    save(root, record)
+    record["status"] = "answered"
+    try:
+        record["answer_file"] = str(answer_document(root, record).resolve())
+        save(root, record)
+    except OSError as exc:
+        return "failed", f"答案文档写入失败：{type(exc).__name__}: {exc}"
     sid = str(record.get("sid") or "")
     if not sid:
-        return "no_sid", "this question names no AT session"
+        return "no_sid", "this question names no current AT session"
     if transport is None:
         return "no_transport", "no send transport is wired"
     try:
@@ -134,6 +205,7 @@ def submit(root, qid: str, answer: str, transport) -> tuple[str, str]:
     except Exception as exc:  # noqa: BLE001  the answer is kept; say so
         return "failed", f"{type(exc).__name__}: {exc}"
     record["submitted"] = True
+    record["status"] = "submitted"
     record["submitted_at"] = _now()
     save(root, record)
     return "submitted", ""
@@ -254,51 +326,100 @@ textarea {
   font-size: .875rem;
   color: var(--ui-muted);
 }
+fieldset {
+  margin: 0 0 var(--ui-space-6);
+  padding: 0;
+  border: 0;
+}
+legend {
+  margin-block-end: var(--ui-space-2);
+  padding: 0;
+  font-size: 1.125rem;
+  font-weight: 700;
+}
+.options { display: grid; gap: var(--ui-space-3); }
+.option {
+  display: grid;
+  grid-template-columns: 1.5rem minmax(0, 1fr);
+  align-items: start;
+  gap: var(--ui-space-3);
+  min-height: 48px;
+  padding: var(--ui-space-4);
+  background: var(--ui-surface);
+  border: 1px solid var(--ui-rule);
+  border-radius: var(--ui-radius-card);
+}
+.option input {
+  width: 1.25rem;
+  height: 1.25rem;
+  margin: .2rem 0 0;
+  accent-color: var(--ui-accent);
+}
+.option label { display: block; cursor: pointer; }
+.option-title { display: block; font-weight: 650; }
+.option-description {
+  display: block;
+  margin-block-start: var(--ui-space-1);
+  color: var(--ui-muted);
+  font-size: .9375rem;
+}
+.option input:focus-visible + label {
+  outline: 3px solid var(--ui-accent);
+  outline-offset: 4px;
+  border-radius: 2px;
+}
+.supplement { margin-block-end: var(--ui-space-5); }
+textarea { min-height: 8rem; }
+.submit-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ui-space-4);
+}
+.submit-row .hint { margin: 0; flex: 1 1 16rem; }
 button {
+  min-height: 48px;
   padding: var(--ui-space-3) var(--ui-space-5);
-  background: transparent;
-  color: var(--ui-accent);
+  background: var(--ui-accent);
+  color: var(--ui-surface);
   border: 1px solid var(--ui-accent);
   border-radius: var(--ui-radius-ctl);
   font: inherit;
-  font-weight: 600;
+  font-weight: 700;
   cursor: pointer;
 }
-button:hover { background: var(--ui-paper-2); }
+button:hover { filter: brightness(.92); }
 button:focus-visible,
 textarea:focus-visible {
-  outline: 2px solid var(--ui-accent);
-  outline-offset: 2px;
+  outline: 3px solid var(--ui-accent);
+  outline-offset: 3px;
+}
+@media (pointer: coarse) {
+  .option, button { min-height: 52px; }
+}
+@media (forced-colors: active) {
+  .option, button { border: 1px solid ButtonText; }
 }
 """
 
-# **No `box-shadow` anywhere in this sheet, and it is deliberate.** The report
-# this style follows states the rule plainly: a shadow pulls the page back into
-# "admin console". Depth comes from one 1px `--ui-rule` hairline instead.
-#
-# **No `all: unset`.** It is the shorthand that silently swallows the focus ring;
-# the controls here get their look from explicit properties, and the focus ring
-# is `outline`, not a shadow, so it survives Forced Colors Mode.
-#
-# **No `touch-action`.** The page has one scrolling textarea and no gestures, so
-# the property would be cargo cult; if a gesture ever lands here it must be
-# per-axis (`pan-y`), never `touch-action: none`.
 _PAGE = """<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>AT 问卷 · #{issue}</title>
+<title>#{issue} AT 需求确认 · r{revision}</title>
 <style>{style}</style>
 </head>
 <body>
 <main>
-<p class="eyebrow">{project} · 问卷</p>
-<h1>AT 有疑问 · #{issue}</h1>
-<p class="meta"><strong>{thread}</strong>（cid {cid}）</p>
-<section class="q">
-<p>{question}</p>
+<p class="eyebrow">{project} · AT 需求确认</p>
+<h1>确认你的选择</h1>
+<p class="meta"><strong>#{issue} · revision {revision}</strong><br>{thread}（问题 cid {cid}）</p>
+<section class="q" aria-labelledby="question-heading">
+<p class="eyebrow">本轮一个问题</p>
+<h2 id="question-heading">{question}</h2>
+{objective}
 </section>
 {notice}
 {body}
@@ -307,39 +428,87 @@ _PAGE = """<!doctype html>
 </html>
 """
 
-_FORM = """<form method="post" action="/q/{qid}">
-<label for="answer">你的回答</label>
-<textarea id="answer" name="answer" rows="6" required aria-describedby="hint"></textarea>
-<p id="hint" class="hint">提交后答案会回传给 AT。</p>
-<p><button type="submit">提交答案</button></p>
+_FORM = """<form method="post" action="/q/{qid}" aria-labelledby="question-heading">
+{options}
+{custom}
+<div class="submit-row">
+<p class="hint">确认后保存全文，并通知当前 AT。重复提交不会重复发送。</p>
+<button type="submit">确认并回答 AT</button>
+</div>
 </form>"""
 
 
 def _notice(text: str, *, warn: bool = False) -> str:
-    """One status line. **Colour is never the signal**: the border and the
-    weight carry it, and the words say it outright."""
-    state = ' data-state="warn"' if warn else ""
+    state = ' data-state="warn" role="alert"' if warn else ' role="status"'
     return f'<p class="notice"{state}>{text}</p>'
 
 
 def _page(record: dict, body: str, notice: str = "") -> str:
     thread = str(record.get("thread") or "")
+    objective = str(record.get("objective") or "")
+    objective_html = (f'<p class="hint">目标：{html.escape(objective)}</p>'
+                      if objective else "")
     return _PAGE.format(
-        style=_STYLE,
-        project=html.escape(thread.split("#", 1)[0] or "AT"),
+        style=_STYLE, project=html.escape(thread.split("#", 1)[0] or "AT"),
         issue=html.escape(str(record.get("issue") or "")),
+        revision=html.escape(str(record.get("revision") or 0)),
         thread=html.escape(thread),
         cid=html.escape(str(record.get("comment_id") or "")),
         question=html.escape(str(record.get("question") or "")),
-        notice=notice,
-        body=body)
+        objective=objective_html, notice=notice, body=body)
 
 
 def _form(record: dict) -> str:
-    return _FORM.format(qid=html.escape(str(record.get("id") or "")))
+    interaction = record.get("interaction") or {}
+    options = interaction.get("options") or []
+    selected = set(record.get("choices") or [])
+    rows = []
+    input_type = "checkbox" if interaction.get("choice_mode") == "multiple" else "radio"
+    for index, option in enumerate(options):
+        option_id = str(option.get("id") or "")
+        control_id = f"choice-{index}"
+        checked = " checked" if option_id in selected else ""
+        description = str(option.get("description") or "")
+        describedby = f' aria-describedby="{control_id}-description"' if description else ""
+        description_html = (f'<span id="{control_id}-description" class="option-description">'
+                            f'{html.escape(description)}</span>' if description else "")
+        rows.append(
+            f'<div class="option"><input type="{input_type}" id="{control_id}" '
+            f'name="choice" value="{html.escape(option_id)}"{checked}{describedby}>'
+            f'<label for="{control_id}"><span class="option-title">'
+            f'{html.escape(str(option.get("label") or option_id))}</span>'
+            f'{description_html}</label></div>')
+    options_html = ""
+    if rows:
+        legend = "选择一个或多个选项" if input_type == "checkbox" else "选择一个选项"
+        options_html = (f'<fieldset><legend>{legend}</legend>'
+                        f'<p id="choice-hint" class="hint">可只补充说明；选项与补充会一起保存。</p>'
+                        f'<div class="options">{"".join(rows)}</div></fieldset>')
+    custom_html = ""
+    if interaction.get("allow_custom", True):
+        label = "补充说明" if rows else "你的回答"
+        required = "" if rows else " required"
+        custom_html = (f'<div class="supplement"><label for="answer">{label}</label>'
+                       f'<p id="answer-hint" class="hint">填写约束、偏好或其他选项没有覆盖的内容。</p>'
+                       f'<textarea id="answer" name="answer" rows="5"{required} '
+                       f'aria-describedby="answer-hint">{html.escape(str(record.get("answer") or ""))}</textarea></div>')
+    return _FORM.format(qid=html.escape(str(record.get("id") or "")),
+                        options=options_html, custom=custom_html)
 
 
-def make_handler(root, transport):
+def _answer_summary(record: dict) -> str:
+    selected = record.get("choice_labels") or []
+    parts = []
+    if selected:
+        parts.append("<p><strong>已选：</strong>" + html.escape("；".join(selected)) + "</p>")
+    if record.get("answer"):
+        parts.append("<p><strong>补充：</strong></p><pre class=\"answer\">"
+                     + html.escape(str(record.get("answer"))) + "</pre>")
+    return "".join(parts)
+
+
+def make_handler(root, transport, *, requirement_resolver=None,
+                 binding_resolver=None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):  # keep the console quiet
             return
@@ -359,16 +528,20 @@ def make_handler(root, transport):
                 self._send(404, _page({"issue": ""}, "",
                                       _notice("问卷不存在。")))
                 return
+            stale = stale_reason(record, requirement_resolver)
+            if stale:
+                self._send(410, _page(record, "", _notice(
+                    "本问题已过期，未提交：" + html.escape(stale), warn=True)))
+                return
             if record.get("submitted"):
-                self._send(200, _page(
-                    record, "<pre class=\"answer\">"
-                            + html.escape(str(record.get("answer") or ""))
-                            + "</pre>",
-                    _notice("本题答案已提交。")))
+                self._send(200, _page(record, _answer_summary(record),
+                                      _notice("本题答案已提交并回传当前 AT。")))
                 return
             self._send(200, _page(record, _form(record)))
 
         def do_POST(self):  # noqa: N802
+            from urllib.parse import parse_qs
+
             qid = self._qid()
             record = load(root, qid) if qid else None
             if record is None:
@@ -377,30 +550,38 @@ def make_handler(root, transport):
                 return
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(length).decode("utf-8", "replace")
-            answer = ""
-            for part in raw.split("&"):
-                key, _, value = part.partition("=")
-                if key == "answer":
-                    answer = _unquote(value)
-            outcome, detail = submit(root, qid, answer, transport)
+            form = parse_qs(raw, keep_blank_values=True)
+            answer = str((form.get("answer") or [""])[0])
+            choices = [str(value) for value in form.get("choice") or []]
+            outcome, detail = submit(
+                root, qid, answer, transport, choices=choices,
+                requirement_resolver=requirement_resolver,
+                binding_resolver=binding_resolver)
+            latest = load(root, qid) or record
             if outcome == "submitted":
-                self._send(200, _page(
-                    record, "", _notice("已提交，答案已回传 AT。")))
+                self._send(200, _page(latest, _answer_summary(latest),
+                                      _notice("已确认，答案已回传当前 AT。")))
+            elif outcome == "stale":
+                self._send(410, _page(record, "", _notice(
+                    "本问题已过期，答案未保存、未回传：" + html.escape(detail),
+                    warn=True)))
+            elif outcome == "invalid":
+                record["answer"] = answer
+                record["choices"] = choices
+                self._send(422, _page(record, _form(record),
+                                      _notice(html.escape(detail), warn=True)))
+            elif outcome == "already_submitted":
+                self._send(409, _page(latest, _answer_summary(latest), _notice(
+                    "本题已经提交，不重复回传。", warn=True)))
             elif outcome == "no_sid":
-                self._send(409, _page(
-                    record, "",
-                    _notice("答案已保存，但没有回传：本题没有登记 AT 会话。",
-                            warn=True)))
+                self._send(409, _page(latest, "", _notice(
+                    "答案文档已保存，但没有回传：当前没有可用 AT 会话。", warn=True)))
             elif outcome == "no_transport":
-                self._send(409, _page(
-                    record, "",
-                    _notice("答案已保存，但没有回传：服务未接入发送通道。",
-                            warn=True)))
+                self._send(409, _page(latest, "", _notice(
+                    "答案文档已保存，但没有回传：服务未接入发送通道。", warn=True)))
             else:
-                self._send(502, _page(
-                    record, "",
-                    _notice("答案已保存，但回传失败：" + html.escape(detail),
-                            warn=True)))
+                self._send(502, _page(latest, "", _notice(
+                    "答案未回传：" + html.escape(detail), warn=True)))
 
         def do_HEAD(self):  # noqa: N802
             self._send(200, "")
@@ -437,28 +618,48 @@ class _Server(ThreadingHTTPServer):
     allow_reuse_address = False
 
 
-def serve(*, root, port: int = DEFAULT_PORT, transport=None) -> ThreadingHTTPServer:
-    """Bind ``127.0.0.1:port`` **now** and return the server, unserved.
-
-    Binding is part of construction: an occupied port must fail before anyone
-    is handed a link, because a link that answers nothing is worse than an
-    error the operator can read. The caller runs ``serve_forever`` and closes.
-
-    The pid file is written here and removed by :func:`run`, which is the entry
-    that owns the process lifetime.
-    """
+def serve(*, root, port: int = DEFAULT_PORT, transport=None,
+          requirement_resolver=None, binding_resolver=None) -> ThreadingHTTPServer:
+    """Bind loopback now and return the server, unserved."""
     base = Path(root) / "atserve"
     base.mkdir(parents=True, exist_ok=True)
-    server = _Server((HOST, int(port)), make_handler(root, transport))
+    server = _Server((HOST, int(port)), make_handler(
+        root, transport, requirement_resolver=requirement_resolver,
+        binding_resolver=binding_resolver))
     (base / "atserve.pid").write_text(str(os.getpid()), encoding="utf-8")
     return server
 
 
-def run(*, root, port: int = DEFAULT_PORT, transport=None) -> int:
-    """Serve until interrupted; return an exit code (0 clean, 1 bind failure)."""
+def _deployment_resolvers(root):
+    from . import requirements
+    from . import session_ledger
+
+    def requirement(requirement_id):
+        return requirements.current(requirements.load_projection(root), requirement_id)
+
+    def binding(record):
+        database = session_ledger.load_issue_sessions()
+        for key in record.get("binding_keys") or [record.get("thread")]:
+            entry = database.get(str(key)) or {}
+            at = entry.get("at") if isinstance(entry, dict) else {}
+            if isinstance(at, dict) and at.get("session"):
+                return at
+        return {}
+    return requirement, binding
+
+
+def run(*, root, port: int = DEFAULT_PORT, transport=None,
+        requirement_resolver=None, binding_resolver=None) -> int:
+    """Serve until interrupted; wire live requirement and AT binding lookups."""
     base = Path(root) / "atserve"
+    if requirement_resolver is None or binding_resolver is None:
+        default_requirement, default_binding = _deployment_resolvers(root)
+        requirement_resolver = requirement_resolver or default_requirement
+        binding_resolver = binding_resolver or default_binding
     try:
-        server = serve(root=root, port=port, transport=transport)
+        server = serve(root=root, port=port, transport=transport,
+                       requirement_resolver=requirement_resolver,
+                       binding_resolver=binding_resolver)
     except OSError as exc:
         print(f"at_serve: 无法绑定 {HOST}:{port} - {exc}", file=sys.stderr)
         return 1
@@ -486,6 +687,7 @@ def _real_transport(sid: str, text: str) -> bool:
 def main(argv=None) -> int:
     import argparse
 
+    from . import agent_config
     from . import config as config_mod
     from . import store as store_mod
 
@@ -497,8 +699,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     # Resolve the root the same way ``cli._build`` does, so the service reads
     # the files the engine wrote instead of a look-alike directory beside them.
-    root, _note = store_mod.choose_root(
-        config_mod.state_root(config_mod.load(None, {})))
+    root, _note = store_mod.choose_root(config_mod.state_root(
+        config_mod.load(overrides=agent_config.overrides())))
     if args.root:
         root = Path(args.root)
     return run(root=root, port=args.port,

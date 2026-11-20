@@ -9,6 +9,7 @@
 - **milestone 1 已完成**：单 Issue 闭环，Thread × Assignment 状态机＋确定性快通道（#20）。
 - **milestone 2 已完成**：QA 直通、`waiting_release`、关单对账四条件两轮，引擎只核对不关单（#21）。
 - **Reporter 已完成**：只读首屏、三类动作桶、unknown 不读成 none（#49）。
+- **AT 模式已实现（#110）**：Issue 版本化需求包、精确批准、Assignment revision/hash 门禁、T1/T2 PM 路由、旧 outbox 失效、本地选项问卷和答案文档。操作见 `docs/at_mode.md`；公开默认 `at_mode=false`。
 
 ## 在办与待开工
 

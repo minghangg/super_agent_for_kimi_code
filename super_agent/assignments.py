@@ -83,7 +83,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 ACTIVE_STATES = ("queued", "working", "waiting_review", "waiting_release",
-                 "close_reconcile", "blocked", "waiting_person")
+                 "close_reconcile", "blocked", "waiting_person",
+                 "waiting_requirement")
 TERMINAL_STATES = ("completed",)
 PARTICIPANT_ROLES = ("worker", "qa")
 
@@ -267,17 +268,56 @@ def session_events_active(state: dict) -> dict:
     return active_keys(state)
 
 
-def sync(index: dict, thread: str, issue, live: list[dict], *,
-         crosscheck: set[str] | None = None) -> dict:
-    """Create/refresh assignments for ``live`` bindings.
+def _requirement_fields(package: dict | None) -> dict:
+    if not package:
+        return {}
+    return {
+        "requirement_id": package.get("requirement_id"),
+        "requirement_ref": package.get("source_ref"),
+        "revision": package.get("revision"),
+        "requirement_hash": package.get("requirement_hash"),
+        "approval_ref": package.get("approval_ref"),
+        "review_policy": dict(package.get("review_policy") or {}),
+    }
 
-    Returns ``{"created": [...], "updated": [...], "conflict": [...]}``. A
-    session already carried by an active assignment is not re-created; the
-    earliest assignment for the same ``(thread, role)`` wins, so a rotation
-    updates ``sid`` instead of forking a second worker.
-    """
+
+def _same_requirement(rec: dict, package: dict | None) -> bool:
+    if not package:
+        return False
+    fields = _requirement_fields(package)
+    return (rec.get("requirement_id") == fields["requirement_id"]
+            and rec.get("revision") == fields["revision"]
+            and rec.get("requirement_hash") == fields["requirement_hash"])
+
+
+def supersede(index: dict, thread: str, package: dict | None) -> list[str]:
+    """Pause every assignment not bound to the currently approved package."""
+    changed = []
+    for aid, rec in (index.get("assignments") or {}).items():
+        if str(rec.get("thread") or "") != thread:
+            continue
+        if str(rec.get("status") or "") in TERMINAL_STATES:
+            continue
+        if package and str(package.get("status")) in ("approved", "dispatched") \
+                and _same_requirement(rec, package):
+            continue
+        if str(rec.get("status") or "") != "waiting_requirement":
+            rec["requirement_previous_status"] = rec.get("status")
+            rec["status"] = "waiting_requirement"
+            rec["requirement_hold_at"] = now()
+            changed.append(aid)
+        rec["requirement_current_revision"] = (package or {}).get("revision")
+        rec["requirement_current_hash"] = (package or {}).get("requirement_hash")
+    return changed
+
+
+def sync(index: dict, thread: str, issue, live: list[dict], *,
+         crosscheck: set[str] | None = None,
+         requirement: dict | None = None) -> dict:
+    """Create/refresh assignments, optionally bound to an approved AT revision."""
     assignments = index.setdefault("assignments", {})
-    out = {"created": [], "updated": [], "conflict": [], "crosscheck": []}
+    out = {"created": [], "updated": [], "conflict": [], "crosscheck": [],
+           "resumed": []}
     by_role: dict[str, list[str]] = {}
     for aid, rec in assignments.items():
         if str(rec.get("thread") or "") != thread:
@@ -290,17 +330,24 @@ def sync(index: dict, thread: str, issue, live: list[dict], *,
         role = bind["role"]
         key = bind.get("name") or bind["key"]
         existing = sorted(by_role.get(role) or [])
-        # A role may be held by more than one session at a time, so the match
-        # key is the *session* (sid or session name), not the role alone.
-        # Matching on the role merged a second worker into the first record and
-        # lost it.
         match = None
         for aid in existing:
             rec = assignments[aid]
-            if rec.get("sid") == bind["sid"] or (
+            if rec.get("sid") != bind["sid"] and not (
                     rec.get("session_key") and rec.get("session_key") == key):
-                match = aid
-                break
+                continue
+            if requirement and str(rec.get("status") or "") == "waiting_requirement":
+                if _same_requirement(rec, requirement):
+                    rec["status"] = "working"
+                    rec["resumed_at"] = now()
+                    rec.pop("requirement_previous_status", None)
+                    out["resumed"].append(aid)
+                    match = aid
+                # A different approved revision gets a new Assignment. The old
+                # one remains a visible audit record and cannot accept delivery.
+                continue
+            match = aid
+            break
         if match is not None:
             rec = assignments[match]
             if rec.get("sid") != bind["sid"]:
@@ -316,9 +363,10 @@ def sync(index: dict, thread: str, issue, live: list[dict], *,
             "input_comment_id": None, "status": "working",
             "attempts": 0, "notification_action_id": "", "notified_at": "",
             "delivery_comment_id": None, "delivery_cids": [],
-            "delivery_marker": "",
-            "matched_by": "", "created_at": now(), "updated_at": now(),
+            "delivery_marker": "", "matched_by": "",
+            "created_at": now(), "updated_at": now(),
             "archived_at": "", "tombstone": {},
+            **_requirement_fields(requirement),
         }
         by_role.setdefault(role, []).append(aid)
         out["created"].append(aid)
@@ -382,6 +430,9 @@ def on_delivery(assignment: dict, delivery_cid, name: str,
         return {"changed": False, "reason": "assignment already completed"}
     if status in HOLD_STATES:
         return {"changed": False, "reason": "late delivery after a QA pass"}
+    if status == "waiting_requirement":
+        return {"changed": False, "refused": True,
+                "reason": "requirement revision is not approved for this assignment"}
     if status == "blocked":
         gate = blocked_exit(assignment, delivery_cid)
         if not gate["ok"]:
@@ -460,6 +511,8 @@ def qa_gate(assignment: dict) -> tuple[bool, str]:
     """
     if str(assignment.get("status") or "") in TERMINAL_STATES:
         return False, "assignment already completed"
+    if str(assignment.get("status") or "") == "waiting_requirement":
+        return False, "requirement revision is waiting for approval"
     verdict = str(assignment.get("qa_verdict") or "")
     if verdict == "pass":
         return True, "qa pass"
@@ -507,6 +560,9 @@ def on_review(assignment: dict, review: dict, *, review_cid, verified: bool = Tr
     if status in TERMINAL_STATES or status == "close_reconcile":
         return {"changed": False, "refused": True,
                 "reason": "review after the hold state"}
+    if status == "waiting_requirement":
+        return {"changed": False, "refused": True,
+                "reason": "requirement revision is not approved for this assignment"}
     verdict = str(review.get("verdict") or "")
     edited = _is_edited(assignment, review_cid, verdict)
     # A comment that has already been read and has **not** changed is a replay,

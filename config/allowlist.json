@@ -5,4 +5,4 @@
                  "cwd": ".",
                  "mode": "observe", "creation_mode": "pm_created",
                  "issues": [1], "actions": ["bus_inject", "collect", "bind", "archive", "reconcile"],
-                 "max_active_writers": 1, "roles": ["worker", "qa"]}}}
+                 "max_active_writers": 1, "roles": ["worker", "qa"], "at_mode": false}}}

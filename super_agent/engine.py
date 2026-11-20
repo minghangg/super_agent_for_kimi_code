@@ -78,7 +78,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import (at_serve, envelope, github_source, health, issuekey, markers,
-               needs, session_events, session_ledger, sessionkeys)
+               needs, requirements, session_events, session_ledger, sessionkeys)
 from . import assignments as asg_mod
 from .allowlist import ProjectAllowlist
 from .store import Store, action_id
@@ -313,6 +313,74 @@ class Engine:
             if issue in entry["issues"]:
                 return name
         return None
+
+    def _at_mode(self, issue) -> bool:
+        entry = self.projects.project(self._project_for(issue)) if self.projects else None
+        return bool((entry or {}).get("at_mode", False))
+
+    @staticmethod
+    def _requirement_projection(index: dict) -> dict:
+        projection = index.get("requirements")
+        if not isinstance(projection, dict):
+            projection = {"schema_version": requirements.SCHEMA_VERSION,
+                          "requirements": {}, "seen_comment_ids": [], "errors": []}
+            index["requirements"] = projection
+        return projection
+
+    def _apply_requirement_comments(self, index: dict, thread: str,
+                                    comments: list[dict]) -> dict | None:
+        projection = requirements.project_comments(
+            comments, self._requirement_projection(index))
+        index["requirements"] = projection
+        return requirements.current(projection, thread)
+
+    @staticmethod
+    def _requirement_current(index: dict, thread: str) -> dict | None:
+        projection = index.get("requirements") or {}
+        return requirements.current(projection, thread)
+
+    def _requirement_event_error(self, index: dict, thread: str, issue: int,
+                                 comment: dict, assignment: dict | None = None) -> str:
+        if not self._at_mode(issue):
+            return ""
+        reference = requirements.event_reference(str(comment.get("body") or ""))
+        if reference is None:
+            return "missing or ambiguous requirement revision marker"
+        package = self._requirement_current(index, thread)
+        if not package or str(package.get("status")) not in ("approved", "dispatched"):
+            return "current requirement revision is not approved"
+        if not requirements.reference_matches(reference, package):
+            return "event belongs to a stale requirement revision"
+        if assignment is not None and not requirements.reference_matches(
+                reference, assignment):
+            return "event and Assignment requirement revisions differ"
+        return ""
+
+    def _referenced_assignment(self, index: dict, thread: str, issue: int,
+                               comment: dict, name: str = "") -> tuple[dict | None, str]:
+        error = self._requirement_event_error(index, thread, issue, comment)
+        if error:
+            return None, error
+        reference = requirements.event_reference(str(comment.get("body") or ""))
+        candidates = []
+        for rec in (index.get("assignments") or {}).values():
+            if str(rec.get("thread") or "") != thread:
+                continue
+            if str(rec.get("role") or "") != "worker":
+                continue
+            if str(rec.get("status") or "") in asg_mod.TERMINAL_STATES + (
+                    "waiting_requirement",):
+                continue
+            if name and str(rec.get("session_key") or "") != str(name):
+                continue
+            if requirements.reference_matches(reference, rec):
+                candidates.append(rec)
+        if not candidates:
+            return None, "no active Assignment matches the requirement reference"
+        if name == "" and len(candidates) > 1:
+            candidates.sort(key=lambda rec: int(rec.get("delivery_comment_id") or 0),
+                            reverse=True)
+        return candidates[0], ""
 
     def _sync_allowlist_issues(self, issue_numbers, summary: dict) -> dict:
         """Keep ``allowlist.issues`` equal to the issues the source returned.
@@ -1223,12 +1291,17 @@ class Engine:
                    review: dict, summary: dict) -> str:
         """Apply a verdict, then route it. Returns the triage state."""
         cid = int(comment["id"])
-        assignment = self._review_target(index, thread)
+        if self._at_mode(issue):
+            assignment, requirement_error = self._referenced_assignment(
+                index, thread, issue, comment)
+        else:
+            assignment, requirement_error = self._review_target(index, thread), ""
         if assignment is None:
+            reason = requirement_error or "no active worker assignment"
             self.store.log_event({"type": "review.unmatched", "at": _now(),
                                   "thread": thread, "comment_id": cid,
-                                  "reason": "no active worker assignment"})
-            return "needs_person", "review without an active assignment"
+                                  "reason": reason})
+            return "needs_person", reason
         verified = self._review_verified(thread, comment)
         moved = asg_mod.on_review(assignment, review, review_cid=cid,
                                   verified=verified)
@@ -2084,7 +2157,10 @@ class Engine:
         record = {"thread": thread, "comment_id": int(cid),
                   "state": str(verdict.get("state") or ""),
                   "matched": str(verdict.get("matched") or ""),
-                  "issue": verdict.get("issue"), "at": _now()}
+                  "issue": verdict.get("issue"), "at": _now(),
+                  "requirement_id": verdict.get("requirement_id"),
+                  "revision": verdict.get("revision"),
+                  "requirement_hash": verdict.get("requirement_hash")}
         ledger[thread] = record
         if isinstance(index.get("at_stall"), dict):
             index["at_stall"].pop(thread, None)
@@ -2143,10 +2219,15 @@ class Engine:
         except (TypeError, ValueError):
             port = at_serve.DEFAULT_PORT
         try:
+            question = str(verdict.get("line") or "")
+            requirement = verdict.get("_requirement")
+            if requirement and requirement.get("open_questions"):
+                question = str(requirement["open_questions"][0])
             qid = at_serve.create_question(
                 root=self.store.root, thread=thread, issue=int(issue),
-                comment_id=int(cid), sid=self._at_sid(thread),
-                question=str(verdict.get("line") or ""))
+                comment_id=int(cid), sid=self._at_sid(thread), question=question,
+                requirement=requirement,
+                binding_keys=self._issue_session_keys(thread))
         except OSError as exc:
             self.store.log_event({
                 "type": "at.question_unfiled", "at": _now(), "thread": thread,
@@ -2200,6 +2281,31 @@ class Engine:
                 f"verdict names issue #{int(named)} but thread is #{int(issue)}")
             return "needs_person", (f"verdict names issue #{int(named)} but "
                                     f"thread is #{int(issue)}")
+        if self._at_mode(issue) and state in ("ready", "questions"):
+            try:
+                packages = requirements.blocks(str(comment.get("body") or ""),
+                                               requirements.PACKAGE_FENCE)
+                if len(packages) != 1:
+                    raise requirements.RequirementError(
+                        "AT READY/questions requires exactly one requirement fence")
+                package = requirements.validate_package(packages[0])
+                current = self._requirement_current(index, thread)
+                if not current or current.get("source_comment_id") != cid \
+                        or current.get("requirement_hash") != package["requirement_hash"]:
+                    raise requirements.RequirementError(
+                        "AT verdict is not the current readable requirement revision")
+                if state == "questions" and not package.get("open_questions"):
+                    raise requirements.RequirementError(
+                        "questions verdict requires a non-empty open_questions list")
+            except requirements.RequirementError as exc:
+                self._pm_needs_person(index, thread, cid,
+                                      "at.requirement_invalid[user]", str(exc))
+                return "needs_person", str(exc)
+            verdict = dict(verdict)
+            verdict.update(requirement_id=package["requirement_id"],
+                           revision=package["revision"],
+                           requirement_hash=package["requirement_hash"],
+                           _requirement=package)
         self._record_at_verdict(index, thread, verdict, cid)
         if self._at_announced(index, thread, cid) is not None:
             self.store.log_event({
@@ -2578,6 +2684,21 @@ class Engine:
                 self._pm_needs_person(index, thread, cid, "pm.verdict[user]",
                                       detail, verdict)
                 return "needs_person", f"pm verdict: {detail}"
+        if self._at_mode(issue):
+            if declared_delivery is None:
+                detail = "AT-mode PM verdict requires an exact delivery coordinate"
+                self._pm_needs_person(index, thread, cid, "pm.verdict[user]",
+                                      detail, verdict)
+                return "needs_person", detail
+            requirement_error = self._requirement_event_error(
+                index, thread, issue, comment, owner)
+            if requirement_error:
+                self.store.log_event({"type": "pm.requirement_refused", "at": _now(),
+                                      "thread": thread, "comment_id": cid,
+                                      "reason": requirement_error})
+                self._pm_needs_person(index, thread, cid, "pm.verdict[user]",
+                                      requirement_error, verdict)
+                return "needs_person", requirement_error
         named = verdict.get("issue")
         if named is not None and int(named) != int(issue):
             # The verdict speaks about a different issue. Filing it against
@@ -3464,7 +3585,34 @@ class Engine:
                 sid = str((entry or {}).get("session") or "")
                 if sid:
                     crosscheck.add(sid)
-        out = asg_mod.sync(index, thread, issue, live, crosscheck=crosscheck)
+        requirement = None
+        if self._at_mode(issue):
+            requirement = self._requirement_current(index, thread)
+            held = asg_mod.supersede(index, thread, requirement)
+            if held:
+                self.store.log_event({"type": "assignment.waiting_requirement",
+                                      "at": _now(), "thread": thread,
+                                      "assignments": held,
+                                      "revision": (requirement or {}).get("revision")})
+            if not self._at_sid(thread):
+                self._append_needs_person(index, thread, {
+                    "comment_id": 0, "reason": "at.session_missing[user]",
+                    "at": _now()})
+            if not requirement or str(requirement.get("status")) not in (
+                    "approved", "dispatched"):
+                if live:
+                    self.store.log_event({"type": "assignment.requirement_refused",
+                                          "at": _now(), "thread": thread,
+                                          "status": (requirement or {}).get("status"),
+                                          "bindings": len(live)})
+                    self._append_needs_person(index, thread, {
+                        "comment_id": 0,
+                        "reason": "requirement.not_approved[user]", "at": _now()})
+                return {"created": [], "updated": [], "conflict": [],
+                        "crosscheck": [], "resumed": [],
+                        "requirement_refused": True}
+        out = asg_mod.sync(index, thread, issue, live, crosscheck=crosscheck,
+                           requirement=requirement)
         if out["conflict"]:
             self.store.log_event({"type": "assignment.source_conflict", "at": _now(),
                                   "thread": thread, "conflict": out["conflict"]})
@@ -3491,7 +3639,12 @@ class Engine:
             "payload": {"thread": assignment.get("thread"),
                         "assignment": assignment["id"],
                         "sid": assignment.get("sid"),
-                        "delivery_comment_id": delivery},
+                        "delivery_comment_id": delivery,
+                        "requirement_id": assignment.get("requirement_id"),
+                        "revision": assignment.get("revision"),
+                        "requirement_hash": assignment.get("requirement_hash"),
+                        "approval_ref": assignment.get("approval_ref"),
+                        "review_policy": assignment.get("review_policy")},
         })
         if result.get("dispatched"):
             # ``ok`` is the only confirmation: ``mark_done`` runs only when the
@@ -3544,20 +3697,31 @@ class Engine:
         dropped), which is the one place this differs from the other outcomes.
         """
         cid = int(comment["id"])
-        assignment, matched_by = asg_mod.match_delivery(index, thread,
-                                                        delivery["name"],
-                                                        delivery["marker"])
+        if self._at_mode(issue):
+            assignment, matched_by = self._referenced_assignment(
+                index, thread, issue, comment, delivery["name"])
+        else:
+            assignment, matched_by = asg_mod.match_delivery(
+                index, thread, delivery["name"], delivery["marker"])
         if assignment is None:
             self.store.log_event({"type": "assignment.unmatched", "at": _now(),
                                   "thread": thread, "comment_id": cid,
                                   "marker": delivery["name"],
                                   "reason": matched_by})
-            return "needs_person", f"unmatched delivery {delivery['name']!r}"
+            return "needs_person", f"unmatched delivery {delivery['name']!r}: {matched_by}"
         moved = asg_mod.on_delivery(assignment, cid, delivery["name"], matched_by)
         if moved["changed"]:
             self.store.log_event({"type": "assignment.delivery", "at": _now(),
                                   "assignment": assignment["id"], "thread": thread,
-                                  "comment_id": cid, "matched_by": matched_by})
+                                  "comment_id": cid, "matched_by": matched_by,
+                                  "requirement_id": assignment.get("requirement_id"),
+                                  "revision": assignment.get("revision"),
+                                  "requirement_hash": assignment.get("requirement_hash")})
+        elif moved.get("refused"):
+            self.store.log_event({"type": "assignment.delivery_refused", "at": _now(),
+                                  "assignment": assignment["id"], "thread": thread,
+                                  "comment_id": cid, "reason": moved.get("reason")})
+            return "needs_person", str(moved.get("reason") or "delivery refused")
         # Retried on a later round when the previous attempt was refused or
         # suppressed: those paths write no attempt counter on purpose.
         self._notify_waiting_review(assignment)
@@ -4242,6 +4406,31 @@ class Engine:
         })
         return out
 
+    def _prepared_requirement_error(self, rec: dict) -> str:
+        issue = rec.get("issue")
+        if not self._at_mode(issue):
+            return ""
+        outer = rec.get("payload") or {}
+        payload = outer.get("payload") if isinstance(outer.get("payload"), dict) else outer
+        reference = {key: payload.get(key) for key in
+                     ("requirement_id", "revision", "requirement_hash")}
+        if not all(reference.values()):
+            return "AT-mode prepared action has no requirement version"
+        index = self.store.load_index()
+        thread = str(payload.get("thread") or self._thread_key(issue))
+        package = self._requirement_current(index, thread)
+        if not package or str(package.get("status")) not in ("approved", "dispatched"):
+            return "prepared action requirement is no longer approved"
+        if not requirements.reference_matches(reference, package):
+            return "prepared action belongs to a superseded requirement"
+        assignment = (index.get("assignments") or {}).get(str(rec.get("assignment_id") or ""))
+        if assignment is not None:
+            if str(assignment.get("status") or "") == "waiting_requirement":
+                return "prepared action Assignment is waiting for a requirement"
+            if not requirements.reference_matches(reference, assignment):
+                return "prepared action and Assignment versions differ"
+        return ""
+
     def replay_prepared(self) -> list[dict]:
         """Replay only actions recorded as ``prepared`` (certain not to have run).
 
@@ -4262,6 +4451,18 @@ class Engine:
                       "payload": payload.get("payload") if isinstance(
                           payload.get("payload"), dict) else payload}
             action.setdefault("event", payload.get("event"))
+            requirement_error = self._prepared_requirement_error(rec)
+            if requirement_error:
+                aid = str(rec.get("action_id"))
+                self.store.mark_reconciled(aid, "done",
+                                           f"superseded requirement: {requirement_error}")
+                self.store.log_event({"type": "outbox.requirement_superseded",
+                                      "at": _now(), "action_id": aid,
+                                      "reason": requirement_error})
+                result = {"dispatched": False, "refused": True,
+                          "reason": requirement_error, "action_id": aid}
+                out.append(result)
+                continue
             result = self._dispatch(action, reuse_action_id=rec.get("action_id"))
             result["action_id"] = rec.get("action_id")
             out.append(result)
@@ -4457,21 +4658,29 @@ class Engine:
         rec = issues.setdefault(key, {"state": "idle", "comments_seen": 0,
                                       "needs_person": []})
         rec["title"] = rec.get("title") or self.source.title(issue)
-        # Assignments come from the session stream, once per issue per round,
-        # before any comment is triaged: a delivery needs its assignment to
-        # exist already.
-        synced = self._sync_assignments(index, key, issue)
-        summary["assignments"] += len(synced.get("created") or [])
         # Qualified key first, legacy second: a mixed file converges instead of
         # re-reading comments already consumed under the old form.
         cur = int(issuekey.read_both(cursor.get("issues") or {}, key, legacy) or 0)
-        # Paged read from the cursor, then take the **oldest** N new comments:
-        # taking the newest N (the old slice) silently skipped the middle when
-        # an issue had more new comments than the cap.
         comments = github_source.comments_from(self.source, issue, since_id=cur,
                                                max_pages=max_pages)
         fresh = [c for c in comments if int(c["id"]) > cur][:max_comments]
         summary["comments_new"] += len(fresh)
+        if self._at_mode(issue):
+            # Rebuild from the Issue, not from the cursor: approval may predate
+            # at_mode being enabled. The projection is only a disposable cache.
+            history = github_source.comments_from(self.source, issue, since_id=0,
+                                                  max_pages=100)
+            self._apply_requirement_comments(index, key, history)
+            try:
+                requirements.save_projection(self.store.root, index["requirements"])
+            except OSError as exc:
+                self.store.log_event({"type": "requirement.projection_write_failed",
+                                      "at": _now(), "thread": str(key),
+                                      "error": f"{type(exc).__name__}: {exc}"})
+        # Requirement projection precedes session discovery: a live binding is
+        # not permission to work before the exact revision has been approved.
+        synced = self._sync_assignments(index, key, issue)
+        summary["assignments"] += len(synced.get("created") or [])
 
         seen_this_round: set[int] = set()
         # The window the double-ring guard reads: a PM verdict anywhere in this

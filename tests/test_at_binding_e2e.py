@@ -338,16 +338,18 @@ class E3AnswerComesBack(Base):
             self.assertTrue(link.startswith(f"http://127.0.0.1:{port}/q/"))
 
             page = urllib.request.urlopen(link, timeout=5).read().decode("utf-8")
-            self.assertIn("AT 有疑问", page)
+            self.assertIn("AT 需求确认", page)
 
             data = urllib.parse.urlencode({"answer": "先补 E3 证据"}).encode()
             body = urllib.request.urlopen(link, data=data, timeout=5).read() \
                 .decode("utf-8")
-            self.assertIn("已提交", body)
+            self.assertIn("已确认", body)
             self.assertEqual(len(received), 1)
             self.assertEqual(received[0][0], AT_SID,
                              "the answer must reach the session the CLI bound")
-            self.assertIn("先补 E3 证据", received[0][1])
+            self.assertNotIn("先补 E3 证据", received[0][1])
+            record = at_serve.load(self.state, link.rsplit("/", 1)[1])
+            self.assertIn("先补 E3 证据", Path(record["answer_file"]).read_text(encoding="utf-8"))
         finally:
             server.shutdown()
             server.server_close()

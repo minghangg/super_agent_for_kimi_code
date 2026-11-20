@@ -70,11 +70,11 @@ class DocumentStructure(unittest.TestCase):
     def test_p3_exactly_one_h1_and_no_heading_jump(self):
         page = render()
         self.assertEqual(page.count("<h1>"), 1)
-        self.assertNotIn("<h2>", page,
-                         "a page with one heading level needs no <h2>")
+        self.assertIn('<h2 id="question-heading">', page,
+                      "the question is the subsection under the page heading")
         body = re.search(r"<body>(.*?)</body>", page, re.S).group(1)
-        self.assertLess(body.index("<h1>"), body.index("<form"),
-                        "the heading is the page's subject, above the form")
+        self.assertLess(body.index("<h1>"), body.index('<h2 id="question-heading">'))
+        self.assertLess(body.index('<h2 id="question-heading">'), body.index("<form"))
 
     def test_the_page_declares_the_language(self):
         self.assertIn('<html lang="zh-CN">', render())
@@ -111,8 +111,8 @@ class Semantics(unittest.TestCase):
         # A verbose label is read on every focus; instructions belong in
         # ``aria-describedby`` so they can be skipped.
         page = render()
-        self.assertIn('aria-describedby="hint"', page)
-        self.assertIn('id="hint"', page)
+        self.assertIn('aria-describedby="answer-hint"', page)
+        self.assertIn('id="answer-hint"', page)
         label = re.search(r"<label[^>]*>(.*?)</label>", page, re.S).group(1)
         self.assertNotIn("回传", label)
 

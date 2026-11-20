@@ -35,7 +35,7 @@
 
 | | |
 |---|---|
-| **角色要薄** | 项目 PM 领单、判两个开关、原样转述结论、五句话向上报告。它不做调研。 |
+| **角色要薄** | 强 AT 前置澄清需求；PM 只按结构化策略调度，不重写需求、不重新判断 QA 开关。 |
 | **流转是代码** | 「这次交付现在该送复核」是一条规则，不是一次判断。状态机免费执行，而且不会累。 |
 | **记忆是记录** | Issue 是长期真源。本地索引是可重建的缓存 —— 删掉它会自己长回来。 |
 | **换血是常规操作** | 因为没有任何有价值的东西只活在会话里，扔掉一个会话很便宜。这才是长期工作能成立的原因。 |
@@ -58,6 +58,18 @@
   引擎（纯代码）在这些框之间搬东西；
   它从不判断活干得好不好。
 ```
+
+## AT 前置需求模式
+
+AT 模式下，开发从已批准的需求版本开始：AT 通过本地网页一轮问一个问题，用户点击选项、补充并确认；supervisor 批准精确 revision/hash；PM 只运行确定性路由。旧交付、旧 QA、旧问卷和旧 outbox 不能推进新版本。
+
+```bash
+python -m super_agent.at serve start --allow-send
+python -m super_agent.at start --role supervisor --project <项目> --issue <n> --cwd <项目仓>
+python -m super_agent.requirements approve --role supervisor --project <项目> --issue <n>
+```
+
+完整需求 schema、用户操作、T1/T2 路由和回退见 [AT 操作手册](docs/at_mode.md)。公开配置默认 `at_mode=false`。
 
 ## 想试
 

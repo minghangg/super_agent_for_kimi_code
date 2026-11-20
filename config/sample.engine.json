@@ -37,6 +37,7 @@
     "allowlist": [
       "issue_comment.created"
     ],
+    "at_question_port": 58731,
     "cooldown_s": 900,
     "assignments": {},
     "session_state_dir": "",

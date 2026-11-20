@@ -56,7 +56,7 @@ DEFAULT_ACTIONS = ("collect", "reconcile")
 # Fields a local overlay may override. Everything else is inherited from the
 # tracked file: the overlay adds a deployment fact (the real repository name),
 # it is not a second place to define project policy.
-OVERLAY_FIELDS = ("repo", "issues", "actions", "mode", "roles")
+OVERLAY_FIELDS = ("repo", "issues", "actions", "mode", "roles", "at_mode")
 OVERLAY_SUFFIX = ".local.json"
 
 
@@ -170,6 +170,9 @@ def validate(data) -> dict:
                      f"(known: {sorted(ACTIONS)})")
         roles = raw.get("roles", ["worker", "qa"])
         clean_roles = _string_list(roles, f"project {name!r}: roles")
+        at_mode = raw.get("at_mode", False)
+        _require(isinstance(at_mode, bool),
+                 f"project {name!r}: at_mode must be a boolean")
         normalized["projects"][name.strip()] = {
             "repo": repo.strip(),
             "cwd": cwd.strip(),
@@ -178,6 +181,7 @@ def validate(data) -> dict:
             "issues": sorted(set(clean_issues)),
             "actions": sorted(set(clean_actions)),
             "roles": clean_roles,
+            "at_mode": raw.get("at_mode", False),
         }
     return normalized
 

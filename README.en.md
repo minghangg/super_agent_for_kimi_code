@@ -33,7 +33,7 @@ Everything else in this repository follows from those two.
 
 | | |
 |---|---|
-| **Roles are thin** | A project manager agent takes the item, decides two switches, relays verdicts verbatim, and reports upward in five lines. It does not investigate. |
+| **Roles are thin** | A strong AT clarifies requirements up front; the PM only routes structured decisions and never rewrites requirements or re-decides QA policy. |
 | **Transitions are code** | "This delivery goes to review now" is a rule, not a judgement. A state machine executes it for free and never gets tired. |
 | **Memory is a record** | Issues are the long-term truth. The local index is a rebuildable cache — delete it and it comes back. |
 | **Rotation is routine** | Because nothing valuable lives only in a session, throwing a session away is cheap. That is what makes long-running work possible. |
@@ -56,6 +56,12 @@ Everything else in this repository follows from those two.
   the engine (plain code) moves items between these boxes;
   it never decides whether the work is any good.
 ```
+
+## AT requirement-first mode
+
+Development starts from an approved requirement revision. AT asks one question at a time through a local page; the user picks options, adds context and confirms. The supervisor approves an exact revision/hash, and the PM only executes deterministic routing. Stale deliveries, reviews, answers and outbox actions cannot advance a new revision.
+
+See the [AT operations guide](docs/at_mode.md) for the schema, commands, T1/T2 flow and rollback. Public configuration defaults to `at_mode=false`.
 
 ## Try it
 

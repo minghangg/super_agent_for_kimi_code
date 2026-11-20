@@ -1275,6 +1275,10 @@ def main(argv: list[str] | None = None) -> int:
         "--no-activate", action="store_true",
         help="skip the warm-up turn that activates a fresh session",
     )
+    parser.add_argument(
+        "--activate-only", action="store_true",
+        help="create a session, optionally run warm-up, and submit no task",
+    )
     parser.add_argument("--json", action="store_true", help="also print a JSON result block")
     parser.add_argument(
         "--ctx-force", action="store_true",
@@ -1320,8 +1324,10 @@ def main(argv: list[str] | None = None) -> int:
         base = discover_base(token, args.port)
         print(fetch_final_answer(base, token, args.session) or "(该会话没有 assistant 消息)")
         return 0
-    if not args.task:
-        parser.error("--task is required (unless --fetch)")
+    if not args.task and not args.activate_only:
+        parser.error("--task is required (unless --fetch or --activate-only)")
+    if args.activate_only and args.session:
+        parser.error("--activate-only is only valid when creating a session")
     if args.state_dir:
         _sess_events().apply_state_dir(["--state-dir", args.state_dir])
 
@@ -1397,6 +1403,13 @@ def main(argv: list[str] | None = None) -> int:
         activated = activate_session(base, token, sid, args.timeout,
                                      charter=_baseline, name=name,
                                      supplement=_supplement)
+    if args.activate_only:
+        print(f"[dispatch] activated only: session id {sid} (name={name})")
+        if args.json:
+            print(json.dumps({"session_id": sid, "name": name,
+                              "activated": activated, "activate_only": True,
+                              "model": model, "effort": effort}, ensure_ascii=False))
+        return 0
 
     marker = args.stop_marker or os.path.join(os.path.abspath(cwd), ".kimi", "tools", "STOP")
     progress_dir = os.path.join(os.path.abspath(cwd), ".kimi", "tools")

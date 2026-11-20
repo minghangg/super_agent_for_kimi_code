@@ -10,6 +10,12 @@
 2. **旧键必须删**。不删就是白名单里的僵尸键，指向已归档会话。
 3. **记录进运维单**，不进本地临时文件。本地 `rotation_*.md` 是 30 天缓存，不是真源。
 
+## 0.1 AT 专项接续
+
+AT 换血时，交接只带当前 requirement_ref/revision/hash、未决问题、最近答案文档路径和必要事实，不复制全部项目历史。更新 `sessions.json` 后还必须更新每个在飞 Issue 的 `at` 绑定；用一条新问题或现有待答问题实测答案只回新 sid，旧 sid 零投喂。旧 revision 页面仍须返回 410，不能因换血绕过版本校验。
+
+PM 换血只带 approved 调度包、当前路由阶段和异常队列；新 PM 不重写需求、不重判 review_policy。worker/QA 的版本绑定随 Assignment 保留，换会话不能改变 revision/hash。
+
 ## 1. 五步流水线（PM 与长命相同）
 
 | 步 | 动作 | 命令（全部 safkc） | 判据 |

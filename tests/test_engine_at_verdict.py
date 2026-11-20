@@ -490,17 +490,19 @@ class QuestionnaireEndToEnd(Base):
             link = payload["question_url"]
 
             page = urllib.request.urlopen(link, timeout=5).read().decode("utf-8")
-            self.assertIn("AT 有疑问", page)
+            self.assertIn("AT 需求确认", page)
 
             data = urllib.parse.urlencode({"answer": "先做 X"}).encode()
             reply = urllib.request.urlopen(link, data=data, timeout=5)
             body = reply.read().decode("utf-8")
-            self.assertIn("已提交", body)
+            self.assertIn("已确认", body)
             self.assertEqual(received, [("session_at",
                                          at_serve.answer_text(
                                              at_serve.load(self.state,
                                                            link.rsplit("/", 1)[1])))])
-            self.assertIn("先做 X", received[0][1])
+            self.assertNotIn("先做 X", received[0][1])
+            record = at_serve.load(self.state, link.rsplit("/", 1)[1])
+            self.assertIn("先做 X", Path(record["answer_file"]).read_text(encoding="utf-8"))
         finally:
             server.shutdown()
             server.server_close()
