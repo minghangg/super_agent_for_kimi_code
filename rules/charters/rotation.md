@@ -17,26 +17,31 @@
 | 0 | **核旧模型，记下来** | 读旧会话 wire 的最后一条 `usage.record.model` | 有值；这是新会话必须沿用的模型 |
 | 1 | 核旧会话占用 | `python -m super_agent.rotation show --key <键>` | `old_ctx` 有值；<60% 时换血收益低，须说明理由 |
 | 2 | 要求对方写交接档 | `python -m super_agent.console send <旧sid> "请按 handoff 模板写交接档"` | 对方回 `[交接完成]` |
-| 3 | 建新会话 | `python -m super_agent.dispatch_cli --cwd <工作台> --name <新键> --detach --no-activate --task <初始化>` | 见下「warmup 必须手工补」 |
-| 3b | **手工补 warmup** | 用 `dispatch_cli.warmup_prompt(<charter>, <新键>)` 生成文本，再 `--session <新sid> --detach --no-activate --task <那段文本>` | 新会话 wire 出现 `Read done.`，且首条消息含契约路径 |
+| 3 | 建新会话（**第一遍：建 + warmup**） | `python -m super_agent.dispatch_cli --cwd <工作台> --name <新键> --detach --task ""`（**不带 `--no-activate`**） | 新会话 wire 出现 `Read done.`，首条消息含契约与章程路径 |
+| 3b | **第二遍：发真正的内容** | `python -m super_agent.dispatch_cli --session <新sid> --detach --no-activate --task <任务>` | 任务正常执行 |
 | 4 | **把模型改回第 0 步的值** | `POST /api/v1/sessions/<新sid>/profile` `{"agent_config":{"model":"<第0步的值>"}}`，再发一轮让它生效 | 新会话 wire 的 `usage.record.model` **等于**旧会话的值 |
 | 5 | 换登记 ＋ 归档 | `python -m super_agent.sessions_ledger set <键> <新sid>` 然后 `archive <旧sid>` | `session.rotated` 与 `session.archived` 都落事件流 |
 | 6 | 写记录 | `python -m super_agent.rotation record --key <键> --trigger-reason … --ordered-by … --handoff-doc …` | 记录贴进运维单 |
 
-**warmup 必须手工补（2026-11-20 实测）**：warmup 只在 `if not args.no_activate and not args.session` 时自动跑（`dispatch_cli.py:1396`）。换血建新会话**必须带 `--no-activate`**（不带的话实测报 `round did not start within 120s`，主轮也起不来），于是 warmup 被一起跳过——**新会话首条消息里没有契约和章程，等于换血没换到位**。
-
-补法两步：
+**新建会话＝两条命令，不是一条（用户 2026-11-20 定）**：warmup 只在 `if not args.no_activate and not args.session` 时跑（`dispatch_cli.py:1396`），所以**建会话时不带 `--no-activate`，复用会话时才带**。
 
 ```bash
-# 1) 生成标准 warmup 文本（读契约 + 读章程 + 告知键名）
-python -c "from super_agent import dispatch_cli as D; \
-  print(D.warmup_prompt('D:/github/super_agent_for_kimi_code/rules/charters/scout.md','scout-<日期>-<尾>'))"
+# 第一遍：建会话 + 自动 warmup（读契约 + 读章程 + 告知键名）
+python -m super_agent.dispatch_cli --cwd <工作台> --name <新键> --detach \
+  --timeout 300 --task ""
 
-# 2) 作为一条 task 发进去（复用会话时 --session 本身就不跑 warmup）
-python -m super_agent.dispatch_cli --session <新sid> --detach --no-activate --task "<上面那段>"
+# 第二遍：发真正的内容（--session 本身就不跑 warmup，加 --no-activate 免掉多余等待）
+python -m super_agent.dispatch_cli --session <新sid> --detach --no-activate \
+  --timeout 300 --task "<真正要做的事>"
 ```
 
-**判据**：新会话 wire 里出现 `Read done.`，且 `context.append_message` 的首条含 `session_contract.md` 与角色章程路径。
+**为什么分两遍**：第一遍的 `--task` 内容会被 warmup 挤掉——warmup 占掉一轮，`--timeout` 预算被它吃掉，主任务赶不上就报 `round did not start within 120s`。分两遍后各拿各的预算，两轮都完整。
+
+**判据**：
+- 第一遍后 wire 有 `Read done.`，`context.append_message` 首条含 `session_contract.md` 与角色章程路径；
+- 第二遍后 wire 出现任务的实际输出。
+
+**别用 `--no-activate` 建会话**——那会跳过 warmup，新会话读不到契约与章程，「换了会话但没换到位」。真发生了就补：用 `dispatch_cli.warmup_prompt(<charter>, <新键>)` 生成文本，作为一条 task 发进去。
 
 **第 4 步不可省（用户 2026-11-20 令）**：新会话是用默认模型建的，**换血不得改变模型**——用户可能手工给这个角色调过模型，那个选择是长期决定，不是本次换血的副产品。换血只换会话，不换模型。
 
