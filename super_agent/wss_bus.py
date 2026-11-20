@@ -2730,10 +2730,77 @@ def make_app():
         status, payload = control(body)
         return web.json_response(payload, status=status)
 
+    async def journal(req):
+        """``GET /journal?sid=<sid>&since=<ts>[&verb=send]`` — read-only.
+
+        The journal is the daemon's own durable record of non-idempotent
+        actions. Until now it was reachable only from inside this process, so a
+        caller that needed to answer "was this session fed after time T" had to
+        read ``state/wss_bus_journal.jsonl`` — a private file path that belongs
+        to whichever workbench the daemon was started from. That is exactly the
+        kind of dependency ISS-90 removes: a rotation check must be answerable
+        from the daemon's own interface, not from a path.
+
+        Filtering happens here rather than in the caller because the file grows
+        without bound; returning it whole would move the cost, not remove it.
+
+        ``since`` is an epoch second (float allowed). Records without a
+        timestamp are dropped when ``since`` is given: an untimed record cannot
+        answer "after T", and guessing would make the check wrong in the
+        direction that matters (it would claim "no feed" when there was one).
+        """
+        try:
+            since = float(req.query.get("since", "0") or 0)
+        except ValueError:
+            return web.json_response({"ok": False, "err": "since 不是数字"},
+                                     status=400)
+        sid = str(req.query.get("sid") or "").strip()
+        verb = str(req.query.get("verb") or "").strip()
+        try:
+            limit = min(int(req.query.get("limit", "500")), 5000)
+        except ValueError:
+            limit = 500
+        out: list[dict] = []
+        bad = 0
+        try:
+            path = _journal_path()
+            if path.is_file():
+                with path.open("r", encoding="utf-8", errors="replace") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except ValueError:
+                            bad += 1
+                            continue
+                        if not isinstance(rec, dict):
+                            bad += 1
+                            continue
+                        if sid and str(rec.get("sid") or "") != sid:
+                            continue
+                        if verb and str(rec.get("verb") or "") != verb:
+                            continue
+                        if since:
+                            at = rec.get("at")
+                            if not isinstance(at, (int, float)) or at <= since:
+                                continue
+                        out.append(rec)
+        except OSError as exc:
+            return web.json_response({"ok": False, "err": f"journal 读不出：{exc}"},
+                                     status=500)
+        return web.json_response({
+            "ok": True, "count": len(out), "records": out[-limit:],
+            "unparsable": bad, "path_is_default": True,
+            "journal_ok": STATE.journal.ok,
+        })
+
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/state", state_all)
     app.router.add_get("/state/{sid}", state_one)
     app.router.add_get("/events", events)
+    app.router.add_get("/journal", journal)
     app.router.add_get("/tasks/{sid}", tasks)
     app.router.add_get("/pending/{sid}", pending)
     app.router.add_post("/control/{verb}", control_handler := ctrl)

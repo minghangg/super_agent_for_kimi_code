@@ -75,8 +75,19 @@ def _joined(*parts: str) -> str:
 # uses it for "close without archiving", this side for long-lived vs one-shot.
 FIXED_KEYS = {"steward", "qa", "scout", "auditor", "planner", "reviewer",
               _joined("re", "ed")}
+# Long-lived roles whose key may carry a random tail. `_is_fixed_key` asks "is
+# this key a long-lived role", and a key like `scout-3f7c1a90` is the **same
+# role** as `scout` -- the tail is what makes it unguessable (sessionkeys
+# requires it), not what makes it one-shot. Before ISS-90 only the bare names
+# matched, so a rotation that gave a long-lived role a random tail silently
+# demoted it to a one-shot worker with the 35% line instead of 60%.
+#
+# `wk-` is deliberately absent: a one-shot worker must stay one-shot however its
+# key is spelled.
 FIXED_PREFIXES = ("pm-", _joined("qa-l", "wa-"), _joined("re", "ed"),
-                  _joined("at", "-"))
+                  _joined("at", "-"),
+                  "scout-", "steward-", "auditor-", "reviewer-",
+                  "analyst-", "planner-")
 
 THRESHOLD_ONESHOT_REFUSE = 0.35
 THRESHOLD_REFUSE = 0.60
