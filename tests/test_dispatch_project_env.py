@@ -57,11 +57,11 @@ class PointerTest(unittest.TestCase):
 
     def test_basename_lowercased_matches_the_document(self) -> None:
         self.configure()
-        (self.env_dir / "laike_work_with_agent.md").write_text("# doc\n", encoding="utf-8")
-        cwd = self.root / "Laike_Work_With_Agent"
+        (self.env_dir / "demo_project.md").write_text("# doc\n", encoding="utf-8")
+        cwd = self.root / "Demo_Project"   # mixed case: the key is lower-cased
         line = D.project_env_pointer(str(cwd))
-        self.assertEqual(line, f"项目环境：laike_work_with_agent → "
-                               f"{self.env_dir / 'laike_work_with_agent.md'}")
+        self.assertEqual(line, f"项目环境：demo_project → "
+                               f"{self.env_dir / 'demo_project.md'}")
 
     def test_no_document_is_silent(self) -> None:
         self.configure()
