@@ -183,8 +183,9 @@ class PortChain(unittest.TestCase):
 
     def test_no_second_instance_parser(self) -> None:
         source = (Path(dispatch_cli.__file__)).read_text(encoding="utf-8")
-        self.assertNotIn("glob(", source)
         self.assertNotIn("instances/*.json", source)
+        # 实例解析只许走 paths.latest_instance()：禁止 glob instances 目录
+        self.assertNotRegex(source, r"glob\([^)]*instances")
 
 
 if __name__ == "__main__":
