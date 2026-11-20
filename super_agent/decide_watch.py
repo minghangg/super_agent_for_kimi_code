@@ -2267,6 +2267,13 @@ def _is_real_delivery(title: str) -> bool:
     ``No Notify`` does **not** disqualify a delivery: a worker may deliver
     without asking anyone to be paged, and the quota is about the reminder the
     watcher would send, not about the comment.
+
+    ``接单`` is the exception, by the user's 2026-11-20 ruling: acknowledging a
+    job notifies nobody but must leave a state the dispatcher can look up. It
+    therefore records and stays greppable, and spends no quota -- the same
+    treatment ``调试`` gets, for the same reason (nothing for a person to act
+    on). Spending quota on it would let routine acknowledgements push real
+    deliveries past the daily cap.
     """
     five = markers.parse_five(title)
     if five is None:
@@ -2275,7 +2282,7 @@ def _is_real_delivery(title: str) -> bool:
         return False
     if not markers.is_session_key_name(five["who"]):
         return False
-    return five["do"] not in markers.SILENT_ACTIONS
+    return five["do"] not in markers.QUIET_ACTIONS
 
 
 def _ledger_rows() -> list[dict]:

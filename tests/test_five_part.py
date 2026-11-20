@@ -240,3 +240,60 @@ class EveryAction(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LongLivedKeys(unittest.TestCase):
+    """ISS-99 round 2: the long-lived roles name their sessions in full.
+
+    Checking only the abbreviations (``WK``/``SC``/…) read ``scout-…``,
+    ``pm-…`` and ``qa-…`` as "not a session key", so 84 of the 147 recorded
+    keys produced no delivery at all -- every long-lived assistant's report
+    was silently dropped.
+    """
+
+    def test_full_role_names_are_session_keys(self):
+        for name in ("scout-20261120-0ca928f3", "pm-x-abc12345",
+                     "qa-lwa-ISS-99", "steward-1", "auditor-1",
+                     "reviewer-1", "analyst-1", "wk-1"):
+            self.assertTrue(markers.is_session_key_name(name), name)
+
+    def test_a_bare_role_word_is_still_not_one(self):
+        for name in ("WK", "SC", "PM", "QA", "scout", "steward"):
+            self.assertFalse(markers.is_session_key_name(name), name)
+
+    def test_a_long_lived_roles_delivery_is_a_delivery(self):
+        for name in ("scout-20261120-0ca928f3", "pm-x-abc12345",
+                     "qa-lwa-ISS-99"):
+            got = markers.parse_delivery(f"[{name}]-[完工]-[No Notify]-[lwa]")
+            self.assertIsNotNone(got, name)
+            self.assertEqual(got["name"], name)
+
+
+class AcknowledgeIsQuiet(unittest.TestCase):
+    """``接单`` changes state, notifies nobody, and spends no quota.
+
+    User 2026-11-20: 「接单不通知，但是要改评论状态，发起者可以查询」. Every row
+    of the ISS-99 table writes ``No Notify`` for it; the acknowledgement is
+    looked up, not delivered.
+    """
+
+    def test_acknowledge_never_notifies(self):
+        for notify in ("No Notify", "pm-x-abc12345", "All Active"):
+            five = markers.parse_five(
+                f"[wk-1]-[接单]-[{notify}]-[lwa]")
+            self.assertFalse(markers.wants_notify(five), notify)
+
+    def test_acknowledge_is_not_a_delivery(self):
+        # It is recorded and greppable, but it is not work delivered.
+        self.assertIsNone(markers.parse_delivery("[wk-1]-[接单]-[No Notify]-[lwa]"))
+
+    def test_acknowledge_spends_no_quota(self):
+        for notify in ("No Notify", "pm-x-abc12345"):
+            title = f"[wk-1]-[接单]-[{notify}]-[lwa]"
+            self.assertIn("接单", markers.QUIET_ACTIONS)
+            # The watcher's predicate is the one that decides the counter.
+            self.assertFalse(decide_watch._is_real_delivery(title), notify)
+
+    def test_a_delivery_still_spends_quota(self):
+        self.assertTrue(decide_watch._is_real_delivery(
+            "[wk-1]-[完工]-[pm-x]-[lwa]"))

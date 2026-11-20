@@ -42,6 +42,7 @@ import re
 import unicodedata
 
 from . import issuekey
+from . import sessionkeys
 
 # A delivery is ``[<role>:<name>]`` on the first line, name 1..64 non-]
 # characters. The role set is closed on purpose: ``PM`` and ``QA`` are
@@ -157,6 +158,13 @@ NOTIFY_ACTIONS = (
 #: not have to pretend to be a delivery.
 SILENT_ACTIONS = frozenset({"已归档", "调试"})
 
+#: Actions that spend no delivery quota. A superset of `SILENT_ACTIONS`:
+#: `接单` notifies nobody either (user 2026-11-20: 「接单不通知，但是要改评论
+#: 状态，发起者可以查询」), so it must stay out of the counter. Counting it
+#: would let routine acknowledgements push real deliveries past the daily cap,
+#: and there is nothing in an acknowledgement for a person to act on.
+QUIET_ACTIONS = SILENT_ACTIONS | {"接单"}
+
 NO_NOTIFY = "No Notify"
 
 
@@ -198,26 +206,52 @@ def parse_five(body: str) -> dict | None:
 
 
 def wants_notify(five: dict | None) -> bool:
-    """Does this title ask anyone to be told? ``False`` when it says No Notify."""
+    """Does this title ask anyone to be told? ``False`` when it says No Notify.
+
+    ``接单`` never notifies whoever the ``notify`` segment names: acknowledging a
+    job is a state change, not a request for attention (user 2026-11-20
+    「接单不通知，但是要改评论状态，发起者可以查询」). The dispatcher looks the
+    acknowledgement up by ``grep``/ledger; waking anyone for it just spends a
+    turn to read "OK". Treating it as silent regardless of the segment also
+    matches every row of the ISS-99 table, where the column is always
+    ``No Notify`` -- a caller that wrote something else by mistake should not
+    get a page out of it.
+    """
     if not five or not five.get("action_ok"):
         return False
-    if five["do"] in SILENT_ACTIONS:
+    if five["do"] in QUIET_ACTIONS:
         return False
     return _norm_notify(five["notify"]) != _norm_notify(NO_NOTIFY)
 
 
 def is_session_key_name(name: str) -> bool:
-    """Is ``name`` a session key (``wk-…``) rather than a bare role prefix?
+    """Is ``name`` a session key (``wk-1``, ``scout-…``) rather than a bare role?
 
-    A bare prefix carries no name, so a delivery it claims matches no
-    assignment. Both the engine (``_five_leaf``) and the watcher
+    A bare role word carries no name, so a delivery it claims matches no
+    assignment (``assignment.unmatched`` on a comment that looked fine). Both
+    the engine (``_five_leaf``) and the watcher
     (``decide_watch._is_real_delivery``) ask this question, and they must not
     answer it differently -- one refusing a line the other counts would let a
     comment be "not a delivery" for the engine and "spend quota" for the
     watcher.
+
+    Two conditions, and the second is the one a prefix table cannot express:
+
+    * a role prefix ``sessionkeys.role_of`` knows -- all eleven spellings, in
+      both the short (``wk-``) and the long form (``scout-``, ``pm-``, ``qa-``).
+      Checking ``DELIVERY_PREFIXES`` alone -- ``WK``, ``SC``, ``ST`` … -- read
+      every long-lived assistant's session as "not a session key", so 84 of the
+      147 recorded keys produced no delivery at all;
+    * something **after** that prefix: ``[WK]`` is a role, ``[WK:wk-1]``'s name
+      is a session. Without this a bare ``[WK]-[完工]-…`` becomes a delivery
+      named ``WK``.
     """
-    upper = str(name or "").strip().upper()
-    return any(upper.startswith(prefix + "-") for prefix in DELIVERY_PREFIXES)
+    text = str(name or "").strip()
+    role = sessionkeys.role_of(text)
+    if not role:
+        return False
+    rest = text[len(role):].lstrip("-_ ")
+    return bool(rest)
 
 
 #: The roles whose session keys may carry a PM verdict. ``supervisor`` is here
