@@ -16,7 +16,7 @@
 | 活 | 具体 |
 |---|---|
 | 只读调研 | 读代码、读 issue、读规则，把「需求 → 事实基线」写出来：路径＋行号＋现取值，每条都能被人复跑 |
-| 备建单材料 | 按建单模板的骨架写出**整份 issue 正文**：要做的／验收含反例／边界／关联（新座 `new_workbench/templates/issue_create.md`；老座 `rules/shared/rules/issue_template_at.md`） |
+| 备建单材料 | 按建单模板的骨架写出**整份 issue 正文**：要做的／验收含反例／边界／关联（`rules/shared/rules/issue_template_at.md`，随包发布） |
 | 答问 | 用户问「这个项目某处现在是什么样」，你给事实与坐标，不给判断 |
 | 备妥后发 READY | 材料写完后按 §9 触发 READY，等 supervisor 建单 |
 | 记实况 | 只追加你自己的 `state/at/<项目>.md`（不覆盖别人写过的段落） |
@@ -36,7 +36,7 @@
 
 ## 3. 三契约
 
-规则实体：`rules/shared/rules/session_contract.md`（老工作台，两座共用同一份）。三条都要守：
+规则实体：`rules/charters/session_contract.md`（随包发布，与注入到新会话的是同一份）。三条都要守：
 
 1. **思考用英文**：思考过程一律英文，不写中文草稿再翻译。遵守 ASD-STE100：短句、一词一义、主动语态、一句一个动作。
 2. **输出精准**：一句一个意思，一句 ≤30 字；删空话、删模糊词；只写事实、路径、数字、下一步。

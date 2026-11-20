@@ -27,6 +27,7 @@ and the whole reason for two files is that one of them is private.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from . import agent_config
@@ -128,15 +129,87 @@ def charter_files(name: str) -> tuple[str, str]:
     return str(baseline), sup
 
 
+def broken_charters(names) -> dict[str, list[str]]:
+    """``{session name: missing refs}`` for names whose charter points nowhere.
+
+    The check that ``charter_files`` cannot do for itself: a charter that is
+    present but names a rule file this package does not ship reads as a working
+    install and is not one (ISS-107). This is what a doctor-style report asks,
+    and it answers with every name it was given rather than stopping at the
+    first fault -- one run should show the whole picture.
+
+    Names that map to no charter, or whose charter is absent, are **not**
+    reported here: ``charter_files`` already refuses those outright, and
+    repeating them would turn one install fault into two lines.
+    """
+    out: dict[str, list[str]] = {}
+    for name in names:
+        leaf = leaf_for(name)
+        if not leaf:
+            continue
+        baseline = baseline_root() / leaf
+        if not baseline.is_file():
+            continue
+        try:
+            missing = unresolved_refs(baseline.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if missing:
+            out[name] = missing
+    return out
+
+
+#: A cross-reference a charter makes to another rule file, written relative to
+#: the package root (``rules/...``). Absolute and workbench paths are not
+#: matched: those are a different defect (a private dependency) and the privacy
+#: gate already refuses them.
+REF_RE = re.compile(r"`(rules/[A-Za-z0-9_./-]+\.md)`")
+
+
+def unresolved_refs(text: str, root: Path | None = None) -> list[str]:
+    """Every ``rules/...`` path a charter text names that does not exist.
+
+    Why this check exists (ISS-107): ``charter_files`` only proves **the charter
+    file itself** is present. A charter whose body says "see
+    `rules/shared/rules/newtrack_common.md`" passed every check while that file
+    did not exist at all -- the reader could open the charter and not the rule
+    it points at. ``describe()`` answered ``ok: True`` throughout.
+
+    Absence of the referent is never evidence about the referent, so an
+    unreadable reference is a fault, not a skip. Only paths that start with
+    ``rules/`` are inspected: those are the ones this package is supposed to
+    ship.
+    """
+    root = Path(root) if root is not None else Path(__file__).resolve().parents[1]
+    missing = []
+    for ref in REF_RE.findall(text):
+        if not (root / ref).is_file() and ref not in missing:
+            missing.append(ref)
+    return missing
+
+
 def describe(name: str) -> dict:
-    """A printable summary for doctor-style checks; never raises."""
+    """A printable summary for doctor-style checks; never raises.
+
+    ``ok`` covers the whole install, not just the file lookup: a charter that
+    exists but points at a rule file this package does not ship is broken in the
+    way ISS-107 was raised for, and answering ``ok: True`` there is what let it
+    go unnoticed. Broken references are reported, not raised.
+    """
     try:
         base, sup = charter_files(name)
-        return {"name": name, "leaf": leaf_for(name), "baseline": base,
-                "supplement": sup or "(未配置)",
-                "supplement_root": supplement_root() or "(未配置)",
-                "ok": True}
     except CharterMissing as exc:
         return {"name": name, "leaf": leaf_for(name), "baseline": "",
                 "supplement": "", "supplement_root": supplement_root() or "(未配置)",
                 "ok": False, "error": str(exc)}
+    text = Path(base).read_text(encoding="utf-8")
+    if sup:
+        text += "\n" + Path(sup).read_text(encoding="utf-8")
+    broken = unresolved_refs(text)
+    out = {"name": name, "leaf": leaf_for(name), "baseline": base,
+           "supplement": sup or "(未配置)",
+           "supplement_root": supplement_root() or "(未配置)",
+           "ok": not broken}
+    if broken:
+        out["broken_refs"] = broken
+    return out

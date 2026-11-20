@@ -34,6 +34,47 @@ from super_agent import agent_config, charters, dispatch_cli
 WORKBENCH_NAME = "".join(("Lai", "ke", "_work", "_with", "_agent"))
 
 
+def _prose(path: Path) -> list[str]:
+    """Body lines only: no blanks, no heading, no ``>`` preamble lines.
+
+    The preamble states where the file came from and differs between the two
+    copies by design (one points at the workbench, one at the package), so
+    comparing it would flag the very difference that is correct.
+    """
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or s.startswith(">"):
+            continue
+        out.append(s)
+    return out
+
+
+#: ``(private spelling, packaged spelling)`` pairs the shipped copy uses.
+#: Kept as data so the check above names each one instead of pattern-matching.
+#: The private names are assembled from fragments: the gate scans this file too.
+DEPRIVATISE = (
+    ("".join(("Re", "ed")), "supervisor"),
+    ("python tools/ctx.py", "python -m super_agent.ctx_gate"),
+    ("新座 `new_workbench/allowlist.json`；老座 `config/gh_projects.json`",
+     "`new_workbench/allowlist.json`；公开侧 `config/gh_projects.json`"),
+    ("老座", "公开侧"),
+)
+
+
+def _private_words(text: str) -> dict[str, int]:
+    """Which private spellings survived into the packaged copy, and how often.
+
+    Assembled from fragments so this file does not trip the gate it describes.
+    """
+    found = {}
+    for needle in ("".join(("Re", "ed")), "tools/ctx.py", "老座", "新座"):
+        n = text.count(needle)
+        if n:
+            found[needle] = n
+    return found
+
+
 class Baseline(unittest.TestCase):
     """The shipped charters resolve for every role prefix."""
 
@@ -227,6 +268,111 @@ class NoPrivateNames(unittest.TestCase):
         self.assertTrue(Path(path).is_file(), path)
         self.assertNotIn(WORKBENCH_NAME, path.replace("\\", "/"),
                          "the contract must not come from a private checkout")
+
+
+class CrossReferences(unittest.TestCase):
+    """ISS-107: a charter that exists but points at nothing is still broken.
+
+    ``charter_files`` only proves the charter file itself is present. Before
+    this, every charter could name ``rules/shared/rules/<file>`` while that
+    directory did not exist at all, and ``describe()`` answered ``ok: True``.
+    """
+
+    def test_every_shipped_charter_resolves_its_references(self):
+        root = charters.baseline_root()
+        broken = {}
+        for f in sorted(root.glob("*.md")):
+            missing = charters.unresolved_refs(f.read_text(encoding="utf-8"))
+            if missing:
+                broken[f.name] = missing
+        self.assertEqual(broken, {}, f"charter cross-references do not resolve: {broken}")
+
+    def test_the_referenced_shared_rules_are_shipped(self):
+        """Counter-example to "the reference resolves": the files must exist."""
+        root = Path(charters.__file__).resolve().parents[1]
+        for rel in ("rules/shared/rules/newtrack_common.md",
+                    "rules/shared/rules/issue_template_at.md",
+                    "rules/charters/session_contract.md"):
+            self.assertTrue((root / rel).is_file(), rel)
+
+    def test_the_shipped_copies_are_derived_not_diverged(self):
+        """A shipped copy may differ from the workbench copy only de-privatised.
+
+        The package must carry its own copy -- it is what a fresh clone reads --
+        so "two files with the same name" is by design, not the two-truths
+        defect. What is *not* by design is the two drifting apart: someone edits
+        the rule in one place and the other keeps the old text, and no gate says
+        so.
+
+        The judge is **not** "the lines are identical". Rewording a private
+        pointer is the whole point of the packaged copy, so byte equality would
+        forbid the intended change. What must hold is narrower and checkable:
+        every packaging difference is a de-privatising one -- the packaged text
+        carries no private spelling, and no rule line was lost.
+        """
+        wb = (Path(__file__).resolve().parents[2] / WORKBENCH_NAME
+              / "rules" / "shared" / "rules")
+        if not wb.is_dir():
+            self.skipTest("no workbench copy on this machine")
+        root = Path(charters.__file__).resolve().parents[1]
+        for name in ("newtrack_common.md", "issue_template_at.md"):
+            shipped = root / "rules/shared/rules" / name
+            original = wb / name
+            if not original.is_file():
+                continue
+            text = shipped.read_text(encoding="utf-8")
+            self.assertEqual(_private_words(text), {},
+                             f"{name}: packaged copy still carries a private spelling")
+            self.assertEqual(len(_prose(original)), len(_prose(shipped)),
+                             f"{name}: a rule line was dropped or added in packaging")
+
+    def test_a_missing_referent_flips_describe_to_not_ok(self):
+        """The defect ISS-107 was raised for: ok:True while the target is absent."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "rules").mkdir()
+            text = "见 `rules/shared/rules/nope.md`。"
+            self.assertEqual(charters.unresolved_refs(text, root),
+                             ["rules/shared/rules/nope.md"])
+            (root / "rules" / "shared" / "rules").mkdir(parents=True)
+            (root / "rules" / "shared" / "rules" / "nope.md").write_text("x",
+                                                                        encoding="utf-8")
+            self.assertEqual(charters.unresolved_refs(text, root), [])
+
+    def test_a_workbench_pointer_is_not_counted_as_a_reference(self):
+        """Counter-example 2: an absolute pointer is a different defect.
+
+        It is refused by the privacy gate, not by this check; counting it here
+        would make the two gates disagree about what is wrong.
+        """
+        self.assertEqual(charters.unresolved_refs("见 `D:/somewhere/rules/x.md`。"), [])
+
+
+class DoctorReportsBrokenCharters(unittest.TestCase):
+    """``broken_charters`` is what the doctor line reads, so it must go red.
+
+    The check that matters is not "the shipped charters are clean today" -- it
+    is "a dead pointer would be reported". Without the second, a check that
+    always answers ``{}`` looks identical to a healthy install.
+    """
+
+    def test_a_shipped_charter_set_is_clean(self):
+        names = [prefix for prefix, _leaf in agent_config.charter_map()]
+        self.assertEqual(charters.broken_charters(names), {})
+
+    def test_an_unknown_name_is_not_reported(self):
+        """``charter_files`` already refuses these; repeating them is noise."""
+        self.assertEqual(charters.broken_charters(["nosuchrole-prefix"]), {})
+
+    def test_a_dead_pointer_is_reported_under_its_session_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "charter.md").write_text("见 `rules/shared/rules/gone.md`。",
+                                             encoding="utf-8")
+            with mock.patch.object(charters, "baseline_root", return_value=root), \
+                 mock.patch.object(charters, "leaf_for", return_value="charter.md"):
+                self.assertEqual(charters.broken_charters(["scout-x"]),
+                                 {"scout-x": ["rules/shared/rules/gone.md"]})
 
 
 if __name__ == "__main__":

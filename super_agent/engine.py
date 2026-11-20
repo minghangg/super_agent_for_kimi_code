@@ -4743,12 +4743,43 @@ class Engine:
 
         add(*self._check_supervisor_visibility())
 
+        add(*self._check_charters())
+
         counters = self.store.load_counters()
         return {"checks": checks, "external_actions":
                 int(counters.get("external_actions") or 0),
                 "mode": self.mode}
 
     # ------------------------------------------------------ doctor sub-checks
+    def _check_charters(self) -> tuple:
+        """Fault 11: a charter that points at a rule file this package lacks.
+
+        ``charter_files`` refuses an **absent** charter, so that shape was
+        already visible. A charter that exists but says "see
+        ``rules/shared/rules/newtrack_common.md``" while that file was never
+        shipped reads as a working install: every check passed, the session was
+        created, and the rule it points at could not be opened (ISS-107).
+
+        Not a refusal, a report: the session still runs, and the reader is told
+        which pointer is dead. A deployment that ships no charters at all is
+        ``ok`` -- that is a shape, not a fault, same reasoning as
+        :meth:`_check_supervisor_visibility`.
+        """
+        from . import agent_config as _agent_cfg
+        from . import charters
+
+        names = [prefix for prefix, _leaf in _agent_cfg.charter_map()]
+        broken = charters.broken_charters(names)
+        if not broken:
+            return ("charters", True,
+                    f"{len(names)} session prefixes resolve every rule reference",
+                    "warn", "charter-refs-broken")
+        detail = "; ".join(f"{name}: {', '.join(refs)}"
+                           for name, refs in sorted(broken.items()))
+        return ("charters", False,
+                f"charter-refs-broken: {detail}", "warn", "charter-refs-broken")
+
+
     def _check_supervisor_visibility(self) -> tuple:
         """Fault 10: a supervisor sid that no frame can reach.
 

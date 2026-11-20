@@ -168,7 +168,7 @@ def positions_of(reg: dict, sid: str) -> list[str]:
     """台账里所有会让投喂者取到 ``sid`` 的位置（三种形状全认）。
 
     `{"id": sid}`        — `pm-*`／角色键（issue_watch、worker_watch 的 PM 侧）
-    `{"session": sid}`   — `decide_watch.reed_sid` 优先读它
+    `{"session": sid}`   — `decide_watch.supervisor_sid` 优先读它
     `{"worker": {"session": sid}}` — `worker_watch._tracked_workers`
     """
     out = []

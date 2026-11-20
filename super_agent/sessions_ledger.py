@@ -255,7 +255,7 @@ def cmd_retire(args):
             entry["id"] = new_sid
             touched = True
             moved.append(f"{key}.id")
-        # `decide_watch.reed_sid` 读 `session` 优先、`id` 兜底：只改 id 会让它继续用旧 sid
+        # `decide_watch.supervisor_sid` 读 `session` 优先、`id` 兜底：只改 id 会让它继续用旧 sid
         if str(entry.get("session") or "") == old_sid:
             entry["session"] = new_sid
             touched = True

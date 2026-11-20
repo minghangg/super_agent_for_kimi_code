@@ -40,6 +40,27 @@ class GateSource(unittest.TestCase):
         self.assertEqual(gate.scan_files(ROOT), [])
         self.assertEqual(gate.main(), 0)
 
+    def test_the_role_name_survives_an_underscore_on_each_side(self):
+        """ISS-108: ``\\b`` treats ``_`` as a word character, so it missed this.
+
+        The private state file is named ``supervisor_<role>_state.md``: the
+        spelling sat between two underscores, both sides failed ``\\b``, and the
+        gate answered clean on the one shape it most needed to catch. Measured
+        2026-11-21: the file was named that way and the gate never reported it.
+
+        The counter-examples are the other half -- a check that fires on
+        ``Reader`` would be turned off by the first person it inconvenienced.
+        """
+        pattern = gate.PATTERNS["role name"]
+        private = gate._joined("Re", "ed")
+        for text in (f"supervisor_{private}_state.md",
+                     f"x_{private}_x",
+                     f"{private} 私有位",
+                     f"session_de114499_{private}"):
+            self.assertTrue(pattern.search(text), text)
+        for text in ("Reader", "reeds", "already", "credit"):
+            self.assertFalse(pattern.search(text), text)
+
     def test_repository_history_is_clean(self):
         self.assertEqual(gate.scan_history(ROOT), [])
 

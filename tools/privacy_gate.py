@@ -54,7 +54,14 @@ def _joined(*parts: str) -> str:
 
 
 PATTERNS = {
-    "role name": re.compile(r"\b" + _joined("Re", "ed") + r"\b", re.IGNORECASE),
+    # ``\b`` is not enough: it treats ``_`` as a word character, so a filename
+    # like ``supervisor_<role>_state.md`` slipped through the gate entirely --
+    # the very shape a private state file is written in (ISS-108). The lookaround
+    # is "not a letter", which still rejects ``Reader``/``reeds`` while catching
+    # the underscore-joined form. Digits are allowed on the left so that
+    # ``session_de114499_<role>`` style keys are not the only thing matched.
+    "role name": re.compile(r"(?<![^\W\d_])" + _joined("Re", "ed")
+                            + r"(?![^\W\d_])", re.IGNORECASE),
     "project name": re.compile(_joined("lai", "ke"), re.IGNORECASE),
     "private account": re.compile(_joined("yuan", "hai", "|", "ming", "hangg"),
                                   re.IGNORECASE),
