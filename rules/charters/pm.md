@@ -297,7 +297,7 @@ nohup python tools/pm_watch.py --interval 60 >> state/pm_watch.out 2>&1 &
 | 起在哪 | `--cwd` 写**项目仓绝对路径**（如 `D:/github/<项目>`）；项目活不许在工作台里跑 |
 | 任务书 | 先写 `/tmp/<任务>_<YYYYMMDD>.txt`（六段，含**反例**），**全文发 issue 评论**留档，再发短令（`--task "看 <任务书路径>"，不内联，§1.0）；**不落 `state/dispatch/`**（issue #9）；禁止行内传正文（反引号会被 shell 吃掉）。任务书**必须写明**：完成时 worker 须在 issue 留 `[WK:]` 评论（gh_issue.py comment --worker-name，含 commit／实测／遗留）——收答案时无 [WK] 评论＝交付不全，退回。**★ 并写明 `--worker-name` 的值必须是它自己的完整会话键名**（形如 `wk-ISS-<n>-<slug>-<日期>`，含 `wk-` 前缀）——引擎用精确相等匹配 assignment，少前缀＝`assignment.unmatched`＝交付静默不记账、你收不到完工提醒（2026-11-18 #<n> 实证：三条交付全丢） |
 | 命名 | `--name wk-<任务>-<日期>`；一次性会话，交付即归档。**QA/worker 新会话一律 PM 建**（用户 2026-11-06 定）：模型/effort 选定报 <supervisor> 批后由你 dispatch 新建；<supervisor> 只做 `sessions.py set/archive`（含仲裁换血例外，如 2026-11-06 #8 新 QA 由 <supervisor> 亲建） |
-| 模型 | **只有新建会话才设模型**（用户 2026-10-31 定）：一律以 **`config/model_profiles.json`** 为唯一真相（ISS-32）——`pm`／`qa`／`steward`／`planner` 等按**画像键**取参数：`python tools/pick_worker_model.py --profile <角色>`；**`worker` 走 `rotation` 轮换表（`python tools/pick_worker_model.py`，不带 `--profile`）**，`profiles` 里**没有 `worker` 键**。**默认值**（config 缺失或坏掉时的回退，与 2026-11-08 之前一致）：助手（PM/QA/其他）＝ `cb-deepseek-v4.1-flash` high 或 `cb-step-5-preview` high；worker＝`rotation` 表当前列出的 `cb-deepseek-v4.1-flash`／`high`（用户 2026-11-02 定：其它模型太耗积分，表内只留 cdy dsp v4.1 flash 一档；轮换机制本身保留，用户 2026-10-31 裁决）。**复用会话（`--session`）一律不带模型参数**。**steward 不派开发单**（用户 2026-11-07 定）：steward 只做保洁，一切开发任务建 `wk-*` 短工执行 |
+| 模型 | **只有新建会话才设模型**（用户 2026-10-31 定）：一律以 **`config/model_profiles.json`** 为唯一真相（ISS-32）——`pm`／`qa`／`steward`／`planner` 等按**画像键**取参数：`python -m super_agent.pick_worker_model --profile <角色>`；**`worker` 走 `rotation` 轮换表（`python -m super_agent.pick_worker_model`，不带 `--profile`）**，`profiles` 里**没有 `worker` 键**。**默认值**（config 缺失或坏掉时的回退，与 2026-11-08 之前一致）：助手（PM/QA/其他）＝ `cb-deepseek-v4.1-flash` high 或 `cb-step-5-preview` high；worker＝`rotation` 表当前列出的 `cb-deepseek-v4.1-flash`／`high`（用户 2026-11-02 定：其它模型太耗积分，表内只留 cdy dsp v4.1 flash 一档；轮换机制本身保留，用户 2026-10-31 裁决）。**复用会话（`--session`）一律不带模型参数**。**steward 不派开发单**（用户 2026-11-07 定）：steward 只做保洁，一切开发任务建 `wk-*` 短工执行 |
 | 权限／超时 | **`--permission-mode auto`（Never Ask＝完全自动）** ＋ `--timeout 900`；禁止 `manual`；**也别用 `yolo`**——它是 Ask When Needed，风险动作仍停下来问人 |
 | 派法 | **一律加 `--detach`**：提交即返回 session id，不阻塞。要答案另发一轮（见下）——**不许在派单这一轮里等 worker 跑完** |
 | 收 | worker 只回结论 ≤15 行；你只核三件：验收命令、实测数字、**反例结果**；缺反例＝退回 |
@@ -310,8 +310,7 @@ cd D:/github/super_agent_for_kimi_code
 
 # ── 第一遍：建会话（不带 --no-activate，让 warmup 自动跑）──
 # worker 模型走轮换（避开单模型 4 亿日限流）：先取下一份
-# 模型轮换仍在工作台（safkc 没有这份表）：
-OPTS=$(python <工作台>/tools/pick_worker_model.py --log wk-<任务>-<YYYYMMDD>)
+OPTS=$(python -m super_agent.pick_worker_model --log wk-<任务>-<YYYYMMDD>)
 python -m super_agent.dispatch_cli \
   --cwd D:/github/<项目> --name wk-<任务>-<YYYYMMDD> \
   $OPTS \

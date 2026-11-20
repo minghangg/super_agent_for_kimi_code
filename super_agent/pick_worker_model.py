@@ -17,12 +17,12 @@ or malformed, so a broken config changes no behaviour -- it only prints a WARN
 on stderr. Cooldown (``state/model_cooldown.json``) is unchanged.
 
 Usage:
-    python -m super_agent.model_rotation                    # -> worker rotation slot
-    python -m super_agent.model_rotation --peek             # same, without advancing
-    python -m super_agent.model_rotation --json             # {"model": ..., "effort": ..., "index": N}
-    python -m super_agent.model_rotation --log wk-<任务>-<日期>
-    python -m super_agent.model_rotation --profile qa       # -> role profile args
-    python -m super_agent.model_rotation --profile qa --json
+    python -m super_agent.pick_worker_model                    # -> worker rotation slot
+    python -m super_agent.pick_worker_model --peek             # same, without advancing
+    python -m super_agent.pick_worker_model --json             # {"model": ..., "effort": ..., "index": N}
+    python -m super_agent.pick_worker_model --log wk-<任务>-<日期>
+    python -m super_agent.pick_worker_model --profile qa       # -> role profile args
+    python -m super_agent.pick_worker_model --profile qa --json
 """
 import json
 import os
@@ -34,9 +34,18 @@ PROFILES = os.path.join(ROOT, "config", "model_profiles.json")
 
 
 def _state_root() -> str:
-    """轮换游标与冷却登记所在的根：`paths.state_dir`，未配置则本仓 `state/`。"""
-    from . import agent_config
-    return agent_config.state_dir() or os.path.join(ROOT, "state")
+    """轮换游标与冷却登记所在的根。
+
+    走 `sess_events.resolve_root()`，与会话事件、台账、`sessions.json` 同一个
+    解析链——迁址时游标跟着走，不会「从头开始」让所有 worker 撞到同一档模型。
+    解析不出（新检出没配任何根）时才回退本仓 `state/`：轮换游标是运行态，
+    不能因为一个没配的部署就抛异常、拒绝派单。
+    """
+    from . import sess_events, session_events
+    try:
+        return str(sess_events.resolve_root())
+    except session_events.SessionStreamNotConfigured:
+        return os.path.join(ROOT, "state")
 
 
 def _profiles_path() -> str:
@@ -88,6 +97,7 @@ def load_profiles(path: str = "") -> dict:
     """
     path = path or _profiles_path()
     if not os.path.isfile(path):
+        warn(f"没有模型画像表 {path}，回退内置默认")
         return {}
     try:
         with open(path, encoding="utf-8") as fh:
