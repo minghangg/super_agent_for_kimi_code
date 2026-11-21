@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from . import markers
 from . import session_ledger
+from . import sessionkeys
 
 
 def claimed_key(comment: dict) -> str:
@@ -32,7 +33,10 @@ def at_verifier(cfg: dict, requirement_id: str, project: str):
 
 def supervisor_keys(cfg: dict) -> set[str]:
     engine = cfg.get("engine") or {}
-    keys = {str(key) for key in engine.get("supervisor_keys") or ["supervisor"]}
+    # No built-in supervisor name. Explicit keys must be issued, random-tailed
+    # session keys; a supervisor_sid may instead name the key through the ledger.
+    keys = {str(key) for key in engine.get("supervisor_keys") or []
+            if sessionkeys.has_random_suffix(str(key))}
     sid = str(engine.get("supervisor_sid") or "")
     if sid:
         try:

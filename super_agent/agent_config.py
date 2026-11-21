@@ -90,6 +90,7 @@ ENV = {
     # :mod:`super_agent.config`, and a second copy here would be injected by
     # :func:`overrides` on every run, outranking a ``--config`` file's own value.
     "engine.session_archive_cmd": "SAFKC_ARCHIVE_CMD",
+    "engine.supervisor_sid": "SAFKC_SUPERVISOR_SID",
 }
 
 #: Built-in session-name prefix → charter file (ISS-95).
@@ -444,6 +445,12 @@ def overrides() -> dict:
     archive = session_archive_cmd()
     if archive:
         engine["session_archive_cmd"] = archive
+    supervisor_sid = str(get("engine.supervisor_sid") or "").strip()
+    if supervisor_sid:
+        engine["supervisor_sid"] = supervisor_sid
+    supervisor_keys = get("engine.supervisor_keys")
+    if isinstance(supervisor_keys, list):
+        engine["supervisor_keys"] = supervisor_keys
     char = charter_root()
     if char:
         engine["charter_root"] = char

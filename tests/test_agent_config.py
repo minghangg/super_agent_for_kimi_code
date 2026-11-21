@@ -269,6 +269,22 @@ class ConfigDeclarationTest(unittest.TestCase):
             config.validate(cfg)
 
 
+class SupervisorConfigTest(_Isolated):
+    def test_supervisor_identity_reaches_the_engine_through_the_one_loader(self):
+        self.write({"engine": {"supervisor_sid": "session_sup",
+                               "supervisor_keys": ["supervisor-demo-1a2b3c4d"]}})
+        cfg = config.load(overrides=agent_config.overrides())
+        self.assertEqual(cfg["engine"]["supervisor_sid"], "session_sup")
+        self.assertEqual(cfg["engine"]["supervisor_keys"],
+                         ["supervisor-demo-1a2b3c4d"])
+
+    def test_unconfigured_identity_does_not_override_a_config_file(self):
+        own = self.root / "own.json"
+        cfg = config.load(_write_cfg(own, {"engine": {"supervisor_sid": "session_own"}}),
+                          agent_config.overrides())
+        self.assertEqual(cfg["engine"]["supervisor_sid"], "session_own")
+
+
 class ArchiveCommandTest(_Isolated):
     """ISS-100 D1/D5: the archive command has one priority chain, and the
     private layer must not outrank a ``--config`` file when it says nothing.

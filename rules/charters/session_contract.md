@@ -35,7 +35,7 @@
 - 新 revision 暂停旧 Assignment；旧结果与旧 outbox 不推进新版本。
 - T2 不可为省 token 降级。
 - 非 AT 项目保持既有流程，不伪造需求包。
-- 需求包 fence 只认当前 Issue 的 AT 会话绑定；批准 fence 只认配置的 supervisor 会话键。未验证来源不得改变需求或批准状态。
+- 需求包 fence 只认当前 Issue 的 AT 会话绑定；批准 fence 只认带随机尾的 supervisor 配置键或 supervisor_sid 反查键，无内置名称。未验证来源不得改变需求或批准状态。
 - 只有 READY 且来源完整的包可被批准；dispatch 再次核双来源。
 
 worker、QA、PM 的相关评论必须带：

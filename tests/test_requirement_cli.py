@@ -99,9 +99,11 @@ class ApprovalSource(unittest.TestCase):
         ctx = SimpleNamespace(
             roles=role_config.load("missing-roles.json"), projects={"demo": "owner/demo"},
             call={}, fetch={},
-            cfg=config.load(None, {"engine": {"supervisor_keys": ["supervisor"]}}))
+            cfg=config.load(None, {"engine": {
+                "supervisor_keys": ["supervisor-demo-1a2b3c4d"]}}))
         args = SimpleNamespace(role="supervisor", project="demo", issue=7,
-                               revision=1, hash="", session_key="supervisor",
+                               revision=1, hash="",
+                               session_key="supervisor-demo-1a2b3c4d",
                                dry_run=False, state_dir="")
         return projection, ctx, args
 
@@ -114,7 +116,7 @@ class ApprovalSource(unittest.TestCase):
                 mock.patch.object(requirement_cli.issue_cli, "_call", return_value={"id": 101}) as call:
             self.assertEqual(requirement_cli.cmd_approve(args), 0)
         body = call.call_args.args[2]["body"]
-        self.assertIn("<!-- session: supervisor -->", body)
+        self.assertIn("<!-- session: supervisor-demo-1a2b3c4d -->", body)
         self.assertIn(req.APPROVAL_FENCE, body)
 
     def test_wrong_supervisor_key_is_refused_before_post(self):

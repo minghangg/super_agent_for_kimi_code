@@ -1019,6 +1019,9 @@ class Engine:
         for role, entry in ledger.items():
             if str(role).lower() != "at" or not isinstance(entry, dict):
                 continue
+            bound_sid = str(entry.get("session") or "")
+            if bound_sid and self._sid_archived(bound_sid):
+                continue
             for field in ("name", "session"):
                 value = str(entry.get(field) or "")
                 if value:
@@ -1038,13 +1041,14 @@ class Engine:
             if sessionkeys.role_of(name) != "at":
                 continue
             if not sessionkeys.has_random_suffix(name):
-                # Guessable name: it stays in ``sessions.json``, it stops being
-                # a check. Same rule as the PM and QA routes.
                 continue
             if name in released:
                 continue
             sid = str((item or {}).get("id") or "") if isinstance(item, dict) else ""
             if (sessions.get(sid) or {}).get("archived"):
+                continue
+            if sid and getattr(self, "session_api", None) is not None \
+                    and self._live_archived(sid):
                 continue
             keys.add(name)
         return keys

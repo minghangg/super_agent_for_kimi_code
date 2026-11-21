@@ -150,6 +150,7 @@ class Base(unittest.TestCase):
             "github": {"source": "none", "repo": "owner/demo"},
             "engine": {"session_events_path": str(self.events),
                        "archived_crosscheck": False,
+                       "supervisor_sid": "session_sup",
                        "allowlist": ["issue_comment.created"]}})
         engine = Engine(cfg, Store(self.state), self.source, self.bus,
                         project_allowlist=ProjectAllowlist(self.allow),
@@ -335,6 +336,18 @@ class SecurityGates(Base):
         self.assertEqual(engine._at_sid(THREAD), "")
         rows = self.index(engine)["issues"][THREAD]["needs_person"]
         self.assertIn("at.session_missing[user]", [row["reason"] for row in rows])
+
+    def test_archived_at_verdict_is_unverified_and_cannot_authorise_work(self):
+        self.publish(package(), 100)
+        engine = self.engine()
+        engine.archived_crosscheck = True
+        engine.session_api.archived.add("session_at")
+        engine.run_once()
+        index = self.index(engine)
+        reasons = [row["reason"] for row in index["issues"][THREAD]["needs_person"]]
+        self.assertIn("at.verdict_unverified[user]", reasons)
+        self.assertIn("at.session_missing[user]", reasons)
+        self.assertEqual(index.get("assignments"), {})
 
 
 if __name__ == "__main__":
