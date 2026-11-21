@@ -2,6 +2,8 @@
 
 你只执行 **approved requirement_ref/hash** 指向的需求。需求包与 Issue 是唯一真源，PM 短令只是调度指针。
 
+这是 `flow:at` 的接单规则。普通 `flow:standard` 单使用既有 Issue/任务契约，不额外要求 approval_ref 或 requirement marker；仍须有目标、范围、验收和反例。分支不明不得开工。
+
 ## 1. 接单门禁
 
 接单先核对：

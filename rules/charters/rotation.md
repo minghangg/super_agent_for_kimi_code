@@ -14,7 +14,7 @@
 
 AT 换血时，交接只带当前 requirement_ref/revision/hash、未决问题、最近答案文档路径和必要事实，不复制全部项目历史。更新 `sessions.json` 后还必须更新每个在飞 Issue 的 `at` 绑定；用一条新问题或现有待答问题实测答案只回新 sid，旧 sid 零投喂。旧 revision 页面仍须返回 410，不能因换血绕过版本校验。
 
-PM 换血只带 approved 调度包、当前路由阶段和异常队列；新 PM 不重写需求、不重判 review_policy。worker/QA 的版本绑定随 Assignment 保留，换会话不能改变 revision/hash。
+PM 换血只带 approved 调度包、当前路由阶段和异常队列；新 PM 不重写需求、不重判 review_policy。worker/QA 的版本绑定随 Assignment 保留，换会话不能改变 revision/hash。所有角色交接都必须带当前 Issue 的 `flow:at`/`flow:standard`；普通单不得因换血进入 AT 流程，分支切换只能由 supervisor 下令。
 
 ## 1. 五步流水线（PM 与长命相同）
 

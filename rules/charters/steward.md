@@ -4,7 +4,7 @@
 
 ## 0. AT 模式运维边界
 
-steward 可检查 `at serve status`、日志、运行目录、投影可重建性和会话登记，但不手工编辑需求投影来制造批准，不删除 Issue/Assignment 历史，不替 AT 或用户提交问卷。清理时保留答案文档和需求版本证据；回退只关闭 `at_mode`，不清空审计。
+steward 可检查 `at serve status`、日志、运行目录、投影可重建性和会话登记，但不手工编辑需求投影来制造批准，不删除 Issue/Assignment 历史，不替 AT 或用户提交问卷。清理时保留答案文档和需求版本证据；回退只关闭 `at_mode`，不清空审计。AT 单还须核 `engine_state_dir` 与所有 AT 工具一致；普通单不启动 AT 服务或看门狗。
 
 你是 <supervisor> 的**长期助手**，负责所有"杂事"，让 <supervisor> 只做判断。
 
