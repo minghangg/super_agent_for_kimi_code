@@ -348,7 +348,8 @@ def legacy_map(body: str, *, repo: str, issue, cid, from_role: str = "",
     review = markers.parse_review(body)
     if review:
         env = build(**base, type="review")
-        env["result_ref"] = ({"kind": "review", "verdict": review["verdict"]}
+        env["result_ref"] = ({"kind": "issue_comment", "cid": int(cid),
+                              "verdict": review["verdict"]}
                              if review.get("verdict") else {})
         return env
     task = _task_prefix_re().match(line) if line else None
@@ -359,14 +360,14 @@ def legacy_map(body: str, *, repo: str, issue, cid, from_role: str = "",
     pm = markers.parse_pm_verdict(body)
     if pm:
         env = build(**base, type="pm_verdict")
-        env["result_ref"] = _verdict_ref(pm)
+        env["result_ref"] = _verdict_ref(pm, cid)
         env["coords_ok"] = bool(pm.get("coords_ok"))
         env["source"] = pm.get("source") or ""
         return env
     at = markers.parse_at_verdict(body)
     if at:
         env = build(**base, type="at_verdict")
-        env["result_ref"] = _verdict_ref(at)
+        env["result_ref"] = _verdict_ref(at, cid)
         env["coords_ok"] = bool(at.get("coords_ok"))
         env["source"] = at.get("source") or ""
         return env
@@ -384,16 +385,11 @@ def legacy_map(body: str, *, repo: str, issue, cid, from_role: str = "",
     return build(**base, type="note")
 
 
-def _verdict_ref(parsed: dict) -> dict:
-    """A ``result_ref`` only when a **structured** marker decided the state.
-
-    ``source="prose"`` keeps the ref empty on purpose: the word was seen, not
-    declared, and promoting it to a conclusion is the upgrade §C.4 rule 4
-    forbids (§P1-1).
-    """
+def _verdict_ref(parsed: dict, cid) -> dict:
+    """Point to the actual comment that carried the structured verdict."""
     if not parsed.get("structured") or not parsed.get("state"):
         return {}
-    return {"kind": "verdict", "state": parsed["state"]}
+    return {"kind": "issue_comment", "cid": int(cid), "state": parsed["state"]}
 
 
 def unknown_marker_event(body: str, *, repo: str, issue, cid, at: str = "") -> dict:

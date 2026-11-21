@@ -107,7 +107,7 @@ def cmd_start(args) -> int:
     database = session_ledger.load_issue_sessions(cfg)
     key = f"{args.project}#{args.issue}"
     record = database.setdefault(key, {})
-    record["at"] = {"session": sid, "name": name,
+    record["at"] = {"session": sid, "name": name, "awaiting": True,
                     "bound": datetime.now().isoformat(timespec="seconds")}
     session_ledger.save_issue_sessions(database, cfg=cfg)
     session_ledger.emit("session.bound", cfg=cfg, issue=args.issue,

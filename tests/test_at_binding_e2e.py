@@ -224,6 +224,11 @@ class Base(unittest.TestCase):
              "--bind-role", "at", "--session", session, "--name", name],
             cwd=str(LWA), capture_output=True, text=True,
             env=dict(os.environ, SESS_EVENTS_STATE_DIR=str(self.shared)))
+        if proc.returncode == 0:
+            path = self.shared / "issue_sessions.json"
+            database = json.loads(path.read_text(encoding="utf-8"))
+            database[CLI_KEY]["at"]["awaiting"] = True
+            path.write_text(json.dumps(database), encoding="utf-8")
         return proc
 
     # ------------------------------------------------------------------ engine

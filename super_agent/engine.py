@@ -3155,6 +3155,39 @@ class Engine:
     def _pm_stall_text(thread: str, issue, rounds: int) -> str:
         return f"【PM 停摆】#{int(issue or 0)} QA 已通过，但 {rounds} 轮无 PM 结论"
 
+    def _question_answered(self, thread: str, comment_id) -> bool:
+        for path in (self.store.root / "atserve" / "questions").glob("*.json"):
+            record = at_serve.load(self.store.root, path.stem) or {}
+            if (str(record.get("thread") or "") == thread
+                    and record.get("comment_id") == comment_id
+                    and record.get("submitted") is True):
+                return True
+        return False
+
+    def _at_needs_answer(self, index: dict, thread: str, at_entry: dict) -> bool:
+        issue = at_entry.get("issue")
+        if issue is None:
+            _repo, issue = issuekey.split_key(thread)
+        live = getattr(self, "_live_issues", set())
+        if issue is not None and live and int(issue) not in live:
+            return False
+        if issue is not None and self._issue_state(issue) == "closed":
+            return False
+        if not self._at_sid(thread):
+            return False
+        current = self._requirement_current(index, thread)
+        if current and str(current.get("status")) in (
+                "ready", "approved", "dispatched", "completed"):
+            return False
+        verdict = self._at_verdict(index, thread)
+        if verdict:
+            if str(verdict.get("state") or "") == "questions":
+                return self._question_answered(thread, verdict.get("comment_id"))
+            return False
+        if current and current.get("open_questions"):
+            return self._question_answered(thread, current.get("source_comment_id"))
+        return bool(at_entry.get("awaiting") or current)
+
     # ------------------------------------------------------- at stall watchdog
     def _check_at_stall(self, index: dict) -> int:
         """Ask once about a registered AT that stopped answering.
@@ -3201,6 +3234,9 @@ class Engine:
             if number is None:
                 continue
             registered[str(self._thread_key(number))] = entry["at"]
+        for thread in list(registered):
+            if not self._at_needs_answer(index, thread, registered[thread]):
+                registered.pop(thread, None)
         for thread in list(stall):
             if thread not in registered:
                 seqs = index.setdefault("at_stall_seq", {})
@@ -3209,9 +3245,6 @@ class Engine:
                 stall.pop(thread, None)
         fired = 0
         for thread, at_entry in sorted(registered.items()):
-            if self._at_verdict(index, thread) is not None:
-                stall.pop(thread, None)
-                continue
             entry = stall.get(thread)
             if not isinstance(entry, dict):
                 entry = {"thread": thread, "rounds": 0, "fired": False,
@@ -3245,7 +3278,7 @@ class Engine:
                 exception=True, kind="at_stall",
                 reason=f"no at verdict in {entry['rounds']} rounds",
                 action_key=action_key,
-                body_text=(f"【AT 停摆】#{int(issue or 0)} "
+                body_text=(f"【AT 停摆】{thread} "
                            f"{entry['rounds']} 轮无 AT 结论"))
             entry["fired"] = True
             entry["hold_seq"] = seq
@@ -4581,6 +4614,7 @@ class Engine:
         except Exception as exc:  # noqa: BLE001  a dead source is a reportable state
             summary["errors"].append(f"issues: {type(exc).__name__}: {exc}")
             issue_numbers = []
+        self._live_issues = {int(issue) for issue in issue_numbers}
 
         # The issue itself now says whether it is live (open, not on hold), so
         # the allowlist is kept in step with that instead of being a hand-kept

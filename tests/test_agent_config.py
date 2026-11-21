@@ -285,6 +285,23 @@ class SupervisorConfigTest(_Isolated):
         self.assertEqual(cfg["engine"]["supervisor_sid"], "session_own")
 
 
+class EngineStateRootTest(_Isolated):
+    def test_engine_artifacts_and_session_ledger_can_have_separate_roots(self):
+        engine_root = self.root / "engine-data"
+        session_root = self.root / "session-data"
+        self.write({"paths": {"state_dir": str(session_root),
+                              "engine_state_dir": str(engine_root)}})
+        cfg = config.load(overrides=agent_config.overrides())
+        self.assertEqual(config.state_root(cfg), engine_root)
+        self.assertEqual(cfg["engine"]["session_state_dir"], str(session_root))
+
+    def test_unconfigured_engine_root_keeps_the_existing_state_root(self):
+        session_root = self.root / "session-data"
+        self.write({"paths": {"state_dir": str(session_root)}})
+        cfg = config.load(overrides=agent_config.overrides())
+        self.assertEqual(config.state_root(cfg), session_root)
+
+
 class ArchiveCommandTest(_Isolated):
     """ISS-100 D1/D5: the archive command has one priority chain, and the
     private layer must not outrank a ``--config`` file when it says nothing.

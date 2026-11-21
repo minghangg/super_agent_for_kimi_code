@@ -36,7 +36,9 @@ class FiveFormats(unittest.TestCase):
     def test_a_qa_line_maps_to_review(self):
         env = self._map("[QA] 复核：**通过**")
         self.assertEqual(env["type"], "review")
-        self.assertEqual(env["result_ref"], {"kind": "review", "verdict": "pass"})
+        self.assertEqual(env["result_ref"], {"kind": "issue_comment", "cid": 11,
+                                             "verdict": "pass"})
+        self.assertTrue(envelope.validate(env)[0])
 
     def test_a_task_book_maps_to_pm_task_with_no_result(self):
         env = self._map("[PM:TASK] ISS-92 任务书")
@@ -47,13 +49,17 @@ class FiveFormats(unittest.TestCase):
         env = self._map("[PM] ready #92 <!-- verdict: ready -->",
                         thread="o/n#92")
         self.assertEqual(env["type"], "pm_verdict")
-        self.assertEqual(env["result_ref"], {"kind": "verdict", "state": "ready"})
+        self.assertEqual(env["result_ref"], {"kind": "issue_comment", "cid": 11,
+                                             "state": "ready"})
+        self.assertTrue(envelope.validate(env)[0])
         self.assertTrue(env["coords_ok"])
 
     def test_an_at_verdict_maps_to_at_verdict(self):
         env = self._map("[AT] 可派单 #1 <!-- verdict: ready -->", thread="o/n#1")
         self.assertEqual(env["type"], "at_verdict")
-        self.assertEqual(env["result_ref"], {"kind": "verdict", "state": "ready"})
+        self.assertEqual(env["result_ref"], {"kind": "issue_comment", "cid": 11,
+                                             "state": "ready"})
+        self.assertTrue(envelope.validate(env)[0])
 
     def test_plain_discussion_maps_to_note(self):
         env = self._map("普通讨论，无标记")

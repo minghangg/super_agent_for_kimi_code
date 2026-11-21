@@ -31,9 +31,10 @@ Importing this module reads nothing: :func:`load` reads on first call and
 caches the result. That keeps "import has no side effects" true for the whole
 package and keeps the tests offline.
 
-Note on ``paths.state_dir``: it is injected as both ``state_dir`` and
-``engine.session_state_dir`` so that the ledger and the engine share one root.
-When it is not configured the derived fallback is ``config.DEFAULTS["state_dir"]``
+Note on ``paths.state_dir``: it is the session-ledger root and also the default
+engine root. ``paths.engine_state_dir`` may override only the engine/AT artifact
+root when a deployment intentionally separates them; both must then stay explicit.
+When neither is configured the derived fallback is ``config.DEFAULTS["state_dir"]``
 (``data``) **resolved against this checkout**, so the two keys stay equal and
 the value does not move with the process working directory. That absolute path
 is still a **known degradation**, not a fix: the close guard reads
@@ -65,6 +66,7 @@ ENV_FILE = "SAFKC_AGENT_CONFIG"
 # first and from the JSON file second; a key not listed here is file-only.
 ENV = {
     "paths.state_dir": "SESS_EVENTS_STATE_DIR",
+    "paths.engine_state_dir": "SAFKC_ENGINE_STATE_DIR",
     "paths.project_env_dir": "SAFKC_PROJECT_ENV_DIR",
     "paths.sessions_dir": "SESS_WIRE_ROOT",
     "github.projects_file": "SAFKC_PROJECTS_FILE",
@@ -281,6 +283,17 @@ def state_dir() -> str:
     return str(path.resolve())
 
 
+def engine_state_dir() -> str:
+    """The engine/AT artifact root, independent of the session ledger root."""
+    raw = str(get("paths.engine_state_dir") or "").strip()
+    if not raw:
+        return ""
+    path = Path(os.path.expanduser(raw))
+    if not path.is_absolute():
+        path = (CHECKOUT / path)
+    return str(path.resolve())
+
+
 def project_env_dir() -> str:
     """The declared project-environment directory, or ``""`` (the caller decides).
 
@@ -417,6 +430,9 @@ def overrides() -> dict:
         (CHECKOUT / str(config_mod.DEFAULTS.get("state_dir") or "data")).resolve())
     if state:
         out["state_dir"] = state
+    engine_state = engine_state_dir()
+    if engine_state:
+        out["state_dir"] = engine_state
     # ``paths`` is a declared section (``config.DEFAULTS["paths"]``), so
     # mapping it here goes through ``config.validate`` like every other key.
     # Leaving it out was not harmless: a ``--config`` file's
@@ -471,6 +487,7 @@ def describe() -> dict:
         "config_path": str(config_path()),
         "exists": config_path().is_file(),
         "state_dir": state_dir() or "(未配置，派生 config.DEFAULTS.state_dir)",
+        "engine_state_dir": engine_state_dir() or "(未配置，复用 state_dir)",
         "sessions_dir": sessions_dir() or "(未配置，回落 super_agent.paths)",
         "project_env_dir": project_env_dir() or "(未配置)",
         "projects": len(projects()),
@@ -489,7 +506,7 @@ def _reset_cache() -> None:
 __all__ = [
     "AgentConfigError", "ENV", "DEFAULTS", "allowlist_file", "autostart_tasks",
     "charter_map", "charter_project_prefixes", "charter_root", "config_path",
-    "describe", "dispatch_console", "get", "load", "model_profiles_file",
+    "describe", "dispatch_console", "engine_state_dir", "get", "load", "model_profiles_file",
     "overrides", "project_env_dir", "projects", "projects_file", "quota_config",
     "quota_cores_dir", "role_prefixes", "sessions_dir", "state_dir",
     "token_source",

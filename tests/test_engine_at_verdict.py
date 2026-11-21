@@ -139,7 +139,7 @@ class Base(unittest.TestCase):
         self.issue_sessions = self.events.parent / "issue_sessions.json"
         self.issue_sessions.write_text(json.dumps({
             THREAD: {"at": {"name": "at-demo-3f7c1a90", "session": "session_at",
-                            "issue": 1}}}), encoding="utf-8")
+                            "issue": 1, "awaiting": True}}}), encoding="utf-8")
         self.bind()
 
     def tearDown(self):
@@ -379,6 +379,40 @@ class WatchdogsDoNotSeeEachOther(Base):
         engine.run_once()
         kinds = self.bus.kinds("event.agent.supervisor")
         self.assertEqual(kinds.count("at_stall"), 0)
+
+
+class ActualObligations(Base):
+    def test_a_binding_without_active_work_is_not_watched(self):
+        entry = json.loads(self.issue_sessions.read_text(encoding="utf-8"))
+        entry[THREAD]["at"]["awaiting"] = False
+        self.issue_sessions.write_text(json.dumps(entry), encoding="utf-8")
+        engine = self.engine(engine_cfg={"at_stall_rounds": 1})
+        engine.run_once()
+        self.assertEqual(self.bus.kinds("event.agent.supervisor"), [])
+
+    def test_a_question_waiting_for_the_user_is_not_an_at_stall(self):
+        self.source.add(9100, AT_QUESTIONS)
+        engine = self.engine(engine_cfg={"at_stall_rounds": 1})
+        engine.run_once()
+        self.assertNotIn("at_stall", self.bus.kinds("event.agent.supervisor"))
+
+    def test_an_answered_question_becomes_an_at_obligation_with_full_thread(self):
+        self.source.add(9100, AT_QUESTIONS)
+        engine = self.engine(engine_cfg={"at_stall_rounds": 1})
+        engine.run_once()
+        qid = next((self.state / "atserve" / "questions").glob("*.json")).stem
+        at_serve.submit(self.state, qid, "answer", lambda sid, text: None)
+        engine.run_once()
+        payloads = [p for p in self.bus.payloads("event.agent.supervisor")
+                    if p.get("kind") == "at_stall"]
+        self.assertEqual(len(payloads), 1)
+        self.assertIn(THREAD, payloads[0]["text"])
+
+    def test_a_closed_issue_is_not_an_at_obligation(self):
+        self.source.issue_state = lambda issue: "closed"
+        engine = self.engine(engine_cfg={"at_stall_rounds": 1})
+        engine.run_once()
+        self.assertNotIn("at_stall", self.bus.kinds("event.agent.supervisor"))
 
 
 class AtMostOnce(Base):

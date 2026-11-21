@@ -36,6 +36,19 @@
 
 公开默认是 `false`。关闭此开关即回退既有流程，不需要删除 Issue、Assignment 或需求历史。
 
+引擎和 AT 工具必须共用引擎产物根。若会话台账需要单独放置，显式配置两个路径，不能只改引擎启动参数：
+
+```json
+{
+  "paths": {
+    "state_dir": "/absolute/path/to/session-state",
+    "engine_state_dir": "/absolute/path/to/engine-data"
+  }
+}
+```
+
+`requirements publish`、引擎问卷、`at serve` 和 `at questions` 都使用 `engine_state_dir`；会话台账仍使用 `state_dir`。
+
 启动问卷服务：
 
 ```bash
