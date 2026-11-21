@@ -10,6 +10,7 @@ from pathlib import Path
 from . import agent_config
 from . import at_serve
 from . import config as config_mod
+from . import flow as flow_mod
 from . import issue_cli
 from . import requirement_auth
 from . import requirements as req
@@ -65,6 +66,12 @@ def _sync(args, ctx=None) -> tuple[dict, str]:
 
 def _rid(repo: str, issue: int) -> str:
     return f"{repo.lower()}#{int(issue)}"
+
+
+def _refuse_standard(args, ctx, repo: str) -> None:
+    row = issue_cli._call("GET", f"/repos/{repo}/issues/{args.issue}", **ctx.call)
+    if flow_mod.from_labels(row.get("labels")) == flow_mod.STANDARD:
+        raise issue_cli.Denied("flow:standard 不得执行 AT publish/approve")
 
 
 def cmd_init(args) -> int:
@@ -138,6 +145,7 @@ def cmd_publish(args) -> int:
     if not args.session_key.startswith("at-"):
         raise issue_cli.Denied("AT 发布需求包必须带自己的 --session-key")
     repo = issue_cli._repo(args.project, ctx.projects)
+    _refuse_standard(args, ctx, repo)
     projection = _project(args, ctx, repo)
     raw = json.loads(Path(args.file).read_text(encoding="utf-8"))
     raw["requirement_id"] = _rid(repo, args.issue)
@@ -193,7 +201,10 @@ def cmd_approve(args) -> int:
     if role != "supervisor":
         raise issue_cli.Denied("需求批准只能由 supervisor 执行")
     issue_cli._check("comment", role, ctx.roles)
+    if args.session_key not in requirement_auth.supervisor_keys(ctx.cfg):
+        raise issue_cli.Denied("--session-key 不是当前配置的 supervisor 键")
     repo = issue_cli._repo(args.project, ctx.projects)
+    _refuse_standard(args, ctx, repo)
     projection = _project(args, ctx, repo)
     rid = _rid(repo, args.issue)
     package = req.current(projection, rid)
@@ -210,8 +221,6 @@ def cmd_approve(args) -> int:
         "requirement_hash": package["requirement_hash"],
         "package_ref": package["source_ref"], "approved_at": req.now(),
     }
-    if args.session_key not in requirement_auth.supervisor_keys(ctx.cfg):
-        raise issue_cli.Denied("--session-key 不是当前配置的 supervisor 键")
     body = (f"{ctx.roles.brackets(role)} 批准需求 #{args.issue} "
             f"r{package['revision']}\n{req.fence(req.APPROVAL_FENCE, approval)}"
             f"\n<!-- session: {args.session_key} -->")

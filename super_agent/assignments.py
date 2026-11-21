@@ -311,6 +311,23 @@ def supersede(index: dict, thread: str, package: dict | None) -> list[str]:
     return changed
 
 
+def pause_for_flow(index: dict, thread: str, reason: str) -> list[str]:
+    """Block unfinished work when an Issue changes or loses a valid flow."""
+    changed = []
+    for aid, rec in (index.get("assignments") or {}).items():
+        if str(rec.get("thread") or "") != thread:
+            continue
+        status = str(rec.get("status") or "")
+        if status in TERMINAL_STATES or status == "blocked":
+            continue
+        rec["flow_previous_status"] = status
+        rec["status"] = "blocked"
+        rec["flow_hold_at"] = now()
+        rec["flow_hold_reason"] = str(reason or "flow changed")
+        changed.append(aid)
+    return changed
+
+
 def sync(index: dict, thread: str, issue, live: list[dict], *,
          crosscheck: set[str] | None = None,
          requirement: dict | None = None) -> dict:
@@ -434,6 +451,9 @@ def on_delivery(assignment: dict, delivery_cid, name: str,
         return {"changed": False, "refused": True,
                 "reason": "requirement revision is not approved for this assignment"}
     if status == "blocked":
+        if assignment.get("flow_hold_reason"):
+            return {"changed": False, "refused": True,
+                    "reason": "flow change is waiting for supervisor recovery"}
         gate = blocked_exit(assignment, delivery_cid)
         if not gate["ok"]:
             return {"changed": False, "reason": gate["reason"]}
@@ -563,6 +583,9 @@ def on_review(assignment: dict, review: dict, *, review_cid, verified: bool = Tr
     if status == "waiting_requirement":
         return {"changed": False, "refused": True,
                 "reason": "requirement revision is not approved for this assignment"}
+    if status == "blocked" and assignment.get("flow_hold_reason"):
+        return {"changed": False, "refused": True,
+                "reason": "flow change is waiting for supervisor recovery"}
     verdict = str(review.get("verdict") or "")
     edited = _is_edited(assignment, review_cid, verdict)
     # A comment that has already been read and has **not** changed is a replay,
@@ -869,6 +892,8 @@ def unblock(assignment: dict, reason: str = "") -> dict:
     assignment["unblocked_at"] = now()
     assignment["unblock_reason"] = str(reason or "")
     assignment["updated_at"] = now()
+    for key in ("flow_previous_status", "flow_hold_at", "flow_hold_reason"):
+        assignment.pop(key, None)
     return {"changed": True, "status": "working", "reason": "unblocked"}
 
 

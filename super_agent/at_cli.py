@@ -17,6 +17,7 @@ from pathlib import Path
 from . import agent_config
 from . import at_serve
 from . import config as config_mod
+from . import flow as flow_mod
 from . import issue_cli
 from . import requirements
 from . import session_ledger
@@ -96,6 +97,11 @@ def cmd_start(args) -> int:
         print(f"[dry-run] AT {name} existing={bool(existing)} "
               f"project={args.project} issue={args.issue} cwd={args.cwd}")
         return 0
+    issue_row = issue_cli._call(
+        "GET", f"/repos/{issue_cli._repo(args.project, ctx.projects)}/issues/{args.issue}",
+        **ctx.call)
+    if flow_mod.from_labels(issue_row.get("labels")) == flow_mod.STANDARD:
+        raise issue_cli.Denied("该 Issue 是 flow:standard；不得启动 AT")
     task = args.task or (
         f"处理 {args.project}#{args.issue}：只读 Issue 与项目事实，建立版本化需求包。"
         "需要澄清就发布带选项的问题；无需澄清就发布 READY。不要开发、不要派工。")

@@ -52,6 +52,9 @@ class PagedLiveSource(github_source.LiveSource):
     def title(self, issue):
         return "t"
 
+    def flow(self, issue):
+        return ""
+
     def _get(self, path, query=None):
         page = int((query or {}).get("page") or 1)
         self.requests.append(dict(query or {}))

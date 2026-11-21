@@ -55,6 +55,7 @@ from pathlib import Path
 from . import agent_config
 from . import allowlist as allowlist_mod
 from . import config as config_mod
+from . import flow as flow_mod
 from . import markers
 from . import role_config as roles_mod
 from . import session_ledger as ledger_mod
@@ -78,6 +79,7 @@ HOLD_LABEL_COLORS = {
     "stage:plan-review": "6f42c1", "stage:plan-revise": "d4c5f9",
     "stage:dev": "1d76db", "stage:qa": "fbca04",
     "stage:released": "0e8a16", HOLD_LABEL: "ededed",
+    "flow:at": "6f42c1", "flow:standard": "1d76db",
     "sev:p0": "b60205", "sev:p1": "d93f0b", "sev:p2": "fbca04",
     "kind:bug": "e11d21", "kind:feat": "a2eeef", "kind:ops": "bfd4f2",
 }
@@ -825,9 +827,16 @@ def cmd_label(args, ctx) -> int:
         print(f"labeled #{args.issue} +{names}")
     if args.remove:
         for name in [x.strip() for x in args.remove.split(",") if x.strip()]:
-            _call("DELETE", f"/repos/{repo}/issues/{args.issue}/labels/"
-                            f"{urllib.parse.quote(name)}",
-                  dry_run=args.dry_run, **ctx.call)
+            path = (f"/repos/{repo}/issues/{args.issue}/labels/"
+                    f"{urllib.parse.quote(name)}")
+            out = _call_raw("DELETE", path, dry_run=args.dry_run, **ctx.call)
+            status = out.get("_status", 200) if isinstance(out, dict) else 200
+            if status == 404:
+                print(f"labeled #{args.issue} -{name}（本就不存在）")
+                continue
+            if not str(status).startswith("2"):
+                raise SystemExit(f"GitHub API {status} DELETE {path}："
+                                 f"{out.get('_error') or out}")
             print(f"labeled #{args.issue} -{name}")
     if args.dry_run:
         return 0
@@ -836,6 +845,23 @@ def cmd_label(args, ctx) -> int:
         note += f" created={','.join(created)}"
     _ledger(role, "label", repo, args.issue, ctx.cfg, note=note)
     return 0
+
+
+def cmd_flow(args, ctx) -> int:
+    role = _role(args.role, ctx.roles)
+    _check("label", role, ctx.roles)
+    selected = str(args.flow).lower()
+    if selected not in flow_mod.LABELS:
+        raise Denied("--flow 只能是 at 或 standard")
+    args.add = flow_mod.LABELS[selected]
+    args.remove = flow_mod.LABELS[flow_mod.STANDARD if selected == flow_mod.AT
+                                    else flow_mod.AT]
+    args.no_create = False
+    args.color = "6f42c1" if selected == flow_mod.AT else "1d76db"
+    result = cmd_label(args, ctx)
+    if result == 0:
+        print(f"flow #{args.issue} = {selected}")
+    return result
 
 
 def cmd_close(args, ctx) -> int:
@@ -1181,6 +1207,12 @@ def _parser() -> argparse.ArgumentParser:
                    help="不自动创建缺失的 label（GitHub 挂载时仍会代建）")
     p.add_argument("--color", default="ededed", help="自动建 label 的颜色")
     p.set_defaults(func=cmd_label)
+
+    p = sub.add_parser("flow", help="选择 Issue 的 AT/普通流程（supervisor）")
+    common(p)
+    p.add_argument("--issue", type=int, required=True)
+    p.add_argument("--flow", required=True, choices=["at", "standard"])
+    p.set_defaults(func=cmd_flow)
 
     p = sub.add_parser("close", help="关单（supervisor，且必须有 [QA] 评论）")
     common(p)

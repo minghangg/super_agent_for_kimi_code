@@ -23,7 +23,7 @@
 
 ## 4. AT 分支共同协议
 
-每张 Issue 只走 supervisor 选择的 `flow:at` 或 `flow:standard`。普通分支沿用既有流程，不创建需求包、不使用 AT 门禁或看门狗；分支不明时停止外部动作。`flow:*` 在引擎接线前只是目标契约，不得冒充已生效代码。
+每张 Issue 只走 supervisor 选择的 `flow:at` 或 `flow:standard`。普通分支沿用既有流程，不创建需求包、不使用 AT 门禁或看门狗；分支不明时停止外部动作。引擎按标签分流，无标签存量单回退项目 `at_mode`；双标签冲突会停止执行并交 supervisor。分支切换会阻断未完成 Assignment，worker/QA 不得自行恢复。
 
 共同流程：
 

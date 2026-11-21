@@ -882,6 +882,18 @@ class BlockedExit(unittest.TestCase):
         self.assertTrue(asg.unblock(rec, "why")["refused"])
         self.assertEqual(rec["status"], "working")
 
+    def test_flow_hold_refuses_delivery_until_supervisor_unblocks(self):
+        rec = Verdicts.record(status="working")
+        index = {"assignments": {rec["id"]: rec}}
+        self.assertEqual(asg.pause_for_flow(index, THREAD, "flow.changed:at->standard"),
+                         [rec["id"]])
+        out = asg.on_delivery(rec, 9001, "wk-probe-1", "marker")
+        self.assertTrue(out["refused"])
+        self.assertEqual(rec["status"], "blocked")
+        self.assertTrue(asg.unblock(rec, "supervisor approved")["changed"])
+        self.assertNotIn("flow_hold_reason", rec)
+        self.assertEqual(rec["status"], "working")
+
 
 class Matching(unittest.TestCase):
     def test_marker_wins_over_sole(self):

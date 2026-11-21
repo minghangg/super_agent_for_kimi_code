@@ -77,8 +77,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import (at_serve, envelope, github_source, health, issuekey, markers,
-               needs, requirement_auth, requirements, session_events, session_ledger,
+from . import (at_serve, envelope, flow as flow_mod, github_source, health, issuekey,
+               markers, needs, requirement_auth, requirements, session_events, session_ledger,
                sessionkeys)
 from . import assignments as asg_mod
 from .allowlist import ProjectAllowlist
@@ -315,9 +315,23 @@ class Engine:
                 return name
         return None
 
-    def _at_mode(self, issue) -> bool:
+    def _flow_selection(self, issue) -> tuple[str, str]:
         entry = self.projects.project(self._project_for(issue)) if self.projects else None
-        return bool((entry or {}).get("at_mode", False))
+        default_at = bool((entry or {}).get("at_mode", False))
+        try:
+            selected = self.source.flow(issue) if callable(
+                getattr(self.source, "flow", None)) else ""
+        except flow_mod.FlowError as exc:
+            return "invalid", str(exc)
+        if selected == flow_mod.AT:
+            return flow_mod.AT, ""
+        if selected == flow_mod.STANDARD:
+            return flow_mod.STANDARD, ""
+        return (flow_mod.AT if default_at else flow_mod.STANDARD), ""
+
+    def _at_mode(self, issue) -> bool:
+        selected, _error = self._flow_selection(issue)
+        return selected == flow_mod.AT
 
     @staticmethod
     def _requirement_projection(index: dict) -> dict:
@@ -3168,6 +3182,14 @@ class Engine:
         issue = at_entry.get("issue")
         if issue is None:
             _repo, issue = issuekey.split_key(thread)
+        if issue is not None:
+            try:
+                selected = self.source.flow(issue) if callable(
+                    getattr(self.source, "flow", None)) else ""
+            except flow_mod.FlowError:
+                return False
+            if selected == flow_mod.STANDARD:
+                return False
         live = getattr(self, "_live_issues", set())
         if issue is not None and live and int(issue) not in live:
             return False
@@ -4452,7 +4474,15 @@ class Engine:
 
     def _prepared_requirement_error(self, rec: dict) -> str:
         issue = rec.get("issue")
-        if not self._at_mode(issue):
+        selected, flow_error = self._flow_selection(issue)
+        if flow_error:
+            return f"invalid Issue flow: {flow_error}"
+        index = self.store.load_index()
+        assignment = (index.get("assignments") or {}).get(str(rec.get("assignment_id") or ""))
+        if assignment is not None and str(assignment.get("status") or "") == "blocked" \
+                and assignment.get("flow_hold_reason"):
+            return "prepared action Assignment is paused by a flow change"
+        if selected != flow_mod.AT:
             return ""
         outer = rec.get("payload") or {}
         payload = outer.get("payload") if isinstance(outer.get("payload"), dict) else outer
@@ -4460,14 +4490,12 @@ class Engine:
                      ("requirement_id", "revision", "requirement_hash")}
         if not all(reference.values()):
             return "AT-mode prepared action has no requirement version"
-        index = self.store.load_index()
         thread = str(payload.get("thread") or self._thread_key(issue))
         package = self._requirement_current(index, thread)
         if not package or str(package.get("status")) not in ("approved", "dispatched"):
             return "prepared action requirement is no longer approved"
         if not requirements.reference_matches(reference, package):
             return "prepared action belongs to a superseded requirement"
-        assignment = (index.get("assignments") or {}).get(str(rec.get("assignment_id") or ""))
         if assignment is not None:
             if str(assignment.get("status") or "") == "waiting_requirement":
                 return "prepared action Assignment is waiting for a requirement"
@@ -4702,6 +4730,29 @@ class Engine:
         issues = index.setdefault("issues", {})
         rec = issues.setdefault(key, {"state": "idle", "comments_seen": 0,
                                       "needs_person": []})
+        selected_flow, flow_error = self._flow_selection(issue)
+        previous_flow = str(rec.get("flow") or "")
+        rec["flow"] = selected_flow
+        if flow_error:
+            paused = asg_mod.pause_for_flow(index, key, "flow.conflict[user]")
+            rec["state"] = "needs_person"
+            self._append_needs_person(index, key, {
+                "comment_id": 0, "reason": "flow.conflict[user]", "at": _now()})
+            summary["needs_person"] += 1
+            self.store.log_event({"type": "flow.rejected", "at": _now(),
+                                  "issue": issue, "reason": flow_error,
+                                  "assignments_paused": paused})
+            return
+        if previous_flow in (flow_mod.AT, flow_mod.STANDARD) \
+                and previous_flow != selected_flow:
+            reason = f"flow.changed:{previous_flow}->{selected_flow}"
+            paused = asg_mod.pause_for_flow(index, key, reason)
+            self.store.log_event({"type": "flow.changed", "at": _now(),
+                                  "issue": issue, "previous": previous_flow,
+                                  "current": selected_flow,
+                                  "assignments_paused": paused})
+            self._append_needs_person(index, key, {
+                "comment_id": 0, "reason": "flow.switch_pause[user]", "at": _now()})
         rec["title"] = rec.get("title") or self.source.title(issue)
         # Qualified key first, legacy second: a mixed file converges instead of
         # re-reading comments already consumed under the old form.

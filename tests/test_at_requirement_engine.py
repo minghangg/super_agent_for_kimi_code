@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from super_agent import at_serve, config, requirements as req, session_events
+from super_agent import at_serve, config, flow as flow_mod, requirements as req, session_events
 from super_agent.allowlist import ProjectAllowlist
 from super_agent.engine import Engine
 from super_agent.store import Store
@@ -286,6 +286,102 @@ class Gates(Base):
         self.assertTrue(results[0]["refused"])
         self.assertIn("superseded", results[0]["reason"])
         self.assertNotIn(aid, engine.store.load_outbox_state()["actions"])
+
+
+class FlowBranches(Base):
+    def test_standard_flow_keeps_legacy_assignments_without_at_versions(self):
+        self.publish(package(), 100)
+        self.source.flow = lambda issue: flow_mod.STANDARD
+        engine = self.engine()
+        engine.run_once()
+        index = self.index(engine)
+        self.assertEqual(index["assignments"]["asg_1_worker_1"]["status"], "working")
+        self.assertFalse(index["assignments"]["asg_1_worker_1"].get("requirement_id"))
+        self.assertEqual(index["issues"][THREAD]["flow"], "standard")
+
+    def test_flow_at_uses_the_approved_requirement_gate(self):
+        self.publish(package(), 100)
+        self.source.flow = lambda issue: flow_mod.AT
+        engine = self.engine()
+        engine.run_once()
+        index = self.index(engine)
+        self.assertEqual(index["assignments"]["asg_1_worker_1"]["status"], "working")
+        self.assertEqual(index["issues"][THREAD]["flow"], "at")
+
+    def test_conflicting_flow_labels_fail_closed(self):
+        self.publish(package(), 100)
+
+        def conflict(issue):
+            raise flow_mod.FlowError("both flow labels")
+        self.source.flow = conflict
+        engine = self.engine()
+        engine.run_once()
+        index = self.index(engine)
+        self.assertEqual(index.get("assignments"), {})
+        self.assertEqual(index["issues"][THREAD]["flow"], "invalid")
+        self.assertIn("flow.conflict[user]",
+                      [row["reason"] for row in index["issues"][THREAD]["needs_person"]])
+
+    def test_at_to_standard_blocks_old_work_for_explicit_recovery(self):
+        value = package()
+        self.publish(value, 100)
+        engine = self.engine()
+        engine.run_once()
+        engine.store.begin_action(
+            "asg_1_worker_1:bus_inject:9001", verb="bus_inject",
+            assignment_id="asg_1_worker_1", input_ref="9001", issue=1,
+            payload={"thread": THREAD, "requirement_id": THREAD, "revision": 1,
+                     "requirement_hash": value["requirement_hash"]})
+        self.source.flow = lambda issue: flow_mod.STANDARD
+        engine.run_once()
+        index = self.index(engine)
+        assignment = index["assignments"]["asg_1_worker_1"]
+        self.assertEqual(assignment["status"], "blocked")
+        self.assertEqual(assignment["flow_previous_status"], "working")
+        self.assertEqual(assignment["flow_hold_reason"], "flow.changed:at->standard")
+        self.assertIn("flow.switch_pause[user]",
+                      [row["reason"] for row in index["issues"][THREAD]["needs_person"]])
+        self.source.add({"id": 9001, "issue": 1, "author": "worker",
+                         "body": "[WK:wk-probe-1] delivery during flow switch"})
+        engine.run_once()
+        assignment = self.index(engine)["assignments"]["asg_1_worker_1"]
+        self.assertEqual(assignment["status"], "blocked")
+        self.assertIsNone(assignment.get("delivery_comment_id"))
+        self.source.add({"id": 9002, "issue": 1, "author": "qa",
+                         "session_key": QA_KEY,
+                         "body": f"[QA] 通过 <!-- fix_needed: false -->\n"
+                                 f"<!-- session: {QA_KEY} -->"})
+        engine.run_once()
+        assignment = self.index(engine)["assignments"]["asg_1_worker_1"]
+        self.assertEqual(assignment["status"], "blocked")
+        self.assertNotEqual(assignment.get("qa_verdict"), "pass")
+        before = len(self.bus.rows)
+        results = engine.replay_prepared()
+        self.assertTrue(results[0]["refused"])
+        self.assertIn("paused by a flow change", results[0]["reason"])
+        self.assertEqual(len(self.bus.rows), before)
+
+    def test_conflict_blocks_existing_standard_work(self):
+        self.source.flow = lambda issue: flow_mod.STANDARD
+        engine = self.engine()
+        engine.run_once()
+        engine.store.begin_action(
+            "asg_1_worker_1:bus_inject:9001", verb="bus_inject",
+            assignment_id="asg_1_worker_1", input_ref="9001", issue=1,
+            payload={"thread": THREAD})
+
+        def conflict(issue):
+            raise flow_mod.FlowError("both flow labels")
+        self.source.flow = conflict
+        engine.run_once()
+        assignment = self.index(engine)["assignments"]["asg_1_worker_1"]
+        self.assertEqual(assignment["status"], "blocked")
+        self.assertEqual(assignment["flow_hold_reason"], "flow.conflict[user]")
+        before = len(self.bus.rows)
+        results = engine.replay_prepared()
+        self.assertTrue(results[0]["refused"])
+        self.assertIn("invalid Issue flow", results[0]["reason"])
+        self.assertEqual(len(self.bus.rows), before)
 
 
 class SecurityGates(Base):

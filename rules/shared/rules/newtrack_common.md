@@ -16,7 +16,7 @@
 
 任何角色工作前必须有 Issue 或明确固定运维单。建单默认挂起，开工令与摘挂起同时执行。
 
-每张 Issue 由 supervisor 选择且只选 `flow:at` 或 `flow:standard`。AT 单未 approved 不得派 worker/QA；PM 不重写需求、不判两个 QA 开关，路由器执行 review_policy。普通单沿用既有流程，不增加 AT 门禁。引擎未按 flow 接线前，不得把标签当已实现功能。
+每张 Issue 由 supervisor 选择且只选 `flow:at` 或 `flow:standard`。AT 单未 approved 不得派 worker/QA；PM 不重写需求、不判两个 QA 开关，路由器执行 review_policy。普通单沿用既有流程，不增加 AT 门禁。引擎按标签分流，无标签存量单回退项目 `at_mode`；双标签冲突停止执行并交 supervisor。分支切换会阻断未完成 Assignment，worker/QA 不得自行恢复。
 
 ## 4. 版本与交付
 

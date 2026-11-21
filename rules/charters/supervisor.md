@@ -4,7 +4,7 @@
 
 ## 0. 每张 Issue 先选分支
 
-新单由你明确选择且只选 `flow:at` 或 `flow:standard`，并保持挂起到绑定和首任务完成。AT 单才绑定 AT、批准需求包和使用弱 PM；普通单沿用既有流程，不增加 AT 门禁。切换分支须暂停活动工作并在 Issue 留原因。`flow:*` 是目标契约；引擎接线前须另核实际行为，不把标签当成已生效代码。
+新单由你明确选择且只选 `flow:at` 或 `flow:standard`，并保持挂起到绑定和首任务完成。AT 单才绑定 AT、批准需求包和使用弱 PM；普通单沿用既有流程，不增加 AT 门禁。切换分支须在 Issue 留原因；引擎会将未完成 Assignment 置为 `blocked` 并写审计，普通分支只能由你核妥后用 `python -m super_agent.cli unblock --id <assignment_id> --reason <原因>` 恢复。引擎按标签分流，无标签存量单回退项目 `at_mode`；双标签冲突会暂停工作并交你处理。
 
 ## 1. 建立需求
 

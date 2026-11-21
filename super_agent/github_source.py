@@ -25,6 +25,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from . import flow as flow_mod
 from . import markers
 
 API = "https://api.github.com"
@@ -135,6 +136,10 @@ class FixtureSource:
             return "unknown"
         return str(rec.get("state") or "open")
 
+    def flow(self, issue: int) -> str:
+        rec = (self.data.get("issues") or {}).get(str(issue)) or {}
+        return flow_mod.from_labels(rec.get("labels") or [])
+
 
 class LiveSource:
     """Public GitHub REST, GET-only."""
@@ -148,6 +153,7 @@ class LiveSource:
         self.timeout_s = timeout_s
         self.on_hold_labels = tuple(
             str(x) for x in (on_hold_labels or ()) if str(x or "").strip())
+        self._labels_by_issue: dict[int, list] = {}
 
     def _get(self, path: str, query: dict | None = None):
         url = API + path
@@ -196,15 +202,26 @@ class LiveSource:
                 continue
             if row.get("pull_request") is not None:
                 continue
+            number = int(row["number"])
+            self._labels_by_issue[number] = list(row.get("labels") or [])
             if held:
                 names = {str((x or {}).get("name") or "")
                          for x in (row.get("labels") or []) if isinstance(x, dict)}
                 if names & held:
                     continue
-            out.append(int(row["number"]))
+            out.append(number)
             if len(out) >= int(limit):
                 break
         return out
+
+    def flow(self, issue: int) -> str:
+        number = int(issue)
+        if number not in self._labels_by_issue:
+            row = self._get(f"/repos/{self.repo}/issues/{number}")
+            if not isinstance(row, dict):
+                raise SourceError("unexpected issue payload")
+            self._labels_by_issue[number] = list(row.get("labels") or [])
+        return flow_mod.from_labels(self._labels_by_issue[number])
 
     def comments(self, issue: int) -> list[dict]:
         rows = self._get(f"/repos/{self.repo}/issues/{int(issue)}/comments",
@@ -302,6 +319,9 @@ class NullSource:
         return []
 
     def title(self, issue: int) -> str:
+        return ""
+
+    def flow(self, issue: int) -> str:
         return ""
 
     def issue_state(self, issue: int) -> str:
