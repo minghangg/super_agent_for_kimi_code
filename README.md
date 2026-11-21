@@ -66,7 +66,7 @@ AT 模式下，开发从已批准的需求版本开始：AT 通过本地网页�
 ```bash
 python -m super_agent.at serve start --allow-send
 python -m super_agent.at start --role supervisor --project <项目> --issue <n> --cwd <项目仓>
-python -m super_agent.requirements approve --role supervisor --project <项目> --issue <n>
+python -m super_agent.requirements approve --role supervisor --project <项目> --issue <n> --session-key <supervisor 键名>
 ```
 
 完整需求 schema、用户操作、T1/T2 路由和回退见 [AT 操作手册](docs/at_mode.md)。公开配置默认 `at_mode=false`。

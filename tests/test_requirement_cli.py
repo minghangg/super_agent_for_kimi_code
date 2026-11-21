@@ -80,5 +80,53 @@ class PublishQuestionLink(unittest.TestCase):
             self.assertEqual(record["interaction"]["options"][0]["label"], "core")
 
 
+class ApprovalSource(unittest.TestCase):
+    def _fixture(self):
+        package = {
+            "schema_version": 1, "requirement_id": "owner/demo#7", "revision": 1,
+            "status": "ready", "objective": "approved only by supervisor",
+            "context_refs": [], "scope": [], "out_of_scope": [], "constraints": [],
+            "acceptance": ["valid approval carries source"],
+            "negative_tests": ["wrong supervisor key is refused"], "risk_tier": "T1",
+            "review_policy": {"plan_qa": False, "implementation_qa": True,
+                              "worker_mode": "plan_and_implement", "test_level": "L1"},
+            "open_questions": [], "approval_ref": "", "updated_at": "",
+        }
+        package["requirement_hash"] = req.requirement_hash(package)
+        projection = req.project_comments(
+            [{"id": 100, "body": req.fence(req.PACKAGE_FENCE, package)}],
+            package_verifier=lambda comment: True)
+        ctx = SimpleNamespace(
+            roles=role_config.load("missing-roles.json"), projects={"demo": "owner/demo"},
+            call={}, fetch={},
+            cfg=config.load(None, {"engine": {"supervisor_keys": ["supervisor"]}}))
+        args = SimpleNamespace(role="supervisor", project="demo", issue=7,
+                               revision=1, hash="", session_key="supervisor",
+                               dry_run=False, state_dir="")
+        return projection, ctx, args
+
+    def test_approval_comment_carries_the_verified_supervisor_key(self):
+        projection, ctx, args = self._fixture()
+        with mock.patch.object(requirement_cli, "_ctx", return_value=ctx), \
+                mock.patch.object(requirement_cli, "_project", return_value=projection), \
+                mock.patch.object(requirement_cli, "_sync"), \
+                mock.patch.object(requirement_cli.issue_cli, "_ledger"), \
+                mock.patch.object(requirement_cli.issue_cli, "_call", return_value={"id": 101}) as call:
+            self.assertEqual(requirement_cli.cmd_approve(args), 0)
+        body = call.call_args.args[2]["body"]
+        self.assertIn("<!-- session: supervisor -->", body)
+        self.assertIn(req.APPROVAL_FENCE, body)
+
+    def test_wrong_supervisor_key_is_refused_before_post(self):
+        projection, ctx, args = self._fixture()
+        args.session_key = "worker"
+        with mock.patch.object(requirement_cli, "_ctx", return_value=ctx), \
+                mock.patch.object(requirement_cli, "_project", return_value=projection), \
+                mock.patch.object(requirement_cli.issue_cli, "_call") as call:
+            with self.assertRaises(requirement_cli.issue_cli.Denied):
+                requirement_cli.cmd_approve(args)
+        call.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

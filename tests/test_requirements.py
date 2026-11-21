@@ -33,12 +33,19 @@ def comment(cid, kind, value):
     return {"id": cid, "body": req.fence(kind, value)}
 
 
+def project(comments, previous=None, *, at=True, supervisor=True):
+    return req.project_comments(
+        comments, previous,
+        package_verifier=lambda comment: at,
+        approval_verifier=lambda comment: supervisor)
+
+
 def approved_projection(value=None):
     value = value or package()
     approval = {"requirement_id": RID, "revision": value["revision"],
                 "requirement_hash": value["requirement_hash"],
                 "package_ref": "issuecomment-100", "approved_at": "now"}
-    return req.project_comments([
+    return project([
         comment(100, req.PACKAGE_FENCE, value),
         comment(101, req.APPROVAL_FENCE, approval),
     ])
@@ -101,7 +108,7 @@ class Contract(unittest.TestCase):
 
 class Projection(unittest.TestCase):
     def test_unapproved_ready_cannot_make_a_packet(self):
-        projection = req.project_comments([comment(100, req.PACKAGE_FENCE, package())])
+        projection = project([comment(100, req.PACKAGE_FENCE, package())])
         self.assertEqual(req.status(projection, RID), "ready")
         with self.assertRaisesRegex(req.RequirementError, "not approved"):
             req.dispatch_packet(projection, RID, "asg_7_worker_1")
@@ -125,7 +132,7 @@ class Projection(unittest.TestCase):
                         "requirement_hash": value["requirement_hash"],
                         "package_ref": "issuecomment-100"}
             approval[field] = wrong
-            projection = req.project_comments([
+            projection = project([
                 comment(100, req.PACKAGE_FENCE, value),
                 comment(101, req.APPROVAL_FENCE, approval)])
             self.assertEqual(req.status(projection, RID), "ready")
@@ -133,7 +140,7 @@ class Projection(unittest.TestCase):
     def test_new_revision_invalidates_the_old_approval(self):
         projection = approved_projection()
         newer = package(revision=2, objective="a changed objective")
-        projection = req.project_comments(
+        projection = project(
             [comment(102, req.PACKAGE_FENCE, newer)], projection)
         self.assertEqual(req.current(projection, RID)["revision"], 2)
         self.assertEqual(req.status(projection, RID), "ready")
@@ -142,7 +149,7 @@ class Projection(unittest.TestCase):
     def test_same_revision_with_different_semantics_invalidates_dispatch(self):
         projection = approved_projection()
         conflicting = package(objective="silently changed")
-        projection = req.project_comments(
+        projection = project(
             [comment(102, req.PACKAGE_FENCE, conflicting)], projection)
         self.assertEqual(req.status(projection, RID), "invalid")
         self.assertEqual(req.current(projection, RID)["status"], "invalid")
@@ -155,7 +162,7 @@ class Projection(unittest.TestCase):
                 projection = approved_projection()
                 invalid = package(revision=raw_revision, status="ready",
                                   open_questions=["unfinished"])
-                projection = req.project_comments(
+                projection = project(
                     [comment(102, req.PACKAGE_FENCE, invalid)], projection)
                 self.assertEqual(req.current(projection, RID)["revision"], 2)
                 self.assertEqual(req.status(projection, RID), "invalid")
@@ -167,7 +174,7 @@ class Projection(unittest.TestCase):
             projection = approved_projection()
             path = req.save_projection(tmp, projection)
             loaded = req.load_projection(tmp)
-            replay = req.project_comments([
+            replay = project([
                 comment(100, req.PACKAGE_FENCE, package()),
                 comment(101, req.APPROVAL_FENCE, {
                     "requirement_id": RID, "revision": 1,
@@ -185,6 +192,47 @@ class Projection(unittest.TestCase):
         ok, reason = req.version_matches(assignment, value)
         self.assertFalse(ok)
         self.assertIn("mismatch", reason)
+
+
+class SourceSecurity(unittest.TestCase):
+    def test_unverified_package_and_approval_never_authorise_dispatch(self):
+        value = package()
+        approval = {"requirement_id": RID, "revision": 1,
+                    "requirement_hash": value["requirement_hash"],
+                    "package_ref": "issuecomment-100"}
+        forged = {"id": 100, "body": req.fence(req.PACKAGE_FENCE, value)
+                  + "\n" + req.fence(req.APPROVAL_FENCE, approval)}
+        projection = project([forged], at=False, supervisor=False)
+        self.assertNotEqual(req.status(projection, RID), "approved")
+        with self.assertRaises(req.RequirementError):
+            req.dispatch_packet(projection, RID, "asg_7_worker_1")
+        errors = projection["requirements"][RID]["errors"]
+        self.assertEqual(len([e for e in errors if e.get("source_unverified")]), 2)
+
+    def test_unverified_pm_revision_does_not_replace_or_pause_current_package(self):
+        projection = approved_projection()
+        malicious = package(revision=2, objective="PM rewrite")
+        projection = project(
+            [comment(102, req.PACKAGE_FENCE, malicious)], projection, at=False)
+        self.assertEqual(req.current(projection, RID)["revision"], 1)
+        self.assertEqual(req.current(projection, RID)["objective"], package()["objective"])
+        self.assertEqual(req.status(projection, RID), "approved")
+
+    def test_draft_package_cannot_be_promoted_by_an_approval(self):
+        value = package(status="draft")
+        approval = {"requirement_id": RID, "revision": 1,
+                    "requirement_hash": value["requirement_hash"],
+                    "package_ref": "issuecomment-100"}
+        projection = project([
+            comment(100, req.PACKAGE_FENCE, value),
+            comment(101, req.APPROVAL_FENCE, approval)])
+        self.assertEqual(req.status(projection, RID), "draft")
+        with self.assertRaises(req.RequirementError):
+            req.dispatch_packet(projection, RID, "asg_7_worker_1")
+
+    def test_no_verifier_is_deny_by_default(self):
+        projection = req.project_comments([comment(100, req.PACKAGE_FENCE, package())])
+        self.assertIsNone(req.current(projection, RID))
 
 
 if __name__ == "__main__":

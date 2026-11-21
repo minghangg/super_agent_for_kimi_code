@@ -36,7 +36,8 @@ AT READY 不等于批准。先同步并核对 objective、范围、验收、反�
 python -m super_agent.requirements sync --project <项目> --issue <n>
 python -m super_agent.requirements show --project <项目> --issue <n>
 python -m super_agent.requirements approve --role supervisor \
-  --project <项目> --issue <n> --revision <n> --hash <sha256:...>
+  --project <项目> --issue <n> --revision <n> --hash <sha256:...> \
+  --session-key <当前 supervisor 键名>
 ```
 
 批准绑定需求包 cid、revision 和 hash。普通需求可由 supervisor 批准；权限、生产、重大取舍必须先取得用户明确批准。

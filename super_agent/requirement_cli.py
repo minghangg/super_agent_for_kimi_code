@@ -11,6 +11,7 @@ from . import agent_config
 from . import at_serve
 from . import config as config_mod
 from . import issue_cli
+from . import requirement_auth
 from . import requirements as req
 from . import session_ledger
 
@@ -45,10 +46,18 @@ def _comments(ctx, repo: str, issue: int) -> list[dict]:
             for row in rows if isinstance(row, dict) and row.get("id") is not None]
 
 
+def _project(args, ctx, repo: str, comments=None) -> dict:
+    rid = _rid(repo, args.issue)
+    return req.project_comments(
+        _comments(ctx, repo, args.issue) if comments is None else comments,
+        package_verifier=requirement_auth.at_verifier(ctx.cfg, rid, args.project),
+        approval_verifier=requirement_auth.supervisor_verifier(ctx.cfg))
+
+
 def _sync(args, ctx=None) -> tuple[dict, str]:
     ctx = ctx or _ctx(args)
     repo = issue_cli._repo(args.project, ctx.projects)
-    projection = req.project_comments(_comments(ctx, repo, args.issue))
+    projection = _project(args, ctx, repo)
     path = req.save_projection(_root(args), projection)
     print(f"projection={path}")
     return projection, repo
@@ -129,7 +138,7 @@ def cmd_publish(args) -> int:
     if not args.session_key.startswith("at-"):
         raise issue_cli.Denied("AT 发布需求包必须带自己的 --session-key")
     repo = issue_cli._repo(args.project, ctx.projects)
-    projection = req.project_comments(_comments(ctx, repo, args.issue))
+    projection = _project(args, ctx, repo)
     raw = json.loads(Path(args.file).read_text(encoding="utf-8"))
     raw["requirement_id"] = _rid(repo, args.issue)
     raw["status"] = "clarifying" if raw.get("open_questions") else "ready"
@@ -185,7 +194,7 @@ def cmd_approve(args) -> int:
         raise issue_cli.Denied("需求批准只能由 supervisor 执行")
     issue_cli._check("comment", role, ctx.roles)
     repo = issue_cli._repo(args.project, ctx.projects)
-    projection = req.project_comments(_comments(ctx, repo, args.issue))
+    projection = _project(args, ctx, repo)
     rid = _rid(repo, args.issue)
     package = req.current(projection, rid)
     if package is None:
@@ -201,8 +210,11 @@ def cmd_approve(args) -> int:
         "requirement_hash": package["requirement_hash"],
         "package_ref": package["source_ref"], "approved_at": req.now(),
     }
+    if args.session_key not in requirement_auth.supervisor_keys(ctx.cfg):
+        raise issue_cli.Denied("--session-key 不是当前配置的 supervisor 键")
     body = (f"{ctx.roles.brackets(role)} 批准需求 #{args.issue} "
-            f"r{package['revision']}\n{req.fence(req.APPROVAL_FENCE, approval)}")
+            f"r{package['revision']}\n{req.fence(req.APPROVAL_FENCE, approval)}"
+            f"\n<!-- session: {args.session_key} -->")
     out = issue_cli._call("POST", f"/repos/{repo}/issues/{args.issue}/comments",
                           {"body": body}, dry_run=args.dry_run, **ctx.call)
     if out.get("dry_run"):
@@ -296,6 +308,7 @@ def _parser() -> argparse.ArgumentParser:
     common(p, role=True)
     p.add_argument("--revision", type=int, default=0)
     p.add_argument("--hash", default="")
+    p.add_argument("--session-key", required=True)
     p.set_defaults(func=cmd_approve)
 
     p = sub.add_parser("show", help="print the current projected package")

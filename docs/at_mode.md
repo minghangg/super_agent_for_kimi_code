@@ -64,10 +64,13 @@ AT READY 后：
 python -m super_agent.requirements sync --project <项目> --issue <n>
 python -m super_agent.requirements show --project <项目> --issue <n>
 python -m super_agent.requirements approve --role supervisor \
-  --project <项目> --issue <n> --revision <revision> --hash <sha256:...>
+  --project <项目> --issue <n> --revision <revision> --hash <sha256:...> \
+  --session-key <当前 supervisor 键名>
 ```
 
 批准前核对目标、范围、验收、反例和 T1/T2。权限、生产和重大取舍必须先取得用户明确批准。
+
+来源门禁不依赖 GitHub 共用作者名：需求包只接受当前 Issue 绑定 AT 的 `session` 标记；批准只接受配置的 `engine.supervisor_keys`。未验证 fence 只记错误，不改变 current；非 READY 包不能被批准。`dispatch_packet` 会再次检查双来源。
 
 ## 4. AT：发布问题或 READY
 

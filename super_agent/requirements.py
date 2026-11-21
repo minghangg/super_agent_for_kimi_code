@@ -218,8 +218,9 @@ def _entry(projection: dict, rid: str) -> dict:
     })
 
 
-def project_comments(comments: list[dict], previous: dict | None = None) -> dict:
-    """Apply comments in cid order. Replaying the full list is idempotent."""
+def project_comments(comments: list[dict], previous: dict | None = None, *,
+                     package_verifier=None, approval_verifier=None) -> dict:
+    """Apply only source-verified contracts; unverified fences are inert."""
     projection = copy.deepcopy(previous) if previous else {
         "schema_version": SCHEMA_VERSION, "requirements": {}, "errors": [],
     }
@@ -245,6 +246,16 @@ def project_comments(comments: list[dict], previous: dict | None = None) -> dict
             for raw in values:
                 rid = str(raw.get("requirement_id") or "")
                 entry = _entry(projection, rid) if rid else None
+                verifier = package_verifier if kind == PACKAGE_FENCE else approval_verifier
+                if verifier is None or not verifier(comment):
+                    error = {"comment_id": cid, "revision": raw.get("revision"),
+                             "error": f"unverified {kind} source", "fatal": False,
+                             "source_unverified": True}
+                    if entry is not None:
+                        entry.setdefault("errors", []).append(error)
+                    else:
+                        projection["errors"].append(error)
+                    continue
                 try:
                     if kind == PACKAGE_FENCE:
                         package = validate_package(raw)
@@ -255,6 +266,7 @@ def project_comments(comments: list[dict], previous: dict | None = None) -> dict
                                 "same revision has different semantics; increment revision")
                         package["source_ref"] = f"issuecomment-{cid}"
                         package["source_comment_id"] = cid
+                        package["source_verified"] = True
                         entry["revisions"][str(revision)] = package
                         if revision >= int(entry.get("current_revision") or 0):
                             entry["current_revision"] = revision
@@ -264,6 +276,7 @@ def project_comments(comments: list[dict], previous: dict | None = None) -> dict
                         approval = validate_approval(raw)
                         approval["approval_ref"] = f"issuecomment-{cid}"
                         approval["comment_id"] = cid
+                        approval["source_verified"] = True
                         entry["approvals"] = [a for a in entry.get("approvals", [])
                                               if a.get("comment_id") != cid]
                         entry["approvals"].append(approval)
@@ -311,10 +324,13 @@ def _refresh_entry(projection: dict, rid: str) -> None:
                      if a.get("revision") == revision
                      and a.get("requirement_hash") == package.get("requirement_hash")
                      and a.get("package_ref") == package.get("source_ref")), None)
-    if approval is not None:
+    if (approval is not None and status == "ready"
+            and package.get("source_verified") is True
+            and approval.get("source_verified") is True):
         package = copy.deepcopy(package)
-        package["status"] = "approved" if status != "completed" else "completed"
+        package["status"] = "approved"
         package["approval_ref"] = approval["approval_ref"]
+        package["approval_source_verified"] = True
         entry["revisions"][str(revision)] = package
         entry["approval"] = approval
         status = package["status"]
@@ -322,6 +338,7 @@ def _refresh_entry(projection: dict, rid: str) -> None:
         entry.pop("approval", None)
         package = copy.deepcopy(package)
         package["approval_ref"] = ""
+        package.pop("approval_source_verified", None)
         entry["revisions"][str(revision)] = package
     entry["status"] = status
     entry["current"] = package
@@ -345,6 +362,9 @@ def dispatch_packet(projection: dict, requirement_id: str, assignment: str,
         raise RequirementError(f"requirement not found: {requirement_id}")
     if str(package.get("status")) not in ("approved", "dispatched"):
         raise RequirementError("requirement is READY but not approved")
+    if (package.get("source_verified") is not True
+            or package.get("approval_source_verified") is not True):
+        raise RequirementError("requirement or approval source is unverified")
     validate_package(package, approved=True)
     return {
         "requirement_id": requirement_id,

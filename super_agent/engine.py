@@ -78,7 +78,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import (at_serve, envelope, github_source, health, issuekey, markers,
-               needs, requirements, session_events, session_ledger, sessionkeys)
+               needs, requirement_auth, requirements, session_events, session_ledger,
+               sessionkeys)
 from . import assignments as asg_mod
 from .allowlist import ProjectAllowlist
 from .store import Store, action_id
@@ -330,7 +331,9 @@ class Engine:
     def _apply_requirement_comments(self, index: dict, thread: str,
                                     comments: list[dict]) -> dict | None:
         projection = requirements.project_comments(
-            comments, self._requirement_projection(index))
+            comments, self._requirement_projection(index),
+            package_verifier=lambda comment: self._at_verified(thread, comment),
+            approval_verifier=self._supervisor_verified)
         index["requirements"] = projection
         return requirements.current(projection, thread)
 
@@ -1071,7 +1074,8 @@ class Engine:
         """
         entry = self._issue_session_entry(thread).get("at")
         if isinstance(entry, dict) and str(entry.get("session") or ""):
-            return str(entry["session"])
+            sid = str(entry["session"])
+            return "" if self._sid_archived(sid) else sid
         return ""
 
     def _at_verified(self, thread: str, comment: dict) -> bool:
@@ -1093,6 +1097,9 @@ class Engine:
         if claimed:
             return claimed in keys
         return False
+
+    def _supervisor_verified(self, comment: dict) -> bool:
+        return requirement_auth.supervisor_verifier(self.cfg)(comment)
 
     def _pm_target(self, thread: str, issue: int) -> dict:
         """Where a verdict goes: the project's PM, never a worker."""
