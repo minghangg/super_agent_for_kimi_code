@@ -126,6 +126,25 @@ class Acceptance(Base):
         cursor = json.loads((self.state / "cursor.json").read_text(encoding="utf-8"))
         self.assertEqual(cursor["issues"]["42"], 9004)
 
+    def test_closed_issue_resolves_needs_without_deleting_history(self):
+        from super_agent import needs as needs_mod
+        fixture = json.loads(json.dumps(FIXTURE))
+        fixture["issues"]["42"]["state"] = "closed"
+        self.fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+        self.engine.source = FixtureSource(self.fixture_path)
+        self.engine._live_issues = set()
+        index = {"issues": {"owner/demo#42": {"needs_person": [
+            {"comment_id": 9100, "reason": "old", "at": "old"}]}}}
+        resolved = self.engine._resolve_closed_needs(index)
+        self.assertEqual(resolved, 1)
+        rows = index["issues"]["owner/demo#42"]["needs_person"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["at"], "old")
+        self.assertFalse(needs_mod.is_open(index, "owner/demo#42", rows[0]))
+        mark = needs_mod.stored_row(index, "owner/demo#42", 9100)
+        self.assertEqual(mark["reason"], "issue closed")
+        self.assertEqual(mark["entries"], 1)
+
     def test_a7_atomic_replace_keeps_old_index(self):
         self.store.save_index({"version": 1, "meta": {"good": True},
                                "issues": {}, "assignments": {}})

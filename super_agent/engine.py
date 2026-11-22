@@ -4637,6 +4637,40 @@ class Engine:
                             "detail": verdict.get("detail") or ""})
         return results
 
+    def _resolve_closed_needs(self, index: dict) -> int:
+        """Mark needs_person rows resolved once their Issue is confirmed closed."""
+        try:
+            limit = max(1, int((self.cfg.get("engine") or {}).get(
+                "max_closed_thread_checks") or 10))
+        except (TypeError, ValueError):
+            limit = 10
+        pending = []
+        for thread, rec in (index.get("issues") or {}).items():
+            rows = [row for row in (rec.get("needs_person") or [])
+                    if needs.is_open(index, thread, row)]
+            if rows:
+                pending.append((thread, rows))
+        resolved = 0
+        for thread, rows in sorted(pending)[:limit]:
+            issue = issuekey.issue_number(thread)
+            if issue is None or issue in getattr(self, "_live_issues", set()):
+                continue
+            if self._issue_state(issue) != "closed":
+                continue
+            for row in rows:
+                cid = needs.cid_of(row)
+                if cid is None:
+                    continue
+                entries = sum(needs.cid_of(other) == cid for other in rows)
+                marked = needs.mark(index, thread, cid, state=needs.RESOLVED,
+                                    by="engine", reason="issue closed", entries=entries)
+                if marked.get("changed"):
+                    resolved += 1
+                    self.store.log_event({"type": "needs_person.closed_resolved",
+                                          "at": _now(), "thread": thread,
+                                          "comment_id": cid, "entries": entries})
+        return resolved
+
     def run_round(self) -> dict:
         index = self.store.load_index()
         # Checked before anything else so the health snapshot and the
@@ -4738,6 +4772,7 @@ class Engine:
                 result = self.archive_thread(thread, index)
                 summary.setdefault("archived", []).extend(result["archived"])
                 summary.setdefault("archive_blocked", []).extend(result["blocked"])
+        summary["needs_resolved_closed"] = self._resolve_closed_needs(index)
 
         # Index is written once per round, atomically: a crash leaves the old one.
         # The dismissal side table is monotonic, so unioning whatever is on disk
