@@ -14,6 +14,9 @@ State machine::
                         |                             +-> working (reopen)
                         +-> working (unblock)
 
+    active non-hold without QA pass       Issue closed              cancelled
+    cancelled                             any late event            unchanged (audit)
+
 ``waiting_release`` and ``close_reconcile`` are *hold* states: the work is
 done and a QA pass is recorded, but the engine has not proved the Issue is
 closed and the sessions are archived. They are active on purpose - the engine
@@ -85,7 +88,7 @@ from datetime import datetime, timezone
 ACTIVE_STATES = ("queued", "working", "waiting_review", "waiting_release",
                  "close_reconcile", "blocked", "waiting_person",
                  "waiting_requirement")
-TERMINAL_STATES = ("completed",)
+TERMINAL_STATES = ("completed", "cancelled")
 PARTICIPANT_ROLES = ("worker", "qa")
 
 # A hold state waits for the supervisor to close the Issue; a delivery that
@@ -838,13 +841,32 @@ def enter_close_reconcile(assignment: dict, reason: str = "") -> dict:
 
 
 def complete(assignment: dict) -> dict:
-    """Write the terminal state - only through :func:`qa_gate`."""
+    """Write the completed state - only through :func:`qa_gate`."""
+    if str(assignment.get("status") or "") == "cancelled":
+        return {"changed": False, "reason": "cancelled work is not completed",
+                "refused": True}
     ok, why = qa_gate(assignment)
     if not ok:
         return {"changed": False, "reason": why, "refused": True}
     assignment["status"] = "completed"
     assignment["updated_at"] = now()
     return {"changed": True, "status": "completed", "reason": why}
+
+
+def cancel_closed(assignment: dict) -> dict:
+    """End unfinished work because its Issue is closed, without claiming QA."""
+    status = str(assignment.get("status") or "")
+    if (status not in ACTIVE_STATES or status in HOLD_STATES
+            or str(assignment.get("qa_verdict") or "") == "pass"):
+        return {"changed": False, "reason": "not cancellable active work",
+                "refused": True}
+    assignment["previous_status"] = status
+    assignment["status"] = "cancelled"
+    assignment["cancelled_at"] = now()
+    assignment["updated_at"] = assignment["cancelled_at"]
+    assignment["cancel_reason"] = "issue closed before QA release"
+    return {"changed": True, "status": "cancelled", "previous_status": status,
+            "reason": assignment["cancel_reason"]}
 
 
 def reopen(assignment: dict, *, review_cid=None, delivery_cid=None,

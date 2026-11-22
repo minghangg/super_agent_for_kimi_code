@@ -265,6 +265,30 @@ class Cancellation(unittest.TestCase):
         self.assertNotIn(":abort\"", inspect.getsource(direct.cancel_session))
         self.assertNotIn(":abort\"", inspect.getsource(direct.abort_session))
 
+    def test_standalone_stop_uses_cancel_and_event_wait(self) -> None:
+        from super_agent import stop_session
+        with mock.patch.object(stop_session.sys, "argv", ["stop", SID]), \
+                mock.patch.object(D, "read_token", return_value="t"), \
+                mock.patch.object(D, "discover_base", return_value="http://x"), \
+                mock.patch.object(stop_session, "_status",
+                                  return_value={"activity": "turn"}), \
+                mock.patch.object(direct, "cancel_session",
+                                  return_value=(True, 0)) as cancel, \
+                mock.patch.object(D, "wait_rounds",
+                                  return_value={"activity": "idle",
+                                                "outcome": "interrupted"}) as wait:
+            self.assertEqual(stop_session.main(), 0)
+        cancel.assert_called_once_with(SID, include_background=False)
+        wait.assert_called_once_with("http://x", "t", SID, 60.0,
+                                     permission_mode="manual")
+
+    def test_standalone_stop_has_no_legacy_ws_protocol(self) -> None:
+        import inspect
+        from super_agent import stop_session
+        source = inspect.getsource(stop_session)
+        self.assertNotIn("client_hello", source)
+        self.assertNotIn("_abort_via_ws", source)
+
 
 class LivenessReadsActivity(unittest.TestCase):
     """§1.4③: `probe_liveness` stops falling through to "no busy field"."""

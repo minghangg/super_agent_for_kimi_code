@@ -85,6 +85,16 @@ class QueuedIsNotAStart(unittest.TestCase):
         self.assertIn("round did not start", str(ctx.exception))
         self.assertEqual(seen["n"], 1)          # submitted once, never re-sent
 
+    def test_short_timeout_is_not_inflated_to_thirty_seconds(self) -> None:
+        with mock.patch.object(D, "http_post", return_value={
+                "code": 0, "data": {"prompt_id": "msg_1", "status": "queued"}}), \
+                mock.patch.object(D, "current_ordinal", return_value=6), \
+                mock.patch.object(D, "await_turn_start",
+                                  side_effect=D.DispatchError("stop")) as fence:
+            with self.assertRaises(D.DispatchError):
+                D.run_turn("http://x", "t", SID, "hi", timeout=1, quiet=True)
+        self.assertEqual(fence.call_args.kwargs["deadline_s"], 1)
+
     def test_blocked_fails_before_the_fence(self) -> None:
         def fake_post(url, token, body, timeout=60):
             return {"code": 0, "data": {"prompt_id": "msg_1", "status": "blocked"}}

@@ -15,7 +15,7 @@ from super_agent import decide_watch as dw
 
 
 class Fallback(unittest.TestCase):
-    """With no ``to_role`` the plain chain answers (supervisor only since #72)."""
+    """With no ``to_role`` the plain chain answers with the project PM."""
 
     def test_none_and_no_role_fall_back_to_the_chain(self):
         calls = []
@@ -87,10 +87,8 @@ class OnTheDeliveryPath(unittest.TestCase):
                              event_source=lambda: [],
                              heartbeat=lambda *a, **k: None,
                              send_transport=lambda *a, **k: True))
-        # #72: the delivery target is the supervisor. Before #72 this fixture had
-        # only a bare ``pm-demo`` key - it passed because the bare key was leg
-        # ①, which is the defect #72 removes. Keeping it would now mean "nobody
-        # to send to" (empty resolver ⇒ undelivered, sent=0).
+        # The delivery target is the project PM. The supervisor entry is a
+        # counter-example: it must never receive an ordinary worker receipt.
         (tmp / "sessions.json").write_text(json.dumps(
             {"pm-demo": {"id": "session_00000000-0000-4000-8000-000000000001"},
              "supervisor": {"id": "session_00000000-0000-4000-8000-000000000002"}}),

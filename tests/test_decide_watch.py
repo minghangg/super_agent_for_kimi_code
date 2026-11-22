@@ -351,7 +351,7 @@ class DeliveryRegression(Fixture):
     def test_os_lock_allows_only_one_subprocess(self):
         code = f"""
 from pathlib import Path
-import time
+import sys
 from super_agent import decide_watch as d
 class B:
     PORT = 58800
@@ -362,11 +362,11 @@ d._event_health = lambda port: {{}}
 ok, _ = d.acquire_lock()
 print(ok, flush=True)
 if ok:
-    time.sleep(3)
+    sys.stdin.readline()
 """
         first = subprocess.Popen([sys.executable, "-c", code], cwd=str(ROOT),
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                 text=True)
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True)
         try:
             line = first.stdout.readline().strip()
             if not line:
@@ -376,8 +376,14 @@ if ok:
                                     capture_output=True, text=True, timeout=10)
             self.assertEqual(second.stdout.strip().splitlines()[-1], "False", second.stderr)
         finally:
-            first.kill()
-            first.wait(timeout=10)
+            if first.poll() is None:
+                first.stdin.write("\n")
+                first.stdin.flush()
+            try:
+                first.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                first.kill()
+                first.wait(timeout=10)
 
 
 class ShimFallback(Fixture):

@@ -156,9 +156,12 @@ class Base(unittest.TestCase):
             "github": {"source": "none", "repo": "owner/demo"},
             "engine": extra,
         })
-        return Engine(cfg, Store(self.state), self.source, self.bus,
-                      project_allowlist=ProjectAllowlist(self.allow),
-                      session_api=self.sessions)
+        engine = Engine(cfg, Store(self.state), self.source, self.bus,
+                        project_allowlist=ProjectAllowlist(self.allow),
+                        session_api=self.sessions)
+        engine._test_tasks = {}
+        engine._running_tasks = lambda sid: ([], "")
+        return engine
 
     def deliver_and_pass(self, engine, body=PASS_BODY):
         self.source.add(9001, "[WK:wk-probe-1] done")

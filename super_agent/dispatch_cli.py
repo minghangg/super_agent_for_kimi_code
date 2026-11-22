@@ -1088,7 +1088,7 @@ def run_turn(base: str, token: str, sid: str, text: str, timeout: float,
     if status in ("blocked", "failed"):
         raise DispatchError(f"prompt not accepted: status={status!r} (session {sid})")
     new_ord = await_turn_start(base, token, sid, prev, expect_prompt_id=pid,
-                               deadline_s=min(120.0, max(30.0, timeout)))
+                               deadline_s=min(120.0, max(0.01, timeout)))
     res = wait_rounds(base, token, sid, timeout, prompt_id=pid,
                       permission_mode=permission_mode)
     if not quiet:

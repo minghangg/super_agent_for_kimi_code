@@ -359,19 +359,20 @@ class PidLockTests(Base):
 
     def test_two_processes_race_and_only_one_wins(self):
         script = (
-            "import sys, time\n"
+            "import sys\n"
             "sys.path.insert(0, r'%s')\n"
             "from super_agent.pidlock import PidLock\n"
             "lock = PidLock(r'%s')\n"
             "ok, info = lock.try_acquire()\n"
             "print('acquired' if ok else 'refused')\n"
             "sys.stdout.flush()\n"
-            "time.sleep(2.0)\n"
+            "if ok:\n"
+            "    sys.stdin.readline()\n"
             "lock.release()\n" % (ROOT, self.state / "engine.pid"))
         procs = [subprocess.Popen([sys.executable, "-c", script],
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                  text=True) for _ in range(2)]
-        outs = [p.communicate(timeout=30)[0].strip() for p in procs]
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True) for _ in range(2)]
+        outs = [p.communicate("release\n", timeout=30)[0].strip() for p in procs]
         self.assertEqual(sorted(outs), ["acquired", "refused"], outs)
         self.assertEqual([p.returncode for p in procs], [0, 0])
 

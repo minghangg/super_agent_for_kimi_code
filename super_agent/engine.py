@@ -4394,25 +4394,51 @@ class Engine:
                 snap["conditions"], "consecutive_ok": streak}
 
     def _round_closed_threads(self, index: dict) -> list[dict]:
-        """Check the held threads of this round, up to the configured cap.
+        """Reconcile closed Issues and held releases, up to the configured cap.
 
-        Only ``waiting_release`` and ``close_reconcile`` qualify: every other
-        active assignment is still being worked on, and a terminal one has
-        nothing left to prove.
+        A closed Issue ends unfinished work as ``cancelled``; it never fabricates
+        a QA pass. Assignments with a QA pass still use the four-condition,
+        two-round completion gate. Open and unknown states change nothing.
         """
         engine_cfg = self.cfg.get("engine") or {}
         try:
             limit = max(1, int(engine_cfg.get("max_closed_thread_checks") or 10))
         except (TypeError, ValueError):
             limit = 10
-        threads = sorted({str(rec.get("thread") or "")
-                          for rec in (index.get("assignments") or {}).values()
-                          if str(rec.get("status") or "") in
-                          ("waiting_release", "close_reconcile")})
+        by_thread: dict[str, list[dict]] = {}
+        for rec in (index.get("assignments") or {}).values():
+            if str(rec.get("status") or "") in asg_mod.ACTIVE_STATES:
+                by_thread.setdefault(str(rec.get("thread") or ""), []).append(rec)
         out = []
-        for thread in [t for t in threads if t][:limit]:
+        for thread in sorted(t for t in by_thread if t)[:limit]:
+            records = by_thread[thread]
+            issue = records[0].get("issue")
             try:
-                out.append(self._reconcile_thread(index, thread))
+                state = self._issue_state(issue)
+                cancelled = []
+                if state == "closed":
+                    for assignment in records:
+                        if str(assignment.get("status") or "") in asg_mod.HOLD_STATES:
+                            continue
+                        moved = asg_mod.cancel_closed(assignment)
+                        if moved.get("changed"):
+                            cancelled.append(assignment["id"])
+                            self.store.log_event({
+                                "type": "assignment.cancelled", "at": _now(),
+                                "thread": thread, "assignment": assignment.get("id"),
+                                "previous_status": moved.get("previous_status"),
+                                "reason": moved.get("reason")})
+                held = any(str(rec.get("status") or "") in asg_mod.HOLD_STATES
+                           for rec in records)
+                if held:
+                    result = self._reconcile_thread(index, thread)
+                    if cancelled:
+                        result["cancelled"] = cancelled
+                    out.append(result)
+                else:
+                    out.append({"thread": thread, "status": "cancelled" if cancelled
+                                else "active", "cancelled": cancelled,
+                                "completed": [], "issue_state": state})
             except Exception as exc:  # noqa: BLE001  one bad thread is isolated
                 self.store.log_event({"type": "close_reconcile.blocked",
                                       "at": _now(), "thread": thread,
@@ -4427,7 +4453,7 @@ class Engine:
         recs = [rec for rec in (index.get("assignments") or {}).values()
                 if str(rec.get("thread") or "") == thread]
         unfinished = [rec["id"] for rec in recs
-                      if str(rec.get("status") or "") != "completed"]
+                      if str(rec.get("status") or "") not in asg_mod.TERMINAL_STATES]
         if unfinished:
             return {"ok": False, "reason": "assignments not completed",
                     "unfinished": sorted(unfinished)}
