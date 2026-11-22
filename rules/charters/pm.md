@@ -39,7 +39,14 @@ python -m super_agent.pm_router --packet <packet.json> --event implementation_qa
 
 ## 3. 派单短令
 
-派单令只含 Issue、需求包引用、revision/hash、路由阶段和本地 packet 路径。不要再写六段任务书，不复述目标/边界/验收。
+**派令形态以 `session_contract.md` §3.1 为准**（≤3 行 ＋ 本地链接 ＋ 短说明）。本节只说 PM 特有的部分。
+
+**PM 派单 = 两步，缺一不可**：
+
+1. **Issue 留档**：在该单发一条 `[pm-…]-[派单]-[<目标键名>]-[<项目>]` 评论，正文写任务书全文。
+2. **投进会话**：`dispatch_cli --session <目标sid> --detach --no-activate --task "<短令>"`。
+
+**只发评论不投递 ⇒ 对方不知道要干活；只投递不发评论 ⇒ Issue 上没有留档，事后查不到派了什么。**
 
 新会话先 warmup 读契约和角色章程，再用 `--session --no-activate --detach` 发短令。创建后立刻 bind。复用会话前执行 ctx 门禁。
 
