@@ -37,10 +37,13 @@ from super_agent import agent_config, autostart
 PYW = r'"D:\Program Files\Python310\pythonw.exe"'
 
 
-def task_row(script: Path | None = None, py: Path | None = None) -> dict:
+def task_row(script: Path | None = None, py: Path | None = None,
+             part: str = "") -> dict:
     if script is not None:
+        suffix = f" -Part {part}" if part else ""
         return {"found": True, "execute": PYW,
-                "arguments": f'-NoProfile -ExecutionPolicy Bypass -File "{script}"',
+                "arguments": (f'-NoProfile -ExecutionPolicy Bypass -File "{script}"'
+                              + suffix),
                 "workdir": "", "trigger": "MSFT_TaskLogonTrigger"}
     return {"found": True, "execute": PYW,
             "arguments": f'"{py}" --daemon', "workdir": "", "trigger": "MSFT_TaskLogonTrigger"}
@@ -238,13 +241,27 @@ class VerifyVerdictTest(_Base):
         self.configure()
         py = self.workbench / "tools" / "wss_bus.py"
         py2 = self.workbench / "tools" / "decide_watch.py"
-        rows = {"KimiWssBus": task_row(script=self.script),
-                "KimiDecideWatch": task_row(script=self.script)}
+        rows = {"KimiWssBus": task_row(script=self.script, part="wss_bus"),
+                "KimiDecideWatch": task_row(script=self.script, part="decide_watch")}
         processes = [(10, f"{PYW} {py} --daemon"), (11, f"{PYW} {py2}")]
         rc, out, _err = self._verify(rows, processes)
         self.assertEqual(rc, 0)
         self.assertIn("三方一致", out)
         self.assertNotIn("未指向启动脚本", out)
+
+    def test_all_or_missing_part_is_a_mismatch(self) -> None:
+        self.configure()
+        py = self.workbench / "tools" / "wss_bus.py"
+        py2 = self.workbench / "tools" / "decide_watch.py"
+        processes = [(10, f"{PYW} {py} --daemon"), (11, f"{PYW} {py2}")]
+        for wrong in ("", "all", "decide_watch"):
+            with self.subTest(wrong=wrong):
+                rows = {"KimiWssBus": task_row(script=self.script, part=wrong),
+                        "KimiDecideWatch": task_row(script=self.script,
+                                                   part="decide_watch")}
+                rc, out, _err = self._verify(rows, processes)
+                self.assertEqual(rc, 20)
+                self.assertIn("应为 wss_bus", out)
 
     def test_task_directly_naming_the_py_is_consistent_but_prompts(self) -> None:
         """Today's real shape: consistent, on an entry point group A replaces."""
@@ -284,8 +301,8 @@ class VerifyVerdictTest(_Base):
 
     def test_no_process_is_rc21_and_the_other_two_still_compare(self) -> None:
         self.configure()
-        rows = {"KimiWssBus": task_row(script=self.script),
-                "KimiDecideWatch": task_row(script=self.script)}
+        rows = {"KimiWssBus": task_row(script=self.script, part="wss_bus"),
+                "KimiDecideWatch": task_row(script=self.script, part="decide_watch")}
         rc, out, _err = self._verify(rows, [])
         self.assertEqual(rc, 21)
         self.assertIn("未运行", out)
@@ -297,8 +314,8 @@ class VerifyVerdictTest(_Base):
     def test_no_start_process_line_is_rc22(self) -> None:
         self.configure()
         self.script.write_text("# nothing here\n", encoding="utf-8")
-        rows = {"KimiWssBus": task_row(script=self.script),
-                "KimiDecideWatch": task_row(script=self.script)}
+        rows = {"KimiWssBus": task_row(script=self.script, part="wss_bus"),
+                "KimiDecideWatch": task_row(script=self.script, part="decide_watch")}
         rc, out, _err = self._verify(rows, [])
         self.assertEqual(rc, 22)
         self.assertIn("找不到启动行", out)
@@ -322,7 +339,9 @@ class InjectTest(_Base):
 
         with mock.patch.object(autostart, "read_processes", no_read), \
                 mock.patch.object(autostart, "read_task",
-                                  lambda name: task_row(script=self.script)):
+                                  lambda name: task_row(
+                    script=self.script,
+                    part="wss_bus" if name == "KimiWssBus" else "decide_watch")):
             rc, out, _err = self.run_main([
                 "--verify", "--part", "wss_bus",
                 "--command-line", f"{PYW} {py} --daemon"])
@@ -339,7 +358,9 @@ class InjectTest(_Base):
         """
         self.configure()
         with mock.patch.object(autostart, "read_task",
-                               lambda name: task_row(script=self.script)):
+                               lambda name: task_row(
+                    script=self.script,
+                    part="wss_bus" if name == "KimiWssBus" else "decide_watch")):
             rc, out, _err = self.run_main([
                 "--verify", "--part", "wss_bus",
                 "--command-line", "pythonw.exe --daemon"])
@@ -351,7 +372,9 @@ class InjectTest(_Base):
         """Two candidate files: "the first hit wins" is the answer we refuse."""
         self.configure()
         with mock.patch.object(autostart, "read_task",
-                               lambda name: task_row(script=self.script)):
+                               lambda name: task_row(
+                    script=self.script,
+                    part="wss_bus" if name == "KimiWssBus" else "decide_watch")):
             rc, out, _err = self.run_main([
                 "--verify", "--part", "wss_bus",
                 "--command-line",
@@ -385,7 +408,9 @@ class InjectTest(_Base):
         self.assertIn("15068", proc.detail)
         self.assertIn("15076", proc.detail)
         with mock.patch.object(autostart, "read_task",
-                               lambda name: task_row(script=self.script)):
+                               lambda name: task_row(
+                    script=self.script,
+                    part="wss_bus" if name == "KimiWssBus" else "decide_watch")):
             rc, out, _err = self.run_main([
                 "--verify", "--part", "decide_watch",
                 "--command-line", command, "--command-line", command])

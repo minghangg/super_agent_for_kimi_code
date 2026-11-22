@@ -484,6 +484,9 @@ def release_lock() -> None:
         pass
 
 
+_LAST_SUPERVISOR_STATE = ""
+
+
 def _state_file() -> Path:
     """跨进程的去重状态文件（与 STATE_DIR 同步，便于隔离测试）。"""
     return _path("health_state_path", "supervisor_health_state.json")
@@ -505,7 +508,8 @@ def _last_state_read() -> str:
 def _last_state_write(st: str, sid: str = "") -> None:
     try:
         _path("health_state_path", "supervisor_health_state.json").parent.mkdir(parents=True, exist_ok=True)
-        tmp = _state_file().with_suffix(".tmp")
+        target = _state_file()
+        tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
         tmp.write_text(json.dumps({"state": st, "last_state": st, "sid": sid,
                                    "ts": time.time()}, ensure_ascii=False),
                        encoding="utf-8")
@@ -749,7 +753,7 @@ def _notice_last_write(**fields) -> None:
     try:
         p = _notice_last_path()
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".json.tmp")
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, p)
     except OSError as exc:
@@ -1237,7 +1241,7 @@ def _liveness_state_write(st: dict) -> None:
     try:
         p = _liveness_state_path()
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".json.tmp")
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
         os.replace(tmp, p)
     except OSError as exc:
@@ -1895,6 +1899,10 @@ def load_delivery_state() -> dict:
         st["_baseline_reason"] = "bad_json"
         return st
     st.update(raw)
+    if raw.get("baseline_established") is not True:
+        st["_baseline_reason"] = "no_flag"
+    elif "undelivered_offset" not in raw:
+        st["_baseline_reason"] = "offset_missing"
     return st
 
 

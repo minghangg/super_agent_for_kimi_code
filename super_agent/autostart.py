@@ -538,12 +538,22 @@ def _short(path: str, root: Path | None) -> str:
     return f"{root.name}/{rel}"
 
 
-def _task_side(row: dict, root: Path | None, script: Path) -> Side:
-    """What the task starts: the startup script, or a ``.py`` of its own."""
+def _task_side(row: dict, root: Path | None, script: Path, part: str = "") -> Side:
+    """What the task starts, including which startup-script part it selects."""
     if not row.get("found"):
         return Side("unregistered")
     combined = f"{row.get('execute') or ''} {row.get('arguments') or ''}"
     if _normalize(script) in _normalize(combined):
+        if part:
+            matches = re.findall(
+                r"(?i)(?:^|\s)-Part(?:\s+|=)(?:\"([^\"]+)\"|'([^']+)'|([^\s]+))",
+                str(row.get("arguments") or ""))
+            values = [next(value for value in match if value) for match in matches]
+            if len(values) != 1 or values[0] != part:
+                actual = values[0] if len(values) == 1 else (values or "all（缺省）")
+                return Side("wrong_part",
+                            detail=f"{name if (name := row.get('name')) else '计划任务'} "
+                                   f"Part={actual}，应为 {part}")
         return Side("via_script", detail=str(script))
     path, why = _single_token(combined)
     if why:
@@ -683,7 +693,7 @@ def verify(parts: list[str], *, script: Path | None = None,
     for part in parts:
         name = names.get(part) or ""
         row = read_task(name) if name else {"found": False}
-        task = _task_side(row, root, script) if script is not None else \
+        task = _task_side(row, root, script, part=part) if script is not None else \
             Side("unregistered")
         if not row.get("found"):
             task = Side("unregistered")
@@ -723,6 +733,9 @@ def verify(parts: list[str], *, script: Path | None = None,
         if task.state == "unregistered":
             unregistered.append(part)
             verdict = "未注册"
+        elif task.state == "wrong_part":
+            mismatches.append(part)
+            verdict = "否"
         elif task.state == "unparsable":
             unparsable.append(part)
             verdict = "不可判"

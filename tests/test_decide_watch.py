@@ -312,12 +312,30 @@ class DeliveryRegression(Fixture):
         path = dw._delivery_paths()["undelivered"]
         path.write_text(json.dumps({"t": 1, "enqueued_ts": 1, "rec": rec}) + "\n",
                         encoding="utf-8")
-        dw._delivery_paths()["state"].write_text("{", encoding="utf-8")
+        cases = ("{", "{}", json.dumps({
+            "v": 1, "baseline_established": True, "offset": 0,
+            "seen": {}, "stats": {}}))
+        for raw in cases:
+            with self.subTest(raw=raw):
+                dw._delivery_paths()["state"].write_text(raw, encoding="utf-8")
+                st = dw.load_delivery_state()
+                with mock.patch.object(dw, "_send_delivery", return_value=1) as send:
+                    self.assertEqual(dw.retry_undelivered(st, dry=False, now=100), 0)
+                send.assert_not_called()
+                self.assertEqual(st["undelivered_offset"], path.stat().st_size)
+
+    def test_complete_baseline_still_retries_undelivered(self):
+        rec = {"repo": "owner/neutral_project", "issue": 1,
+               "evidence": "cid:old", "detected_ts": 1}
+        path = dw._delivery_paths()["undelivered"]
+        path.write_text(json.dumps({"t": 1, "enqueued_ts": 1, "rec": rec}) + "\n",
+                        encoding="utf-8")
+        dw._delivery_paths()["state"].write_text(json.dumps({
+            "baseline_established": True, "undelivered_offset": 0}), encoding="utf-8")
         st = dw.load_delivery_state()
         with mock.patch.object(dw, "_send_delivery", return_value=1) as send:
-            self.assertEqual(dw.retry_undelivered(st, dry=False, now=100), 0)
-        send.assert_not_called()
-        self.assertEqual(st["undelivered_offset"], path.stat().st_size)
+            self.assertEqual(dw.retry_undelivered(st, dry=False, now=100), 1)
+        send.assert_called_once()
 
     def test_delivery_goes_only_to_the_scoped_pm(self):
         dw.SESSIONS().write_text(json.dumps({
@@ -336,6 +354,21 @@ class DeliveryRegression(Fixture):
         self.assertEqual(row["last_state"], "ok")
         self.assertEqual(row["sid"], "session_supervisor_fixture")
         self.assertGreater(row["ts"], 0)
+
+    def test_all_state_writes_use_pid_local_temp_files(self):
+        with mock.patch.object(dw.os, "replace") as replace:
+            dw._last_state_write("ok", "session_supervisor_fixture")
+            dw._notice_last_write()
+            dw._liveness_state_write({})
+        self.assertEqual(replace.call_count, 3)
+        for call in replace.call_args_list:
+            self.assertIn(f".{os.getpid()}.tmp", str(call.args[0]))
+
+    def test_health_check_without_a_previous_state_does_not_raise(self):
+        self.assertFalse(dw._state_file().exists())
+        result = dw.check_supervisor_health()
+        self.assertIn(result["state"], ("ok", "missing", "dead", "unknown"))
+        self.assertTrue(dw._state_file().exists())
 
     def test_write_failure_blocks_the_next_delivery_tick(self):
         dw._DELIVERY_WRITE_FAILED = True
