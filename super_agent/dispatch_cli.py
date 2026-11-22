@@ -966,7 +966,8 @@ def current_ordinal(base: str, token: str, sid: str) -> int:
     turns = d.get("turns") or []
     if not turns:
         return -1
-    return int(turns[0].get("ordinal") or -1)
+    ordinal = turns[0].get("ordinal")
+    return -1 if ordinal is None else int(ordinal)
 
 
 def await_turn_start(base: str, token: str, sid: str, prev_ordinal: int,
@@ -987,8 +988,9 @@ def await_turn_start(base: str, token: str, sid: str, prev_ordinal: int,
         d = unwrap(http_get(f"{base}/api/v1/sessions/{sid}/agents/main/turns?page_size=2",
                             token), "read turns")
         for t in (d.get("turns") or []):
-            if int(t.get("ordinal") or -1) > prev_ordinal:
-                return int(t["ordinal"])
+            ordinal = t.get("ordinal")
+            if ordinal is not None and int(ordinal) > prev_ordinal:
+                return int(ordinal)
         time.sleep(0.5)
     raise DispatchError(
         f"round did not start within {deadline_s:.0f}s (session {sid}); "

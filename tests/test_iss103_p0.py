@@ -49,6 +49,23 @@ class RoundFence(unittest.TestCase):
         with mock.patch.object(D, "http_get", lambda *a, **k: {"code": 0, "data": turns}):
             self.assertEqual(D.await_turn_start("http://x", "t", SID, 6, deadline_s=1), 7)
 
+    def test_first_turn_zero_is_accepted(self) -> None:
+        turns = {"turns": [{"ordinal": 0, "status": "ended"}]}
+        with mock.patch.object(D, "http_get", lambda *a, **k: {"code": 0, "data": turns}):
+            self.assertEqual(D.await_turn_start("http://x", "t", SID, -1, deadline_s=1), 0)
+
+    def test_current_ordinal_preserves_zero(self) -> None:
+        turns = {"turns": [{"ordinal": 0, "status": "ended"}]}
+        with mock.patch.object(D, "http_get", lambda *a, **k: {"code": 0, "data": turns}):
+            self.assertEqual(D.current_ordinal("http://x", "t", SID), 0)
+
+    def test_missing_ordinal_still_means_no_turn(self) -> None:
+        turns = {"turns": [{"status": "running"}]}
+        with mock.patch.object(D, "http_get", lambda *a, **k: {"code": 0, "data": turns}):
+            self.assertEqual(D.current_ordinal("http://x", "t", SID), -1)
+            with self.assertRaises(D.DispatchError):
+                D.await_turn_start("http://x", "t", SID, -1, deadline_s=0.01)
+
     def test_source_has_no_running_status_bypass(self) -> None:
         """Freeze the rule, not just today's behaviour: no `status == "running"` judge."""
         import inspect
