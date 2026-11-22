@@ -264,8 +264,16 @@ class Counterfact3(Base):
         engine.run_once()
         engine.run_once()
         rec = self.index(engine)["assignments"]["asg_1_worker_1"]
-        self.assertEqual(rec["status"], "blocked")
+        self.assertEqual(rec["status"], "close_reconcile")
         self.assertNotEqual(rec["status"], "completed")
+        state = self.index(engine)["close_reconcile"][THREAD]
+        self.assertFalse(state["conditions"]["sid_archived"])
+
+        engine.sessions.archived.add("session_w1")
+        engine.run_once()
+        engine.run_once()
+        rec = self.index(engine)["assignments"]["asg_1_worker_1"]
+        self.assertEqual(rec["status"], "completed")
 
     def test_an_open_issue_blocks_completion(self):
         self.issue_state = "open"

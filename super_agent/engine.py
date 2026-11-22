@@ -4418,7 +4418,18 @@ class Engine:
                 cancelled = []
                 if state == "closed":
                     for assignment in records:
-                        if str(assignment.get("status") or "") in asg_mod.HOLD_STATES:
+                        status = str(assignment.get("status") or "")
+                        if status in asg_mod.HOLD_STATES:
+                            continue
+                        if str(assignment.get("qa_verdict") or "") == "pass":
+                            moved = asg_mod.enter_close_reconcile(
+                                assignment, "closed Issue with QA pass")
+                            if moved.get("changed"):
+                                self.store.log_event({
+                                    "type": "assignment.close_reconcile", "at": _now(),
+                                    "thread": thread, "assignment": assignment.get("id"),
+                                    "previous_status": status,
+                                    "reason": moved.get("reason")})
                             continue
                         moved = asg_mod.cancel_closed(assignment)
                         if moved.get("changed"):
