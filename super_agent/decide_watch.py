@@ -502,11 +502,12 @@ def _last_state_read() -> str:
         return ""
 
 
-def _last_state_write(st: str) -> None:
+def _last_state_write(st: str, sid: str = "") -> None:
     try:
         _path("health_state_path", "supervisor_health_state.json").parent.mkdir(parents=True, exist_ok=True)
         tmp = _state_file().with_suffix(".tmp")
-        tmp.write_text(json.dumps({"state": st, "ts": time.time()}, ensure_ascii=False),
+        tmp.write_text(json.dumps({"state": st, "last_state": st, "sid": sid,
+                                   "ts": time.time()}, ensure_ascii=False),
                        encoding="utf-8")
         os.replace(tmp, _state_file())
     except OSError:
@@ -536,7 +537,7 @@ def check_supervisor_health(port: int = 0) -> dict:
     st = res.get("state")
     prev = _last_state_read() or _LAST_SUPERVISOR_STATE      # 文件优先（跨进程），内存兜底
     _LAST_SUPERVISOR_STATE = st
-    _last_state_write(st)
+    _last_state_write(st, str(res.get("sid") or ""))
 
     if st == "ok":
         if prev and prev != "ok":

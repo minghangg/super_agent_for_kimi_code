@@ -329,6 +329,14 @@ class DeliveryRegression(Fixture):
         self.assertNotEqual(targets[0][1], "session_supervisor_fixture")
         self.assertEqual(dw.resolve_recipients("owner/other_project"), [])
 
+    def test_supervisor_snapshot_is_current_and_wss_compatible(self):
+        dw._last_state_write("ok", "session_supervisor_fixture")
+        row = json.loads(dw._state_file().read_text(encoding="utf-8"))
+        self.assertEqual(row["state"], "ok")
+        self.assertEqual(row["last_state"], "ok")
+        self.assertEqual(row["sid"], "session_supervisor_fixture")
+        self.assertGreater(row["ts"], 0)
+
     def test_write_failure_blocks_the_next_delivery_tick(self):
         dw._DELIVERY_WRITE_FAILED = True
         try:
