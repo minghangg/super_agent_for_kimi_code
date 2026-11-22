@@ -11,7 +11,7 @@ The properties pinned here:
 * a late event on a terminal assignment is audited, not restarted;
 * a gate refusal keeps the thread record ``pending`` (never ``completed``), so
   the next round still selects it;
-* closed unfinished work becomes ``cancelled``, never fake ``completed``;
+* unfinished work is never batch-cancelled by the close scanner;
 * the scan honours ``engine.max_closed_thread_checks``.
 
 Run: ``python -m pytest tests/test_close_reconcile.py -q``
@@ -264,16 +264,8 @@ class Counterfact3(Base):
         engine.run_once()
         engine.run_once()
         rec = self.index(engine)["assignments"]["asg_1_worker_1"]
-        self.assertEqual(rec["status"], "close_reconcile")
+        self.assertEqual(rec["status"], "blocked")
         self.assertNotEqual(rec["status"], "completed")
-        state = self.index(engine)["close_reconcile"][THREAD]
-        self.assertFalse(state["conditions"]["sid_archived"])
-
-        engine.sessions.archived.add("session_w1")
-        engine.run_once()
-        engine.run_once()
-        rec = self.index(engine)["assignments"]["asg_1_worker_1"]
-        self.assertEqual(rec["status"], "completed")
 
     def test_an_open_issue_blocks_completion(self):
         self.issue_state = "open"
@@ -365,20 +357,16 @@ class Counterfact6(Base):
 
 
 class ScanBounds(Base):
-    def test_closed_work_is_cancelled_and_the_cap_applies(self):
+    def test_only_held_states_are_checked_and_the_cap_applies(self):
         engine = self.engine()
         self.deliver_and_pass(engine)
         index = self.index(engine)
-        rec = index["assignments"]["asg_1_worker_1"]
-        rec["status"] = "working"
-        rec["qa_verdict"] = ""
+        index["assignments"]["asg_1_worker_1"]["status"] = "working"
         engine.store.save_index(index)
-        index = engine.store.load_index()
-        out = engine._round_closed_threads(index)
-        rec = index["assignments"]["asg_1_worker_1"]
-        self.assertEqual(rec["status"], "cancelled")
-        self.assertEqual(rec["previous_status"], "working")
-        self.assertEqual(out[0]["cancelled"], ["asg_1_worker_1"])
+        out = engine._round_closed_threads(engine.store.load_index())
+        self.assertEqual(out, [])
+        self.assertEqual(engine.store.load_index()["assignments"]
+                         ["asg_1_worker_1"]["status"], "working")
 
         index = self.index(engine)
         for n in range(2, 6):

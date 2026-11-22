@@ -306,6 +306,19 @@ class Behaviour(Fixture):
 
 
 class DeliveryRegression(Fixture):
+    def test_missing_ledger_creates_an_empty_file_with_a_visible_log(self):
+        path = dw._delivery_paths()["ledger"]
+        path.unlink(missing_ok=True)
+        st = dw._default_state()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(dw.scan_deliveries(st, dry=False, now=100), 0)
+        self.assertTrue(path.is_file())
+        self.assertEqual(path.stat().st_size, 0)
+        self.assertIn("ledger_created", out.getvalue())
+        self.assertEqual(st["offset"], 0)
+        self.assertTrue(st["baseline_established"])
+
     def test_bad_state_never_replays_the_undelivered_log(self):
         rec = {"repo": "owner/neutral_project", "issue": 1,
                "evidence": "cid:old", "detected_ts": 1}

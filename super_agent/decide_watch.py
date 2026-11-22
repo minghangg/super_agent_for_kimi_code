@@ -2506,7 +2506,13 @@ def scan_deliveries(st: dict, *, dry: bool, now: float, force_replay: bool = Fal
     """
     p = _delivery_paths()["ledger"]
     if not p.is_file():
-        return 0
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.touch(exist_ok=True)
+            delivery_log("ledger_created: 台账不存在，已创建空文件并建立空文件基线")
+        except OSError as exc:
+            delivery_log(f"ledger_create_failed: {type(exc).__name__}: {exc}")
+            return 0
     try:
         size = p.stat().st_size
     except OSError:

@@ -149,21 +149,29 @@ def _now_ts() -> float:
 _CODE_VERSION = None
 
 
-def _code_version() -> tuple[str, bool | None]:
-    global _CODE_VERSION
-    if _CODE_VERSION is not None:
-        return _CODE_VERSION
+def _current_head() -> str:
     root = Path(__file__).resolve().parent.parent
     try:
-        commit = subprocess.run(
+        return subprocess.run(
             ["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
             capture_output=True, text=True, timeout=3, check=False).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _code_version() -> tuple[str, bool | None]:
+    global _CODE_VERSION
+    root = Path(__file__).resolve().parent.parent
+    commit = str((_CODE_VERSION or ("", None))[0] or "")
+    try:
+        if not commit:
+            commit = _current_head()
         dirty = bool(subprocess.run(
             ["git", "-C", str(root), "status", "--porcelain"],
             capture_output=True, text=True, timeout=3, check=False).stdout.strip())
         _CODE_VERSION = (commit, dirty)
     except (OSError, subprocess.SubprocessError):
-        _CODE_VERSION = ("", None)
+        _CODE_VERSION = (commit, None)
     return _CODE_VERSION
 
 
@@ -531,6 +539,7 @@ class Engine:
     def write_health(self, *, error: str = "", degraded: bool = False,
                      running: bool = True, phase: str = "") -> dict:
         self._capture_bus_error()
+        self.code_commit, self.worktree_dirty = _code_version()
         return health.write(self.store.health_path,
                             self.health_record(error=error, degraded=degraded,
                                                running=running, phase=phase))
@@ -1539,8 +1548,8 @@ class Engine:
         * the **thread completes** (no ``comment_id``) - nothing on it waits for
           a person any more.
 
-        The event log keeps the audit trail; this only stops the queue from
-        lying. Returns how many ``review_refused`` entries were cleared.
+        The original ``needs_person`` rows stay append-only; supersession marks
+        hide them from the open queue. Returns cleared ``review_refused`` entries.
         """
         def wanted(rec) -> bool:
             if not isinstance(rec, dict):
@@ -1562,15 +1571,20 @@ class Engine:
                 cleared += 1
         numbers = (index.get("issues") or {}).get(thread)
         if isinstance(numbers, dict):
+            from . import needs as needs_mod
             rows = numbers.get("needs_person")
             if isinstance(rows, list):
-                numbers["needs_person"] = [
-                    r for r in rows
-                    if not (isinstance(r, dict)
-                            and str(r.get("reason") or "").startswith(
-                                "review.refused_after_hold")
-                            and (comment_id is None
-                                 or str(r.get("comment_id")) == str(comment_id)))]
+                for row in rows:
+                    if not isinstance(row, dict) or not str(
+                            row.get("reason") or "").startswith("review.refused_after_hold"):
+                        continue
+                    if comment_id is not None and str(row.get("comment_id")) != str(comment_id):
+                        continue
+                    cid = needs_mod.cid_of(row)
+                    if cid is not None:
+                        needs_mod.mark(index, thread, cid, state=needs_mod.SUPERSEDED,
+                                       by="engine", reason="review refusal cleared",
+                                       by_comment=comment_id)
         if cleared:
             self.store.log_event({
                 "type": "review.refused_cleared", "at": _now(),
@@ -4394,62 +4408,20 @@ class Engine:
                 snap["conditions"], "consecutive_ok": streak}
 
     def _round_closed_threads(self, index: dict) -> list[dict]:
-        """Reconcile closed Issues and held releases, up to the configured cap.
-
-        A closed Issue ends unfinished work as ``cancelled``; it never fabricates
-        a QA pass. Assignments with a QA pass still use the four-condition,
-        two-round completion gate. Open and unknown states change nothing.
-        """
+        """Check held releases only; never batch-close unfinished assignments."""
         engine_cfg = self.cfg.get("engine") or {}
         try:
             limit = max(1, int(engine_cfg.get("max_closed_thread_checks") or 10))
         except (TypeError, ValueError):
             limit = 10
-        by_thread: dict[str, list[dict]] = {}
-        for rec in (index.get("assignments") or {}).values():
-            if str(rec.get("status") or "") in asg_mod.ACTIVE_STATES:
-                by_thread.setdefault(str(rec.get("thread") or ""), []).append(rec)
+        threads = sorted({str(rec.get("thread") or "")
+                          for rec in (index.get("assignments") or {}).values()
+                          if str(rec.get("status") or "") in
+                          ("waiting_release", "close_reconcile")})
         out = []
-        for thread in sorted(t for t in by_thread if t)[:limit]:
-            records = by_thread[thread]
-            issue = records[0].get("issue")
+        for thread in [t for t in threads if t][:limit]:
             try:
-                state = self._issue_state(issue)
-                cancelled = []
-                if state == "closed":
-                    for assignment in records:
-                        status = str(assignment.get("status") or "")
-                        if status in asg_mod.HOLD_STATES:
-                            continue
-                        if str(assignment.get("qa_verdict") or "") == "pass":
-                            moved = asg_mod.enter_close_reconcile(
-                                assignment, "closed Issue with QA pass")
-                            if moved.get("changed"):
-                                self.store.log_event({
-                                    "type": "assignment.close_reconcile", "at": _now(),
-                                    "thread": thread, "assignment": assignment.get("id"),
-                                    "previous_status": status,
-                                    "reason": moved.get("reason")})
-                            continue
-                        moved = asg_mod.cancel_closed(assignment)
-                        if moved.get("changed"):
-                            cancelled.append(assignment["id"])
-                            self.store.log_event({
-                                "type": "assignment.cancelled", "at": _now(),
-                                "thread": thread, "assignment": assignment.get("id"),
-                                "previous_status": moved.get("previous_status"),
-                                "reason": moved.get("reason")})
-                held = any(str(rec.get("status") or "") in asg_mod.HOLD_STATES
-                           for rec in records)
-                if held:
-                    result = self._reconcile_thread(index, thread)
-                    if cancelled:
-                        result["cancelled"] = cancelled
-                    out.append(result)
-                else:
-                    out.append({"thread": thread, "status": "cancelled" if cancelled
-                                else "active", "cancelled": cancelled,
-                                "completed": [], "issue_state": state})
+                out.append(self._reconcile_thread(index, thread))
             except Exception as exc:  # noqa: BLE001  one bad thread is isolated
                 self.store.log_event({"type": "close_reconcile.blocked",
                                       "at": _now(), "thread": thread,
@@ -5235,8 +5207,25 @@ class Engine:
         if info.get("pid"):
             pid = info.get("pid")
             if process_alive(pid):
+                last_loop = _parse_ts(snap.get("last_loop_at"))
+                age_s = (int((datetime.now(timezone.utc) - last_loop).total_seconds())
+                         if last_loop else None)
+                if snap.get("running") and (age_s is None or age_s > 300):
+                    return ("process", False,
+                            f"stalled: pid={pid} alive but last_loop_at="
+                            f"{snap.get('last_loop_at')} age_s={age_s} threshold_s=300",
+                            "fail", "process-stalled")
+                head = _current_head()
+                running_commit = str(snap.get("code_commit") or "")
+                if head and running_commit and running_commit != head:
+                    return ("process", False,
+                            f"stale code: running={running_commit} HEAD={head} pid={pid}; "
+                            "restart the engine to activate the checkout",
+                            "fail", "process-version")
                 return ("process", True,
-                        f"engine.pid pid={pid} alive since={info.get('started_at')}",
+                        f"engine.pid pid={pid} alive since={info.get('started_at')} "
+                        f"last_loop_age_s={age_s} code_commit={running_commit or 'unknown'} "
+                        f"HEAD={head or 'unknown'}",
                         "fail", "process-dead")
             if startup_failed:
                 return ("process", False,
@@ -5296,8 +5285,14 @@ class Engine:
         issue = int(issue)
         index = self.store.load_index()
         cursor = self.store.load_cursor()
-        rec = {"state": "idle", "comments_seen": 0, "needs_person": [],
-               "title": self.source.title(issue), "rebuilt_at": _now()}
+        key = self._thread_key(issue)
+        previous = (index.get("issues") or {}).get(key) or {}
+        kept = [dict(row) for row in (previous.get("needs_person") or [])
+                if isinstance(row, dict)]
+        rec = dict(previous)
+        rec.update({"state": "needs_person" if kept else "idle", "comments_seen": 0,
+                    "needs_person": kept, "title": self.source.title(issue),
+                    "rebuilt_at": _now()})
         comments = self.source.comments(issue)
         for comment in comments:
             cid = int(comment["id"])
@@ -5305,12 +5300,12 @@ class Engine:
             state, reason = self._triage(comment)
             if state == "needs_person":
                 rec["state"] = "needs_person"
-                rec["needs_person"].append({"comment_id": cid, "reason": reason,
-                                            "at": _now()})
+                if not any(row.get("comment_id") == cid for row in rec["needs_person"]):
+                    rec["needs_person"].append({"comment_id": cid, "reason": reason,
+                                                "at": _now()})
             elif rec["state"] == "idle":
                 rec["state"] = "tracked"
         rec["last_comment_id"] = max((int(c["id"]) for c in comments), default=0)
-        key = self._thread_key(issue)
         index.setdefault("issues", {})[key] = rec
         index.setdefault("meta", {})["updated_at"] = _now()
         index["meta"]["rebuilt_issue"] = issue

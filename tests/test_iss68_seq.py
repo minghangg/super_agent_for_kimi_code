@@ -722,10 +722,11 @@ class VariantE4_CleanupOnCompleted(Base):
         index = self.index(engine)
         self.assertEqual(self.rec(engine)["status"], "completed")
         self.assertEqual(index.get("review_refused") or {}, {})
-        rows = (index["issues"][THREAD].get("needs_person") or [])
-        self.assertEqual([r for r in rows
-                          if str(r.get("reason") or "").startswith(
-                              "review.refused_after_hold")], [])
+        from super_agent import needs as needs_mod
+        rows = [r for r in (index["issues"][THREAD].get("needs_person") or [])
+                if str(r.get("reason") or "").startswith("review.refused_after_hold")]
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(needs_mod.is_open(index, THREAD, rows[0]))
 
     def test_another_threads_rows_survive(self):
         engine = self.deliver_then_park()
@@ -787,7 +788,9 @@ class VariantE5_ReplayIsNotNews(Base):
         self.assertEqual(left, [])
         rows = [r for r in index["issues"][THREAD]["needs_person"]
                 if str(r.get("comment_id")) == "9200"]
-        self.assertEqual(rows, [])
+        self.assertEqual(len(rows), 1)
+        from super_agent import needs as needs_mod
+        self.assertFalse(needs_mod.is_open(index, THREAD, rows[0]))
         self.assertEqual(self.rec(engine)["qa_verdict"], "pass")
 
     def park_two_reviews(self):

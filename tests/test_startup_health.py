@@ -235,9 +235,10 @@ class RuntimeObservability(Base):
                 raise TimeoutError("bus down")
         engine = self.engine()
         engine.bus = DownBus()
-        engine.code_commit = "abc123"
-        engine.worktree_dirty = False
-        engine.write_health()
+        from super_agent import engine as engine_mod
+        with mock.patch.object(engine_mod, "_code_version",
+                               return_value=("abc123", False)):
+            engine.write_health()
         snap = health.read(self.state / "health.json")
         self.assertEqual(snap["code_commit"], "abc123")
         self.assertFalse(snap["worktree_dirty"])
@@ -245,6 +246,54 @@ class RuntimeObservability(Base):
         self.assertIn("bus down", snap["bus_last_error"])
         self.assertIn("bus down", snap["last_error"])
         self.assertTrue(snap["degraded"])
+
+    def test_dirty_state_is_refreshed_without_changing_the_running_commit(self):
+        from super_agent import engine as engine_mod
+        saved = engine_mod._CODE_VERSION
+        try:
+            engine_mod._CODE_VERSION = ("abc123", False)
+            with mock.patch.object(engine_mod.subprocess, "run",
+                                   side_effect=[mock.Mock(stdout=""),
+                                                mock.Mock(stdout=" M README.md")]) as run, \
+                    mock.patch.object(engine_mod, "_current_head") as head:
+                self.assertEqual(engine_mod._code_version(), ("abc123", False))
+                self.assertEqual(engine_mod._code_version(), ("abc123", True))
+            self.assertEqual(run.call_count, 2)
+            head.assert_not_called()
+        finally:
+            engine_mod._CODE_VERSION = saved
+
+
+class ProcessFreshness(Base):
+    def setUp(self):
+        super().setUp()
+        self.lock = PidLock(self.state / "engine.pid")
+        self.lock.try_acquire()
+        self.addCleanup(self.lock.release)
+
+    def snapshot(self, last_loop_at, commit):
+        health.write(self.state / "health.json", {
+            "pid": os.getpid(), "running": True, "phase": "running",
+            "last_loop_at": last_loop_at, "code_commit": commit})
+
+    def test_live_pid_with_a_stale_round_is_stalled(self):
+        from datetime import datetime, timedelta, timezone
+        old = (datetime.now(timezone.utc) - timedelta(seconds=601)).isoformat()
+        self.snapshot(old, "same")
+        out = self.engine()._check_process()
+        self.assertFalse(out[1])
+        self.assertEqual(out[4], "process-stalled")
+        self.assertIn("threshold_s=300", out[2])
+
+    def test_running_commit_must_match_the_current_head(self):
+        from datetime import datetime, timezone
+        from super_agent import engine as engine_mod
+        self.snapshot(datetime.now(timezone.utc).isoformat(), "old123")
+        with mock.patch.object(engine_mod, "_current_head", return_value="new456"):
+            out = self.engine()._check_process()
+        self.assertFalse(out[1])
+        self.assertEqual(out[4], "process-version")
+        self.assertIn("running=old123 HEAD=new456", out[2])
 
 
 class StaleLockOrdering(Base):

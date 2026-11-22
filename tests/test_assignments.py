@@ -752,16 +752,14 @@ class Verdicts(unittest.TestCase):
         self.assertTrue(asg.late_event(rec, "delivery", cid=9999)["audit"])
         self.assertEqual(rec["status"], "completed")
 
-    def test_cancelled_assignment_is_terminal_without_a_qa_pass(self):
-        rec = self.record(status="working", qa_verdict="")
-        out = asg.cancel_closed(rec)
-        self.assertEqual(out["previous_status"], "working")
-        self.assertEqual(rec["status"], "cancelled")
+    def test_legacy_cancelled_assignment_stays_terminal(self):
+        rec = self.record(status="cancelled", qa_verdict="")
         self.assertNotIn(rec["id"], asg.active_assignments(
             {"assignments": {rec["id"]: rec}}))
         self.assertTrue(asg.late_event(rec, "delivery", cid=9999)["audit"])
         self.assertTrue(asg.complete(rec)["refused"])
         self.assertEqual(rec["status"], "cancelled")
+        self.assertFalse(hasattr(asg, "cancel_closed"))
 
     def test_close_reconcile_refuses_without_a_pass(self):
         rec = self.record(status="waiting_release", qa_verdict="")

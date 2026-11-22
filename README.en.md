@@ -77,11 +77,13 @@ python -m super_agent.cli doctor
 python -m super_agent.cli once --mode observe
 #   one round, compute only. observe performs zero external actions by design.
 #   expect: mode=observe issues=0 ... external_actions=0
+#   a resident engine locks its state root; run doctor/status first,
+#   or give this trial its own --state-dir /tmp/safkc-observe.
 
 python -m super_agent.cli reporter --out status.html
 #   a self-contained status page: "what needs me right now". open it in a browser.
 
-python -m unittest discover -s tests -v      # 30 files, every counterexample included
+python -m unittest discover -s tests -v      # growing suite, every counterexample included
 ```
 
 To point it at real data, set the source to `fixture` (local JSON) or `live` (read-only REST, token from the environment). The default is `none`, so nothing leaves your machine.
@@ -115,7 +117,7 @@ super_agent/
   github_source.py     read-only Issue comment collection
   dispatch_adapter.py  create, bind, archive — the thin layer that talks to sessions
   brief.py · ctx_gate.py · reporter.py    recovery pack · context gate · status page
-tests/                 30 files, stdlib unittest, every counterexample encoded
+tests/                 growing suite, stdlib unittest, every counterexample encoded
 config/                allowlist: which project, which issue, which action is permitted
 ```
 

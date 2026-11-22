@@ -14,7 +14,7 @@ State machine::
                         |                             +-> working (reopen)
                         +-> working (unblock)
 
-    active non-hold without QA pass       Issue closed              cancelled
+    cancelled                             legacy user-authorized cleanup; no engine transition
     cancelled                             any late event            unchanged (audit)
 
 ``waiting_release`` and ``close_reconcile`` are *hold* states: the work is
@@ -851,22 +851,6 @@ def complete(assignment: dict) -> dict:
     assignment["status"] = "completed"
     assignment["updated_at"] = now()
     return {"changed": True, "status": "completed", "reason": why}
-
-
-def cancel_closed(assignment: dict) -> dict:
-    """End unfinished work because its Issue is closed, without claiming QA."""
-    status = str(assignment.get("status") or "")
-    if (status not in ACTIVE_STATES or status in HOLD_STATES
-            or str(assignment.get("qa_verdict") or "") == "pass"):
-        return {"changed": False, "reason": "not cancellable active work",
-                "refused": True}
-    assignment["previous_status"] = status
-    assignment["status"] = "cancelled"
-    assignment["cancelled_at"] = now()
-    assignment["updated_at"] = assignment["cancelled_at"]
-    assignment["cancel_reason"] = "issue closed before QA release"
-    return {"changed": True, "status": "cancelled", "previous_status": status,
-            "reason": assignment["cancel_reason"]}
 
 
 def reopen(assignment: dict, *, review_cid=None, delivery_cid=None,

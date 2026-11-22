@@ -403,7 +403,7 @@ class InjectTest(_Base):
         command = r'"py.exe" D:\wb\tools\decide_watch.py'
         proc = autostart._process_side(
             "decide_watch", [(15068, command), (15076, command)], injected=True)
-        self.assertNotEqual(proc.state, "ok")
+        self.assertEqual(proc.state, "duplicate")
         self.assertIn("重复实例", proc.detail)
         self.assertIn("15068", proc.detail)
         self.assertIn("15076", proc.detail)
@@ -416,6 +416,15 @@ class InjectTest(_Base):
                 "--command-line", command, "--command-line", command])
         self.assertEqual(rc, 22)
         self.assertIn("重复实例", out)
+        self.assertIn("结论：检测到 1 个部件的重复实例", out)
+        self.assertNotIn("结论：部分无法判定（解析失败）", out)
+
+    def test_multiple_pid_filters_use_or(self) -> None:
+        with mock.patch.object(autostart, "_ps", return_value=(0, "", "")) as ps:
+            self.assertEqual(autostart.read_processes(pids=[101, 202]), [])
+        script = ps.call_args.args[0]
+        self.assertIn("ProcessId=101 or ProcessId=202", script)
+        self.assertNotIn("ProcessId=101,ProcessId=202", script)
 
     def test_process_side_accepts_the_shim_name(self) -> None:
         """`<part>_<suffix>.py` names the same part as `<part>.py` (ISS-102).

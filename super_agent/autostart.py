@@ -491,7 +491,7 @@ def read_processes(pattern: str = "wss_bus|decide_watch",
     import json
 
     if pids:
-        filters = ",".join(f"ProcessId={int(p)}" for p in pids)
+        filters = " or ".join(f"ProcessId={int(p)}" for p in pids)
         query = f"@(Get-CimInstance Win32_Process -Filter {_ps_literal(filters)})"
     else:
         query = ("@(Get-CimInstance Win32_Process | Where-Object { "
@@ -602,7 +602,7 @@ def _process_side(part: str, rows: list[tuple[int, str]],
                         detail=f"{len(hits)} 个进程指向不同文件，无法判定")
         if len(hits) > 1:
             pids = sorted(p for p, _ in hits)
-            return Side("unparsable",
+            return Side("duplicate",
                         detail=f"重复实例：{len(hits)} 个同路径进程（PID {pids}）")
         pid = min(p for p, _ in hits)
         # pid 0 means the line came from ``--command-line``, which has no
@@ -686,6 +686,7 @@ def verify(parts: list[str], *, script: Path | None = None,
     mismatches: list[str] = []
     unregistered: list[str] = []
     unparsable: list[str] = []
+    duplicates: list[str] = []
     not_running: list[str] = []
     direct_py: list[str] = []
     unparsed_html: list[str] = []
@@ -745,6 +746,9 @@ def verify(parts: list[str], *, script: Path | None = None,
         elif proc.state == "unparsable":
             unparsable.append(part)
             verdict = "不可判"
+        elif proc.state == "duplicate":
+            duplicates.append(part)
+            verdict = "重复"
         elif task_value and task_value != scr.value:
             mismatches.append(part)
             verdict = "否"
@@ -772,13 +776,18 @@ def verify(parts: list[str], *, script: Path | None = None,
         print(f"    建议：python -m super_agent.autostart --register {part} --apply")
     for part in unparsable:
         print(f"  · {part}：无法判定（见上表）")
+    for part in duplicates:
+        print(f"  · {part}：检测到重复实例（见上表 PID）")
     for part in unregistered:
         print(f"  · {part}：计划任务未注册")
         print(f"    建议：python -m super_agent.autostart --register {part} --apply")
     for part in not_running:
         print(f"  · {part}：进程侧未运行；另两方仍已比对")
 
-    if mismatches:
+    if duplicates:
+        print(f"结论：检测到 {len(duplicates)} 个部件的重复实例")
+        rc = EXIT_VERIFY_UNPARSABLE
+    elif mismatches:
         print(f"结论：{len(mismatches)} 处不一致")
         rc = EXIT_VERIFY_MISMATCH
     elif unparsable:

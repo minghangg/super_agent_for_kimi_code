@@ -164,6 +164,18 @@ class DismissHidesIt(Base):
         rc, text = self.status()
         self.assertIn("无", text)
 
+    def test_replay_preserves_rows_absent_from_the_source(self):
+        cfg = self.seed()
+        index = self.index()
+        index["issues"][THREAD]["needs_person"].append({
+            "comment_id": 9999, "reason": "locally preserved", "at": "old"})
+        self.store.save_index(index)
+        rc, text = self.run_cli(["replay", "--config", str(cfg), "--issue", "1"])
+        self.assertEqual(rc, 0, text)
+        rows = self.entries()
+        self.assertEqual([r["comment_id"] for r in rows], [9100, 9999])
+        self.assertEqual(rows[1]["at"], "old")
+
     def test_brief_hides_it_too(self):
         from super_agent import brief as brief_mod
         self.seed()
