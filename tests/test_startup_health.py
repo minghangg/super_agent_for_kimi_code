@@ -263,6 +263,18 @@ class RuntimeObservability(Base):
         finally:
             engine_mod._CODE_VERSION = saved
 
+    def test_git_subprocesses_hide_the_windows_console(self):
+        from super_agent import engine as engine_mod
+        kwargs = engine_mod._quiet_subprocess_kwargs()
+        if os.name == "nt":
+            self.assertTrue(kwargs["creationflags"] & engine_mod.subprocess.CREATE_NO_WINDOW)
+            self.assertTrue(kwargs["startupinfo"].dwFlags &
+                            engine_mod.subprocess.STARTF_USESHOWWINDOW)
+            self.assertEqual(kwargs["startupinfo"].wShowWindow,
+                             engine_mod.subprocess.SW_HIDE)
+        else:
+            self.assertEqual(kwargs, {})
+
 
 class ProcessFreshness(Base):
     def setUp(self):

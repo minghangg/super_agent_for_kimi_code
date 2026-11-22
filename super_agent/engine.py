@@ -149,12 +149,22 @@ def _now_ts() -> float:
 _CODE_VERSION = None
 
 
+def _quiet_subprocess_kwargs() -> dict:
+    if os.name != "nt":
+        return {}
+    info = subprocess.STARTUPINFO()
+    info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    info.wShowWindow = subprocess.SW_HIDE
+    return {"creationflags": subprocess.CREATE_NO_WINDOW, "startupinfo": info}
+
+
 def _current_head() -> str:
     root = Path(__file__).resolve().parent.parent
     try:
         return subprocess.run(
             ["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, timeout=3, check=False).stdout.strip()
+            capture_output=True, text=True, timeout=3, check=False,
+            **_quiet_subprocess_kwargs()).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return ""
 
@@ -168,7 +178,8 @@ def _code_version() -> tuple[str, bool | None]:
             commit = _current_head()
         dirty = bool(subprocess.run(
             ["git", "-C", str(root), "status", "--porcelain"],
-            capture_output=True, text=True, timeout=3, check=False).stdout.strip())
+            capture_output=True, text=True, timeout=3, check=False,
+            **_quiet_subprocess_kwargs()).stdout.strip())
         _CODE_VERSION = (commit, dirty)
     except (OSError, subprocess.SubprocessError):
         _CODE_VERSION = (commit, None)
