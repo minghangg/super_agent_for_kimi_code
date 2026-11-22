@@ -35,6 +35,7 @@ from . import config as config_mod
 from . import github_source
 from . import reporter as reporter_mod
 from . import session_events
+from . import session_ledger
 from . import assignments as asg_mod
 from . import issuekey
 from . import needs as needs_mod
@@ -649,6 +650,12 @@ def cmd_doctor(args) -> int:
     label_width = max((len(c.get("label") or "") for c in report["checks"]), default=4)
     print(f"doctor  role={engine.role} mode={report['mode']} "
           f"external_actions={report['external_actions']}")
+    from . import agent_config
+    allowlist = getattr(engine.projects, "path", "") or "(none)"
+    config_origin = getattr(args, "config", None) or agent_config.config_path()
+    print(f"paths   engine_state={store.root} "
+          f"session_state={session_ledger.sessions_path(cfg).parent} "
+          f"allowlist={allowlist} config={config_origin}")
     for check in report["checks"]:
         mark = {"ok": "OK  ", "warn": "WARN", "fail": "FAIL"}[check["level"]]
         label = check.get("label") or check["name"]

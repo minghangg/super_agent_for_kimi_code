@@ -228,6 +228,25 @@ class HealthInvariant(Base):
             self.assertEqual(warn, "")
 
 
+class RuntimeObservability(Base):
+    def test_health_contains_version_and_the_current_bus_error(self):
+        class DownBus:
+            def healthz(self):
+                raise TimeoutError("bus down")
+        engine = self.engine()
+        engine.bus = DownBus()
+        engine.code_commit = "abc123"
+        engine.worktree_dirty = False
+        engine.write_health()
+        snap = health.read(self.state / "health.json")
+        self.assertEqual(snap["code_commit"], "abc123")
+        self.assertFalse(snap["worktree_dirty"])
+        self.assertTrue(snap["started_at"])
+        self.assertIn("bus down", snap["bus_last_error"])
+        self.assertIn("bus down", snap["last_error"])
+        self.assertTrue(snap["degraded"])
+
+
 class StaleLockOrdering(Base):
     """A leftover ``engine.pid`` must not bury a startup-failed snapshot."""
 

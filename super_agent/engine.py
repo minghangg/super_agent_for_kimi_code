@@ -73,6 +73,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -145,6 +146,27 @@ def _now_ts() -> float:
     return time.time()
 
 
+_CODE_VERSION = None
+
+
+def _code_version() -> tuple[str, bool | None]:
+    global _CODE_VERSION
+    if _CODE_VERSION is not None:
+        return _CODE_VERSION
+    root = Path(__file__).resolve().parent.parent
+    try:
+        commit = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=3, check=False).stdout.strip()
+        dirty = bool(subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=3, check=False).stdout.strip())
+        _CODE_VERSION = (commit, dirty)
+    except (OSError, subprocess.SubprocessError):
+        _CODE_VERSION = ("", None)
+    return _CODE_VERSION
+
+
 def _tail_events(path: Path, *, limit: int, max_bytes: int = 512 * 1024) -> list:
     """The last ``limit`` JSON rows of an append-only JSONL file.
 
@@ -210,6 +232,9 @@ class Engine:
         self.session_api = session_api
         self.bus = bus
         self.clock = clock
+        self.started_at = _now()
+        self.code_commit, self.worktree_dirty = _code_version()
+        self._bus_last_error = ""
         self.mode = str(cfg.get("mode") or OBSERVE)
         # Machine-checkable switch. Observe => always False. A test flips this
         # attribute to prove the external-action counter is not hard-wired to 0.
@@ -469,7 +494,8 @@ class Engine:
         # (ISS-79 P1-1). Duplicates are dropped: the round joins its own error
         # list in, and the same reason must not appear twice.
         reasons: list[str] = []
-        for reason in (error, self._index_error, self._stream_error):
+        for reason in (error, self._index_error, self._stream_error,
+                       self._bus_last_error):
             if reason and reason not in reasons:
                 reasons.append(reason)
         last_error = "; ".join(reasons)
@@ -478,15 +504,33 @@ class Engine:
                   "last_successful_action_at": self.last_successful_action_at,
                   "active_assignments": active,
                   "degraded": bool(degraded or error or self._index_error
-                                   or self._stream_error),
+                                   or self._stream_error or self._bus_last_error),
                   "last_error": last_error,
-                  "running": bool(running)}
+                  "running": bool(running),
+                  "started_at": self.started_at, "code_commit": self.code_commit,
+                  "worktree_dirty": self.worktree_dirty,
+                  "bus_last_error": self._bus_last_error}
         if phase:
             record["phase"] = phase
         return record
 
+    def _capture_bus_error(self) -> None:
+        self._bus_last_error = ""
+        probe = getattr(self.bus, "healthz", None)
+        if not callable(probe):
+            return
+        try:
+            snap = probe()
+        except Exception as exc:  # noqa: BLE001 - health must retain the fault
+            self._bus_last_error = f"bus: {type(exc).__name__}: {exc}"
+            return
+        error = str((snap or {}).get("error") or "")
+        if error or (snap and not snap.get("ok")):
+            self._bus_last_error = error or "bus: not ok"
+
     def write_health(self, *, error: str = "", degraded: bool = False,
                      running: bool = True, phase: str = "") -> dict:
+        self._capture_bus_error()
         return health.write(self.store.health_path,
                             self.health_record(error=error, degraded=degraded,
                                                running=running, phase=phase))

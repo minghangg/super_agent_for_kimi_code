@@ -264,6 +264,10 @@ class Gate(Base):
                                   "--role", "quartermaster"])
             self.assertEqual(rc, 0, text)
             self.assertIn("role=quartermaster", text.splitlines()[0], text)
+            if command == "doctor":
+                self.assertIn("engine_state=", text)
+                self.assertIn("session_state=", text)
+                self.assertIn("allowlist=", text)
 
     def test_a11_role_flag_is_written_before_the_subcommand(self):
         rc, text = self._run(["--role", "quartermaster", "--state-dir",

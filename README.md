@@ -85,11 +85,13 @@ python -m super_agent.cli doctor
 python -m super_agent.cli once --mode observe
 #   跑一轮，只计算。observe 按设计不执行任何外部动作。
 #   预期：mode=observe issues=0 ... external_actions=0
+#   若已有常驻引擎，同一状态根会被锁拒绝；先跑 doctor/status，
+#   或给这次体验一个独立的 --state-dir /tmp/safkc-observe。
 
 python -m super_agent.cli reporter --out status.html
 #   生成自包含状态页：「现在什么需要我」，浏览器打开即可
 
-python -m unittest discover -s tests -v      # 30 个文件，每条反例都在里面
+python -m unittest discover -s tests -v      # 持续增加，每条反例都在里面
 ```
 
 想看真数据，把数据源设成 `fixture`（本地 JSON）或 `live`（只读 REST，token 走环境变量）。默认是 `none`，什么都不会离开你的机器。
@@ -123,7 +125,7 @@ super_agent/
   github_source.py     只读采集 Issue 评论
   dispatch_adapter.py  建、绑、归档 —— 与会话打交道的那层薄壳
   brief.py · ctx_gate.py · reporter.py    恢复包 · 上下文闸 · 状态页
-tests/                 30 个文件，标准库 unittest，每条反例都写成测试
+tests/                 持续增加，标准库 unittest，每条反例都写成测试
 config/                白名单：允许碰哪个项目、哪张单、哪个动作
 ```
 

@@ -11,6 +11,10 @@ Fields (all always present, so a watchdog never has to guess):
 ``last_error``                 the reason it is degraded, or ""
 ``running``                    True while a resident loop owns the state dir
 ``phase``                      ``running`` | ``startup-failed`` | ``stopped``
+``started_at``                 process start (ISO-8601 UTC)
+``code_commit``                short HEAD of the running checkout
+``worktree_dirty``             whether the checkout has changes
+``bus_last_error``             current bus health error, or ""
 
 Writes go to a temporary file then ``os.replace``, so a reader either sees the
 previous snapshot or the new one, never a truncated file. ``running`` separates
@@ -35,7 +39,8 @@ from pathlib import Path
 from .store import atomic_write_text
 
 FIELDS = ("pid", "mode", "last_loop_at", "last_successful_action_at",
-          "active_assignments", "degraded", "last_error", "running", "phase")
+          "active_assignments", "degraded", "last_error", "running", "phase",
+          "started_at", "code_commit", "worktree_dirty", "bus_last_error")
 
 PHASES = ("running", "startup-failed", "stopped")
 
@@ -44,7 +49,8 @@ def blank() -> dict:
     return {"pid": None, "mode": "observe", "last_loop_at": None,
             "last_successful_action_at": None, "active_assignments": 0,
             "degraded": False, "last_error": "", "running": False,
-            "phase": "stopped"}
+            "phase": "stopped", "started_at": None, "code_commit": "",
+            "worktree_dirty": None, "bus_last_error": ""}
 
 
 def read(path: str | Path) -> dict:
