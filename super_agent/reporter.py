@@ -764,6 +764,48 @@ def _storage(store) -> dict:
     }
 
 
+def _backlog_summary(index: dict) -> dict:
+    index = index if isinstance(index, dict) else {}
+    unique: dict[tuple, dict] = {}
+    raw = 0
+    issues = index.get("issues") if isinstance(index.get("issues"), dict) else {}
+    for thread, issue in issues.items():
+        rows = issue.get("needs_person") if isinstance(issue, dict) else []
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict) or not needs_mod.is_open(index, thread, row):
+                continue
+            raw += 1
+            cid = needs_mod.cid_of(row)
+            key = (thread, cid) if cid is not None else (thread, "row", raw)
+            reason = str(row.get("reason") or "未说明")
+            group = unique.setdefault(key, {"at": [], "reasons": set()})
+            if row.get("at"):
+                group["at"].append(str(row["at"]))
+            group["reasons"].add(reason)
+    reasons: dict[str, int] = {}
+    for group in unique.values():
+        for reason in group["reasons"]:
+            reasons[reason] = reasons.get(reason, 0) + 1
+    statuses: dict[str, int] = {}
+    nonterminal = 0
+    assignments = index.get("assignments") if isinstance(index.get("assignments"), dict) else {}
+    for rec in assignments.values():
+        if not isinstance(rec, dict):
+            continue
+        status = str(rec.get("status") or "")
+        if status in asg_mod.ACTIVE_STATES:
+            nonterminal += 1
+            statuses[status] = statuses.get(status, 0) + 1
+    oldest = min((at for group in unique.values() for at in group["at"]), default="")
+    return {"raw": raw, "unique": len(unique), "oldest_at": oldest,
+            "reasons": sorted(({"reason": key, "count": value}
+                               for key, value in reasons.items()),
+                              key=lambda row: (-row["count"], row["reason"])),
+            "nonterminal": nonterminal, "status_counts": statuses}
+
+
 # -------------------------------------------------------------------- collect
 def collect(engine, *, source=None, quotes: bool = True, now=None,
             source_error: str = "") -> dict:
@@ -851,6 +893,7 @@ def collect(engine, *, source=None, quotes: bool = True, now=None,
         "projects": _projects(engine, health["index"].get("data")),
         "engine": _engine_state(engine, health),
         "storage": _storage(store),
+        "backlog": _backlog_summary(health["index"].get("data")),
     }
 
 
@@ -969,6 +1012,20 @@ def _render_details(report: dict) -> list[str]:
     stuck = engine.get("stuck")
     out.append(f"<dt>超时未完成</dt>"
                f"<dd>{'未知' if stuck is None else int(stuck)}</dd>")
+    out.append("</dl>")
+    backlog = report.get("backlog") or {}
+    out.append('<h3 id="backlog-title">运行积压</h3>')
+    out.append('<dl class="facts" aria-labelledby="backlog-title">')
+    out.append(f"<dt>待人工唯一项</dt><dd>{int(backlog.get('unique') or 0)}"
+               f"（原始行 {int(backlog.get('raw') or 0)}）</dd>")
+    out.append(f"<dt>最老待人工</dt><dd>{_esc(backlog.get('oldest_at') or '无')}</dd>")
+    out.append(f"<dt>非终态 Assignment</dt><dd>{int(backlog.get('nonterminal') or 0)}</dd>")
+    status_counts = backlog.get("status_counts") or {}
+    out.append(f"<dt>状态分布</dt><dd>{_esc(' · '.join(f'{k}={v}' for k, v in sorted(status_counts.items())) or '无')}</dd>")
+    reasons = backlog.get("reasons") or []
+    reason_text = " · ".join("{}={}".format(row["reason"], row["count"])
+                             for row in reasons)
+    out.append(f"<dt>原因聚合</dt><dd>{_esc(reason_text or '无')}</dd>")
     out.append("</dl>")
     out.append('<h3 id="storage-title">存储</h3>')
     storage = report.get("storage") or {}

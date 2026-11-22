@@ -1145,6 +1145,33 @@ class Cli(Base):
         self.assertIn("from --fixture", out.read_text(encoding="utf-8"))
 
 
+class BacklogSummary(unittest.TestCase):
+    def test_unique_counts_reasons_age_and_assignment_states(self):
+        index = {"issues": {THREAD: {"needs_person": [
+            {"comment_id": 11, "reason": "route", "at": "2026-11-01"},
+            {"comment_id": 11, "reason": "route", "at": "2026-11-02"},
+            {"comment_id": 12, "reason": "qa", "at": "2026-11-03"},
+            {"comment_id": 13, "reason": "old", "at": "2026-10-01"},
+        ]}}, "assignments": {
+            "w1": {"status": "working"}, "w2": {"status": "waiting_review"},
+            "done": {"status": "completed"},
+        }}
+        needs_mod.mark(index, THREAD, 13, state=needs_mod.RESOLVED,
+                       by="supervisor", entries=1)
+        out = rep._backlog_summary(index)
+        self.assertEqual((out["raw"], out["unique"]), (3, 2))
+        self.assertEqual(out["oldest_at"], "2026-11-01")
+        self.assertEqual(out["nonterminal"], 2)
+        self.assertEqual(out["status_counts"], {"waiting_review": 1, "working": 1})
+        self.assertEqual(out["reasons"], [{"reason": "qa", "count": 1},
+                                          {"reason": "route", "count": 1}])
+        page = rep.render({"status": "none", "counts": {}, "backlog": out,
+                           "role": "supervisor"})
+        self.assertIn("待人工唯一项", page)
+        self.assertIn("原始行 3", page)
+        self.assertIn("route=1", page)
+
+
 class _FakeComments:
     """A source double that only implements what the reporter reads."""
 
