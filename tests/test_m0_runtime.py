@@ -369,11 +369,32 @@ class PidLockTests(Base):
             "if ok:\n"
             "    sys.stdin.readline()\n"
             "lock.release()\n" % (ROOT, self.state / "engine.pid"))
+        import threading
         procs = [subprocess.Popen([sys.executable, "-c", script],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True) for _ in range(2)]
-        outs = [p.communicate("release\n", timeout=30)[0].strip() for p in procs]
-        self.assertEqual(sorted(outs), ["acquired", "refused"], outs)
+        outs = [""] * 2
+
+        def read_result(index, proc):
+            outs[index] = proc.stdout.readline().strip()
+
+        readers = [threading.Thread(target=read_result, args=(i, p))
+                   for i, p in enumerate(procs)]
+        for thread in readers:
+            thread.start()
+        try:
+            for thread in readers:
+                thread.join(timeout=30)
+            self.assertFalse(any(thread.is_alive() for thread in readers),
+                             "both processes must attempt the lock")
+            self.assertEqual(sorted(outs), ["acquired", "refused"], outs)
+        finally:
+            for proc in procs:
+                if proc.poll() is None:
+                    proc.stdin.write("release\n")
+                    proc.stdin.flush()
+            for proc in procs:
+                proc.wait(timeout=30)
         self.assertEqual([p.returncode for p in procs], [0, 0])
 
 
