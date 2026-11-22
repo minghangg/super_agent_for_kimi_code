@@ -122,14 +122,8 @@ class OnTheDeliveryPath(unittest.TestCase):
         self.assertNotIn("resolve_recipients(rec[", src)
 
 
-class TheChainIsTheSupervisorOnly(unittest.TestCase):
-    """#72: the bare-key leg and the broadcast leg are gone; supervisor is it.
-
-    Before #72 this class was ``TheFourSitesAreMarked`` and asserted the bare
-    ``pm-<project>`` lookup **must still be there**. That was the marking of an
-    unfinished job, not a behaviour worth keeping - the test had to change with
-    the code or it would have blocked the fix it was written for.
-    """
+class TheChainIsTheProjectPmOnly(unittest.TestCase):
+    """Delivery goes to the scoped PM, never to a supervisor or another project."""
 
     def _configure(self, tmp, sessions):
         import json
@@ -143,10 +137,7 @@ class TheChainIsTheSupervisorOnly(unittest.TestCase):
                              sessions_path=tmp / "sessions.json"))
         (tmp / "sessions.json").write_text(json.dumps(sessions), encoding="utf-8")
 
-    def test_a_bare_pm_key_does_not_become_a_recipient(self):
-        # The whole point of #72's part 2: a bare ``pm-<project>`` key sitting in
-        # sessions.json must not win the delivery. It used to be appended first,
-        # and ``_send_delivery`` breaks on the first target it can send.
+    def test_scoped_pm_wins_and_supervisor_is_not_a_fallback(self):
         import tempfile
 
         self._configure(tempfile.mkdtemp(), {
@@ -154,17 +145,14 @@ class TheChainIsTheSupervisorOnly(unittest.TestCase):
             "supervisor": {"id": "session_sup"},
         })
         self.assertEqual(dw.resolve_recipients("acme/demo"),
-                         [("supervisor", "session_sup")])
+                         [("pm-demo", "session_pm_demo")])
 
-    def test_nothing_resolves_to_empty_not_to_a_broadcast(self):
-        # Part 1: with the supervisor missing there is no third leg that spills
-        # the delivery to whatever ``pm-*`` happens to be alive. Empty means the
-        # caller records it as undelivered and retries.
+    def test_no_scoped_pm_is_empty_not_supervisor_or_broadcast(self):
         import tempfile
 
         self._configure(tempfile.mkdtemp(), {
-            "pm-demo": {"id": "session_pm_demo"},
             "pm-other-1a2b3c4d": {"id": "session_pm_other"},
+            "supervisor": {"id": "session_sup"},
         })
         self.assertEqual(dw.resolve_recipients("acme/demo"), [])
 

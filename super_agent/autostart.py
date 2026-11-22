@@ -601,29 +601,29 @@ def _process_side(part: str, rows: list[tuple[int, str]],
     return Side("absent", detail="未运行")
 
 
-def register_action(root: Path) -> tuple[str, list[str]]:
-    """``(display, argv)`` for the Action that runs the startup script.
-
-    ``-NoProfile`` so a login start cannot depend on an interactive profile;
-    ``-ExecutionPolicy Bypass`` so an unknown machine policy cannot block it;
-    ``-File`` rather than ``-Command`` because ``-Command`` re-parses the
-    quotes, and this machine's interpreter path contains a space.
-    """
+def register_action(root: Path, part: str = "all") -> tuple[str, list[str]]:
+    """``(display, argv)`` for the Action that runs one startup-script part."""
+    if part != "all" and part not in PARTS:
+        raise AutostartError(f"未知启动部件：{part}")
     script = script_path(root)
     if not script.is_file():
         raise AutostartError(f"启动脚本不存在：{script}（工作台根 {root}）")
+    suffix = "" if part == "all" else f" -Part {part}"
     display = (f'powershell.exe -NoProfile -ExecutionPolicy Bypass '
-               f'-File "{script}"')
+               f'-File "{script}"{suffix}')
     argv = [_powershell_exe(), "-NoProfile", "-ExecutionPolicy", "Bypass",
             "-File", str(script)]
+    if part != "all":
+        argv.extend(["-Part", part])
     return display, argv
 
 
-def _apply_task(name: str, root: Path) -> int:
+def _apply_task(name: str, root: Path, part: str = "all") -> int:
     """Register or re-point one task. 0 on success, 10 on failure."""
     exists = bool(read_task(name).get("found"))
     script = script_path(root)
-    inner = f'-NoProfile -ExecutionPolicy Bypass -File "{script}"'
+    suffix = "" if part == "all" else f" -Part {part}"
+    inner = f'-NoProfile -ExecutionPolicy Bypass -File "{script}"{suffix}'
     action = (f"New-ScheduledTaskAction -Execute {_ps_literal(_powershell_exe())} "
               f"-Argument {_ps_literal(inner)} "
               f"-WorkingDirectory {_ps_literal(str(root))}")
@@ -793,7 +793,7 @@ def register(part: str, *, apply: bool, root: Path) -> int:
     parts = list(PARTS) if part == "all" else [part]
     for one in parts:
         name = task_name(one)
-        display, _argv = register_action(root)
+        display, _argv = register_action(root, one)
         print(f"[autostart] 部件     {one}")
         print(f"[autostart] 任务名   {name}（来自 agent.json: autostart.tasks）")
         print(f"[autostart] 工作台   {root}（engine.lwa_root）")
@@ -801,7 +801,7 @@ def register(part: str, *, apply: bool, root: Path) -> int:
         print(f"[autostart] Action   {display}")
         print("[autostart] Trigger  AtLogOn")
         if apply:
-            rc = _apply_task(name, root)
+            rc = _apply_task(name, root, one)
             if rc != EXIT_OK:
                 return rc
         else:

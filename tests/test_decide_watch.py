@@ -305,6 +305,73 @@ class Behaviour(Fixture):
         self.assertIn("heartbeat failed", err.getvalue())
 
 
+class DeliveryRegression(Fixture):
+    def test_bad_state_never_replays_the_undelivered_log(self):
+        rec = {"repo": "owner/neutral_project", "issue": 1,
+               "evidence": "cid:old", "detected_ts": 1}
+        path = dw._delivery_paths()["undelivered"]
+        path.write_text(json.dumps({"t": 1, "enqueued_ts": 1, "rec": rec}) + "\n",
+                        encoding="utf-8")
+        dw._delivery_paths()["state"].write_text("{", encoding="utf-8")
+        st = dw.load_delivery_state()
+        with mock.patch.object(dw, "_send_delivery", return_value=1) as send:
+            self.assertEqual(dw.retry_undelivered(st, dry=False, now=100), 0)
+        send.assert_not_called()
+        self.assertEqual(st["undelivered_offset"], path.stat().st_size)
+
+    def test_delivery_goes_only_to_the_scoped_pm(self):
+        dw.SESSIONS().write_text(json.dumps({
+            "pm-neutral_project": {"id": "session_pm_fixture"},
+            "supervisor": {"id": "session_supervisor_fixture"},
+        }), encoding="utf-8")
+        targets = dw.resolve_recipients("owner/neutral_project")
+        self.assertEqual([name for name, _sid in targets], ["pm-neutral_project"])
+        self.assertNotEqual(targets[0][1], "session_supervisor_fixture")
+        self.assertEqual(dw.resolve_recipients("owner/other_project"), [])
+
+    def test_write_failure_blocks_the_next_delivery_tick(self):
+        dw._DELIVERY_WRITE_FAILED = True
+        try:
+            with mock.patch.object(dw, "load_delivery_state") as load:
+                out = dw.delivery_tick(dry=False, now=100)
+            self.assertEqual(out["blocked"], "state_write_failed")
+            self.assertEqual(out["sent"], 0)
+            load.assert_not_called()
+        finally:
+            dw._DELIVERY_WRITE_FAILED = False
+
+    def test_os_lock_allows_only_one_subprocess(self):
+        code = f"""
+from pathlib import Path
+import time
+from super_agent import decide_watch as d
+class B:
+    PORT = 58800
+d.configure(d.DecideWatchConfig(
+    state_root=Path({str(self.state)!r}), workspace_root=Path({str(self.ws)!r}),
+    event_source=B()))
+d._event_health = lambda port: {{}}
+ok, _ = d.acquire_lock()
+print(ok, flush=True)
+if ok:
+    time.sleep(3)
+"""
+        first = subprocess.Popen([sys.executable, "-c", code], cwd=str(ROOT),
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True)
+        try:
+            line = first.stdout.readline().strip()
+            if not line:
+                self.fail(first.stderr.read())
+            self.assertEqual(line, "True")
+            second = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT),
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(second.stdout.strip().splitlines()[-1], "False", second.stderr)
+        finally:
+            first.kill()
+            first.wait(timeout=10)
+
+
 class ShimFallback(Fixture):
     def test_inner_dependency_missing_must_raise_out_of_loader(self):
         code = (

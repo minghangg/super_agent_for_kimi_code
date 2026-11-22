@@ -32,6 +32,7 @@ from pathlib import Path
 from . import autostart as autostart
 from . import markers
 from . import session_health as health_mod
+from . import sessionkeys
 from . import paths as kimi_paths
 
 
@@ -80,7 +81,7 @@ class DecideWatchConfig:
     # 保留的注入面（#72 P2-1）：`_load_alarm_module` 与其 `session_alarm` 导入已
     # 删除（唯一调用点是①/③级收件人降级腿）。这两个字段**不能删**——lwa 薄壳按名
     # 传 `alarm_state_file`，少一个字段即 `TypeError`。字段在、无读取点，是已知的
-    # 死面；再次接线前先读 `resolve_recipients`（收件人只有 supervisor 一级）。
+    # 死面；再次接线前先读 `resolve_recipients`（收单收件人只有项目 PM）。
     alarm_module: object | None = None
     health_module: object | None = None
     autostart_name: str = "DecisionWatch"
@@ -378,53 +379,105 @@ def _cmdline_of(pid: int) -> str:
         return ""
 
 
-def acquire_lock(force: bool = False) -> tuple[bool, str]:
-    """单实例锁（issue #17 退修 P1-2）。返回 `(拿到没, 说明)`。
+_LOCK_HANDLE = None
 
-    为什么需要：QA 实测**并发启动两个 decide_watch ⇒ 同一事件双发 2 条通知**
-    （游标只在正常轮次间推进，两个进程各自从同一 since 拉）。
-    判据：锁存在 + pid 活着 + **命令行含 `decide_watch`** 才算「已有实例」——
-    单看 pid 会被 pid 复用骗到；单看锁文件会被陈旧锁永久挡住。
-    陈旧锁（pid 已死/命令行不符）⇒ 自动清理接管。
-    """
+
+def _os_lock(fh, *, unlock: bool = False) -> None:
+    fh.seek(0)
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(fh.fileno(),
+                       msvcrt.LK_UNLCK if unlock else msvcrt.LK_NBLCK, 1)
+        return
+    import fcntl
+    fcntl.flock(fh.fileno(), fcntl.LOCK_UN if unlock else fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _close_lock_handle(fh) -> None:
     try:
-        raw = LOCK().read_text(encoding="utf-8")
-        rec = json.loads(raw)
-    except (OSError, ValueError):
-        rec = {}
-    if rec:
-        pid = int(rec.get("pid") or 0)
-        cmd = _cmdline_of(pid) if _pid_alive(pid) else ""
-        if cmd and "decide_watch" in cmd:
-            msg = (f"已有实例 pid={pid} 在跑（started_at={rec.get('started_at')}）"
-                   f"⇒ 拒绝启动，避免同一事件双发")
-            if force:
-                log(f"[lock] ⚠⚠ --force 越过单实例锁：{msg}")
-            else:
-                print(f"[decide_watch] {msg}", file=sys.stderr)
-                log(f"[lock] {msg}")
-                return False, msg
-        else:
-            why = "pid 已不存在" if not _pid_alive(pid) else "命令行不符（疑似 pid 复用）"
-            log(f"[lock] 清理陈旧锁（pid={pid}：{why}）并接管")
+        _os_lock(fh, unlock=True)
+    except OSError:
+        pass
+    fh.close()
+
+
+def acquire_lock(force: bool = False) -> tuple[bool, str]:
+    """Hold an OS-level lock for the process lifetime, then publish its owner."""
+    global _LOCK_HANDLE
+    if _LOCK_HANDLE is not None:
+        return True, ""
     try:
         STATE_DIR().mkdir(parents=True, exist_ok=True)
-        tmp = LOCK().with_suffix(".lock.tmp")
-        tmp.write_text(json.dumps({
-            "pid": os.getpid(),
-            "started_at": datetime.now().isoformat(timespec="seconds"),
-            "boot_id": str((_event_health(wss_bus().PORT) or {}).get("boot_id") or ""),
-        }, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, LOCK())
+        fh = LOCK().open("a+b")
+        if fh.tell() == 0:
+            fh.write(b"\0")
+            fh.flush()
+        _os_lock(fh)
     except OSError as exc:
-        log(f"[lock] 写锁失败（不阻断启动）：{exc}")
+        try:
+            fh.close()
+        except (UnboundLocalError, OSError):
+            pass
+        msg = f"单实例锁已被另一进程持有或不可写（{exc}）⇒ 拒绝启动，避免同一事件双发"
+        if force:
+            log(f"[lock] --force 越过单实例锁：{msg}")
+            return True, ""
+        print(f"[decide_watch] {msg}", file=sys.stderr)
+        log(f"[lock] {msg}")
+        return False, msg
+
+    try:
+        fh.seek(0)
+        rec = json.loads(fh.read().decode("utf-8", "replace").strip("\0") or "{}")
+        if not isinstance(rec, dict):
+            rec = {}
+    except ValueError:
+        rec = {}
+    pid = int(rec.get("pid") or 0)
+    cmd = _cmdline_of(pid) if _pid_alive(pid) else ""
+    if cmd and "decide_watch" in cmd:
+        msg = (f"已有实例 pid={pid} 在跑（started_at={rec.get('started_at')}）"
+               f"⇒ 拒绝启动，避免同一事件双发")
+        if not force:
+            _close_lock_handle(fh)
+            print(f"[decide_watch] {msg}", file=sys.stderr)
+            log(f"[lock] {msg}")
+            return False, msg
+        log(f"[lock] --force 越过旧实例登记：{msg}")
+    try:
+        body = json.dumps({
+            "pid": os.getpid(), "started_at": datetime.now().isoformat(timespec="seconds"),
+            "boot_id": str((_event_health(wss_bus().PORT) or {}).get("boot_id") or ""),
+        }, ensure_ascii=False).encode("utf-8")
+        fh.seek(0)
+        fh.truncate()
+        fh.write(body)
+        fh.flush()
+    except OSError as exc:
+        _close_lock_handle(fh)
+        msg = f"写单实例锁失败（{exc}）⇒ 拒绝启动"
+        log(f"[lock] {msg}")
+        return False, msg
+    _LOCK_HANDLE = fh
     return True, ""
 
 
 def release_lock() -> None:
-    """只删自己那把锁（别误删别人接管后的锁）。"""
+    """Release only this process's OS lock and remove only its own record."""
+    global _LOCK_HANDLE
+    fh = _LOCK_HANDLE
+    _LOCK_HANDLE = None
     try:
-        rec = json.loads(LOCK().read_text(encoding="utf-8"))
+        if fh is not None:
+            fh.seek(0)
+            rec = json.loads(fh.read().decode("utf-8", "replace").strip("\0") or "{}")
+        else:
+            rec = json.loads(LOCK().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        rec = {}
+    if fh is not None:
+        _close_lock_handle(fh)
+    try:
         if int(rec.get("pid") or 0) == os.getpid():
             LOCK().unlink(missing_ok=True)
     except (OSError, ValueError):
@@ -1844,16 +1897,27 @@ def load_delivery_state() -> dict:
     return st
 
 
+_DELIVERY_WRITE_FAILED = False
+
+
 def save_delivery_state(st: dict) -> None:
+    global _DELIVERY_WRITE_FAILED
     p = _delivery_state_path()
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".json.tmp")
         clean = {k: v for k, v in st.items() if not k.startswith("_")}
         tmp.write_text(json.dumps(clean, ensure_ascii=False, indent=1), encoding="utf-8")
         os.replace(tmp, p)
+        _DELIVERY_WRITE_FAILED = False
     except OSError as exc:
-        delivery_log(f"状态写盘失败（不影响本轮）：{exc}")
+        _DELIVERY_WRITE_FAILED = True
+        delivery_log(f"状态写盘失败（停止后续收单发送；修复后重启）：{exc}")
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _stats(st: dict, now: float) -> dict:
@@ -1973,19 +2037,11 @@ def recipients(env: dict | None, resolve=None) -> list[tuple[str, str]]:
     * ``recipients({"to_role": ["pm"]}, resolve=…)`` 真的走 ``resolve``。
 
     第二个参数是**收件人解析器**，签名 ``fn(env) -> [(name, sid)]``；缺省 ``None``
-    时由本函数自己按 ``env["repo"]`` 走 ``resolve_recipients``（#72 之后只有
-    supervisor 一级），所以 ``to_role`` 有值而无人解析时返回空列表，**不**降级成
-    广播——一个解析不了的收件人必须静默失败，不许变成「发给所有人」。
+    时由本函数自己按 ``env["repo"]`` 走 ``resolve_recipients``（当前项目的 PM）。
+    ``to_role`` 有值而无人解析时返回空列表，**不**降级成广播或 supervisor。
 
-    为什么先摆而不用：``to_role`` 的收件来源依赖「``pm`` 可绑定」，而
-    ``gh_issue.py`` 的 ``--bind-role`` 闭集是 ``{qa, worker, at}``，现网
-    ``issue_sessions.json`` 里 ``pm`` 槽位 0 个 ⇒ 前置未成立。扩闭集属 #74／#87
-    的权限边界，须 supervisor 裁定。
-
-    ``f"pm-{proj}"`` 的**残余两处**（#72 之后）：``scan_deliveries`` 与
-    ``_selftest_rec`` 把 ``pm_key``／``pm_sid`` 写进**投递载荷**。它们不参与
-    收件人解析——收件人只由 ``resolve_recipients`` 的 supervisor 一级决定。
-    ``brief.py:230`` 的过滤已改用 ``sessionkeys.scoped_by``，同一批（#72）。
+    ``scan_deliveries`` 与 ``_selftest_rec`` 仍把 ``pm_key``／``pm_sid`` 写进
+    投递载荷；实际收件人以 ``resolve_recipients`` 的项目级 PM 解析为准。
     """
     env = env if isinstance(env, dict) else {}
     if env.get("to_role"):
@@ -1994,23 +2050,16 @@ def recipients(env: dict | None, resolve=None) -> list[tuple[str, str]]:
 
 
 def resolve_recipients(repo: str) -> list[tuple[str, str]]:
-    """收件人：**只有** `supervisor` 一级（#72 删掉了①级裸键与③级降级腿）。
+    """Resolve only the current project's PM; never fall back to the supervisor.
 
-    解析不到就返回空，调用方落 `delivery_undelivered.log` 并由本进程每轮重试
-    （不是死信）。**不**回落到任何 `pm-*`：一条投给「恰好撞上的别的 pm」的回执
-    比不投更坏——2026-11-16 之前「PM 收单、supervisor 零收」那一段的成因，正是
-    ①级 `pm-<project>` 裸键排在前面被 `_send_delivery` 命中即 `break`。
-
-    ``repo`` 不参与解析，保留参数是为了与 `recipients()` 的适配层、以及 lwa
-    薄壳的 `_guard_resolve_recipients(repo)` 包装签名一致。
+    An absent PM leaves the delivery in the undelivered queue. Choosing another
+    project's PM is forbidden by ``sessionkeys.preferred_key``'s scope check.
     """
     db = _sessions()
-    out: list[tuple[str, str]] = []
-    key = _cfg().supervisor_key
-    rsid = _sid_of(db, key)
-    if rsid:
-        out.append((key, gate_rewrite(rsid, key)))
-    return out
+    project = _project_of_repo(repo)
+    key = sessionkeys.preferred_key(db, "pm", project)
+    sid = _sid_of(db, key) if key else ""
+    return [(key, gate_rewrite(sid, key))] if sid else []
 
 
 def _sink_append(record: dict) -> None:
@@ -2176,12 +2225,9 @@ def _flush_one(st: dict, key: str, items: list, *, dry: bool, now: float) -> boo
 def _send_delivery(st: dict, rec: dict, dry: bool, now: float) -> int:
     key = delivery_group(rec)
     text = render_delivery_text(rec)
-    # The recipients shell is on the delivery path (#92 §P0-1b): every send
-    # goes through ``recipients()``, which answers ``resolve_recipients`` - the
-    # supervisor only, since #72 removed the bare-key and broadcast legs - and
-    # takes ``to_role`` the day that path lands. The resolver is an adapter, not
-    # ``resolve_recipients`` itself - that takes a repo string, so passing it
-    # directly would raise ``TypeError`` and be read as "nobody to send to".
+    # Every delivery resolves the current project's PM through recipients().
+    # The adapter takes an env dict; resolve_recipients itself takes a repo.
+    # Missing PM means undelivered, never a supervisor fallback.
     targets = recipients(rec, lambda env: resolve_recipients(
         str((env or {}).get("repo") or "")))
     ok = False
@@ -2674,8 +2720,16 @@ def retry_undelivered(st: dict, *, dry: bool, now: float) -> int:
         size = p.stat().st_size
     except OSError:
         return 0
-    off = int(st.get("undelivered_offset") or 0)
-    if size <= off:
+    reason = str(st.get("_baseline_reason") or "")
+    off_raw = st.get("undelivered_offset")
+    off_ok = isinstance(off_raw, int) and not isinstance(off_raw, bool) and off_raw >= 0
+    if reason or not off_ok or off_raw > size:
+        st["undelivered_offset"] = size
+        delivery_log(f"拒绝未达重试：状态基线不可信（{reason or 'offset_invalid'}）"
+                     f"⇒ 游标推到 EOF={size}，历史发送 0 条")
+        return 0
+    off = off_raw
+    if size == off:
         return 0
     try:
         with p.open("rb") as fh:
@@ -2738,6 +2792,9 @@ def _write_hb(name: str, extra: dict | None = None) -> None:
 
 def delivery_tick(*, dry: bool, now: float | None = None) -> dict:
     """主循环每轮调用：日切 → 扫描 → 汇总/升级 → 未投递重试 → 心跳。"""
+    if _DELIVERY_WRITE_FAILED:
+        return {"sent": 0, "summaries": 0, "escalations": 0, "retried": 0,
+                "offset": 0, "pending": 0, "blocked": "state_write_failed"}
     now = time.time() if now is None else now
     st = load_delivery_state()
     st["_tick_started"] = now                 # P1-1：本轮入队的不参与本轮 retry
@@ -3235,9 +3292,8 @@ DELIVERY_SELFTEST_SRC = r'''
 def _self_fixture(root: Path) -> dict:
     """造一个干净靶场：ledger 副本 + sessions + issue_sessions。
 
-    `wanted` 里的 `pm-<project>` **裸键保留是有意的**（#72）：①级查找删掉之后，
-    它不再参与收件人解析 —— 保留它 + S 段断言「收件人只有 supervisor」，
-    才能证明「裸键存在也不生效」这条回归防线。删掉这个夹具反而让 S 变弱。
+    `wanted` 保留 `pm-<project>` 与 supervisor；S 段必须证明只选本项目 PM，
+    且夹具会把它的 sid 换成假值，不会改投 supervisor。
     """
     import shutil
     root.mkdir(parents=True, exist_ok=True)
@@ -3258,6 +3314,9 @@ def _self_fixture(root: Path) -> dict:
         rec = dict(v) if isinstance(v, dict) else {"id": v}
         rec["id"] = "session_5e55a000-0000-4000-8000-%012d" % i
         fake[k] = rec
+    pm_key = "pm-" + _project_of_repo("owner/neutral_project")
+    fake.setdefault(pm_key, {
+        "id": "session_5e55a000-0000-4000-8000-000000000999"})
     (root / "sessions.json").write_text(json.dumps(fake, ensure_ascii=False, indent=1),
                                         encoding="utf-8")
     return fake
@@ -3690,12 +3749,8 @@ def self_test() -> int:
                 raise RuntimeError("未注入自检夹具 sessions，拒绝读生产状态")
             shutil.copyfile(source, root / "sessions.json")
             sess = json.loads((root / "sessions.json").read_text(encoding="utf-8"))
-            # **断言来源在 #72 变了，这里是新口径**。改前 S 只验「sid 被换成假值」，
-            # 而那时假值可能来自①级裸键；①级删掉后必须证明两件事同时成立——
-            # ① 裸键**就摆在** sessions.json 里且值是真 sid（否则这条断言空转）；
-            # ② 收件人名单**仍然只有** supervisor（裸键在也不生效）。
-            # 裸键在这里现造，不依赖夹具自带：lwa 的 fixture_sessions 是**真**
-            # sessions.json（里面没有 `pm-<本项目>` 裸键），靠夹具会给出一条空转的绿。
+            # 本项目 PM 就摆在 sessions.json 里；夹具必须只选它并改成假 sid，
+            # 不得因为 supervisor 也存在而改投 supervisor。
             bare = "pm-" + _project_of_repo("owner/neutral_project")
             sess[bare] = {"id": "session_00000000-1111-2222-3333-444444444444"}
             (root / "sessions.json").write_text(json.dumps(sess, ensure_ascii=False),
@@ -3703,9 +3758,9 @@ def self_test() -> int:
             recips = resolve_recipients("owner/neutral_project")
             names = [n for n, _s in recips]
             bare_present = _sid_of(sess, bare) != ""
-            only_supervisor = names == [_cfg().supervisor_key]
+            only_pm = names == [bare]
             all_fake = bool(recips) and all(s.startswith(DELIVERY_FAKE_PREFIX) for _n, s in recips)
-            fake_rewrite_ok = bare_present and only_supervisor and all_fake
+            fake_rewrite_ok = bare_present and only_pm and all_fake
             # 关掉内存 sink，强制走**真实的闸路径**（fixture ⇒ 只写 sink，不 spawn）
             DELIVERY_SINK = None
             spawned = []
@@ -3730,7 +3785,7 @@ def self_test() -> int:
                 os.environ.pop(k, None)
             _self_fixture(root)                       # 恢复假 sessions
         check("S", fake_rewrite_ok and sent_ok and sink_lines >= 1 and not spawned_sess,
-              f"bare_present={bare_present} only_supervisor={only_supervisor} "
+              f"bare_present={bare_present} only_pm={only_pm} "
               f"sink_lines={sink_lines} notify={sent_ok} spawned={len(spawned_sess)}")
 
         # ---------- T（V1 补修）：state 缺 `offset` 键 ＋ 台账 5 行 ok=true

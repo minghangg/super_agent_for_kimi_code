@@ -417,17 +417,19 @@ class RegisterTest(_Base):
         rc, out, _err = self.run_main(["--register", "wss_bus"])
         self.assertEqual(rc, 0)
         self.assertIn(str(self.script), out)
-        display, _argv = autostart.register_action(self.workbench)
+        display, _argv = autostart.register_action(self.workbench, "wss_bus")
         self.assertIn(display, out)
+        self.assertIn("-Part wss_bus", display)
 
     def test_action_does_not_name_a_tools_py_directly(self) -> None:
         self.configure()
-        display, _argv = autostart.register_action(self.workbench)
+        display, _argv = autostart.register_action(self.workbench, "decide_watch")
         self.assertIn("start_bus_watch.ps1", display)
         self.assertNotIn("tools", display)
         self.assertIn("-NoProfile", display)
         self.assertIn("-ExecutionPolicy Bypass", display)
         self.assertIn("-File", display)
+        self.assertIn("-Part decide_watch", display)
 
 
 if __name__ == "__main__":
