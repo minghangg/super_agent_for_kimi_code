@@ -375,6 +375,23 @@ class InjectTest(_Base):
             self.assertEqual(task.state, "unparsable", arguments)
             self.assertEqual(proc.state, "unparsable", arguments)
 
+    def test_same_path_duplicate_processes_are_refused(self) -> None:
+        self.configure()
+        command = r'"py.exe" D:\wb\tools\decide_watch.py'
+        proc = autostart._process_side(
+            "decide_watch", [(15068, command), (15076, command)], injected=True)
+        self.assertNotEqual(proc.state, "ok")
+        self.assertIn("重复实例", proc.detail)
+        self.assertIn("15068", proc.detail)
+        self.assertIn("15076", proc.detail)
+        with mock.patch.object(autostart, "read_task",
+                               lambda name: task_row(script=self.script)):
+            rc, out, _err = self.run_main([
+                "--verify", "--part", "decide_watch",
+                "--command-line", command, "--command-line", command])
+        self.assertEqual(rc, 22)
+        self.assertIn("重复实例", out)
+
     def test_process_side_accepts_the_shim_name(self) -> None:
         """`<part>_<suffix>.py` names the same part as `<part>.py` (ISS-102).
 

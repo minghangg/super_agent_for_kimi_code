@@ -590,6 +590,10 @@ def _process_side(part: str, rows: list[tuple[int, str]],
         if len(values) >= 2:
             return Side("unparsable",
                         detail=f"{len(hits)} 个进程指向不同文件，无法判定")
+        if len(hits) > 1:
+            pids = sorted(p for p, _ in hits)
+            return Side("unparsable",
+                        detail=f"重复实例：{len(hits)} 个同路径进程（PID {pids}）")
         pid = min(p for p, _ in hits)
         # pid 0 means the line came from ``--command-line``, which has no
         # process behind it. Printing "pid 0" would read as a real process
