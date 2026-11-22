@@ -19,13 +19,27 @@ class SupervisorKeys(unittest.TestCase):
         self.assertEqual(requirement_auth.supervisor_keys(cfg),
                          {"supervisor-demo-1a2b3c4d"})
 
-    def test_supervisor_sid_resolves_the_ledger_key(self):
+    def test_supervisor_sid_does_not_exempt_a_fixed_ledger_key(self):
         cfg = config.load(None, {"engine": {"supervisor_sid": "session_sup"}})
         with mock.patch.object(requirement_auth.session_ledger, "load_sessions",
                                return_value={"supervisor": {"id": "session_sup"}}):
-            self.assertEqual(requirement_auth.supervisor_keys(cfg), {"supervisor"})
-            self.assertTrue(requirement_auth.supervisor_verifier(cfg)(
+            self.assertEqual(requirement_auth.supervisor_keys(cfg), set())
+            self.assertFalse(requirement_auth.supervisor_verifier(cfg)(
                 {"session_key": "supervisor"}))
+
+    def test_supervisor_sid_accepts_only_the_random_tailed_alias(self):
+        cfg = config.load(None, {"engine": {"supervisor_sid": "session_sup"}})
+        sessions = {
+            "supervisor": {"id": "session_sup"},
+            "supervisor-demo-1a2b3c4d": {"id": "session_sup"},
+        }
+        with mock.patch.object(requirement_auth.session_ledger, "load_sessions",
+                               return_value=sessions):
+            self.assertEqual(requirement_auth.supervisor_keys(cfg),
+                             {"supervisor-demo-1a2b3c4d"})
+            verify = requirement_auth.supervisor_verifier(cfg)
+            self.assertTrue(verify({"session_key": "supervisor-demo-1a2b3c4d"}))
+            self.assertFalse(verify({"session_key": "supervisor"}))
 
 
 if __name__ == "__main__":

@@ -83,7 +83,7 @@ python -m super_agent.requirements approve --role supervisor \
 
 批准前核对目标、范围、验收、反例和 T1/T2。权限、生产和重大取舍必须先取得用户明确批准。
 
-来源门禁不依赖 GitHub 共用作者名：需求包只接受当前 Issue 绑定 AT 的 `session` 标记；批准只接受 `engine.supervisor_keys` 中带随机尾的显式键，或 `supervisor_sid` 反查到的台账键。没有内置 supervisor 名称。未验证 fence 只记错误，不改变 current；非 READY 包不能被批准。`dispatch_packet` 会再次检查双来源。
+来源门禁不依赖 GitHub 共用作者名：需求包只接受当前 Issue 绑定 AT 的 `session` 标记；批准只接受 `engine.supervisor_keys` 中带随机尾的显式键，或 `supervisor_sid` 反查到且同样带随机尾的台账键。sid 只定位会话，不豁免键名要求；没有内置 supervisor 名称。未验证 fence 只记错误，不改变 current；非 READY 包不能被批准。`dispatch_packet` 会再次检查双来源。
 
 ## 4. AT：发布问题或 READY
 

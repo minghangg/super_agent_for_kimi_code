@@ -14,6 +14,7 @@ THREAD = "owner/demo#1"
 AT_KEY = "at-demo-3f7c1a90"
 QA_KEY = "qa-demo-3f7c1a90"
 PM_KEY = "pm-demo-3f7c1a90"
+SUP_KEY = "supervisor-demo-7c31ade2"
 
 
 def package(revision=1, *, questions=None, objective="build X"):
@@ -47,7 +48,7 @@ def approval(cid, value, package_cid):
                 "requirement_id": THREAD, "revision": value["revision"],
                 "requirement_hash": value["requirement_hash"],
                 "package_ref": f"issuecomment-{package_cid}"})
-                + "\n<!-- session: supervisor -->"}
+                + f"\n<!-- session: {SUP_KEY} -->"}
 
 
 class Bus:
@@ -118,7 +119,7 @@ class Base(unittest.TestCase):
                 "actions": ["bus_inject", "collect", "reconcile", "archive"],
                 "roles": ["worker", "qa", "pm", "at"]}}}), encoding="utf-8")
         (self.shared / "sessions.json").write_text(json.dumps({
-            "supervisor": {"id": "session_sup"}, AT_KEY: {"id": "session_at"},
+            SUP_KEY: {"id": "session_sup"}, AT_KEY: {"id": "session_at"},
             QA_KEY: {"id": "session_qa"}, PM_KEY: {"id": "session_pm"},
         }), encoding="utf-8")
         (self.shared / "issue_sessions.json").write_text(json.dumps({
