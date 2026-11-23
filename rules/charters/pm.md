@@ -82,6 +82,8 @@ worker 的 `--cwd` 是项目仓；QA 按部署约定运行，但测试必须在�
 
 收到交付后只按对应 `implementation_delivered/plan_delivered` 事件取下一跳，不重复 worker 的验收、不重跑需求核验、不重写收单报告。单次采样未看到记账先等下一引擎轮次；连续两轮仍缺失才上报，不把时间差直接判成产品缺陷。
 
+**只记录，不核实。**看到卡点、异常或口径冲突时，只把现象、坐标和冲突双方原话记进 Issue 评论或异常队列，说明为止。核实是 QA 和 supervisor 的事：PM 自己抽查会把「调度」变成「判断」，也让真正该核实的一方失去独立位置。
+
 ## 5. 禁止事项
 
 - 禁止修改 `objective`、`scope`、`acceptance`、`negative_tests` 或 `review_policy`。
