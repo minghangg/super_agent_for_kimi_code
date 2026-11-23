@@ -1,28 +1,30 @@
-"""Find role session-key names in comment bodies (issue #87 round 2).
+"""Find role session-key names in repository files (issue #87 round 2).
 
-The rule this enforces: **a session key name never goes into an issue or a
-comment.** The key is the credential - every role shares one GitHub token, so
-the name in the body is the only thing a verdict is attributed by. A name that
-was published once is public for good, and a rotation is a manual operation
-nobody wants to do twice.
+Private Issues and their comments are operational data and may contain session
+keys, including the five-part title and the body (user ruling, 2026-11-23).
+``--issue`` therefore returns success without reading GitHub. Use
+``--public-issue`` for the legacy check when the tracker really is public.
+Repository documentation keeps the old rule: a published key name cannot be
+called back, so ``--file`` and ``--dir`` still fail on key-shaped tokens.
 
-The scan is deliberately dumb: it looks for the *shape* (``pm-``/``qa-``/``at-``
+The file scan is deliberately dumb: it looks for the *shape* (``pm-``/``qa-``/``at-``
 followed by a word), not for the keys in ``sessions.json``. A scan that only
 knows today's keys cannot see yesterday's leak, which is the one that matters.
 
-Exit codes: ``0`` = no key name, ``1`` = at least one found, ``2`` = could not
-read the input (a scan that did not run must never look clean).
+Exit codes: ``0`` = no key name (or a private-Issue exemption), ``1`` = at least
+one found, ``2`` = could not read the input (a scan that did not run must never
+look clean).
 
 Usage::
 
-    # one comment of one issue, read through this repository's issue CLI
-    python tools/keyname_scan.py --issue 86 --cid 6900753114
+    # private Issue: exempt, with no GitHub request
+    python tools/keyname_scan.py --issue 105 --cid 7099683763
 
-    # a whole issue (body + every comment), or a local file
-    python tools/keyname_scan.py --issue 87
-    python tools/keyname_scan.py --file D:/temp_safkc/some_comment.md
+    # public Issue: retain the old body/comment scan
+    python tools/keyname_scan.py --issue 86 --cid 6900753114 --public-issue
 
-    # a directory tree (documentation gate)
+    # repository files and documentation trees still scan normally
+    python tools/keyname_scan.py --file D:/temp_safkc/some_document.md
     python tools/keyname_scan.py --dir assistants --dir playbooks
 """
 from __future__ import annotations
@@ -125,6 +127,8 @@ def main(argv=None) -> int:
     ap.add_argument("--issue", type=int, help="issue number (needs --project)")
     ap.add_argument("--project", default="", help="project name for --issue")
     ap.add_argument("--cid", default="", help="only this comment id")
+    ap.add_argument("--public-issue", action="store_true",
+                    help="scan a public Issue; private Issues are exempt by default")
     ap.add_argument("--file", action="append", default=[],
                     help="scan these files (repeatable)")
     ap.add_argument("--dir", action="append", default=[],
@@ -137,11 +141,16 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     sources: list[tuple[str, str]] = []
+    private_issue = bool(args.issue and not args.public_issue)
     if args.issue:
         if not args.project:
             raise SystemExit("--issue needs --project")
-        sources.append((f"#{args.issue}", issue_text(args.project, args.issue,
-                                                     args.cid)))
+        if private_issue:
+            if not args.quiet:
+                print(f"SKIP #{args.issue}：私有 Issue／评论允许会话键名，不发 GitHub 请求")
+        else:
+            sources.append((f"#{args.issue}", issue_text(args.project, args.issue,
+                                                         args.cid)))
     for path in args.file:
         p = Path(path)
         sources.append((str(p), p.read_text(encoding="utf-8", errors="replace")))
@@ -152,6 +161,8 @@ def main(argv=None) -> int:
                 sources.append((str(p),
                                 p.read_text(encoding="utf-8", errors="replace")))
     if not sources:
+        if private_issue:
+            return 0
         raise SystemExit("nothing to scan: give --issue, --file or --dir")
 
     total = 0
@@ -167,7 +178,7 @@ def main(argv=None) -> int:
                 print(f"  {key}")
     if total:
         print(f"FAIL {total} key name(s) in {len(sources)} source(s): "
-              f"a key name is a credential, keep it out of issues")
+              f"keep session keys out of public files")
         return 1
     if not args.quiet:
         print(f"OK 0 key names in {len(sources)} source(s)")
