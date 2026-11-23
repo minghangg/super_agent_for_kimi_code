@@ -153,9 +153,35 @@ class Acceptance(Base):
         self.assertTrue(needs_mod.is_open(index, "other/repo#42", cross))
         self.assertIsNone(needs_mod.stored_row(index, "other/repo#42", 9101))
 
-        needs_mod.unmark(index, "owner/demo#42", 9100)
+        events = [json.loads(line) for line in
+                  (self.state / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+        skipped = [row for row in events
+                   if row.get("type") == "needs_person.resolution_skipped"]
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["thread"], "other/repo#42")
+
+        seen = []
+        needs_mod.unmark(index, "owner/demo#42", 9100, on_change=seen.append)
+        self.assertEqual(len(seen), 1)
         self.assertTrue(needs_mod.is_open(index, "owner/demo#42", rows[0]))
         self.assertEqual(rows[0]["at"], "old")
+
+    def test_cross_repo_threads_do_not_consume_closed_check_quota(self):
+        from super_agent import needs as needs_mod
+        fixture = json.loads(json.dumps(FIXTURE))
+        fixture["issues"]["42"]["state"] = "closed"
+        self.fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+        self.engine.source = FixtureSource(self.fixture_path)
+        self.engine.cfg["github"]["repo"] = "owner/demo"
+        self.engine._live_issues = set()
+        issues = {f"other/repo#{n}": {"needs_person": [
+            {"comment_id": n, "reason": "cross", "at": "old"}]}
+            for n in range(10)}
+        issues["owner/demo#42"] = {"needs_person": [
+            {"comment_id": 9100, "reason": "same-repo closed", "at": "old"}]}
+        index = {"issues": issues}
+        self.assertEqual(self.engine._resolve_closed_needs(index), 1)
+        self.assertIsNotNone(needs_mod.stored_row(index, "owner/demo#42", 9100))
 
     def test_a7_atomic_replace_keeps_old_index(self):
         self.store.save_index({"version": 1, "meta": {"good": True},

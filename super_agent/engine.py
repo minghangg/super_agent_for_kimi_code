@@ -4644,19 +4644,29 @@ class Engine:
                 "max_closed_thread_checks") or 10))
         except (TypeError, ValueError):
             limit = 10
+        current_repo = issuekey.repo_full((self.cfg.get("github") or {}).get("repo"))
         pending = []
+        skipped = getattr(self, "_closed_resolution_skipped", None)
+        if skipped is None:
+            skipped = self._closed_resolution_skipped = set()
         for thread, rec in (index.get("issues") or {}).items():
+            repo, issue = issuekey.split_key(thread)
+            repo = repo or current_repo
+            if repo != current_repo:
+                if thread not in skipped:
+                    skipped.add(thread)
+                    self.store.log_event({"type": "needs_person.resolution_skipped",
+                                          "at": _now(), "thread": thread,
+                                          "repo": repo, "current_repo": current_repo})
+                continue
+            if issue is None:
+                continue
             rows = [row for row in (rec.get("needs_person") or [])
                     if needs.is_open(index, thread, row)]
             if rows:
-                pending.append((thread, rows))
+                pending.append((thread, issue, rows))
         resolved = 0
-        current_repo = issuekey.repo_full((self.cfg.get("github") or {}).get("repo"))
-        for thread, rows in sorted(pending)[:limit]:
-            repo, issue = issuekey.split_key(thread)
-            repo = repo or current_repo
-            if repo != current_repo or issue is None:
-                continue
+        for thread, issue, rows in sorted(pending)[:limit]:
             if issue in getattr(self, "_live_issues", set()):
                 continue
             if self._issue_state(issue) != "closed":

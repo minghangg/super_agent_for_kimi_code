@@ -138,7 +138,7 @@ def mark(index, thread, comment_id, *, state, by, reason="", by_comment=None,
     return {"changed": True, "reason": "marked", "row": dict(row)}
 
 
-def unmark(index, thread, comment_id) -> dict:
+def unmark(index, thread, comment_id, *, on_change=None) -> dict:
     """Remove one exact dismissal so a corrected item becomes visible again."""
     cid = cid_of(comment_id)
     if cid is None:
@@ -148,7 +148,10 @@ def unmark(index, thread, comment_id) -> dict:
     if not isinstance(existing, dict):
         return {"changed": False, "reason": "not_marked", "row": None}
     removed = index[MARKS].pop(key)
-    return {"changed": True, "reason": "unmarked", "row": dict(removed)}
+    result = {"changed": True, "reason": "unmarked", "row": dict(removed)}
+    if on_change is not None:
+        on_change(dict(result["row"]))
+    return result
 
 
 def merge_into(index, disk_index) -> int:
