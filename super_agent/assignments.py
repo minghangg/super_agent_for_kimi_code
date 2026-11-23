@@ -174,12 +174,28 @@ def _append_delivery(assignment: dict, cid) -> list[int]:
     return cids
 
 
-def owners_of_delivery(index: dict, thread: str, cid) -> list[dict]:
-    """Worker assignments of ``thread`` whose :func:`assignment_cids` contain ``cid``.
+def assignment_output_cids(rec: dict) -> list[int]:
+    """Delivery cids, plus a QA assignment's own review as its stage output.
 
-    The **only** implementation of "which assignments received this cid". The
-    ``thread`` filter is not optional: assignments are keyed by id, and a cid is
-    unique per repository, not per thread.
+    A normal worker Assignment is reviewed through the worker's delivery. A
+    QA-only Assignment has no worker delivery: its readable review comment is
+    the output the PM routes onward. Keeping that cid derived from
+    ``review_comment_id`` avoids inventing a delivery or a ``matched_by`` value.
+    """
+    cids = assignment_cids(rec)
+    if str(rec.get("role") or "") == "qa":
+        review = _cid_or_none(rec.get("review_comment_id"))
+        if review is not None and review not in cids:
+            cids.append(review)
+    return cids
+
+
+def owners_of_delivery(index: dict, thread: str, cid) -> list[dict]:
+    """Assignments of ``thread`` whose stage-output cids contain ``cid``.
+
+    The thread filter is not optional: assignments are keyed by id, and a cid is
+    unique per repository, not per thread. Both worker deliveries and QA-only
+    review outputs are owned; an arbitrary or cross-thread cid stays unknown.
     """
     wanted = _cid_or_none(cid)
     if wanted is None:
@@ -190,38 +206,35 @@ def owners_of_delivery(index: dict, thread: str, cid) -> list[dict]:
             continue
         if str(rec.get("thread") or "") != thread:
             continue
-        if str(rec.get("role") or "") != "worker":
-            continue
-        if wanted in assignment_cids(rec):
+        if wanted in assignment_output_cids(rec):
             out.append(rec)
     return out
 
 
 def newest_delivery_owner(index: dict, thread: str, states) -> dict | None:
-    """The worker assignment holding this thread's newest delivery, or ``None``.
+    """Newest worker delivery owner, or the QA-only output owner as fallback.
 
-    ``states`` is passed in, not restated here: the caller owns the "which
-    states may still be a review subject" question, and a second copy of that
-    tuple in this module would be a second source of truth. A delivery that
-    sits only on closed assignments yields ``None``.
+    Worker priority preserves the existing worker→QA→PM coordinate contract.
+    Only a thread with no worker delivery in ``states`` uses a QA review output.
     """
-    newest = None
-    newest_cid = None
+    candidates = []
     for rec in (index.get("assignments") or {}).values():
         if not isinstance(rec, dict):
             continue
         if str(rec.get("thread") or "") != thread:
             continue
-        if str(rec.get("role") or "") != "worker":
-            continue
         if str(rec.get("status") or "") not in states:
             continue
-        cid = _cid_or_none(rec.get("delivery_comment_id"))
-        if cid is None:
-            continue
-        if newest_cid is None or cid > newest_cid:
-            newest, newest_cid = rec, cid
-    return newest
+        cids = assignment_output_cids(rec)
+        if cids:
+            candidates.append((rec, max(cids)))
+    workers = [item for item in candidates
+               if str(item[0].get("role") or "") == "worker"]
+    pool = workers or [item for item in candidates
+                       if str(item[0].get("role") or "") == "qa"]
+    if not pool:
+        return None
+    return max(pool, key=lambda item: item[1])[0]
 
 
 def live_bindings(state: dict, thread: str, issue: int | None = None,

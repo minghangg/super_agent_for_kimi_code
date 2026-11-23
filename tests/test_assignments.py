@@ -845,7 +845,7 @@ class Verdicts(unittest.TestCase):
                 "status": "completed", "delivery_comment_id": 9001},
             "asg_1_qa_1": {
                 "id": "asg_1_qa_1", "thread": THREAD, "role": "qa",
-                "status": "waiting_review", "delivery_comment_id": 9001},
+                "status": "waiting_review", "review_comment_id": 9100},
             "asg_2_worker_1": {
                 "id": "asg_2_worker_1", "thread": "owner/demo#2",
                 "role": "worker", "status": "waiting_review",

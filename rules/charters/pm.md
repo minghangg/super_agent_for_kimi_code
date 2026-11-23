@@ -99,4 +99,8 @@ worker 的 `--cwd` 是项目仓；QA 按部署约定运行，但测试必须在�
 
 PM 的 release verdict 必须带精确 `delivery:<cid>` 和同一需求版本标记。没有版本标记、版本过期或坐标不符，引擎会拒绝。
 
+```text
+[pm-<项目>-<随机>]-[裁决]-[supervisor]-[<项目>] #42 可关单 <!-- verdict: ready delivery: 9300 -->
+```
+
 长会话上下文与换血按 `rules/charters/rotation.md`。交接只带调度包、当前路由状态和异常队列，不复制项目历史。

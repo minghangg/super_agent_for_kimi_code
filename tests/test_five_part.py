@@ -284,8 +284,7 @@ class LongLivedKeys(unittest.TestCase):
             self.assertFalse(markers.is_session_key_name(name), name)
 
     def test_a_long_lived_roles_delivery_is_a_delivery(self):
-        for name in ("scout-20261120-0ca928f3", "pm-x-abc12345",
-                     "qa-lwa-ISS-99"):
+        for name in ("scout-20261120-0ca928f3", "pm-x-abc12345"):
             got = markers.parse_delivery(f"[{name}]-[完工]-[No Notify]-[lwa]")
             self.assertIsNotNone(got, name)
             self.assertEqual(got["name"], name)
@@ -339,6 +338,9 @@ class OnlyQaDeclaresAReview(unittest.TestCase):
         passed = markers.parse_review("[qa-lwa-ISS-99]-[完工]-[pm-x]-[lwa]")
         self.assertIsNotNone(passed)
         self.assertEqual(passed["verdict"], "pass")
+        self.assertIsNone(markers.parse_delivery(
+            "[qa-lwa-ISS-99]-[完工]-[pm-x]-[lwa]"),
+            "QA completion is a review, never a competing delivery")
         rejected = markers.parse_review("[qa-lwa-ISS-99]-[退回]-[pm-x]-[lwa]")
         self.assertIsNotNone(rejected)
         self.assertEqual(rejected["verdict"], "reject")

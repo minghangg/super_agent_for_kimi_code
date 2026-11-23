@@ -299,8 +299,8 @@ def _five_leaf(five: dict) -> tuple[str, str]:
 
     A delivery marker needs a name, and a five-part title's first segment is the
     session key -- exactly what ``[WK:<name>]`` carried. The action decides which
-    of the old routes this maps to, so the two parsers cannot disagree about a
-    line that carries both shapes.
+    of the old routes this maps to. QA ``完工`` is the exception: it is a review,
+    never a delivery, so the engine's delivery-first triage cannot swallow it.
 
     ``who`` must start with a delivery prefix. ``[QB]-[完工]-…`` names a session
     that no role owns, so it yields ``("", "")`` and the caller treats it as
@@ -311,6 +311,8 @@ def _five_leaf(five: dict) -> tuple[str, str]:
     action = five["do"]
     if action not in ("完工", "调试"):
         return "", who
+    if _is_qa_key(who):
+        return "", ""
     if not is_session_key_name(who):
         return "", ""
     return who.upper().split("-", 1)[0], who

@@ -1194,30 +1194,52 @@ class Engine:
         project = self._project_for(issue) or ""
         return {"project": project, "pm_sid": pm_sid, "target_role": "pm"}
 
-    def _review_target(self, index: dict, thread: str) -> dict | None:
-        """The worker assignment a verdict on ``thread`` applies to.
+    def _review_target(self, index: dict, thread: str, issue: int,
+                       comment: dict) -> tuple[dict | None, str]:
+        """Worker delivery under review, or the exact QA-only Assignment.
 
-        A verdict judges a **delivery**, so an assignment that never recorded
-        one is not a candidate: without a delivery there is nothing to accept or
-        send back, and moving it would invent state out of a stray comment. The
-        newest delivery wins - an older assignment on the same thread is stale.
-
-        The state filter is ``REVIEW_TARGET_STATES``: every state a verdict has
-        to be able to reach is listed there, including ``waiting_release`` (the
-        archive ran first) and ``waiting_person`` (an earlier unreadable
-        conclusion). Requiring only the three "before the archive" states made
-        those verdicts ``review.unmatched`` and dropped the QA comment (E58/E59).
-        ``on_review`` keeps its own guards, so this widens **who may answer**,
-        not what an answer is allowed to change.
+        Worker candidates always win, preserving the normal flow. The fallback
+        requires the comment's session key to name the QA Assignment; an
+        arbitrary QA comment cannot commandeer another QA's stage.
         """
+        assignment = None
+        requirement_error = ""
+        at_mode = self._at_mode(issue)
+        if at_mode:
+            assignment, requirement_error = self._referenced_assignment(
+                index, thread, issue, comment)
+            if assignment is not None:
+                return assignment, ""
+            if requirement_error != "no active Assignment matches the requirement reference":
+                return None, requirement_error
         candidates = [rec for rec in (index.get("assignments") or {}).values()
                       if str(rec.get("thread") or "") == thread
                       and str(rec.get("role") or "") == "worker"
                       and rec.get("delivery_comment_id") is not None
                       and str(rec.get("status") or "") in REVIEW_TARGET_STATES]
-        if not candidates:
-            return None
-        return max(candidates, key=lambda r: int(r.get("delivery_comment_id") or 0))
+        if candidates:
+            return max(candidates,
+                       key=lambda r: int(r.get("delivery_comment_id") or 0)), ""
+        reviewer = str(comment.get("session_key") or "")
+        reference = requirements.event_reference(str(comment.get("body") or ""))
+        candidates = []
+        for rec in (index.get("assignments") or {}).values():
+            if str(rec.get("thread") or "") != thread:
+                continue
+            if str(rec.get("role") or "") != "qa":
+                continue
+            if str(rec.get("session_key") or "") != reviewer:
+                continue
+            if str(rec.get("status") or "") not in REVIEW_TARGET_STATES:
+                continue
+            if at_mode and not requirements.reference_matches(reference, rec):
+                continue
+            candidates.append(rec)
+        if len(candidates) == 1:
+            return candidates[0], ""
+        if len(candidates) > 1:
+            return None, "multiple QA Assignments match the review"
+        return None, requirement_error or "no active worker assignment"
 
     def _route_action(self, thread: str, issue: int, cid, payload: dict,
                       event: str, *, target_role: str, origin_role: str,
@@ -1380,11 +1402,8 @@ class Engine:
                    review: dict, summary: dict) -> str:
         """Apply a verdict, then route it. Returns the triage state."""
         cid = int(comment["id"])
-        if self._at_mode(issue):
-            assignment, requirement_error = self._referenced_assignment(
-                index, thread, issue, comment)
-        else:
-            assignment, requirement_error = self._review_target(index, thread), ""
+        assignment, requirement_error = self._review_target(
+            index, thread, issue, comment)
         if assignment is None:
             reason = requirement_error or "no active worker assignment"
             self.store.log_event({"type": "review.unmatched", "at": _now(),
@@ -2752,7 +2771,7 @@ class Engine:
                                       detail, verdict)
                 return "needs_person", f"pm verdict: {detail}"
             owner = asg_mod.newest_delivery_owner(index, thread, states)
-            if owner is None or wanted not in asg_mod.assignment_cids(owner):
+            if owner is None or wanted not in asg_mod.assignment_output_cids(owner):
                 # At most one live owner is left, so the failure has three
                 # shapes and the wording must say which one happened: "archived"
                 # printed for a live assignment is a contradiction a reader
@@ -4870,9 +4889,20 @@ class Engine:
         # Qualified key first, legacy second: a mixed file converges instead of
         # re-reading comments already consumed under the old form.
         cur = int(issuekey.read_both(cursor.get("issues") or {}, key, legacy) or 0)
-        comments = github_source.comments_from(self.source, issue, since_id=cur,
-                                               max_pages=max_pages)
-        fresh = [c for c in comments if int(c["id"]) > cur][:max_comments]
+        existing = [rec for rec in (index.get("assignments") or {}).values()
+                    if str(rec.get("thread") or "") == key]
+        worker_output = any(str(rec.get("role") or "") == "worker"
+                            and asg_mod.assignment_cids(rec) for rec in existing)
+        qa_recovery = not worker_output and any(
+            str(rec.get("role") or "") == "qa"
+            and str(rec.get("status") or "") not in asg_mod.TERMINAL_STATES
+            and rec.get("review_comment_id") is None for rec in existing)
+        comments = github_source.comments_from(
+            self.source, issue, since_id=0 if qa_recovery else cur,
+            max_pages=max_pages)
+        fresh = [c for c in comments
+                 if int(c["id"]) > cur or (qa_recovery and markers.parse_review(
+                     str(c.get("body") or "")))][:max_comments]
         summary["comments_new"] += len(fresh)
         if self._at_mode(issue):
             # Rebuild from the Issue, not from the cursor: approval may predate

@@ -1252,6 +1252,59 @@ class GuardDiscriminatesDeclaredFromGuess(Base):
             engine._delivery_for(index, THREAD, 9100, declared=9300), 9300)
 
 
+class FivePartQaRouting(Base):
+    QA_BODY = ("[qa-demo-3f7c1a90]-[完工]-[pm-demo-3f7c1a90]-[demo] "
+               "<!-- fix_needed: false -->\n"
+               "<!-- session: qa-demo-3f7c1a90 -->")
+
+    def qa_only(self):
+        rows = [json.loads(line) for line in
+                self.events.read_text(encoding="utf-8").splitlines() if line]
+        rows = [row for row in rows if row.get("role") != "worker"
+                and row.get("key") != "wk-probe-1"]
+        self.events.write_text("\n".join(json.dumps(row) for row in rows) + "\n",
+                               encoding="utf-8")
+
+    def test_qa_completion_reviews_the_worker_delivery(self):
+        engine = self.engine()
+        self.deliver()
+        self.source.add(9100, self.QA_BODY, author="qa",
+                        session_key="qa-demo-3f7c1a90")
+        engine.run_once()
+        index = engine.store.load_index()
+        self.assertEqual(index["assignments"]["asg_1_worker_1"]["status"],
+                         "waiting_release")
+        self.assertEqual(index["assignments"]["asg_1_worker_1"]["review_comment_id"],
+                         9100)
+        self.assertIn("assignment.qa_review", self.types())
+        self.assertNotIn(9100, [row.get("comment_id") for row in self.rows()
+                                if row["type"] == "assignment.delivery"])
+
+    def test_qa_only_review_is_a_pm_addressable_stage_output(self):
+        self.qa_only()
+        engine = self.engine()
+        engine.run_once()
+        self.source.add(9100, self.QA_BODY, author="qa",
+                        session_key="qa-demo-3f7c1a90")
+        cursor = engine.store.load_cursor()
+        cursor.setdefault("issues", {})[THREAD] = 9100
+        engine.store.save_cursor(cursor)
+        engine.run_once()
+        index = engine.store.load_index()
+        qa = index["assignments"]["asg_1_qa_1"]
+        self.assertEqual(qa["status"], "waiting_release")
+        self.assertEqual(qa["review_comment_id"], 9100)
+        self.assertEqual(qa["matched_by"], "",
+                         "a review output does not invent a worker delivery match")
+
+        self.source.add(9200, "[PM] 可关单 #1 <!-- verdict: ready delivery: 9100 -->")
+        engine.run_once()
+        self.assertEqual([row for row in self.rows()
+                          if row["type"] == "pm.delivery_unknown"], [])
+        frames = engine.store.load_index().get("release_frames") or {}
+        self.assertIn(f"release:{THREAD}:9100", frames)
+
+
 class Selftest(unittest.TestCase):
     """One command: ``python -m tests.test_engine_pm_route``."""
 

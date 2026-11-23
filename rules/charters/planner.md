@@ -18,6 +18,6 @@ AT 分支中，planner 不再为 PM 编写六段开发任务书。需求契约�
 
 ## 3. 交付
 
-输出一个可供 `python -m super_agent.requirements validate --file <文件>` 校验的 JSON 草稿，或一份缺项清单。所有语义修改由 AT 形成新 revision。
+输出一个可供 `python -m super_agent.requirements validate --file <文件>` 校验的 JSON 草稿，或一份缺项清单。所有语义修改由 AT 形成新 revision。临时草稿放部署约定的临时目录，不写进运行投影或仓库真源。
 
 非 AT 项目需要 planner 时，沿用项目自己的既有流程；不要把 AT 字段强加给非 AT 项目。

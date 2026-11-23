@@ -226,6 +226,29 @@ class Gates(Base):
         self.assertEqual(rec["status"], "waiting_release")
         self.assertEqual(rec["qa_verdict"], "pass")
 
+    def test_qa_only_assignment_accepts_its_five_part_review(self):
+        value = package()
+        self.publish(value, 100)
+        rows = [json.loads(line) for line in
+                self.events.read_text(encoding="utf-8").splitlines() if line]
+        rows = [row for row in rows if row.get("role") != "worker"
+                and row.get("key") != "wk-probe-1"]
+        self.events.write_text("\n".join(json.dumps(row) for row in rows) + "\n",
+                               encoding="utf-8")
+        engine = self.engine()
+        engine.run_once()
+        marker = req.reference_marker(value)
+        self.source.add({"id": 9100, "issue": 1, "author": "qa",
+                         "session_key": QA_KEY,
+                         "body": f"[{QA_KEY}]-[完工]-[{PM_KEY}]-[demo] "
+                                 f"<!-- fix_needed: false -->\n"
+                                 f"<!-- session: {QA_KEY} -->\n{marker}"})
+        engine.run_once()
+        qa = self.index(engine)["assignments"]["asg_1_qa_1"]
+        self.assertEqual(qa["status"], "waiting_release")
+        self.assertEqual(qa["review_comment_id"], 9100)
+        self.assertEqual(qa["qa_verdict"], "pass")
+
     def test_stale_qa_hash_cannot_pass_the_current_work(self):
         value = package()
         self.publish(value, 100)

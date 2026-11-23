@@ -73,6 +73,7 @@ DEFAULTS: dict = {
         # The project/issue/action allowlist is a different dimension and lives
         # in config/allowlist.json (see super_agent.allowlist).
         "allowlist": ["issue_comment.created"],
+        "at_question_port": 58731,
         "cooldown_s": 900,
         "assignments": {},         # reserved; M0 must leave this empty
         "session_events_path": "",  # workbench lifecycle stream (read-only); "" = resolve
