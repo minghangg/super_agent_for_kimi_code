@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from . import markers
+from . import session_events
 from . import session_ledger
 from . import sessionkeys
 
@@ -52,8 +53,30 @@ def supervisor_keys(cfg: dict) -> set[str]:
 
 def supervisor_verifier(cfg: dict):
     keys = supervisor_keys(cfg)
+    history = {"loaded": False, "events": []}
+
+    def historical(comment: dict, claimed: str) -> bool:
+        created = str(comment.get("created_at") or "").strip()
+        if not created or session_events._parse_at(created) is None:
+            return False
+        if (sessionkeys.role_of(claimed) != "supervisor"
+                or not sessionkeys.has_random_suffix(claimed)):
+            return False
+        if not history["loaded"]:
+            try:
+                path = session_events.resolve_events_path(cfg)
+                history["events"] = session_events.load_events(path)
+            except Exception:  # noqa: BLE001 - an unreadable history fails closed
+                history["events"] = []
+            history["loaded"] = True
+        state = session_events.replay(history["events"], created)
+        return claimed in session_events.active_keys(state)
 
     def verify(comment: dict) -> bool:
         claimed = claimed_key(comment)
-        return bool(claimed) and claimed in keys
+        if not claimed:
+            return False
+        if claimed in keys:
+            return True
+        return historical(comment, claimed)
     return verify

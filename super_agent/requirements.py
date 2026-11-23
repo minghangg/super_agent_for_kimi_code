@@ -220,7 +220,7 @@ def _entry(projection: dict, rid: str) -> dict:
 
 def project_comments(comments: list[dict], previous: dict | None = None, *,
                      package_verifier=None, approval_verifier=None) -> dict:
-    """Apply only source-verified contracts; unverified fences are inert."""
+    """Apply source-verified contracts and retry only unverified sources."""
     projection = copy.deepcopy(previous) if previous else {
         "schema_version": SCHEMA_VERSION, "requirements": {}, "errors": [],
     }
@@ -228,6 +228,26 @@ def project_comments(comments: list[dict], previous: dict | None = None, *,
     projection.setdefault("requirements", {})
     projection.setdefault("errors", [])
     seen = set(projection.setdefault("seen_comment_ids", []))
+    retry = set()
+    containers = [projection] + list((projection.get("requirements") or {}).values())
+    for container in containers:
+        for error in container.get("errors") or []:
+            if not error.get("source_unverified"):
+                continue
+            try:
+                retry.add(int(error.get("comment_id")))
+            except (TypeError, ValueError):
+                continue
+    seen.difference_update(retry)
+
+    def record_unverified(container: dict, error: dict) -> None:
+        container["errors"] = [
+            old for old in container.get("errors") or []
+            if not (old.get("comment_id") == error.get("comment_id")
+                    and old.get("error") == error.get("error")
+                    and str(old.get("revision")) == str(error.get("revision")))]
+        container.setdefault("errors", []).append(error)
+
     for comment in sorted(comments or [], key=lambda c: int(c.get("id") or 0)):
         try:
             cid = int(comment.get("id"))
@@ -235,7 +255,7 @@ def project_comments(comments: list[dict], previous: dict | None = None, *,
             continue
         if cid in seen:
             continue
-        seen.add(cid)
+        unverified = False
         body = str(comment.get("body") or "")
         for kind in (PACKAGE_FENCE, APPROVAL_FENCE):
             try:
@@ -251,10 +271,8 @@ def project_comments(comments: list[dict], previous: dict | None = None, *,
                     error = {"comment_id": cid, "revision": raw.get("revision"),
                              "error": f"unverified {kind} source", "fatal": False,
                              "source_unverified": True}
-                    if entry is not None:
-                        entry.setdefault("errors", []).append(error)
-                    else:
-                        projection["errors"].append(error)
+                    record_unverified(entry if entry is not None else projection, error)
+                    unverified = True
                     continue
                 try:
                     if kind == PACKAGE_FENCE:
@@ -280,6 +298,8 @@ def project_comments(comments: list[dict], previous: dict | None = None, *,
                         entry["approvals"] = [a for a in entry.get("approvals", [])
                                               if a.get("comment_id") != cid]
                         entry["approvals"].append(approval)
+                        entry["errors"] = [e for e in entry.get("errors", [])
+                                           if e.get("comment_id") != cid or e.get("fatal")]
                 except RequirementError as exc:
                     error = {"comment_id": cid, "error": str(exc),
                              "revision": raw.get("revision"),
@@ -295,6 +315,8 @@ def project_comments(comments: list[dict], previous: dict | None = None, *,
                                 entry["current_revision"] = failed_revision
                     else:
                         projection["errors"].append(error)
+        if not unverified:
+            seen.add(cid)
     for rid in list(projection.get("requirements") or {}):
         _refresh_entry(projection, rid)
     projection["seen_comment_ids"] = sorted(seen)

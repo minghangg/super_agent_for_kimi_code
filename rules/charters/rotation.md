@@ -132,6 +132,9 @@ python -m super_agent.rotation check --key <键> [--feed-since <归档时刻 epo
 | 初始化新会话 | 旧 supervisor 发令 | 新 supervisor 自己执行 |
 | 建 cron | **新 supervisor 自己** | cron 不能跨会话转移 |
 | 归档旧会话 | **新 supervisor** | 与其他角色相反：不是自己归档自己 |
+| 核批准投影 | **新 supervisor** | `requirements.json` 不得残留 `source_unverified`；有则停外部动作并报告，禁止手工清 `seen_comment_ids` 或向 `supervisor_keys` 追加旧键 |
+
+换血后批准验证以评论时刻的 supervisor 生命周期为准。`source_unverified` 评论会自动重验证；确认 `requirements.json` 无该错误是换血完成的必要条件。
 
 **中间有窗口期**：旧 cron 删了、新 cron 没建，这段时间没有巡查。写进交接记录，不要假装没有。
 

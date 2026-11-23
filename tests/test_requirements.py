@@ -206,6 +206,41 @@ class Projection(unittest.TestCase):
         self.assertIn("mismatch", reason)
 
 
+class SourceRecovery(unittest.TestCase):
+    def comments(self):
+        value = package()
+        approval = {"requirement_id": RID, "revision": 1,
+                    "requirement_hash": value["requirement_hash"],
+                    "package_ref": "issuecomment-100"}
+        return [comment(100, req.PACKAGE_FENCE, value),
+                comment(101, req.APPROVAL_FENCE, approval)]
+
+    def project(self, comments, previous, allowed):
+        return req.project_comments(
+            comments, previous,
+            package_verifier=lambda comment: True,
+            approval_verifier=lambda comment: allowed)
+
+    def test_previously_seen_unverified_approval_recovers_after_rotation(self):
+        allowed = False
+        first = self.project(self.comments(), None, allowed)
+        first["seen_comment_ids"] = [100, 101]  # the legacy failure poisoned the cursor
+        recovered = self.project(self.comments(), first, True)
+        self.assertEqual(req.status(recovered, RID), "approved")
+        self.assertEqual(req.current(recovered, RID)["approval_ref"],
+                         "issuecomment-101")
+        errors = recovered["requirements"][RID]["errors"]
+        self.assertFalse([e for e in errors if e.get("source_unverified")])
+        self.assertIn(101, recovered["seen_comment_ids"])
+
+    def test_unverified_retry_does_not_duplicate_errors_or_advance_seen(self):
+        first = self.project(self.comments(), None, False)
+        second = self.project(self.comments(), first, False)
+        errors = second["requirements"][RID]["errors"]
+        self.assertEqual(len([e for e in errors if e.get("source_unverified")]), 1)
+        self.assertNotIn(101, second["seen_comment_ids"])
+
+
 class SourceSecurity(unittest.TestCase):
     def test_unverified_package_and_approval_never_authorise_dispatch(self):
         value = package()
