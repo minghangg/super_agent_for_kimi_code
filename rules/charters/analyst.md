@@ -40,6 +40,8 @@ python -m super_agent.requirements publish --role analyst \
 
 命令在评论成功后直接创建/复用问卷并输出 `question_url`。你把该链接交给 supervisor；引擎随后复用同一问题，不重复建链接。不要把问卷正文塞进会话。
 
+**发布完成后只回一行**：提问给链接，READY 给 cid；不做状态表、不复述需求、不再跑多步核验。用户答案到达后只读答案文档和当前草稿，不重读全部 Issue、章程或项目历史。
+
 ## 3. 用户答案
 
 - 用户提交后，答案先写 `atserve/answers/<question_id>.md`，再回传给你。

@@ -6,12 +6,13 @@
 
 ## 1. 唯一输入
 
-只接受 supervisor 转来的 **approved requirement_ref/hash**。先重建投影，再生成调度包：
+只接受 supervisor 转来的 **approved requirement_ref/hash**。先直接生成调度包；仅投影过期或被拒时才同步一次并重试：
 
 ```bash
-python -m super_agent.requirements sync --project <项目> --issue <n>
 python -m super_agent.requirements packet --project <项目> --issue <n> \
   --assignment <assignment_id> --output <packet.json>
+# 仅失败时：
+python -m super_agent.requirements sync --project <项目> --issue <n>
 ```
 
 未 READY、未批准、缺 hash、缺 AT 会话或需求包不可读：停止外部动作并上报，不自行补字段。
@@ -21,11 +22,9 @@ python -m super_agent.requirements packet --project <项目> --issue <n> \
 ## 2. 下一跳由路由器给出
 
 ```bash
-python -m super_agent.pm_router --packet <packet.json> --event start
-python -m super_agent.pm_router --packet <packet.json> --event plan_delivered
-python -m super_agent.pm_router --packet <packet.json> --event plan_qa --verdict pass
-python -m super_agent.pm_router --packet <packet.json> --event implementation_delivered
-python -m super_agent.pm_router --packet <packet.json> --event implementation_qa --verdict pass
+python -m super_agent.pm_router --packet <packet.json> --event start \
+  --task-output D:/temp_safkc/<assignment>.txt
+# 其他事件同样使用 --task-output，PM 不改写生成文本。
 ```
 
 你只执行返回的 `target_role`、`session` 和 `stage`：
@@ -43,10 +42,10 @@ python -m super_agent.pm_router --packet <packet.json> --event implementation_qa
 
 **PM 派单 = 两步，缺一不可**：
 
-1. **Issue 留档**：在该单发一条 `[pm-…]-[派单]-[<目标键名>]-[<项目>]` 评论，正文写任务书全文。
-2. **投进会话**：`dispatch_cli --session <目标sid> --detach --no-activate --task "<短令>"`。
+1. **Issue 留档**：在该单发一条 `[pm-…]-[派单]-[<目标键名>]-[<项目>]` 评论，正文使用路由器生成的同一个 task 文件，不扩写任务书。
+2. **投进会话**：`dispatch_cli --session <目标sid> --detach --no-activate --task "$(cat <task文件>)"`。
 
-**只发评论不投递 ⇒ 对方不知道要干活；只投递不发评论 ⇒ Issue 上没有留档，事后查不到派了什么。**
+**只发评论不投递 ⇒ 对方不知道要干活；只投递不发评论 ⇒ Issue 上没有留档。禁止再写六段任务书、重复验收或替 worker 预先取证。**
 
 新会话先 warmup 读契约和角色章程，再用 `--session --no-activate --detach` 发短令。创建后立刻 bind。复用会话前执行 ctx 门禁。
 
@@ -80,6 +79,8 @@ worker 的 `--cwd` 是项目仓；QA 按部署约定运行，但测试必须在�
 6. 冷却后重试可重试投递；不盲目重放旧 outbox。
 
 需求 revision/hash 变化时，旧 Assignment 必须保持 `waiting_requirement`。不得把旧交付当新交付，不得修改版本标记让旧结果通过。
+
+收到交付后只按对应 `implementation_delivered/plan_delivered` 事件取下一跳，不重复 worker 的验收、不重跑需求核验、不重写收单报告。单次采样未看到记账先等下一引擎轮次；连续两轮仍缺失才上报，不把时间差直接判成产品缺陷。
 
 ## 5. 禁止事项
 

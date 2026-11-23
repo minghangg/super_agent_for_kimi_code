@@ -94,10 +94,14 @@ def main(argv=None) -> int:
     parser.add_argument("--packet", required=True)
     parser.add_argument("--event", required=True, choices=EVENTS)
     parser.add_argument("--verdict", default="", choices=VERDICTS)
+    parser.add_argument("--task-output", default="",
+                        help="write the exact route task text for comment/dispatch reuse")
     args = parser.parse_args(argv)
     try:
         packet = json.loads(Path(args.packet).read_text(encoding="utf-8"))
         route = next_route(packet, args.event, args.verdict)
+        if args.task_output:
+            Path(args.task_output).write_text(route["task"] + "\n", encoding="utf-8")
     except (OSError, ValueError, RouteError) as exc:
         print(f"[拒绝] {exc}", file=sys.stderr)
         return 2

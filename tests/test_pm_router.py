@@ -57,5 +57,23 @@ class Routing(unittest.TestCase):
         self.assertEqual(route["stage"], "waiting_requirement")
 
 
+class Cli(unittest.TestCase):
+    def test_task_output_is_the_exact_dispatch_and_comment_text(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            packet_path = Path(tmp) / "packet.json"
+            task_path = Path(tmp) / "task.txt"
+            packet_path.write_text(json.dumps(packet("plan_and_implement", False)),
+                                   encoding="utf-8")
+            rc = pm_router.main(["--packet", str(packet_path), "--event", "start",
+                                 "--task-output", str(task_path)])
+            self.assertEqual(rc, 0)
+            expected = pm_router.next_route(packet("plan_and_implement", False), "start")
+            self.assertEqual(task_path.read_text(encoding="utf-8").strip(),
+                             expected["task"])
+
+
 if __name__ == "__main__":
     unittest.main()

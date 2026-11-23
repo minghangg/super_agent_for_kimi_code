@@ -324,7 +324,7 @@ def _refresh_entry(projection: dict, rid: str) -> None:
                      if a.get("revision") == revision
                      and a.get("requirement_hash") == package.get("requirement_hash")
                      and a.get("package_ref") == package.get("source_ref")), None)
-    if (approval is not None and status == "ready"
+    if (approval is not None and status in ("ready", "approved")
             and package.get("source_verified") is True
             and approval.get("source_verified") is True):
         package = copy.deepcopy(package)

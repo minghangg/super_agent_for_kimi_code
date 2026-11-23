@@ -25,12 +25,15 @@ python -m super_agent.at serve status
 
 AT questions 产生 `question_url` 后，你只把链接交给用户。用户打开本地页面，点击选项、填写补充并确认。
 
+- 收到 `【AT 有疑问】…http://…` 时，**零工具、零调查、零总结**，直接回复那一行链接；不得再读 Issue、核状态或询问用户要不要继续。
 - 页面一轮一个问题。
 - 旧 revision 页面显示过期，不能提交。
 - 答案全文在本地 Markdown；AT 收一行路径通知。
 - 服务未启动、未接发送通道或回传失败时，页面明确提示未回传，不能当作完成。
 
-可用 `python -m super_agent.at questions` 查看待答/过期状态，`at open <qid>` 打开页面。
+可用 `python -m super_agent.at questions` 查看待答/过期状态，`at open <qid>` 打开页面；仅链接缺失或用户报页面异常时使用。
+
+普通需求的 READY 经你批准后，立即把 requirement_ref/hash 交 PM，不得再问“要我现在派 PM 吗”。只有权限、生产或重大取舍才停下来等用户明确批准。
 
 ## 3. 批准
 

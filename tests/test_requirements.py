@@ -124,6 +124,18 @@ class Projection(unittest.TestCase):
         self.assertNotIn("objective", packet)
         self.assertNotIn("acceptance", packet)
 
+    def test_reprojecting_an_approved_revision_keeps_the_exact_approval(self):
+        projection = approved_projection()
+        replayed = project([], projection)
+        current = req.current(replayed, RID)
+        self.assertEqual(current["status"], "approved")
+        self.assertEqual(current["approval_ref"], "issuecomment-101")
+        self.assertTrue(current["approval_source_verified"])
+        entry = replayed["requirements"][RID]
+        self.assertEqual(entry["approval"]["approval_ref"], "issuecomment-101")
+        packet = req.dispatch_packet(replayed, RID, "asg_7_worker_1")
+        self.assertEqual(packet["approval_ref"], "issuecomment-101")
+
     def test_wrong_hash_or_package_ref_does_not_approve(self):
         value = package()
         for field, wrong in (("requirement_hash", "sha256:" + "0" * 64),
