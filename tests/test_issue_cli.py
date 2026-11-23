@@ -239,6 +239,16 @@ class Binding(CliCase):
         events = (self.state / "events.jsonl").read_text("utf-8").splitlines()
         self.assertIn("session.bound", events[-1])
 
+    def test_pm_can_be_bound_as_the_issue_recipient(self):
+        sid = "session_" + "3" * 8 + "-3333-3333-3333-" + "3" * 12
+        code, _out, err = self.run_cli("bind", "--role", "supervisor",
+                                       "--project", "demo", "--issue", "7",
+                                       "--bind-role", "pm", "--session", sid,
+                                       "--name", "pm-demo-1a2b3c4d", *self.base())
+        self.assertEqual(code, 0, err)
+        db = json.loads((self.state / "issue_sessions.json").read_text("utf-8"))
+        self.assertEqual(db["demo#7"]["pm"]["session"], sid)
+
     def test_only_pm_and_supervisor_may_bind(self):
         code, _out, err = self.run_cli("bind", "--role", "qa", "--project",
                                        "demo", "--issue", "7", "--bind-role",

@@ -134,6 +134,8 @@ class Base(unittest.TestCase):
         self.source = Comments()
         self.bus = FakeBus()
         self.sessions = FakeSessions()
+        (self.events.parent / "sessions.json").write_text(json.dumps({
+            "pm-demo-3f7c1a90": {"id": "session_pm"}}), encoding="utf-8")
 
     def tearDown(self):
         self.tmp.cleanup()

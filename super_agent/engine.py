@@ -64,9 +64,10 @@ more than it is.
 
 A supervisor notice **is** consumed: ``decide_watch.py`` (ISS-55) subscribes to
 ``event.agent.supervisor`` and delivers ``payload.sid`` the text, with an
-at-most-once ledger keyed by event fingerprint. So a frame sent here is a real
-delivery attempt, not a log line - an older version of this docstring said the
-opposite and it was wrong.
+at-most-once ledger keyed by event fingerprint. ``event.agent.project_pm`` uses
+the same leg and ledger, resolving the project PM before any ring injection.
+So a frame sent here is a real delivery attempt, not a log line - an older
+version of this docstring said the opposite and it was wrong.
 """
 from __future__ import annotations
 
@@ -1185,15 +1186,23 @@ class Engine:
         return self._approval_verifier(comment)
 
     def _pm_target(self, thread: str, issue: int) -> dict:
-        """Where a verdict goes: the project's PM, never a worker."""
-        ledger = self._load_issue_sessions().get(thread) or {}
-        pm_sid = ""
-        if isinstance(ledger, dict):
-            entry = ledger.get("pm")
-            if isinstance(entry, dict):
-                pm_sid = str(entry.get("session") or "")
-        project = self._project_for(issue) or ""
-        return {"project": project, "pm_sid": pm_sid, "target_role": "pm"}
+        """Resolve the issue PM, else the current project PM; never a blank OK."""
+        ledger = self._issue_session_entry(thread)
+        entry = ledger.get("pm") if isinstance(ledger, dict) else None
+        sid = str((entry or {}).get("session") or "") if isinstance(entry, dict) else ""
+        repo, _number = issuekey.split_key(thread)
+        project = self._project_for_repo(repo) or self._project_for(issue) or ""
+        if not sid:
+            try:
+                path = session_events.resolve_sessions_path(self.cfg)
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = {}
+            scope = repo.rsplit("/", 1)[-1].lower() if repo else project
+            key = sessionkeys.preferred_key(data, "pm", scope)
+            entry = (data.get(key) or {}) if key else {}
+            sid = str(entry.get("id") or entry.get("session") or "")
+        return {"project": project, "pm_sid": sid, "target_role": "pm"}
 
     def _review_target(self, index: dict, thread: str, issue: int,
                        comment: dict) -> tuple[dict | None, str]:
@@ -1355,6 +1364,10 @@ class Engine:
                    "review_comment_id": cid,
                    "verdict": str(review.get("verdict") or ""),
                    "project": target["project"], "pm_sid": target["pm_sid"],
+                   "sid": target["pm_sid"],
+                   "text": self._qa_notice_text(
+                       target["project"], issue, cid,
+                       str(review.get("verdict") or "")),
                    "unverified": not verified}
         base = action_id(key, "bus_inject", str(cid))
         routes = index.setdefault("routes", {})
@@ -1365,6 +1378,20 @@ class Engine:
                            "verdict": payload["verdict"], "ok": None,
                            "action_id": base}
         route = routes[key]
+        if not target["pm_sid"]:
+            route.update(ok=False, refused=True, session_delivery="failed")
+            self.store.log_event({
+                "type": "route.decided", "at": _now(), "thread": thread,
+                "comment_id": cid, "to": "project_pm",
+                "project": target["project"], "verdict": payload["verdict"],
+                "dispatched": False, "refused": True,
+                "session_delivery": "failed",
+                "reason": "no project pm session resolved",
+            })
+            self._append_needs_person(index, thread, {
+                "comment_id": cid, "reason": "route.undeliverable", "at": _now()})
+            return {"dispatched": False, "refused": True,
+                    "reason": "no project pm session resolved", "action_id": base}
         if self.store.action_attempted(base) > 0:
             return {"dispatched": False, "reason": "already attempted",
                     "action_id": base}
@@ -1374,6 +1401,7 @@ class Engine:
             assignment_id=key))
         route["ok"] = bool(result.get("ok")) if result.get("dispatched") else False
         route["refused"] = bool(result.get("refused"))
+        route["session_delivery"] = "ring" if result.get("dispatched") else "failed"
         route["action_id"] = result.get("action_id") or base
         # The one place a round learns whether this route was refused. Reading
         # the returned flag, never the wording, keeps the count honest when the
@@ -1388,6 +1416,7 @@ class Engine:
             "verdict": payload["verdict"],
             "dispatched": bool(result.get("dispatched")),
             "refused": bool(result.get("refused")),
+            "session_delivery": "ring" if result.get("dispatched") else "failed",
             "reason": result.get("reason") or "",
         })
         if not result.get("dispatched"):
@@ -1398,6 +1427,35 @@ class Engine:
                 "comment_id": cid, "reason": result.get("reason") or "",
             })
         return result
+
+    def _maybe_arbitrate_review(self, index: dict, thread: str, issue: int,
+                                comment: dict, assignment: dict) -> None:
+        """Second consecutive QA reject asks the supervisor to arbitrate once."""
+        cid = int(comment["id"])
+        try:
+            delivery = int(assignment.get("delivery_comment_id") or 0)
+        except (TypeError, ValueError):
+            delivery = 0
+        streak = 0
+        readings = assignment.get("review_readings") or {}
+        for raw_cid, verdict in sorted(readings.items(), key=lambda item: int(item[0])):
+            review_cid = int(raw_cid)
+            if review_cid <= delivery:
+                continue
+            if verdict == "reject":
+                streak += 1
+            elif verdict == "pass":
+                streak = 0
+        if streak != 2:
+            return
+        action_key = f"qa_arbitration:{assignment.get('id')}:{cid}"
+        text = (f"【QA 仲裁】#{int(issue)} 连续 2 轮退回，最新 QA cid {cid}，"
+                "请 supervisor 仲裁")
+        self._route_pm_frame(
+            index, thread, issue, comment,
+            {"state": "blocked", "delivery": assignment.get("delivery_comment_id")},
+            exception=True, reason="two consecutive QA rejects",
+            action_key=action_key, body_text=text)
 
     def _on_review(self, index: dict, thread: str, issue: int, comment: dict,
                    review: dict, summary: dict) -> str:
@@ -1427,6 +1485,7 @@ class Engine:
             # to decide something the engine has just decided - and #65's
             # repaired comment is exactly that case.
             self._clear_refused(index, thread, comment_id=cid)
+            self._maybe_arbitrate_review(index, thread, issue, comment, assignment)
         elif moved.get("refused"):
             # A verdict that landed and was **not** applied. Three things are
             # needed here, and none existed before this issue:
@@ -2053,6 +2112,10 @@ class Engine:
     def _release_text(issue, cid) -> str:
         """The one line a person reads: the issue and the verdict that closed it."""
         return f"【可关单】#{int(issue)}，QA cid {cid}（P0=0，无必修项）"
+
+    @staticmethod
+    def _qa_notice_text(project, issue, cid, verdict) -> str:
+        return f"【QA 结论】{project}#{int(issue)} {verdict}，QA cid {cid}"
 
     def _note_undeliverable(self, index: dict, thread: str, comment_id,
                             detail: str, *, issue=None, to="supervisor",
@@ -3028,8 +3091,9 @@ class Engine:
         record["undeliverable"] = False
         payload = {"thread": thread, "issue": int(issue),
                    "review_comment_id": cid,
-                   "kind": "pm_stall" if action_key.startswith("pm_stall:")
-                           else "pm_verdict",
+                   "kind": "qa_arbitration" if action_key.startswith("qa_arbitration:")
+                           else ("pm_stall" if action_key.startswith("pm_stall:")
+                                 else "pm_verdict"),
                    "state": str(verdict.get("state") or ""),
                    "exception": bool(exception),
                    "reason": reason,

@@ -1023,8 +1023,8 @@ def cmd_bind(args, ctx) -> int:
     """
     role = _role(args.role, ctx.roles)
     _check("bind", role, ctx.roles)
-    if args.bind_role not in {"qa", "worker", "at"}:
-        raise Denied("--bind-role 只能是 qa、worker 或 at")
+    if args.bind_role not in {"qa", "worker", "at", "pm"}:
+        raise Denied("--bind-role 只能是 qa、worker、at 或 pm")
     problem = ledger_mod.sid_problem(args.session)
     if problem and not getattr(args, "allow_short_sid", False):
         raise Denied(f"--session 不是完整 sid 形态；{problem}。"
@@ -1233,10 +1233,10 @@ def _parser() -> argparse.ArgumentParser:
     common(p)
     p.set_defaults(func=cmd_labels_init)
 
-    p = sub.add_parser("bind", help="登记本单的 QA/worker 会话（关单时归档）")
+    p = sub.add_parser("bind", help="登记本单的 QA/worker/AT/PM 会话")
     common(p)
     p.add_argument("--issue", type=int, required=True)
-    p.add_argument("--bind-role", required=True, choices=["qa", "worker", "at"])
+    p.add_argument("--bind-role", required=True, choices=["qa", "worker", "at", "pm"])
     p.add_argument("--session", required=True)
     p.add_argument("--name", default="")
     p.add_argument("--allow-short-sid", action="store_true", dest="allow_short_sid",

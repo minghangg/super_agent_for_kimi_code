@@ -661,14 +661,16 @@ def handle(events: list[dict], rsid: str, dry: bool, max_age: float) -> int:
 
 
 # --------------------------------------------------------------------- 主管投递哨（ISS-55）
-# `event.agent.supervisor` 的**投递消费端**：事件由 engine 注入，本段把它真投进
-# `payload.sid` 指定的会话。三条硬约束（ISS-55 任务书）：
+# `event.agent.supervisor` 与 `event.agent.project_pm` 的**投递消费端**：事件由
+# engine 注入，本段把它真投进对应会话。三条硬约束（ISS-55 任务书）：
 #   ① 独立一腿，**不进 `WATCH_TYPES`**——`handle()` 用「此刻的 supervisor 键」作目标，
 #      而 `payload.sid` 是发件那一刻解析的，换血后两者会指向不同会话；
 #   ② at-most-once 靠**事件指纹台账**，seq 游标与拍板哨共用（`/events` 排他：
 #      只有 `seq > since` 才会返回，所以「本轮不投且不退游标」＝永久漏投）；
 #   ③ `retry_later` 必须**台账驱动**重试，且台账存**完整 text**（截断会发半句话）。
 SUPERVISOR_NOTICE_EVENT = "event.agent.supervisor"
+PM_NOTICE_EVENT = "event.agent.project_pm"
+NOTICE_EVENT_TYPES = frozenset({SUPERVISOR_NOTICE_EVENT, PM_NOTICE_EVENT})
 SUPERVISOR_FAILED_EVENT = "event.session.supervisor_delivery_failed"
 SUPERVISOR_NOTICE_HEARTBEAT = "supervisor_notice"
 NOTICE_RETRY_LIMIT = 3          # 连续这么多轮仍 unknown ⇒ probe_unknown 终态
@@ -870,15 +872,19 @@ def _inject_notice_failure(row: dict, port: int, detail: str) -> None:
 def _notice_row_from_event(ev: dict) -> dict:
     payload = ev.get("payload")
     payload = payload if isinstance(payload, dict) else {}
+    event_type = str(ev.get("type") or "")
     text = payload.get("text")
     text = text if isinstance(text, str) else ""
+    if not text and event_type == PM_NOTICE_EVENT:
+        text = (f"【QA 结论】{payload.get('project')}#{payload.get('issue')} "
+                f"{payload.get('verdict')}，QA cid {payload.get('review_comment_id')}")
     return {
         "fp": notice_fingerprint(ev),
         "seq": int(ev.get("seq") or 0),
         "ts": ev.get("ts"),
-        "sid": str(payload.get("sid") or ""),
-        # 未知形状按 A（可关单）处理：kind 只影响文案，不影响投不投
-        "kind": str(payload.get("kind") or "close_ok"),
+        "sid": str(payload.get("sid") or payload.get("pm_sid") or ""),
+        "kind": str(payload.get("kind") or
+                    ("qa_review" if event_type == PM_NOTICE_EVENT else "close_ok")),
         "assignment": str(payload.get("assignment") or ""),
         "text": text,             # **完整正文**：重试要发全文
         "text_head": text[:100],  # 给人看的前缀，重试绝不用它
@@ -922,7 +928,7 @@ def _run_notice_row(row: dict, *, dry: bool, port: int, rows: dict) -> str:
 def handle_supervisor_notices(evs, now: float | None = None, *,
                               dry: bool = False, port: int = 0,
                               attempted: set | None = None) -> int:
-    """消费本轮的 `event.agent.supervisor`，返回实际投出的条数。
+    """消费本轮的 supervisor／project_pm 事件，返回实际投出的条数。
 
     指纹已在台账里 ⇒ 跳过（同 seq 重放、daemon 重启重扫都不重发）。
     `attempted` 是**本轮**已试过的指纹集合，与 `_retry_pending` 共用一个，
@@ -934,7 +940,7 @@ def handle_supervisor_notices(evs, now: float | None = None, *,
     rows = _notice_rows()
     delivered = 0
     for ev in evs or []:
-        if str(ev.get("type") or "") != SUPERVISOR_NOTICE_EVENT:
+        if str(ev.get("type") or "") not in NOTICE_EVENT_TYPES:
             continue
         fp = notice_fingerprint(ev)
         if fp in rows:

@@ -250,6 +250,27 @@ class Gates(Base):
         self.assertEqual(qa["review_comment_id"], 9100)
         self.assertEqual(qa["qa_verdict"], "pass")
 
+    def test_second_reject_escalates_to_supervisor_arbitration(self):
+        value = package()
+        self.publish(value, 100)
+        engine = self.engine()
+        engine.run_once()
+        marker = req.reference_marker(value)
+        self.source.add({"id": 9001, "issue": 1, "author": "worker",
+                         "body": f"[WK:wk-probe-1] done\n{marker}"})
+        engine.run_once()
+        for cid in (9100, 9200):
+            self.source.add({"id": cid, "issue": 1, "author": "qa",
+                             "session_key": QA_KEY,
+                             "body": f"[QA] 退回 <!-- fix_needed: true -->\n"
+                                     f"<!-- session: {QA_KEY} -->\n{marker}"})
+            engine.run_once()
+        frames = [frame for frame in self.bus.events("event.agent.supervisor")
+                  if "仲裁" in frame.get("text", "")]
+        self.assertEqual(len(frames), 1)
+        self.assertIn("仲裁", frames[0]["text"])
+        self.assertIn("9200", frames[0]["text"])
+
     def test_stale_qa_hash_cannot_pass_the_current_work(self):
         value = package()
         self.publish(value, 100)

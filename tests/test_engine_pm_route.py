@@ -1305,6 +1305,44 @@ class FivePartQaRouting(Base):
         self.assertIn(f"release:{THREAD}:9100", frames)
 
 
+class ProjectPmTarget(Base):
+    def test_project_pm_falls_back_to_the_project_scoped_session_key(self):
+        engine = self.engine()
+        target = engine._pm_target(THREAD, 1)
+        self.assertEqual(target["project"], "demo")
+        self.assertEqual(target["pm_sid"], "session_pm")
+
+    def test_missing_pm_never_reports_a_successful_delivery(self):
+        self.sessions_path.write_text(json.dumps({
+            "supervisor": {"id": "session_sup"}}), encoding="utf-8")
+        engine = self.engine()
+        self.deliver()
+        self.source.add(9100, PASS, author="qa", session_key="qa-demo-3f7c1a90")
+        engine.run_once()
+        self.assertEqual(self.bus.payloads("event.agent.project_pm"), [])
+        routes = engine.store.load_index().get("routes") or {}
+        self.assertTrue(routes)
+        self.assertTrue(all(rec.get("ok") is False for rec in routes.values()))
+        reasons = [row.get("reason") for row in
+                   engine.store.load_index()["issues"][THREAD]["needs_person"]]
+        self.assertIn("route.undeliverable", reasons)
+
+
+class TwoRoundArbitration(Base):
+    def test_second_consecutive_reject_reaches_the_supervisor(self):
+        engine = self.engine()
+        self.deliver()
+        for cid in (9100, 9200):
+            self.source.add(cid, "[QA] 退回 <!-- fix_needed: true -->",
+                            author="qa", session_key="qa-demo-3f7c1a90")
+            engine.run_once()
+        frames = self.bus.payloads("event.agent.supervisor")
+        self.assertEqual(len(frames), 1)
+        self.assertIn("仲裁", frames[0]["text"])
+        self.assertIn("9200", frames[0]["text"])
+        self.assertEqual(len(self.bus.payloads("event.agent.project_pm")), 2)
+
+
 class Selftest(unittest.TestCase):
     """One command: ``python -m tests.test_engine_pm_route``."""
 

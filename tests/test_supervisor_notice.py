@@ -166,6 +166,35 @@ class Positive(NoticeFixture):
         self.assertEqual(self.ledger_rows()[-1]["state"], "delivered")
         self.assertEqual(self.last()["last_ok_seq"], 11)
 
+    def test_project_pm_event_reaches_its_own_pm_with_a_short_qa_message(self):
+        ev = {"seq": 13, "ts": time.time(), "sid": "file",
+              "type": dw.PM_NOTICE_EVENT,
+              "payload": {"thread": "owner/demo#124", "issue": 124,
+                          "review_comment_id": 7111104662, "verdict": "reject",
+                          "project": "demo", "pm_sid": "session_pm_demo"}}
+        dw.handle_supervisor_notices([ev])
+        self.assertEqual(len(self.sends), 1)
+        sid, text = self.sends[0]
+        self.assertEqual(sid, "session_pm_demo")
+        self.assertIn("#124", text)
+        self.assertIn("7111104662", text)
+        self.assertIn("reject", text)
+        self.assertNotIn("{", text)
+        self.assertEqual(self.ledger_rows()[-1]["state"], "delivered")
+
+    def test_two_projects_do_not_share_a_pm_recipient(self):
+        events = []
+        for seq, project, sid in ((14, "demo-a", "session_pm_a"),
+                                  (15, "demo-b", "session_pm_b")):
+            events.append({"seq": seq, "ts": time.time(), "sid": "file",
+                           "type": dw.PM_NOTICE_EVENT,
+                           "payload": {"thread": f"owner/{project}#1", "issue": 1,
+                                       "review_comment_id": seq, "verdict": "pass",
+                                       "project": project, "pm_sid": sid}})
+        dw.handle_supervisor_notices(events)
+        self.assertEqual([sid for sid, _text in self.sends],
+                         ["session_pm_a", "session_pm_b"])
+
     def test_release_timeout_shape_needs_no_review_fields(self):
         ev = self.notice(seq=12, kind="release_timeout",
                          assignment="ISS-55", status="waiting_release",

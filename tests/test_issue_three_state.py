@@ -185,7 +185,12 @@ class RouteRetry(unittest.TestCase):
         self.allow.write_text(json.dumps(GOOD), encoding="utf-8")
         self.events = self.root / "sessions" / "events.jsonl"
         self.events.parent.mkdir(parents=True, exist_ok=True)
-        self.events.write_text("", encoding="utf-8")
+        self.events.write_text(json.dumps({
+            "seq": 1, "at": "2026-11-10T10:00:00+00:00",
+            "type": "session.created", "sid": "session_pm",
+            "key": "pm-demo-3f7c1a90"}) + "\n", encoding="utf-8")
+        (self.events.parent / "sessions.json").write_text(json.dumps({
+            "pm-demo-3f7c1a90": {"id": "session_pm"}}), encoding="utf-8")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -369,8 +374,13 @@ class RefusedRetryAlert(unittest.TestCase):
         self.allow.write_text(json.dumps(GOOD), encoding="utf-8")
         self.events = self.root / "sessions" / "events.jsonl"
         self.events.parent.mkdir(parents=True, exist_ok=True)
-        self.events.write_text("", encoding="utf-8")
+        self.events.write_text(json.dumps({
+            "seq": 1, "at": "2026-11-10T10:00:00+00:00",
+            "type": "session.created", "sid": "session_pm",
+            "key": "pm-demo-3f7c1a90"}) + "\n", encoding="utf-8")
         self.bus = self.Bus()
+        (self.events.parent / "sessions.json").write_text(json.dumps({
+            "pm-demo-3f7c1a90": {"id": "session_pm"}}), encoding="utf-8")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -604,6 +614,12 @@ class PermanentStillPermanent(unittest.TestCase):
         self.state = self.root / "state"
         self.allow = self.root / "allowlist.json"
         self.allow.write_text(json.dumps(GOOD), encoding="utf-8")
+        (self.root / "sessions.json").write_text(json.dumps({
+            "pm-demo-3f7c1a90": {"id": "session_pm"}}), encoding="utf-8")
+        (self.root / "events.jsonl").write_text(json.dumps({
+            "seq": 1, "at": "2026-11-10T10:00:00+00:00",
+            "type": "session.created", "sid": "session_pm",
+            "key": "pm-demo-3f7c1a90"}) + "\n", encoding="utf-8")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -611,7 +627,8 @@ class PermanentStillPermanent(unittest.TestCase):
     def engine(self):
         cfg = config.load(None, {"mode": "assist",
                                  "github": {"source": "none", "repo": "owner/demo"},
-                                 "engine": {"archived_crosscheck": False}})
+                                 "engine": {"archived_crosscheck": False,
+                                            "session_state_dir": str(self.root)}})
         engine = Engine(cfg, Store(self.state), github_source.NullSource(), None,
                         project_allowlist=ProjectAllowlist(self.allow))
         engine._issue_state = lambda issue: "open"

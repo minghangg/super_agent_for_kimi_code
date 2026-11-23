@@ -116,7 +116,8 @@ class Base(unittest.TestCase):
         self.bus = FakeBus()
         self.sessions = FakeSessions()
         self.bind_both()
-        self.write_sessions({"supervisor": {"id": "session_sup"}})
+        self.write_sessions({"supervisor": {"id": "session_sup"},
+                             "pm-demo-3f7c1a90": {"id": "session_pm"}})
 
     def fresh(self):
         """Restart from a clean state directory, inside one test method."""
