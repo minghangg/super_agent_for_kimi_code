@@ -4651,9 +4651,13 @@ class Engine:
             if rows:
                 pending.append((thread, rows))
         resolved = 0
+        current_repo = issuekey.repo_full((self.cfg.get("github") or {}).get("repo"))
         for thread, rows in sorted(pending)[:limit]:
-            issue = issuekey.issue_number(thread)
-            if issue is None or issue in getattr(self, "_live_issues", set()):
+            repo, issue = issuekey.split_key(thread)
+            repo = repo or current_repo
+            if repo != current_repo or issue is None:
+                continue
+            if issue in getattr(self, "_live_issues", set()):
                 continue
             if self._issue_state(issue) != "closed":
                 continue

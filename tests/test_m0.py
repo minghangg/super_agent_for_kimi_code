@@ -132,9 +132,14 @@ class Acceptance(Base):
         fixture["issues"]["42"]["state"] = "closed"
         self.fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
         self.engine.source = FixtureSource(self.fixture_path)
+        self.engine.cfg["github"]["repo"] = "owner/demo"
         self.engine._live_issues = set()
-        index = {"issues": {"owner/demo#42": {"needs_person": [
-            {"comment_id": 9100, "reason": "old", "at": "old"}]}}}
+        index = {"issues": {
+            "owner/demo#42": {"needs_person": [
+                {"comment_id": 9100, "reason": "old", "at": "old"}]},
+            "other/repo#42": {"needs_person": [
+                {"comment_id": 9101, "reason": "cross-repo open", "at": "old"}]},
+        }}
         resolved = self.engine._resolve_closed_needs(index)
         self.assertEqual(resolved, 1)
         rows = index["issues"]["owner/demo#42"]["needs_person"]
@@ -144,6 +149,13 @@ class Acceptance(Base):
         mark = needs_mod.stored_row(index, "owner/demo#42", 9100)
         self.assertEqual(mark["reason"], "issue closed")
         self.assertEqual(mark["entries"], 1)
+        cross = index["issues"]["other/repo#42"]["needs_person"][0]
+        self.assertTrue(needs_mod.is_open(index, "other/repo#42", cross))
+        self.assertIsNone(needs_mod.stored_row(index, "other/repo#42", 9101))
+
+        needs_mod.unmark(index, "owner/demo#42", 9100)
+        self.assertTrue(needs_mod.is_open(index, "owner/demo#42", rows[0]))
+        self.assertEqual(rows[0]["at"], "old")
 
     def test_a7_atomic_replace_keeps_old_index(self):
         self.store.save_index({"version": 1, "meta": {"good": True},

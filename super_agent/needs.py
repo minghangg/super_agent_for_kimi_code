@@ -138,6 +138,19 @@ def mark(index, thread, comment_id, *, state, by, reason="", by_comment=None,
     return {"changed": True, "reason": "marked", "row": dict(row)}
 
 
+def unmark(index, thread, comment_id) -> dict:
+    """Remove one exact dismissal so a corrected item becomes visible again."""
+    cid = cid_of(comment_id)
+    if cid is None:
+        raise ValueError(f"comment_id is not an integer: {comment_id!r}")
+    key = entry_key(thread, cid)
+    existing = marks(index).get(key)
+    if not isinstance(existing, dict):
+        return {"changed": False, "reason": "not_marked", "row": None}
+    removed = index[MARKS].pop(key)
+    return {"changed": True, "reason": "unmarked", "row": dict(removed)}
+
+
 def merge_into(index, disk_index) -> int:
     """Union the whole side table of ``disk_index`` into ``index``; returns rows changed.
 
