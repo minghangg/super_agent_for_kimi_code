@@ -244,6 +244,7 @@ class Engine:
                  project_allowlist: ProjectAllowlist | None = None,
                  adapter=None, session_api=None):
         self.cfg = cfg
+        self._approval_verifier = requirement_auth.supervisor_verifier(cfg)
         self.store = store
         self.source = source
         # Injected in tests; ``None`` means "use the direct console".
@@ -1181,7 +1182,7 @@ class Engine:
         return False
 
     def _supervisor_verified(self, comment: dict) -> bool:
-        return requirement_auth.supervisor_verifier(self.cfg)(comment)
+        return self._approval_verifier(comment)
 
     def _pm_target(self, thread: str, issue: int) -> dict:
         """Where a verdict goes: the project's PM, never a worker."""

@@ -158,9 +158,15 @@ def _read_jsonl(path: Path) -> list[dict]:
 
 
 def segments(path: Path) -> list[Path]:
-    """Current file plus its bounded rotations (``.1``/``.2``), if present."""
-    return [p for p in (path, path.with_name(path.name + ".1"),
-                        path.with_name(path.name + ".2")) if p.is_file()]
+    """Current file and every numeric rotation, oldest evidence included."""
+    out = [path] if path.is_file() else []
+    rotated = []
+    for candidate in path.parent.glob(path.name + ".*"):
+        suffix = candidate.name[len(path.name) + 1:]
+        if suffix.isdigit() and candidate.is_file():
+            rotated.append((int(suffix), candidate))
+    out.extend(candidate for _number, candidate in sorted(rotated))
+    return out
 
 
 def read_stream(path: Path) -> tuple[list[dict], bool]:
@@ -248,7 +254,7 @@ def replay(events: list[dict], at: str | datetime | None = None) -> dict:
         return sessions.setdefault(sid, {"sid": sid, "role": "", "issue": None,
                                          "assignment": "", "profile": {},
                                          "archived": False, "key": "",
-                                         "at": ""})
+                                         "created_key": "", "at": ""})
 
     for event in events:
         stamp = _event_at(event)
@@ -269,6 +275,7 @@ def replay(events: list[dict], at: str | datetime | None = None) -> dict:
                     # ledger key: sessions.json has no such entry, and treating
                     # it as one would make every fresh session look like drift.
                     rec["key"] = key
+                    rec["created_key"] = key
                     rec["name"] = key
                     rec["name_only"] = True
         elif kind == KEY_CHANGED:

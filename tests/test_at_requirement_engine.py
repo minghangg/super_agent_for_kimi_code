@@ -4,8 +4,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from super_agent import at_serve, config, flow as flow_mod, requirements as req, session_events
+from super_agent import at_serve, config, flow as flow_mod, requirement_auth, requirements as req, session_events
 from super_agent.allowlist import ProjectAllowlist
 from super_agent.engine import Engine
 from super_agent.store import Store
@@ -468,6 +469,16 @@ class SecurityGates(Base):
         self.assertIn("at.verdict_unverified[user]", reasons)
         self.assertIn("at.session_missing[user]", reasons)
         self.assertEqual(index.get("assignments"), {})
+
+
+class SupervisorVerifierCache(Base):
+    def test_engine_reuses_one_verifier_across_comments(self):
+        with mock.patch.object(requirement_auth, "supervisor_verifier",
+                               wraps=requirement_auth.supervisor_verifier) as factory:
+            engine = self.engine()
+            engine._supervisor_verified({})
+            engine._supervisor_verified({})
+        self.assertEqual(factory.call_count, 1)
 
 
 if __name__ == "__main__":

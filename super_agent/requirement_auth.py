@@ -52,8 +52,7 @@ def supervisor_keys(cfg: dict) -> set[str]:
 
 
 def supervisor_verifier(cfg: dict):
-    keys = supervisor_keys(cfg)
-    history = {"loaded": False, "events": []}
+    history = {"signature": None, "events": [], "verdicts": {}}
 
     def historical(comment: dict, claimed: str) -> bool:
         created = str(comment.get("created_at") or "").strip()
@@ -62,21 +61,42 @@ def supervisor_verifier(cfg: dict):
         if (sessionkeys.role_of(claimed) != "supervisor"
                 or not sessionkeys.has_random_suffix(claimed)):
             return False
-        if not history["loaded"]:
-            try:
-                path = session_events.resolve_events_path(cfg)
+        sessions = session_ledger.load_sessions(cfg)
+        entry = sessions.get(claimed) or {}
+        sid = str(entry.get("id") or entry.get("session") or "")
+        if not sid:
+            return False
+        try:
+            path = session_events.resolve_events_path(cfg)
+            signature = tuple((str(p), p.stat().st_mtime_ns, p.stat().st_size)
+                              for p in session_events.segments(path))
+            if signature != history["signature"]:
                 history["events"] = session_events.load_events(path)
-            except Exception:  # noqa: BLE001 - an unreadable history fails closed
-                history["events"] = []
-            history["loaded"] = True
+                history["signature"] = signature
+                history["verdicts"] = {}
+        except Exception:  # noqa: BLE001 - an unreadable history fails closed
+            history["events"] = []
+            history["verdicts"] = {}
+            return False
+        cache_key = (claimed, created)
+        if cache_key in history["verdicts"]:
+            return history["verdicts"][cache_key]
         state = session_events.replay(history["events"], created)
-        return claimed in session_events.active_keys(state)
+        rec = (state.get("sessions") or {}).get(sid) or {}
+        if not rec or rec.get("archived"):
+            result = False
+        else:
+            role = str(rec.get("role") or "")
+            result = (role == "supervisor" if role else
+                      sessionkeys.role_of(str(rec.get("created_key") or "")) == "supervisor")
+        history["verdicts"][cache_key] = result
+        return result
 
     def verify(comment: dict) -> bool:
         claimed = claimed_key(comment)
         if not claimed:
             return False
-        if claimed in keys:
+        if claimed in supervisor_keys(cfg):
             return True
         return historical(comment, claimed)
     return verify
