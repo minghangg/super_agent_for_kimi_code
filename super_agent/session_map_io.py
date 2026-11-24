@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 LOCK_NAME = "session_map.lock"
@@ -72,39 +73,123 @@ def read_locked(path: Path) -> str:
     return _read_bytes(path)
 
 
-def read_map(path: Path) -> dict:
-    """Read a map under the lock; ``{}`` when it is absent or unparseable.
-
-    A reader degrades to ``{}`` on purpose (it must keep working), which is
-    exactly why a writer never uses this function — see
-    ``session_map_store.load_map_for_write``.
-    """
-    lock = _lock_class()
-    with lock(Path(path).parent / LOCK_NAME):
-        text = _read_bytes(Path(path))
-    try:
-        data = json.loads(text)
-    except ValueError:
-        return {}
-    return data if isinstance(data, dict) else {}
+# ``ReplaceFileW``/``os.replace`` swap the name, so for a few microseconds the
+# name can be absent on Windows. That window is not a torn read -- the bytes are
+# always one whole version -- but a reader that treats "absent" as "no keys"
+# reports every key as missing, which is the silent error #129 is about. So a
+# reader retries briefly and then says "unreadable", never "empty".
+# The swap window is microseconds; a handful of sub-millisecond
+# retries covers it without turning a missing file into a stall.
+# ``os.replace`` is atomic with no name gap (measured: 0 gaps in 300 swaps).
+# ``ReplaceFileW`` -- the fallback used when a reader holds the file -- does have
+# a short gap, so the retries below are sized for it and cost nothing on the
+# normal path (the first attempt succeeds and never sleeps).
+READ_ATTEMPTS = 8
+READ_BACKOFF_S = 0.002
+# A read that lands during a swap must not be counted as "unreadable" in one
+# breath: the first attempt is free, so the retries cost nothing when the file
+# is simply there.
 
 
 def read_json(path: Path):
-    """Read a map under the lock, returning ``None`` when it cannot be read."""
-    lock = _lock_class()
-    try:
-        with lock(Path(path).parent / LOCK_NAME):
-            text = _read_bytes(Path(path))
-    except (OSError, ValueError):
+    """One consistent view of a map, or ``None`` when it truly cannot be read.
+
+    ``None`` and ``{}`` are different answers and callers must be able to tell
+    them apart: "no keys" and "could not read" lead to opposite conclusions
+    (a false ``keys_missing_in_events`` versus a clean ledger). Retries ride out
+    the swap window without taking a lock, so the writer never depends on
+    readers cooperating (#129 direction B).
+    """
+    path = Path(path)
+    last: Exception | None = None
+    for attempt in range(READ_ATTEMPTS):
+        try:
+            data = json.loads(_read_bytes(path))
+        except (OSError, ValueError) as exc:
+            last = exc
+            time.sleep(READ_BACKOFF_S * (attempt + 1))
+            continue
+        return data
+    if isinstance(last, FileNotFoundError) and not path.exists():
         return None
-    try:
-        return json.loads(text)
-    except ValueError:
-        return None
+    return None
+
+
+def read_map(path: Path) -> dict:
+    """Reader view: the map, or ``{}`` only when the file genuinely is empty.
+
+    An unreadable file returns ``{}`` for callers that only need "best effort"
+    (the context gate, the monitor), but every caller that draws a conclusion
+    from an *empty* answer must use :func:`read_json` instead -- see
+    ``session_events.read_sessions_text``.
+    """
+    data = read_json(path)
+    return data if isinstance(data, dict) else {}
 
 
 def read_text_shared(path: Path) -> str:
-    """Raw text of a map, read under the lock. Raises on an unreadable file."""
-    lock = _lock_class()
-    with lock(Path(path).parent / LOCK_NAME):
-        return _read_bytes(Path(path))
+    """Raw text of a map. Raises when the file cannot be read.
+
+    Name kept for the callers that already use it; it no longer takes the lock
+    (see :func:`read_unlocked` for why the writer does not need it to).
+    """
+    return read_unlocked(path)
+
+
+def read_unlocked(path: Path) -> str:
+    """Read a map without taking the map lock, riding out the swap window.
+
+    Safe because the writer never overwrites the target in place: it writes a
+    temporary file and swaps it in with ``ReplaceFileW``/``os.replace``, so this
+    handle always sees one whole version of the file -- the old one or the new
+    one, never a torn blend. The *name* can be momentarily absent during the
+    swap, so the read retries that window instead of reporting an empty file.
+
+    Deliberately lock-free: a reader that had to hold the write lock would be
+    part of the correctness argument for the writer, and direction B requires
+    the writer to stand on its own.
+    """
+    text = read_text_retry(path)
+    if text is None:
+        raise FileNotFoundError(f"持续读不到 {path}（可能被外部进程独占）")
+    return text
+
+
+def read_text_retry(path: Path) -> str | None:
+    """Bytes of a map, retried across the swap window; ``None`` if never readable.
+
+    ``None`` means "unreadable", never "empty": the empty file is returned as
+    ``""`` and parsed by the caller, which is what keeps ``reconcile`` from
+    reporting an absent name as an empty ledger.
+    """
+    path = Path(path)
+    # No ``exists()`` pre-check: the writer can swap the name between the check
+    # and the open (TOCTOU), which is exactly the window this function exists to
+    # absorb. A genuinely absent file fails the very first attempt too, so the
+    # check bought nothing and cost a race.
+    for attempt in range(READ_ATTEMPTS):
+        try:
+            return _read_bytes(path)
+        except FileNotFoundError:
+            # Absent: either the file was never created, or the writer is in the
+            # middle of swapping it. Retry briefly, then report "unreadable".
+            if attempt + 1 >= READ_ATTEMPTS:
+                break
+            time.sleep(READ_BACKOFF_S * (attempt + 1))
+        except (OSError, ValueError):
+            return None      # a real read error is not a swap window
+    return None
+
+def read_sessions_text(path: Path) -> str | None:
+    """One consistent view of a map; ``None`` when it cannot be read at all.
+
+    ``None`` and ``"{}"`` are different answers and callers must be able to tell
+    them apart: the second one is a real (empty) ledger, the first is "I could
+    not read this", which must never be reported as "no keys" -- that is what
+    made ``reconcile`` invent ``keys_missing_in_events`` (#129 cid 7142911506).
+
+    Lock-free by design: the writer swaps the file atomically, so this read sees
+    one whole version; the retry covers the moment the name is absent during
+    the swap.
+    """
+    return read_text_retry(path)

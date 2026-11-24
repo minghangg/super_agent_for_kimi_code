@@ -61,86 +61,121 @@ class _StateDir(unittest.TestCase):
 
 
 class Counterexample5OpenReader(_StateDir):
-    """P0-1 ①: an open reader must not turn a write into a failure."""
+    """Direction B: the writer alone guarantees atomicity, readers hold no lock."""
 
-    def test_a_transient_refusal_is_retried_and_the_write_lands(self):
-        from super_agent import session_broker
+    def test_a_reader_uses_a_window_that_does_not_outlive_the_read(self):
+        """The reader must not hold the file open while doing anything else.
 
-        calls = {"n": 0}
-        real = store.os.replace
-
-        def flaky(src, dst):
-            calls["n"] += 1
-            if calls["n"] <= 3:
-                raise _winerror5(str(dst))
-            return real(src, dst)
-
-        with mock.patch.object(store.os, "replace", flaky):
-            mode = session_map_store.write_with_retry(self.sessions, '{"x": 1}')
-        self.assertEqual(mode, "rename")
-        self.assertGreaterEqual(calls["n"], 4)
-        self.assertEqual(self.read(self.sessions), {"x": 1})
-
-    def test_a_reader_using_the_shared_open_does_not_block_the_write(self):
-        """QA P0-1 ①: a reader holding the map open must not fail the write.
-
-        The reader is the repo's own shared-open reader. It takes the lock, so
-        the writer's in-place path (the only one Windows allows while a foreign
-        handle is open) is invisible to it: the write lands and the read is
-        never torn.
+        On this host ``os.replace`` is refused while **any** handle is open,
+        shared flags included (measured: WinError 5 with our own reader). So the
+        reader's contract is that it closes immediately after the bytes are in
+        memory -- which is what makes a bind succeed while reads are happening.
         """
         from super_agent import session_map_io, session_broker
 
-        with session_map_io.open_text(self.sessions) as held:
-            self.assertIsNotNone(held.read(1))
-            session_broker.set_key("qa-b", FULL_SID)
+        text = session_map_io.read_json(self.sessions)      # opens and closes
+        self.assertEqual(text, {"pre": {"id": FULL_SID}})
+        session_broker.set_key("qa-b", FULL_SID)
         self.assertEqual(self.read(self.sessions)["qa-b"]["id"], FULL_SID)
 
-    def test_an_external_plain_handle_is_ridden_out_by_the_retry(self):
-        """A plain ``open()`` handle (no delete sharing) must not lose the write.
+    def test_a_reader_holding_the_file_open_is_refused_not_degraded(self):
+        """An open reader at write time is refused -- the honest answer here."""
+        from super_agent import session_map_io, session_broker
 
-        Windows refuses to rename onto such a handle at all, so the write
-        degrades to the in-place path -- under the lock, so a same-repo reader
-        cannot observe a half-written file. Either way the key must land.
+        before = self.sessions.read_bytes()
+        with session_map_io.open_text(self.sessions) as held:
+            held.read(1)
+            with self.assertRaises(session_map_store.BrokerError):
+                session_broker.set_key("qa-b2", FULL_SID)
+        self.assertEqual(self.sessions.read_bytes(), before)
+
+    def test_a_foreign_plain_handle_is_refused_loudly_not_degraded(self):
+        """A plain ``open()`` holder defeats every atomic swap.
+
+        Measured here: with such a handle held, ``os.replace`` fails with
+        WinError 5 and ``ReplaceFileW`` fails too -- and while it retries it
+        leaves the name absent, so it is not used at all. Direction B requires
+        a loud refusal instead of a degraded write.
         """
         from super_agent import session_broker
 
+        before = self.sessions.read_bytes()
         handle = open(self.sessions, "rb")
         try:
             self.assertIsNotNone(handle.read(1))
-            session_broker.set_key("qa-c", FULL_SID)
+            with self.assertRaises(session_map_store.BrokerError) as caught:
+                session_broker.set_key("qa-c", FULL_SID)
         finally:
             handle.close()
-        self.assertEqual(self.read(self.sessions)["qa-c"]["id"], FULL_SID)
+        message = str(caught.exception)
+        self.assertIn("未写入任何内容", message)
+        self.assertIn("关闭该进程后重试", message)
+        self.assertEqual(self.sessions.read_bytes(), before)
+        self.assertFalse(self.sessions.with_name("sessions.json.tmp").exists())
 
-    def test_a_long_hold_degrades_under_the_lock_and_reports_it(self):
-        """Past the retry budget the write degrades -- never silently, never lost.
+    def test_the_write_lands_as_soon_as_the_foreign_handle_closes(self):
+        from super_agent import session_broker
 
-        The in-place path is only safe because readers take the same lock, so
-        it must be *reported*: a caller that cannot tell which path ran cannot
-        tell a degraded write from a normal one.
-        """
-        mode = session_map_store.write_with_retry(self.sessions, '{"y": 2}')
-        self.assertEqual(mode, "rename")
-        with mock.patch.object(store.os, "replace",
-                               lambda src, dst: (_ for _ in ()).throw(
-                                   _winerror5(str(dst)))):
-            mode = session_map_store.write_with_retry(self.sessions, '{"y": 3}')
-        self.assertEqual(mode, "inplace", "长持有被静默处理")
-        self.assertEqual(self.read(self.sessions), {"y": 3})
+        open(self.sessions, "rb").close()
+        session_broker.set_key("qa-c2", FULL_SID)
+        self.assertEqual(self.read(self.sessions)["qa-c2"]["id"], FULL_SID)
 
-    def test_retry_is_bounded(self):
-        """The attempt count is fixed: a held file cannot make the CLI hang."""
+    def test_no_degraded_write_path_exists_in_code(self):
+        """Direction B: no in-place write, and no second swap mechanism."""
+        import ast
+
+        source = Path(session_map_store.__file__).read_text(encoding="utf-8")
+        self.assertFalse(hasattr(session_map_store, "_inplace_write"))
+        self.assertFalse(hasattr(session_map_store, "write_with_retry"))
+        self.assertFalse(hasattr(session_map_store, "_replace_file_w"))
+        self.assertNotIn("ReplaceFileW(", source)
+
+        tree = ast.parse(source)
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Name) and func.id == "open"):
+                continue
+            mode = ""
+            if len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
+                mode = str(node.args[1].value)
+            for kw in node.keywords:
+                if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
+                    mode = str(kw.value.value)
+            if not any(ch in mode for ch in "wax+"):
+                continue
+            target = node.args[0] if node.args else None
+            name = target.id if isinstance(target, ast.Name) else ""
+            if "tmp" in name.lower() or "+" in mode:
+                continue
+            offenders.append((node.lineno, name, mode))
+        self.assertEqual(offenders, [], f"出现指向目标文件的写 open：{offenders}")
+
+    def test_a_permanent_refusal_changes_nothing(self):
+        before = self.sessions.read_bytes()
+        boom = mock.Mock(side_effect=OSError(5, "Access is denied"))
+        with mock.patch.object(store.os, "replace", boom):
+            with self.assertRaises(session_map_store.BrokerError) as caught:
+                session_map_store.write_atomic(self.sessions, '{"z": 3}')
+        self.assertIn("未写入任何内容", str(caught.exception))
+        self.assertEqual(self.sessions.read_bytes(), before)
+        self.assertFalse(self.sessions.with_name("sessions.json.tmp").exists())
+        self.assertGreaterEqual(boom.call_count, 1)
+
+    def test_the_normal_path_swaps_once(self):
         calls = {"n": 0}
         real = store.os.replace
 
-        def flaky(src, dst):
+        def counted(src, dst):
             calls["n"] += 1
             return real(src, dst)
 
-        with mock.patch.object(store.os, "replace", flaky):
-            session_map_store.write_with_retry(self.sessions, '{"z": 3}')
-        self.assertEqual(calls["n"], 1, "正常路径不该重试")
+        with mock.patch.object(store.os, "replace", counted):
+            session_map_store.write_atomic(self.sessions, '{"z": 4}')
+        self.assertEqual(calls["n"], 1, "正常路径只换一次")
+        self.assertEqual(self.read(self.sessions), {"z": 4})
 
 
 class Counterexample6HalfWrite(_StateDir):
@@ -258,6 +293,158 @@ class Counterexample8UnreadableMap(_StateDir):
         self.sessions.unlink()
         session_broker.set_key("qa-f", FULL_SID)
         self.assertEqual(self.read(self.sessions)["qa-f"]["id"], FULL_SID)
+
+
+
+class Counterexample9BareReaders(_StateDir):
+    """Supervisor cid 7142911506: bare readers must not see an empty ledger.
+
+    A lock-free reader is the normal case -- ``reconcile``, ``sessions_ledger
+    load``, the context gate. Under direction B the writer guarantees the
+    format, so these readers need no lock; what they must never do is turn a
+    swap window into "no keys", which ``reconcile`` reports as every key being
+    missing.
+    """
+
+    def test_a_lock_free_reader_never_sees_an_empty_or_torn_map(self):
+        """Every successful read is one whole version: never empty, never torn.
+
+        The reader opens, reads and closes (that is the production shape -- see
+        ``session_map_io.read_json``). If a swap is in flight the open fails,
+        which is reported as "unreadable" and is *not* the same answer as "no
+        keys". A write refused because a reader is mid-open is also allowed here:
+        direction B says that must be loud, and a bind that fails loudly is not
+        a silent loss.
+        """
+        import threading
+
+        stats = {"ok": 0, "unreadable": 0, "empty": 0, "torn": 0, "refused": 0}
+        stop = threading.Event()
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    raw = self.sessions.read_text(encoding="utf-8")
+                except OSError:
+                    stats["unreadable"] += 1
+                    continue
+                if not raw:
+                    stats["empty"] += 1
+                    continue
+                try:
+                    json.loads(raw)
+                except ValueError:
+                    stats["torn"] += 1
+                    continue
+                stats["ok"] += 1
+
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+        try:
+            for n in range(60):
+                try:
+                    session_map_store.write_atomic(
+                        self.sessions,
+                        json.dumps({"pre": {"id": FULL_SID}, "n": n}))
+                except session_map_store.BrokerError:
+                    stats["refused"] += 1
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+        self.assertGreater(stats["ok"], 0)
+        self.assertEqual(stats["empty"], 0, "裸读读到了空台账")
+        self.assertEqual(stats["torn"], 0, "裸读读到了半写")
+        # Whatever was refused must have left the file parseable.
+        self.assertEqual(json.loads(self.sessions.read_text(encoding="utf-8"))["pre"]["id"],
+                         FULL_SID)
+
+    def test_read_json_separates_unreadable_from_empty(self):
+        from super_agent import session_map_io
+
+        self.sessions.write_text("{}", encoding="utf-8")
+        self.assertEqual(session_map_io.read_json(self.sessions), {},
+                         "空文件必须报 {} 而不是 None")
+        self.sessions.write_text("{ broken", encoding="utf-8")
+        self.assertIsNone(session_map_io.read_json(self.sessions))
+        self.sessions.unlink()
+        self.assertIsNone(session_map_io.read_json(self.sessions))
+
+    def test_reconcile_does_not_invent_missing_keys_under_concurrent_writes(self):
+        """The reported failure: an unreadable ledger made every key 'missing'."""
+        import threading
+
+        from super_agent import session_map_io
+
+        self.sessions.write_text(
+            json.dumps({"a": {"id": FULL_SID}, "b": {"id": FULL_SID}}),
+            encoding="utf-8")
+        events = self.state / "events.jsonl"
+        events.write_text("", encoding="utf-8")
+
+        stop = threading.Event()
+        seen_empty = []
+
+        def writer():
+            n = 0
+            while not stop.is_set():
+                n += 1
+                session_map_store.write_atomic(
+                    self.sessions,
+                    json.dumps({"a": {"id": FULL_SID}, "b": {"id": FULL_SID},
+                                "n": n}))
+
+        thread = threading.Thread(target=writer, daemon=True)
+        thread.start()
+        from super_agent import session_events
+
+        try:
+            for _ in range(40):
+                text = session_map_io.read_sessions_text(self.sessions)
+                if text is None:
+                    seen_empty.append("unreadable")
+                elif not session_events.load_sessions_ledger(self.sessions):
+                    seen_empty.append("empty")
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+        self.assertEqual(seen_empty, [], "reconcile 的读点出现空/不可读台账")
+        self.assertEqual(session_map_io.read_json(self.sessions)["a"]["id"], FULL_SID)
+
+    def test_a_new_lock_free_read_point_still_cannot_see_a_half_write(self):
+        """Counterexample 3: a fresh ``read_text`` point, no lock, no torn read."""
+        import threading
+
+        stop = threading.Event()
+        torn = []
+        big = {"pad": "x" * 4000}
+
+        def writer():
+            n = 0
+            while not stop.is_set():
+                n += 1
+                payload = dict(big, n=n)
+                session_map_store.write_atomic(self.sessions, json.dumps(payload))
+
+        thread = threading.Thread(target=writer, daemon=True)
+        thread.start()
+        try:
+            for _ in range(200):
+                try:
+                    raw = self.sessions.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                if not raw:
+                    torn.append("empty")
+                    continue
+                try:
+                    json.loads(raw)
+                except ValueError:
+                    torn.append("torn")
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+        self.assertEqual(torn, [], f"新增裸读点读到半写：{torn[:5]}")
+
 
 
 if __name__ == "__main__":

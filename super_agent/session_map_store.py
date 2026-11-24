@@ -30,9 +30,10 @@ LOCK_TIMEOUT_S = 15.0
 # A reader that holds the file open longer than the whole retry window is not a
 # torn read waiting to happen; it is a refusal the caller must see, so no
 # in-place fallback is used: that would bring the torn reads back (#129 P0-1).
-REPLACE_ATTEMPTS = 6
-REPLACE_BACKOFF_S = 0.02
-REPLACE_TOTAL_BUDGET_S = 1.0
+# One swap attempt, no retry loop. Direction B (#129 cid 7142911506) asks for a
+# loud failure rather than a writer that waits, and a retry window would also
+# hold the map lock for up to a second -- which every other bind pays for.
+REPLACE_ATTEMPTS = 1
 
 
 class BrokerError(RuntimeError):
@@ -109,65 +110,59 @@ class FileLock:
         return False
 
 
-def write_with_retry(path: Path, text: str) -> str:
-    """Write a map: rename, retried; then an in-place write **under the lock**.
+def atomic_replace(tmp: Path, path: Path) -> None:
+    """Swap the temporary file into place with ``os.replace`` -- nothing else.
 
-    Windows returns ``WinError 5`` from ``os.replace`` while any process holds
-    the target open for reading, and a plain ``open()`` holder has no delete
-    sharing at all -- measured on this machine: rename, ``MoveFileExW``, and
-    delete-then-rename all fail while such a handle is open, whatever share
-    flags the reader asked for. So a retry alone cannot satisfy QA P0-1 ①.
+    Only one mechanism is used, and it is the atomic one: the target name always
+    refers to one whole file, so a reader never sees a torn or absent map.
 
-    Two behaviours, both required:
-
-    * **rename first**, retried with backoff -- it is what removed the torn
-      reads a plain overwrite produced;
-    * **in-place write as the last resort**, which is the baseline behaviour a
-      single open reader used to get for free. It is safe here because readers
-      take the same lock (:func:`read_text_shared`), so no reader can observe a
-      half-written file: the torn read that made an in-place write unacceptable
-      is prevented by the lock, not by the rename.
-
-    Returns ``"rename"`` or ``"inplace"`` so a degraded write is reported.
+    A Windows reader that holds the target open without delete sharing makes
+    this swap impossible. That case is a **refusal**, not a cue to write in
+    place: an in-place overwrite is what produced torn reads, and
+    ``ReplaceFileW`` (the other candidate) was measured to leave the name absent
+    ~1000 times per 300 swaps under a concurrent reader. Both are therefore not
+    used, per #129 direction B (cid 7142911506).
     """
-    last: OSError | None = None
-    deadline = time.time() + REPLACE_TOTAL_BUDGET_S
-    for attempt in range(REPLACE_ATTEMPTS):
-        try:
-            atomic_write_text(path, text)
-            return "rename"
-        except PermissionError as exc:
-            last = exc
-            wait = REPLACE_BACKOFF_S * (2 ** attempt)
-            if attempt + 1 >= REPLACE_ATTEMPTS or time.time() + wait > deadline:
-                break
-            time.sleep(wait)
     try:
-        _inplace_write(path, text)
+        os.replace(tmp, path)
     except OSError as exc:
         raise BrokerError(
-            f"{path.name} 正在被读取，rename（{last}）与原地写（{exc}）都失败，"
-            f"未写入任何内容") from exc
-    return "inplace"
+            f"{path.name} 无法原子替换（{exc}）；未写入任何内容。"
+            f"若提示文件被占用：有外部进程用非共享方式打开了它，"
+            f"关闭该进程后重试（写入端不会原地覆盖）") from exc
 
 
-def _inplace_write(path: Path, text: str) -> None:
-    """Overwrite the file in place. Only ever called with the map lock held.
+def write_atomic(path: Path, text: str) -> None:
+    """Write through a temporary file and swap it in atomically.
 
-    Readers take the same lock, so this cannot be observed half-written by any
-    process in this repo. Its purpose is narrow: a foreign handle opened without
-    delete sharing makes a rename impossible on Windows, and failing the write
-    there would reintroduce the silent loss this change exists to remove.
+    One attempt, no retry loop: a writer that waits holds the map lock, which
+    every other bind pays for, and direction B asks for a loud failure rather
+    than a wait. A failed write leaves the old file byte-identical and removes
+    the temporary file -- it is never degraded into an in-place overwrite.
     """
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(text)
-        fh.flush()
-        os.fsync(fh.fileno())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+
+    def _fill() -> None:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+
+    try:
+        _fill()
+        atomic_replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def read_text_shared(path: Path) -> str:
-    """Read a map under the lock (shared open + lock live in session_map_io)."""
-    return session_map_io.read_text_shared(path)
+    """Read a map without any lock, riding out the writer's swap window.
+
+    Forwarder to :mod:`session_map_io`; the retry is what keeps a reader from
+    reporting "unreadable" for the microseconds a swap takes (#129 direction B).
+    """
+    return session_map_io.read_text_retry(path) or ""
 
 
 def load_map(path: Path) -> dict:
@@ -199,11 +194,14 @@ def load_map_for_write(path: Path) -> dict:
 def save_and_verify(path: Path, data: dict, sort_keys: bool) -> str:
     """Atomic save, then read back and compare: a mismatch is an error.
 
-    Returns which write path ran (``"rename"`` or ``"inplace"``) so a caller
-    can report the degraded case instead of hiding it.
+    Only one write path exists: temporary file, then atomic replace. A caller
+    cannot get a degraded in-place write, so the return value is always
+    ``"atomic"`` -- kept so the signature stays stable for callers that logged
+    the old mode.
     """
-    mode = write_with_retry(path, json.dumps(data, ensure_ascii=False, indent=2,
-                                             sort_keys=sort_keys))
+    write_atomic(path, json.dumps(data, ensure_ascii=False, indent=2,
+                                  sort_keys=sort_keys))
+    mode = "atomic"
     try:
         written = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:

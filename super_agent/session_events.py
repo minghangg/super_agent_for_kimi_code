@@ -372,11 +372,14 @@ def active_keys(state: dict) -> dict:
 
 
 def load_sessions_ledger(path: Path) -> dict:
-    """``sessions.json`` -> ``{key: sid}`` (flat, no filtering)."""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    """``sessions.json`` -> ``{key: sid}`` (flat, no filtering).
+
+    Unreadable yields ``{}``; ``reconcile`` checks readability separately so it
+    never mistakes "could not read" for "no keys" (#129 direction B).
+    """
+    from . import session_map_io
+
+    data = json.loads(session_map_io.read_sessions_text(path) or "{}")
     if not isinstance(data, dict):
         return {}
     out = {}
