@@ -80,8 +80,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import (at_serve, envelope, flow as flow_mod, github_source, health, issuekey,
-               markers, needs, requirement_auth, requirements, session_events, session_ledger,
-               sessionkeys)
+               markers, needs, requirement_auth, requirements, session_broker,
+               session_events, session_ledger, sessionkeys)
 from . import assignments as asg_mod
 from .engine_parts import claims as walk_claims
 from .engine_parts import pause as read_pause_mod
@@ -3793,17 +3793,17 @@ class Engine:
                 "external_actions_total": total}
 
     # ------------------------------------------------------- assignments (ISS-20)
-    def _issue_sessions_path(self) -> Path:
-        """``issue_sessions.json`` beside ``sessions.json`` (cross-check only)."""
-        _events, sessions = self._session_stream()
-        return sessions.parent / "issue_sessions.json"
-
     def _load_issue_sessions(self) -> dict:
+        """Read the map through the broker's one reader (#129), not a second chain.
+
+        An undeclared root is ``{}``, the same answer the inline reader gave:
+        ``SessionStreamNotConfigured`` is a ``FileNotFoundError``, and the map is
+        a cross-check, not the source of truth.
+        """
         try:
-            data = json.loads(self._issue_sessions_path().read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            return session_broker.read_issue_sessions(self.cfg)
+        except OSError:
             return {}
-        return data if isinstance(data, dict) else {}
 
     def _issue_session_keys(self, thread: str) -> list[str]:
         """Candidate ``issue_sessions.json`` keys for ``thread``, strongest first.

@@ -923,8 +923,7 @@ def cmd_close(args, ctx) -> int:
         if skipped:
             print(f"（{skipped} 个会话未归档：归档命令未配置，登记保留）")
             return 0
-        db.pop(key, None)                # every archive succeeded
-        ledger_mod.save_issue_sessions(db, cfg=ctx.cfg)
+        ledger_mod.close_session(key, cfg=ctx.cfg)
     elif rec and args.dry_run:
         print(f"（dry-run：本单登记 {key} 有 {len(rec)} 个会话，未归档、未删登记）")
     elif not rec:
@@ -1034,14 +1033,8 @@ def cmd_bind(args, ctx) -> int:
               file=sys.stderr)
         print(f"       {problem}", file=sys.stderr)
     key = f"{args.project}#{args.issue}"
-    db = ledger_mod.load_issue_sessions(cfg=ctx.cfg)
-    rec = db.setdefault(key, {})
-    rec[args.bind_role] = {
-        "session": args.session,
-        "name": args.name or "",
-        "bound": dt.datetime.now().isoformat(timespec="seconds"),
-    }
-    ledger_mod.save_issue_sessions(db, cfg=ctx.cfg)
+    ledger_mod.bind_session(key, args.bind_role, args.session,
+                            name=args.name or "", cfg=ctx.cfg)
     try:
         ledger_mod.emit("session.bound", cfg=ctx.cfg, issue=int(args.issue),
                         role=args.bind_role, sid=args.session,

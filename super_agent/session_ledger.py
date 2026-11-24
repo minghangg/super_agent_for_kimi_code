@@ -116,14 +116,6 @@ def load_issue_sessions(cfg: dict | None = None) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def save_issue_sessions(data: dict, cfg: dict | None = None) -> Path:
-    path = issue_sessions_path(cfg)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True),
-                    encoding="utf-8")
-    return path
-
-
 def load_sessions(cfg: dict | None = None) -> dict:
     try:
         data = json.loads(sessions_path(cfg).read_text(encoding="utf-8"))
@@ -139,25 +131,33 @@ def register_session_key(name: str, sid: str, cfg: dict | None = None) -> str:
     event has already been emitted by ``bind``. Idempotent, and a failure is
     reported instead of raised -- the registration is not a precondition of
     the binding itself.
+
+    The write itself belongs to :mod:`super_agent.session_broker` (#129): this
+    module no longer rewrites the whole map, so two CLIs binding different keys
+    cannot drop each other's row.
     """
-    key = str(name or "").strip()
-    if not key:
-        return ""
-    path = sessions_path(cfg)
-    data = load_sessions(cfg)
-    old = data.get(key)
-    old_sid = str((old or {}).get("id") or "") if isinstance(old, dict) else ""
-    data[key] = {"id": sid,
-                 "updated": dt.datetime.now().strftime("%Y-%m-%dT%H:%M"),
-                 "note": (old.get("note") or "") if isinstance(old, dict) else ""}
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-                        encoding="utf-8")
-    except OSError as exc:
-        return f"[警告] 登记 {key} 失败：{type(exc).__name__}: {exc}"
-    verb = "已改指" if old_sid and old_sid != sid else "已登记"
-    return f"{verb}会话键 {key} → {sid[:12]}"
+    from . import session_broker
+
+    return session_broker.register_key(name, sid, cfg=cfg)
+
+
+def bind_session(thread: str, role: str, sid: str, name: str = "",
+                 extra: dict | None = None, cfg: dict | None = None) -> dict:
+    """Record ``issue_sessions[thread][role]`` (and the key, when named).
+
+    Forwarder: the write belongs to :mod:`super_agent.session_broker`, so
+    ``bind`` and ``start`` cannot race the engine's reader (#129).
+    """
+    from . import session_broker
+
+    return session_broker.bind_role(thread, role, sid, name=name, extra=extra, cfg=cfg)
+
+
+def close_session(thread: str, cfg: dict | None = None) -> dict:
+    """Drop ``issue_sessions[thread]`` once every bound session is archived."""
+    from . import session_broker
+
+    return session_broker.close_thread(thread, cfg=cfg)
 
 
 def fixed_session_ids(is_fixed, cfg: dict | None = None) -> dict:

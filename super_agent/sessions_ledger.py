@@ -89,10 +89,12 @@ def load(root=None):
     return data if isinstance(data, dict) else {}
 
 
-def save(data, root=None):
-    path = EV.sessions_path(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+def _broker(root):
+    """The write side for both maps (#129); its root is the caller's ``state_dir``."""
+    from . import session_broker
+
+    cfg = None if root is None else {"engine": {"session_state_dir": str(root)}}
+    return session_broker, cfg
 
 
 def cmd_list(args):
@@ -138,14 +140,10 @@ def cmd_set(args):
         print(f"  {problem}", file=sys.stderr)
     data = load(root)
     old = data.get(args.assistant)
-    old_sid = str(old.get("id") or "") if isinstance(old, dict) else ""
-    data[args.assistant] = {
-        "id": args.session_id,
-        "updated": datetime.now().strftime("%Y-%m-%dT%H:%M"),
-        "note": old.get("note", "") if isinstance(old, dict) else "",
-    }
-    save(data, root)
+    broker, cfg = _broker(root)
+    broker.set_key(args.assistant, args.session_id, cfg=cfg)
     role = role_of(args.assistant)
+    old_sid = str(old.get("id") or "") if isinstance(old, dict) else ""
     _emit_soft("session.key_changed", root=root, key=args.assistant, sid=args.session_id,
                role=role, **({"from_sid": old_sid} if old_sid else {}))
     if old_sid and old_sid != args.session_id:
@@ -162,8 +160,8 @@ def cmd_rm(args):
     if args.assistant not in data:
         print(f"无此助手: {args.assistant}")
         return 1
-    old = data.pop(args.assistant)
-    save(data, root)
+    broker, cfg = _broker(root)
+    old = broker.remove_key(args.assistant, cfg=cfg)
     old_sid = str(old.get("id") or "") if isinstance(old, dict) else ""
     _emit_soft("session.key_changed", root=root, key=args.assistant,
                role=role_of(args.assistant), **({"from_sid": old_sid} if old_sid else {}))
@@ -171,50 +169,29 @@ def cmd_rm(args):
     return 0
 
 
-def _retire_issue_sessions(root, old_sid: str, new_sid: str, stamp: str) -> list[str]:
-    """把 `issue_sessions.json` 里两处指向旧 sid 的角色改指新 sid。
+def _retire_maps(root, old_sid: str, new_sid: str, stamp: str) -> tuple[list[str], list[str]]:
+    """Repoint every position naming ``old_sid`` in **both** maps, under one lock.
 
-    形状：`{"<项目>#<issue>": {"qa": {"session": sid}, "worker": {"session": sid}}}`
-    （`gh_issue._sessions_db`／`worker_watch._tracked_workers` 都按这个读）。
-    路径走 `sess_events.issue_sessions_path(root)`，所以隔离 state-dir 下只动自己的。
+    Two shapes in ``sessions.json`` (``{"id": sid}`` and the
+    ``{"worker": {"session": sid}}`` spelling ``worker_watch`` reads) and one in
+    ``issue_sessions.json`` (``{"<项目>#<issue>": {"qa": {"session": sid}}}``,
+    read by ``gh_issue``).
+    Missing any of them leaves a session that is still fed, so the whole
+    traversal lives in :func:`session_broker.retire` — one lock, read back.
     """
     path = EV.issue_sessions_path(root)
-    if not path.is_file():
-        return []
-    try:
-        db = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        print(f"警告：{path} 读不出，跳过（{old_sid[:12]}… 可能还留在里面）",
-              file=sys.stderr)
-        return []
-    if not isinstance(db, dict):
-        return []
-    moved = []
-    for issue_key, roles in db.items():
-        if not isinstance(roles, dict):
-            continue
-        touched = False
-        for role, rec in list(roles.items()):
-            if not isinstance(rec, dict):
-                continue
-            if str(rec.get("session") or "") != old_sid:
-                continue
-            rec = dict(rec)
-            rec["session"] = new_sid
-            rec["updated"] = stamp
-            roles[role] = rec
-            touched = True
-            moved.append(f"{issue_key}.{role}.session")
-        if touched:
-            db[issue_key] = roles
-    if not moved:
-        return []
-    path.write_text(json.dumps(db, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-                    encoding="utf-8")
-    for issue_key in {m.rsplit(".", 2)[0] for m in moved}:
-        _emit_soft("session.key_changed", root=root, key=issue_key, sid=new_sid,
-                   role="worker", from_sid=old_sid)
-    return moved
+    if path.is_file():
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            # The corrupt file is left **as it is**: the broker only writes a map
+            # it actually changed, and an unreadable map reads as ``{}`` (no
+            # match), so no whole-map overwrite can erase it.
+            print(f"警告：{path} 读不出，本单的 issue_sessions 位置未改指"
+                  f"（{old_sid[:12]}… 可能还留在里面）", file=sys.stderr)
+    broker, cfg = _broker(root)
+    result = broker.retire(old_sid, new_sid, stamp=stamp, cfg=cfg)
+    return list(result["sessions"]), list(result["issues"])
 
 
 def cmd_retire(args):
@@ -244,48 +221,21 @@ def cmd_retire(args):
         return 2
 
     stamp = datetime.now().strftime("%Y-%m-%dT%H:%M")
-    data = load(root)
-    moved = []
-    for key, val in list(data.items()):
-        if not isinstance(val, dict):
-            continue
-        entry = dict(val)
-        touched = False
-        if str(entry.get("id") or "") == old_sid:
-            entry["id"] = new_sid
-            touched = True
-            moved.append(f"{key}.id")
-        # `decide_watch.supervisor_sid` 读 `session` 优先、`id` 兜底：只改 id 会让它继续用旧 sid
-        if str(entry.get("session") or "") == old_sid:
-            entry["session"] = new_sid
-            touched = True
-            moved.append(f"{key}.session")
-        worker = entry.get("worker")
-        if isinstance(worker, dict) and str(worker.get("session") or "") == old_sid:
-            worker = dict(worker)
-            worker["session"] = new_sid
-            entry["worker"] = worker
-            touched = True
-            moved.append(f"{key}.worker.session")
-        if not touched:
-            continue
-        entry["updated"] = stamp
-        entry["note"] = (entry.get("note") or "") + f" [retired {old_sid[:12]}]"
-        data[key] = entry
-    if moved:
-        save(data, root)
-        for key in {m.rsplit(".", 1)[0] for m in moved}:
-            _emit_soft("session.key_changed", root=root, key=key, sid=new_sid,
-                       role=role_of(key), from_sid=old_sid)
+    # 两本台账一次改完：`sessions.json` 的 `id`/`session`/`worker.session` 与
+    # `issue_sessions.json` 的 `role.session` 都在 broker 的同一把锁里遍历，
+    # 只改其中一本 = 留一条活路（ISS-29 同区第 1 件）。
+    moved, issue_moved = _retire_maps(root, old_sid, new_sid, stamp)
+    for key in {m.rsplit(".", 1)[0] for m in moved}:
+        _emit_soft("session.key_changed", root=root, key=key, sid=new_sid,
+                   role=role_of(key), from_sid=old_sid)
+    for issue_key in {m.rsplit(".", 2)[0] for m in issue_moved}:
+        _emit_soft("session.key_changed", root=root, key=issue_key, sid=new_sid,
+                   role="worker", from_sid=old_sid)
+    shown_moved = moved + issue_moved
 
-    # `issue_sessions.json` 是**第二本台账**：`{项目#issue: {qa:{session}, worker:{session}}}`
-    # （`gh_issue.binding` 读它，`worker_watch._tracked_workers` 也认这个形状）。
-    # 只改 `sessions.json` = 留了一条活路——PM 实测该文件原地不动（ISS-29 同区第 1 件）。
-    moved += _retire_issue_sessions(root, old_sid, new_sid, stamp)
-
-    rec = RS.retire(old_sid, key=(moved[0].rsplit(".", 1)[0] if moved else ""),
+    rec = RS.retire(old_sid, key=(shown_moved[0].rsplit(".", 1)[0] if shown_moved else ""),
                     replaced_by=new_sid, reason=args.reason, state_dir=root)
-    shown = ", ".join(moved) if moved else "(台账里没有位置指向它)"
+    shown = ", ".join(shown_moved) if shown_moved else "(台账里没有位置指向它)"
     print(f"已退役 {old_sid[:12]}… -> 新 {new_sid[:12]}…；改指位置：{shown}")
     print(f"退役清单：{RS.path(root)}（at={rec.get('at')}）")
     return 0

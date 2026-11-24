@@ -11,7 +11,6 @@ import sys
 import time
 import uuid
 import webbrowser
-from datetime import datetime
 from pathlib import Path
 
 from . import agent_config
@@ -110,12 +109,8 @@ def cmd_start(args) -> int:
                        model=args.model, effort=args.effort)
     sid = str(result["session_id"])
     session_ledger.register_session_key(name, sid, cfg=cfg)
-    database = session_ledger.load_issue_sessions(cfg)
-    key = f"{args.project}#{args.issue}"
-    record = database.setdefault(key, {})
-    record["at"] = {"session": sid, "name": name, "awaiting": True,
-                    "bound": datetime.now().isoformat(timespec="seconds")}
-    session_ledger.save_issue_sessions(database, cfg=cfg)
+    session_ledger.bind_session(f"{args.project}#{args.issue}", "at", sid,
+                                name=name, extra={"awaiting": True}, cfg=cfg)
     session_ledger.emit("session.bound", cfg=cfg, issue=args.issue,
                         role="at", sid=sid, key=name)
     print(f"AT ready: {key} -> {name} ({sid})")
