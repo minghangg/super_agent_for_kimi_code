@@ -94,7 +94,10 @@ class SourceCarriesTheKey(unittest.TestCase):
 
     def test_the_latest_page_reader_reads_the_session_token(self):
         live = github_source.LiveSource("owner/demo", token="")
+        # ``paged`` reads the ``Link`` header, so the stub answers both entry
+        # points: the rows and the pagination statement.
         live._get = lambda path, query=None: [self.ROW]
+        live._get_with_headers = lambda path, query=None: ([self.ROW], {})
         self.assertEqual(live.paged(1)[0]["session_key"], "pm-demo")
 
     def test_no_token_means_empty_in_every_reader(self):
@@ -103,6 +106,7 @@ class SourceCarriesTheKey(unittest.TestCase):
             github_source.LiveSource._normalise([row], 1)[0]["session_key"], "")
         live = github_source.LiveSource("owner/demo", token="")
         live._get = lambda path, query=None: [row]
+        live._get_with_headers = lambda path, query=None: ([row], {})
         self.assertEqual(live.comments(1)[0]["session_key"], "")
         self.assertEqual(live.paged(1)[0]["session_key"], "")
 

@@ -218,9 +218,63 @@ def _entry(projection: dict, rid: str) -> dict:
     })
 
 
+def set_history_complete(projection: dict, rid: str, complete: bool) -> None:
+    """Record whether the history behind this entry was read whole.
+
+    **Collection metadata, not requirement semantics.** It never enters
+    ``SEMANTIC_FIELDS``, so the hash of every package is unchanged by this
+    field - a projection refreshed from a truncated read must not look like a
+    different requirement. It lives on the entry (per requirement, per refresh)
+    because the answer describes *this* read of *this* thread's history, and it
+    is what ``dispatch_packet`` and ``cmd_approve`` consult before acting.
+
+    ``False`` removes the claim rather than writing ``False``: an entry that
+    was never read whole is indistinguishable from one that failed a read, and
+    a stored ``False`` would survive a later complete read that forgot to set
+    it back to True. Absent = unknown = refused.
+    """
+    entry = _entry(projection, rid)
+    if complete:
+        entry["history_complete"] = True
+    else:
+        entry.pop("history_complete", None)
+
+
+def history_complete(projection: dict, rid: str) -> bool:
+    """Only a stored literal ``True`` licenses approval or dispatch."""
+    entry = (projection.get("requirements") or {}).get(rid) or {}
+    return entry.get("history_complete") is True
+
+
+def require_history_complete(projection: dict, rid: str) -> None:
+    """Refuse unless the projection says the history was read whole."""
+    if not history_complete(projection, rid):
+        raise RequirementError(
+            "requirement history is incomplete: the projection was built from a "
+            "page walk that did not reach the last page, so packages may be "
+            "missing; re-read with a larger page budget (cli resume-read) and "
+            "sync again")
+
+
 def project_comments(comments: list[dict], previous: dict | None = None, *,
-                     package_verifier=None, approval_verifier=None) -> dict:
-    """Apply source-verified contracts and retry only unverified sources."""
+                     package_verifier=None, approval_verifier=None,
+                     history_read_complete: bool | None = None,
+                     history_scope: str | None = None) -> dict:
+    """Apply source-verified contracts and retry only unverified sources.
+
+    ``history_read_complete`` is the caller's statement about the walk that
+    produced ``comments``: was the whole listing read? It is stored per entry by
+    :func:`set_history_complete` and never enters the package semantics, so no
+    hash moves. ``None`` means "this caller does not collect" and leaves
+    whatever the ``previous`` projection stored untouched - a refresh that
+    cannot answer must not erase an answer it did not produce.
+
+    ``history_scope`` names the requirement this read was *about* (the engine
+    reads one issue's listing at a time, so it always knows). Without it the
+    claim goes to the requirements whose fences appeared in ``comments``; with
+    it, a thread that has published nothing yet still records that its own
+    history was read whole.
+    """
     projection = copy.deepcopy(previous) if previous else {
         "schema_version": SCHEMA_VERSION, "requirements": {}, "errors": [],
     }
@@ -248,6 +302,7 @@ def project_comments(comments: list[dict], previous: dict | None = None, *,
                     and str(old.get("revision")) == str(error.get("revision")))]
         container.setdefault("errors", []).append(error)
 
+    touched: set[str] = set()
     for comment in sorted(comments or [], key=lambda c: int(c.get("id") or 0)):
         try:
             cid = int(comment.get("id"))
@@ -265,6 +320,8 @@ def project_comments(comments: list[dict], previous: dict | None = None, *,
                 continue
             for raw in values:
                 rid = str(raw.get("requirement_id") or "")
+                if rid:
+                    touched.add(rid)
                 entry = _entry(projection, rid) if rid else None
                 verifier = package_verifier if kind == PACKAGE_FENCE else approval_verifier
                 if verifier is None or not verifier(comment):
@@ -319,6 +376,22 @@ def project_comments(comments: list[dict], previous: dict | None = None, *,
             seen.add(cid)
     for rid in list(projection.get("requirements") or {}):
         _refresh_entry(projection, rid)
+    if history_read_complete is not None:
+        # Only the requirements this batch actually read. The projection is
+        # shared by every issue in the index, so marking all of them would let
+        # a complete read of B stamp A's entry ``True`` while A had not one row
+        # in this snapshot - and a later truncated read of B would clear A's
+        # ``True`` the same way. Both directions are answered by the entry's own
+        # read; a batch that did not mention a requirement has no opinion on it.
+        scope = set(touched)
+        if history_scope:
+            scope.add(str(history_scope))
+        for rid in sorted(scope):
+            # ``_entry`` creates the row for a thread the projection has never
+            # seen: "this thread's history was read whole" is exactly the fact
+            # that makes its *first* package approvable, so it cannot wait for
+            # a fence to exist.
+            set_history_complete(projection, rid, bool(history_read_complete))
     projection["seen_comment_ids"] = sorted(seen)
     projection["projected_at"] = now()
     return projection
@@ -382,6 +455,10 @@ def dispatch_packet(projection: dict, requirement_id: str, assignment: str,
     package = current(projection, requirement_id)
     if package is None:
         raise RequirementError(f"requirement not found: {requirement_id}")
+    # The history claim comes first: an approval or a package found on a
+    # truncated read may be a package that a later page contradicts, and a
+    # dispatch is the one action that cannot be taken back.
+    require_history_complete(projection, requirement_id)
     if str(package.get("status")) not in ("approved", "dispatched"):
         raise RequirementError("requirement is READY but not approved")
     if (package.get("source_verified") is not True

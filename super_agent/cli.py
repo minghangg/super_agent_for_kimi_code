@@ -840,6 +840,34 @@ def cmd_resolve(args) -> int:
     return 1
 
 
+def cmd_resume_read(args) -> int:
+    """Lift a read pause: the only way back in after a hard cap.
+
+    Exit codes: 0 lifted (or already readable), 1 nothing matched, 2 unusable
+    arguments - the same split ``resolve`` documents, kept for the same reason:
+    a script must be able to tell "a person did it" from "there was nothing to
+    do".
+    """
+    cfg, store = _build(args)
+    if not str(args.by or "").strip():
+        print("resume-read: --by is required (who is lifting the pause)",
+              file=sys.stderr)
+        return 2
+    engine = _engine(cfg, store, _bus(cfg), source=NullSource(),
+                     session_api=_session_api(getattr(args, "session_api", None)))
+    out = engine.resume_read(args.issue, by=str(args.by), detail=str(args.note or ""),
+                             max_pages=getattr(args, "max_pages", None))
+    if out.get("number") is None:
+        print(f"resume-read: {out.get('reason')}", file=sys.stderr)
+        return 2
+    if not out.get("changed"):
+        print(f"resume-read: {out.get('reason')}", file=sys.stderr)
+        return 1
+    print(f"resume-read: #{out['number']} lifted ({out.get('reason')}) by {args.by}; "
+          f"the next round reads it again")
+    return 0
+
+
 def cmd_replay(args) -> int:
     cfg, store = _build(args)
     engine = _engine(cfg, store, _bus(cfg),
@@ -1247,6 +1275,21 @@ def build_parser() -> argparse.ArgumentParser:
                           help="show the session view (sid -> role/issue/profile)")
     p_replay.set_defaults(func=cmd_replay)
 
+    p_resume = sub.add_parser(
+        "resume-read", help="lift a read pause (the way back in after a hard cap)")
+    _add_common(p_resume, suppress=True)
+    _index_options(p_resume, suppress=True)
+    p_resume.add_argument("--issue", required=True,
+                          help="owner/name#12, #12, or 12 (every key form is lifted)")
+    p_resume.add_argument("--by", required=True,
+                          help="who is lifting the pause (recorded in the event)")
+    p_resume.add_argument("--note", default="",
+                          help="why the pause is over (recorded in the event)")
+    p_resume.add_argument("--max-pages", type=int, default=None,
+                          help="recorded only: the page budget the operator intends "
+                               "to use next (the config value still decides)")
+    p_resume.set_defaults(func=cmd_resume_read)
+
     p_rec = sub.add_parser("reconcile",
                           help="three-way session check: replay x sessions.json x live")
     _add_common(p_rec, suppress=True)
@@ -1306,7 +1349,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_recycle.set_defaults(func=cmd_recycle)
 
     for sub_parser in (p_once, p_run, p_status, p_doctor, p_unblock, p_resolve,
-                       p_replay, p_rec, p_brief, p_ctx, p_rep):
+                       p_replay, p_resume, p_rec, p_brief, p_ctx, p_rep):
         sub_parser.set_defaults(_has_common=True)
 
     return parser

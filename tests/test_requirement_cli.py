@@ -64,6 +64,7 @@ class PublishQuestionLink(unittest.TestCase):
             with mock.patch.object(requirement_cli, "_ctx", return_value=ctx), \
                     mock.patch.object(requirement_cli, "_comments", return_value=[]), \
                     mock.patch.object(requirement_cli, "_sync", return_value=({}, "owner/demo")), \
+                    mock.patch.object(requirement_cli, "_refuse_standard"), \
                     mock.patch.object(requirement_cli.issue_cli, "_call", return_value={"id": 100}), \
                     mock.patch.object(requirement_cli.issue_cli, "_ledger"), \
                     mock.patch.object(requirement_cli.session_ledger, "load_issue_sessions",
@@ -95,7 +96,8 @@ class ApprovalSource(unittest.TestCase):
         package["requirement_hash"] = req.requirement_hash(package)
         projection = req.project_comments(
             [{"id": 100, "body": req.fence(req.PACKAGE_FENCE, package)}],
-            package_verifier=lambda comment: True)
+            package_verifier=lambda comment: True,
+            history_read_complete=True)
         ctx = SimpleNamespace(
             roles=role_config.load("missing-roles.json"), projects={"demo": "owner/demo"},
             call={}, fetch={},
@@ -111,6 +113,8 @@ class ApprovalSource(unittest.TestCase):
         projection, ctx, args = self._fixture()
         with mock.patch.object(requirement_cli, "_ctx", return_value=ctx), \
                 mock.patch.object(requirement_cli, "_project", return_value=projection), \
+                mock.patch.object(requirement_cli.req, "load_projection",
+                                  return_value=projection), \
                 mock.patch.object(requirement_cli, "_sync"), \
                 mock.patch.object(requirement_cli.issue_cli, "_ledger"), \
                 mock.patch.object(requirement_cli.issue_cli, "_call", return_value={"id": 101}) as call:

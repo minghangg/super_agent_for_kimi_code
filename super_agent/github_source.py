@@ -27,6 +27,9 @@ from pathlib import Path
 
 from . import flow as flow_mod
 from . import markers
+from .paged_comments import (PagedBatch, PagedComments, comments_from,
+                             paged_batch, paged_result, walk_complete)
+from .paged_walk import link_last_page, locate_last_page, walk_listing
 
 API = "https://api.github.com"
 PER_PAGE = 100
@@ -112,13 +115,10 @@ class FixtureSource:
         return sorted(out, key=lambda c: c["id"])
 
     def paged(self, issue: int, *, since_id: int = 0, max_pages: int = 10) -> list[dict]:
-        """Fixture backend of the paged reader: all rows, one synthetic page.
-
-        The fixture is small and local, so "paging" is a no-op that still has to
-        honour the same contract: rows are ordered by id and ``since_id`` is a
-        hint, not a filter (the caller applies the cursor).
-        """
-        return self.comments(issue)
+        """One file is the whole listing, so this walk *is* complete."""
+        rows = self.comments(issue)
+        return PagedComments(rows, complete=True,
+                             pages=[{"page": 1, "rows": len(rows), "status": "ok"}])
 
     def title(self, issue: int) -> str:
         rec = (self.data.get("issues") or {}).get(str(issue)) or {}
@@ -144,6 +144,9 @@ class FixtureSource:
 class LiveSource:
     """Public GitHub REST, GET-only."""
 
+    #: Rows per page; the "short page ends the listing" rule reads this.
+    page_size = PER_PAGE
+
     def __init__(self, repo: str, *, token: str | None = None, timeout_s: float = 15.0,
                  on_hold_labels: list[str] | tuple[str, ...] | None = None):
         if not repo or "/" not in repo:
@@ -155,7 +158,8 @@ class LiveSource:
             str(x) for x in (on_hold_labels or ()) if str(x or "").strip())
         self._labels_by_issue: dict[int, list] = {}
 
-    def _get(self, path: str, query: dict | None = None):
+    def _get_with_headers(self, path: str, query: dict | None = None):
+        """``(payload, headers)``: the same GET, keeping the response headers."""
         url = API + path
         if query:
             url += "?" + urllib.parse.urlencode(query)
@@ -167,7 +171,8 @@ class LiveSource:
             req.add_header("Authorization", f"Bearer {self.token}")
         try:
             with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
-                return json.loads(resp.read().decode("utf-8", "replace"))
+                body = json.loads(resp.read().decode("utf-8", "replace"))
+                return body, dict(resp.headers)
         except urllib.error.HTTPError as exc:
             detail = ""
             try:
@@ -177,6 +182,9 @@ class LiveSource:
             raise SourceError(f"GitHub {exc.code} on {path}: {detail}") from None
         except (urllib.error.URLError, OSError, ValueError) as exc:
             raise SourceError(f"{type(exc).__name__}: {exc}") from None
+
+    def _get(self, path: str, query: dict | None = None):
+        return self._get_with_headers(path, query)[0]
 
     def issues(self, limit: int = 20) -> list[int]:
         """Open issues that are not held, newest first, capped at ``limit``.
@@ -243,34 +251,31 @@ class LiveSource:
             })
         return sorted(out, key=lambda c: c["id"])
 
+    def _comment_page(self, issue: int, page: int) -> tuple[int, list[dict], dict]:
+        """``(raw row count, normalised rows, headers)``; the page number selects."""
+        body, headers = self._get_with_headers(
+            f"/repos/{self.repo}/issues/{int(issue)}/comments",
+            {"per_page": self.page_size, "page": page})
+        if not isinstance(body, list):
+            raise SourceError("unexpected comments payload")
+        return len(body), self._normalise(body, issue), headers
+
     def paged(self, issue: int, *, since_id: int = 0,
               max_pages: int = 10) -> list[dict]:
-        """Comments from the oldest page forward, stopping at ``since_id``.
+        """One walk; the inference lives in :func:`paged_walk.walk_listing`."""
+        return walk_listing(
+            lambda page: self._comment_page(issue, page),
+            page_size=self.page_size, since_id=since_id, max_pages=max_pages)
 
-        Pages are requested in ascending order (``per_page=100&page=n``) and the
-        walk stops as soon as a page contains an id ``<= since_id``: everything
-        after that page is newer than the cursor, so there is nothing left to
-        collect. Any non-200 / network / JSON failure raises :class:`SourceError`
-        **instead of returning what was gathered so far** - a partial list would
-        be silently mistaken for "no new comments" and the cursor would advance
-        past comments that were never read.
-        """
-        since_id = int(since_id or 0)
-        max_pages = max(1, int(max_pages or 1))
-        collected: list[dict] = []
-        for page in range(1, max_pages + 1):
-            rows = self._get(f"/repos/{self.repo}/issues/{int(issue)}/comments",
-                             {"per_page": PER_PAGE, "page": page,
-                              "sort": "created", "direction": "asc"})
-            if not isinstance(rows, list):
-                raise SourceError("unexpected comments payload")
-            if not rows:
-                break
-            page_rows = self._normalise(rows, issue)
-            collected.extend(page_rows)
-            if since_id and page_rows and min(c["id"] for c in page_rows) <= since_id:
-                break
-        return sorted(collected, key=lambda c: c["id"])
+    def _locate_last_page(self, issue: int, max_pages: int):
+        """Forwarder: how many pages exist, probed as deep as the budget allows."""
+        return locate_last_page(lambda page: self._comment_page(issue, page),
+                                max_pages, self.page_size)
+
+    @staticmethod
+    def _link_last_page(headers: dict) -> int | None:
+        """Forwarder: the ``page`` of ``rel="last"``, or None."""
+        return link_last_page(headers)
 
     @staticmethod
     def _normalise(rows: list, issue: int) -> list[dict]:
@@ -316,7 +321,14 @@ class NullSource:
 
     def paged(self, issue: int, *, since_id: int = 0,
               max_pages: int = 10) -> list[dict]:
-        return []
+        """No backend, no listing - and an empty one is not a proof either.
+
+        ``complete`` stays False: "there is no source" and "the walk reached the
+        end of the source" are different facts, and the second one must never be
+        inferred from the first.
+        """
+        return PagedComments((), complete=False, pages=[],
+                             reason="no backend configured")
 
     def title(self, issue: int) -> str:
         return ""
@@ -355,21 +367,6 @@ class BrokenSource:
 
     def issue_state(self, issue: int) -> str:
         raise SourceError(self.error)
-
-
-def comments_from(source, issue: int, *, since_id: int = 0,
-                  max_pages: int = 10) -> list[dict]:
-    """``source.paged()`` when the backend has it, else the whole list.
-
-    Keeping this behind one helper means the engine never needs to know which
-    backend it was given, and a test double that only implements ``comments()``
-    keeps working unchanged.
-    """
-    paged = getattr(source, "paged", None)
-    if callable(paged):
-        return paged(issue, since_id=since_id, max_pages=max_pages)
-    rows = source.comments(issue)
-    return [c for c in rows if int(c["id"]) >= int(since_id or 0)]
 
 
 def build(cfg: dict):

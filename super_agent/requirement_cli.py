@@ -28,9 +28,18 @@ def _ctx(args):
     return issue_cli._Ctx(args)
 
 
-def _comments(ctx, repo: str, issue: int) -> list[dict]:
+def _comments(ctx, repo: str, issue: int, stats: dict | None = None) -> list[dict]:
+    """Every comment on the issue, plus whether the walk reached the last page.
+
+    ``stats`` (optional, filled in place) receives ``{"complete": bool}``: it is
+    ``True`` only when a short page proved the listing ended, and ``False`` when
+    the 100-page bound was hit first - a **prefix**. The distinction is carried
+    out of here so :func:`_project` can store it; a projection rebuilt from a
+    prefix would silently drop every package past the last page read.
+    """
     rows = []
     page = 1
+    complete = False
     while page <= 100:
         batch = issue_cli._call(
             "GET", f"/repos/{repo}/issues/{int(issue)}/comments"
@@ -39,8 +48,11 @@ def _comments(ctx, repo: str, issue: int) -> list[dict]:
             raise req.RequirementError("GitHub comments response is not a list")
         rows.extend(batch)
         if len(batch) < 100:
+            complete = True
             break
         page += 1
+    if stats is not None:
+        stats["complete"] = complete
     return [{"id": row.get("id"), "body": row.get("body") or "",
              "author": (row.get("user") or {}).get("login", ""),
              "created_at": row.get("created_at") or ""}
@@ -49,10 +61,17 @@ def _comments(ctx, repo: str, issue: int) -> list[dict]:
 
 def _project(args, ctx, repo: str, comments=None) -> dict:
     rid = _rid(repo, args.issue)
+    stats: dict = {}
+    if comments is None:
+        comments = _comments(ctx, repo, args.issue, stats)
+        complete = stats.get("complete")
+    else:
+        complete = None      # the caller brought rows, not a claim
     return req.project_comments(
-        _comments(ctx, repo, args.issue) if comments is None else comments,
+        comments, req.load_projection(_root(args)),
         package_verifier=requirement_auth.at_verifier(ctx.cfg, rid, args.project),
-        approval_verifier=requirement_auth.supervisor_verifier(ctx.cfg))
+        approval_verifier=requirement_auth.supervisor_verifier(ctx.cfg),
+        history_read_complete=complete)
 
 
 def _sync(args, ctx=None) -> tuple[dict, str]:
@@ -205,8 +224,15 @@ def cmd_approve(args) -> int:
         raise issue_cli.Denied("--session-key 不是当前配置的 supervisor 键")
     repo = issue_cli._repo(args.project, ctx.projects)
     _refuse_standard(args, ctx, repo)
-    projection = _project(args, ctx, repo)
     rid = _rid(repo, args.issue)
+    # The gate reads the **persisted** projection, never a rebuild: a rebuild
+    # from a truncated read looks identical to a rebuild from a complete one,
+    # and the whole point of the flag is to remember which read produced it.
+    # ``_project`` below still refreshes the view used for the revision and hash
+    # checks; this is the separate, stored fact.
+    stored = req.load_projection(_root(args))
+    req.require_history_complete(stored, rid)
+    projection = _project(args, ctx, repo)
     package = req.current(projection, rid)
     if package is None:
         raise req.RequirementError("no readable requirement package")

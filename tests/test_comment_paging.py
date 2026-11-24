@@ -37,13 +37,21 @@ GOOD = {
 
 
 class PagedLiveSource(github_source.LiveSource):
-    """``LiveSource`` with ``_get`` replaced by an in-memory paged backend."""
+    """``LiveSource`` over an in-memory listing that behaves like the real API.
 
-    def __init__(self, rows, *, per_page=3, fail_on_page=None):
+    Two measured facts are reproduced here too: **``direction`` is ignored**
+    (the per-issue endpoint answers oldest-first regardless) and the page count
+    is announced through ``Link``. A stub that reverses on ``direction`` would
+    hide the very defect ISS-127 is about - it did, once.
+    """
+
+    def __init__(self, rows, *, per_page=3, fail_on_page=None, last_link=True):
         super().__init__("owner/demo")
-        self.rows = list(rows)
+        self.rows = sorted(rows)
         self.per_page = per_page
+        self.page_size = per_page
         self.fail_on_page = fail_on_page
+        self.last_link = last_link
         self.requests = []
 
     def issues(self, limit=20):
@@ -55,15 +63,29 @@ class PagedLiveSource(github_source.LiveSource):
     def flow(self, issue):
         return ""
 
-    def _get(self, path, query=None):
-        page = int((query or {}).get("page") or 1)
-        self.requests.append(dict(query or {}))
+    def page_count(self) -> int:
+        return max(1, -(-len(self.rows) // self.per_page))
+
+    def _get_with_headers(self, path, query=None):
+        query = dict(query or {})
+        page = int(query.get("page") or 1)
+        self.requests.append(query)
         if self.fail_on_page == page:
             raise github_source.SourceError(f"GitHub 502 on {path} (page {page})")
         start = (page - 1) * self.per_page
         chunk = self.rows[start:start + self.per_page]
-        return [{"id": cid, "body": f"b{cid}", "user": {"login": "u"},
+        body = [{"id": cid, "body": f"b{cid}", "user": {"login": "u"},
                  "created_at": ""} for cid in chunk]
+        headers = {}
+        total = self.page_count()
+        if self.last_link and total > 1:
+            headers["Link"] = (f'<https://api.github.com/repos/owner/demo/issues/1/'
+                               f'comments?per_page={self.per_page}&page={total}>; '
+                               f'rel="last"')
+        return body, headers
+
+    def _get(self, path, query=None):
+        return self._get_with_headers(path, query)[0]
 
 
 class Base(unittest.TestCase):
@@ -100,35 +122,103 @@ class Base(unittest.TestCase):
 
 
 class PagingContract(Base):
-    def test_paging_stops_at_the_cursor_page(self):
+    def test_a_settled_page_stops_the_walk(self):
+        src = PagedLiveSource(list(range(1, 13)), per_page=4)
+        rows = src.paged(1, since_id=8)
+        # listing is 3 pages (4 rows each). Probe page 1 for Link, then walk
+        # back: page 3 = 9..12 (min 9 > 8, keep going), page 2 = 5..8
+        # (min 5 <= 8 ⇒ everything above 8 already collected).
+        self.assertEqual([q.get("page") for q in src.requests], [1, 3, 2])
+        self.assertEqual([c["id"] for c in rows], list(range(5, 13)))
+        # Stopping at the cursor proves the unread prefix is contiguous. It does
+        # NOT prove the older pages were read - page 1 was never collected.
+        self.assertTrue(rows.contiguous)
+        self.assertFalse(rows.pagination_complete)
+
+    def test_a_mixed_page_does_not_stop_the_walk(self):
+        """The defect this rule exists for: one old row must not end the walk."""
+        src = PagedLiveSource(list(range(1, 9)), per_page=3)
+        rows = src.paged(1, since_id=5)
+        # 3 pages. page 3 = 7,8 (min 7 > 5) -> page 2 = 4,5,6 (min 4 <= 5: stop)
+        self.assertEqual([q.get("page") for q in src.requests], [1, 3, 2])
+        ids = [c["id"] for c in rows]
+        self.assertIn(6, ids)
+        self.assertIn(8, ids)
+
+    def test_the_walk_starts_at_the_last_page(self):
         src = PagedLiveSource([1, 2, 3, 4, 5, 6], per_page=2)
-        rows = src.paged(1, since_id=3)
-        # page 1 -> [1,2]; min 1 <= 3 so the walk stops: everything after it is
-        # already newer than the cursor.
-        self.assertEqual([c["id"] for c in rows], [1, 2])
-        self.assertEqual(len(src.requests), 1)
-
-    def test_paging_walks_until_the_cursor_page(self):
-        src = PagedLiveSource([10, 20, 30, 40, 50, 60], per_page=2)
-        src.paged(1, since_id=25)
-        # page 1: 10,20 (min 10 <= 25) -> stop after the first page
-        self.assertEqual(len(src.requests), 1)
-
-    def test_paging_requests_ascending_pages(self):
-        src = PagedLiveSource([1, 2, 3, 4], per_page=2)
         src.paged(1, since_id=0)
-        self.assertEqual([q.get("page") for q in src.requests], [1, 2, 3])
-        self.assertTrue(all(q.get("direction") == "asc" for q in src.requests))
+        self.assertEqual([q.get("page") for q in src.requests], [1, 3, 2])
+        self.assertNotIn("direction", src.requests[0],
+                         "the per-issue endpoint ignores direction: never send it")
 
     def test_error_raises_and_returns_no_partial_list(self):
-        src = PagedLiveSource([1, 2, 3, 4, 5, 6], per_page=2, fail_on_page=2)
+        """A failure is never folded into a short list: 1 row is not "the end"."""
+        src = PagedLiveSource(list(range(1, 13)), per_page=4, fail_on_page=2)
         with self.assertRaises(github_source.SourceError):
             src.paged(1, since_id=0)
 
-    def test_page_cap_is_honoured(self):
+    def test_page_cap_is_honoured_and_reported_incomplete(self):
         src = PagedLiveSource(list(range(1, 41)), per_page=2)
         rows = src.paged(1, since_id=0, max_pages=3)
-        self.assertEqual(len(rows), 6)
+        # 20 pages; budget 3 = probe + 2 real pages, all at the newest end.
+        self.assertEqual(len(rows), 4)
+        self.assertFalse(rows.pagination_complete,
+                         "running out of pages is not proof the listing ended")
+        self.assertFalse(rows.contiguous,
+                         "nothing at or below the cursor was reached")
+
+    def test_a_full_page_is_not_proof_of_the_end(self):
+        """Counter-example 3: one page of 100 fresh rows is not a finished walk."""
+        src = PagedLiveSource(list(range(1, 101)), per_page=100)
+        rows = src.paged(1, since_id=0, max_pages=1)
+        self.assertFalse(rows.pagination_complete,
+                         "a full page plus an exhausted budget proves nothing")
+        self.assertEqual([q.get("page") for q in src.requests], [1])
+
+    def test_a_full_page_is_followed_by_the_next_page(self):
+        """...so the walk keeps going until a page at/below the cursor."""
+        src = PagedLiveSource(list(range(1, 201)), per_page=100)
+        rows = src.paged(1, since_id=120)
+        # probe page 1, then newest page 2 = 101..200 (min 101 <= 120 ⇒ stop)
+        self.assertEqual([q.get("page") for q in src.requests], [1, 2])
+        self.assertTrue(rows.contiguous)
+        self.assertFalse(rows.pagination_complete,
+                         "page 1's own rows were never collected")
+        self.assertIn("cursor", rows.stop_reason)
+
+    def test_the_walk_is_a_list(self):
+        """Counter-example 2: old callers index/slice the result, so it is a list."""
+        src = PagedLiveSource([1, 2, 3, 4], per_page=100)
+        rows = src.paged(1)
+        self.assertIsInstance(rows, list)
+        self.assertEqual(rows[-1]["id"], 4)
+        self.assertEqual([c["id"] for c in rows[:2]], [1, 2])
+
+
+class CommentsFromIsTypeTolerant(unittest.TestCase):
+    """Counter-example 2: a two-way unpack would break every plain-list backend."""
+
+    class PlainList:
+        def paged(self, issue, *, since_id=0, max_pages=10):
+            return [{"id": 1}, {"id": 2}]
+
+    class Decorated(github_source.PagedComments):
+        pass
+
+    def test_a_plain_list_backend_is_not_unpacked(self):
+        rows = github_source.comments_from(self.PlainList(), 1)
+        self.assertEqual([c["id"] for c in rows], [1, 2])
+
+    def test_the_decorated_result_still_reports_completeness(self):
+        decorated = github_source.PagedComments([{"id": 1}], complete=True)
+        self.assertTrue(github_source.walk_complete(decorated))
+        self.assertFalse(github_source.walk_complete([{"id": 1}]),
+                         "a plain list proves nothing either way")
+
+    def test_an_empty_walk_is_not_complete_by_default(self):
+        self.assertFalse(github_source.walk_complete(
+            github_source.NullSource().paged(1)))
 
 
 class EngineCursor(Base):
@@ -155,7 +245,8 @@ class EngineCursor(Base):
         self.assertEqual(idx["issues"][engine._thread_key(1)]["comments_seen"], 2)
 
     def test_failed_page_leaves_the_cursor_alone(self):
-        src = PagedLiveSource(list(range(300, 306)), per_page=2, fail_on_page=2)
+        """Counter-example 4: a dead page is an error, never an empty listing."""
+        src = PagedLiveSource(list(range(300, 320)), per_page=8, fail_on_page=2)
         engine = self.engine(src)
         summary = engine.run_once()
         self.assertTrue(summary["errors"], "a dead page is reported")

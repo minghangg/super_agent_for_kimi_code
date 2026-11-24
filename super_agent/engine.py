@@ -83,6 +83,8 @@ from . import (at_serve, envelope, flow as flow_mod, github_source, health, issu
                markers, needs, requirement_auth, requirements, session_events, session_ledger,
                sessionkeys)
 from . import assignments as asg_mod
+from .engine_parts import claims as walk_claims
+from .engine_parts import pause as read_pause_mod
 from .allowlist import ProjectAllowlist
 from .store import Store, action_id
 
@@ -389,11 +391,20 @@ class Engine:
         return projection
 
     def _apply_requirement_comments(self, index: dict, thread: str,
-                                    comments: list[dict]) -> dict | None:
+                                    comments: list[dict],
+                                    history_complete: bool = True) -> dict | None:
+        """Rebuild the projection for ``thread`` from a **complete** history walk.
+
+        ``history_complete`` defaults to True because the only caller that may
+        pass rows here has already checked the walk; it is a parameter so a
+        future caller cannot inherit the claim by accident.
+        """
         projection = requirements.project_comments(
             comments, self._requirement_projection(index),
             package_verifier=lambda comment: self._at_verified(thread, comment),
-            approval_verifier=self._supervisor_verified)
+            approval_verifier=self._supervisor_verified,
+            history_read_complete=history_complete,
+            history_scope=thread)
         index["requirements"] = projection
         return requirements.current(projection, thread)
 
@@ -3005,6 +3016,80 @@ class Engine:
                                declared=(verdict or {}).get("delivery"))
         return "pm_verdict", ""
 
+    @staticmethod
+    def _walk_covers_cursor(walked, cursor: int) -> bool:
+        """Did this walk prove every row above ``cursor`` is present?
+
+        Forwarder: the rule lives in :mod:`super_agent.engine_parts.claims`
+        (ISS-128 L1). The name stays so no test or caller changes.
+        """
+        return walk_claims.walk_covers_cursor(walked, cursor)
+
+    def _pause_read(self, index: dict, key: str, issue: int, cursor: int,
+                    rows: int, max_pages: int, summary: dict) -> None:
+        """Mark the issue as read-paused until a person lifts it (ISS-128 L1).
+
+        Forwarder: the record shape and its dedupe live in
+        :func:`engine_parts.pause.pause_read`; the two side effects this class
+        owns - ``needs_person`` dedupe and the event log - are passed in.
+        """
+        read_pause_mod.pause_read(index, key, issue, cursor, rows, max_pages, summary,
+                          append=self._append_needs_person,
+                          log=self.store.log_event)
+
+    def resume_read(self, issue, *, by: str = "", max_pages: int | None = None,
+                    detail: str = "") -> dict:
+        """Lift a read pause for one issue - the manual way out of the hard cap.
+
+        Forwarder: the state machine lives in :func:`engine_parts.pause.lift`,
+        which clears the record, the ``state`` and the pause rows together, so
+        an orchestrator stops seeing "waiting for a person" the moment a person
+        actually answered.
+
+        ``max_pages`` is the page budget for the **next** read of this issue and
+        is persisted with the lift; the round then uses it for that issue
+        (never for others, never as a new default).
+
+        Returns ``{"changed": bool, "reason": str, "number": int|None,
+        "max_pages": int|None}`` and never reads the source.
+        """
+        number = read_pause_mod.issue_number(issue)
+        out = {"changed": False, "reason": "", "number": number,
+               "max_pages": max_pages}
+        if number is None:
+            out["reason"] = f"cannot read an issue number from {issue!r}"
+            return out
+        index = self.store.load_index()
+        keys = [key for key in (index.get("issues") or {})
+                if read_pause_mod.issue_number(key) == number]
+        if not keys:
+            out["reason"] = f"issue #{number} is not in the index"
+            return out
+        lifted = read_pause_mod.lift(index, keys, by=str(by or ""), max_pages=max_pages,
+                             mark=needs.mark)
+        if lifted["changed"]:
+            for key in keys:
+                if not read_pause_mod.is_paused((index.get("issues") or {}).get(key)):
+                    self.store.log_event({
+                        "type": "read.resumed", "at": _now(),
+                        "issue": number, "thread": str(key),
+                        "by": str(by or ""), "was": lifted["reason"],
+                        "detail": str(detail or ""), "max_pages": max_pages})
+            self.store.save_index(index)
+            out["changed"] = True
+            out["reason"] = lifted["reason"]
+        else:
+            out["reason"] = f"#{number} has no read pause"
+        return out
+
+    @staticmethod
+    def _clear_read_pause_surface(index: dict, key: str, *, by: str = "") -> None:
+        """Put the issue back in the queue state the pause took it out of.
+
+        Forwarder: :func:`engine_parts.pause.clear_surface`.
+        """
+        read_pause_mod.clear_surface(index, key, by=by, mark=needs.mark)
+
     def _append_needs_person(self, index: dict, thread: str, row: dict) -> bool:
         """Append one person-facing row unless ``(thread, cid, reason)`` exists.
 
@@ -4854,7 +4939,7 @@ class Engine:
         summary = {"mode": self.mode, "dispatch_enabled": self.dispatch_enabled,
                    "issues": 0, "comments_new": 0, "processed": 0,
                    "needs_person": 0, "deliveries": 0, "assignments": 0,
-                   "errors": []}
+                   "read_paused": 0, "errors": []}
         if allowlist_reload:
             summary["allowlist_reload"] = allowlist_reload
         self.store.log_event({"type": "run.started", "at": _now(), "mode": self.mode})
@@ -4988,25 +5073,114 @@ class Engine:
             str(rec.get("role") or "") == "qa"
             and str(rec.get("status") or "") not in asg_mod.TERMINAL_STATES
             and rec.get("review_comment_id") is None for rec in existing)
-        comments = github_source.comments_from(
-            self.source, issue, since_id=0 if qa_recovery else cur,
-            max_pages=max_pages)
-        fresh = [c for c in comments
-                 if int(c["id"]) > cur or (qa_recovery and markers.parse_review(
-                     str(c.get("body") or "")))][:max_comments]
-        summary["comments_new"] += len(fresh)
-        if self._at_mode(issue):
+        read_pause = rec.get("read_paused")
+        read_paused = read_pause_mod.is_paused(rec)
+        # Did *this* round stop the read? A pause already writes one queue row,
+        # and the AT history gate below would write a second one for the same
+        # comment id (0) - two rows saying "a person must look at this" for one
+        # cause, and the second would stay open after a lift because ``needs``
+        # keys on ``(thread, cid)``.
+        paused_now = False
+        at_mode = self._at_mode(issue)
+        fresh: list[dict] = []
+        history_rows: list[dict] = []
+        history_done = False
+        # Rows this round walked. Defined before the branch on purpose: the AT
+        # gate below runs on two paths, and reading a local only one of them
+        # defined is how a NameError got swallowed into ``summary["errors"]``.
+        rows_read = 0
+        if read_paused:
+            # The hard cap was reached in an earlier round and nobody has lifted
+            # it yet: do not read this issue at all. Writing ``needs_person`` and
+            # then reading again would be the silent retry the issue forbids -
+            # the walk cannot prove its rows are contiguous, so every extra round
+            # risks consuming a slice that skips the rows below it.
+            summary["read_paused"] = int(summary.get("read_paused") or 0) + 1
+            self.store.log_event({
+                "type": "read.skipped", "at": _now(), "issue": issue,
+                "thread": str(key), "reason": str(read_pause.get("reason") or ""),
+                "since": str(read_pause.get("at") or ""),
+                "resume_with": f"python -m super_agent.cli resume-read --issue {issue}"})
+        else:
+            # A lifted pause may carry the page budget the operator chose when
+            # clearing it (``resume-read --max-pages``). That budget is what
+            # makes the lift a real "continue" instead of "pause again on the
+            # next round": without it a listing larger than the configured window
+            # re-pauses immediately, and the command would be lying about its own
+            # effect. It applies to this issue only and is spent once.
+            budget, pending_budget = read_pause_mod.read_budget(rec, max_pages)
+            if pending_budget:
+                rec["read_budget"] = {}
+            # AT needs the whole listing anyway (the projection is rebuilt from
+            # history every round), so that path reads it once with both uses in
+            # mind rather than walking the same listing twice.
+            #
+            # ``paged_batch`` is that one read: the rows the round may consume
+            # and the rows the projection is rebuilt from are the **same**
+            # snapshot, carrying the same ``cursor_before`` and the walk's own
+            # ``pagination_complete``. Two walks could straddle a comment
+            # arriving between them, and then the round would consume a row the
+            # projection never saw while both sides believe they agree.
+            batch = github_source.paged_batch(
+                self.source, issue, cursor_before=cur, max_pages=budget,
+                whole_listing=bool(qa_recovery or at_mode))
+            rows_read = len(batch.rows)
+            # One walk, two answers: the rows and whether the walk proved it
+            # reached the cursor.
+            if not self._walk_covers_cursor(batch, cur):
+                self._pause_read(index, key, issue, cur, rows_read, budget,
+                                 summary)
+                paused_now = True
+            else:
+                fresh = [c for c in batch.rows
+                         if int(c["id"]) > cur or (qa_recovery and markers.parse_review(
+                             str(c.get("body") or "")))][:max_comments]
+                summary["comments_new"] += len(fresh)
+                if at_mode:
+                    history_rows = walk_claims.walk_rows(batch)
+                    history_done = walk_claims.history_is_complete(batch)
+        if at_mode and not read_paused:
             # Rebuild from the Issue, not from the cursor: approval may predate
             # at_mode being enabled. The projection is only a disposable cache.
-            history = github_source.comments_from(self.source, issue, since_id=0,
-                                                  max_pages=100)
-            self._apply_requirement_comments(index, key, history)
-            try:
-                requirements.save_projection(self.store.root, index["requirements"])
-            except OSError as exc:
-                self.store.log_event({"type": "requirement.projection_write_failed",
-                                      "at": _now(), "thread": str(key),
-                                      "error": f"{type(exc).__name__}: {exc}"})
+            #
+            # The walk must have read the **whole** listing: the projection is
+            # rebuilt from it, so a package on a page that was never fetched
+            # would vanish from the projection and read as "nobody published
+            # it". When the walk cannot claim completeness the projection is left
+            # alone and the issue pauses with a manual way back - never a prefix
+            # written as if it were the listing.
+            if not history_done:
+                # One cause, one row: the page walk above already paused this
+                # issue for the same reason, and a second row under ``cid=0``
+                # would survive the lift (``needs`` keys on ``(thread, cid)``).
+                if not paused_now:
+                    read_pause_mod.pause_history(
+                        index, key, issue,
+                        len(history_rows) or len(fresh), summary,
+                        reason="the requirement history walk did not reach the "
+                               "last page",
+                        append=self._append_needs_person,
+                        log=self.store.log_event)
+                else:
+                    self.store.log_event({
+                        "type": "requirement.history_incomplete", "at": _now(),
+                        "thread": str(key), "issue": int(issue),
+                        "rows_read": rows_read,
+                        "reason": "the same round already paused the page walk, "
+                                  "so the projection is left untouched"})
+            else:
+                # Runs even with zero rows: ``history_scope`` records that this
+                # thread's history was read whole, and a thread whose first
+                # package is not published yet has no other place to carry it.
+                self._apply_requirement_comments(index, key, history_rows)
+                try:
+                    requirements.save_projection(self.store.root,
+                                                 index["requirements"])
+                except OSError as exc:
+                    self.store.log_event({
+                        "type": "requirement.projection_write_failed",
+                        "at": _now(), "thread": str(key),
+                        "error": f"{type(exc).__name__}: {exc}"})
         # Requirement projection precedes session discovery: a live binding is
         # not permission to work before the exact revision has been approved.
         synced = self._sync_assignments(index, key, issue)
@@ -5113,6 +5287,8 @@ class Engine:
         if fresh:
             cursor.setdefault("issues", {})[key] = max(int(c["id"]) for c in fresh)
         else:
+            # Never move the cursor on a round that consumed nothing: a paused
+            # issue (no read at all) must keep its position byte for byte.
             cursor.setdefault("issues", {}).setdefault(key, cur)
         # The window closes here: past this point only the committed ledger
         # speaks, so the stall watchdog cannot be silenced by a batch that was

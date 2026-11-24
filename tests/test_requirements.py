@@ -33,11 +33,20 @@ def comment(cid, kind, value):
     return {"id": cid, "body": req.fence(kind, value)}
 
 
-def project(comments, previous=None, *, at=True, supervisor=True):
+def project(comments, previous=None, *, at=True, supervisor=True,
+            complete=True):
+    """Project ``comments``; the history walk is complete unless asked not to be.
+
+    These tests are about package/approval semantics, so the default says the
+    walk read the whole listing - the alternative would make every one of them
+    fail on the ISS-128 history gate for a reason none of them is testing. The
+    gate itself is exercised in ``tests/test_iss128_history_complete.py``.
+    """
     return req.project_comments(
         comments, previous,
         package_verifier=lambda comment: at,
-        approval_verifier=lambda comment: supervisor)
+        approval_verifier=lambda comment: supervisor,
+        history_read_complete=complete)
 
 
 def approved_projection(value=None):
@@ -219,7 +228,8 @@ class SourceRecovery(unittest.TestCase):
         return req.project_comments(
             comments, previous,
             package_verifier=lambda comment: True,
-            approval_verifier=lambda comment: allowed)
+            approval_verifier=lambda comment: allowed,
+            history_read_complete=True)
 
     def test_previously_seen_unverified_approval_recovers_after_rotation(self):
         allowed = False
