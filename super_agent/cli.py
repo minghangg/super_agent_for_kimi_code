@@ -977,6 +977,9 @@ def cmd_reconcile(args) -> int:
     if not report["server_supplied"]:
         print("result: UNKNOWN (live server not consulted; use --live-file or drop --no-server)")
         return 2
+    if report.get("ledger_error"):
+        print(f"result: UNKNOWN ({report['ledger_error']})")   # nothing compared
+        return 2
     if report["diff_non_empty"]:
         print(f"result: DRIFT ({len(report['diff_non_empty'])} non-empty sections)")
         return 1

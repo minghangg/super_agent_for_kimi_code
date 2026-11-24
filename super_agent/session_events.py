@@ -371,23 +371,16 @@ def active_keys(state: dict) -> dict:
     return out
 
 
-def load_sessions_ledger(path: Path) -> dict:
-    """``sessions.json`` -> ``{key: sid}`` (flat, no filtering).
-
-    Unreadable yields ``{}``; ``reconcile`` checks readability separately so it
-    never mistakes "could not read" for "no keys" (#129 direction B).
-    """
+def read_sessions_ledger(path: Path) -> tuple[dict, str]:
+    """``(ledger, problem)`` -- see :func:`session_map_io.read_ledger`."""
     from . import session_map_io
 
-    data = json.loads(session_map_io.read_sessions_text(path) or "{}")
-    if not isinstance(data, dict):
-        return {}
-    out = {}
-    for key, item in data.items():
-        sid = str((item or {}).get("id") or "") if isinstance(item, dict) else ""
-        if sid:
-            out[key] = sid
-    return out
+    return session_map_io.read_ledger(path)
+
+
+def load_sessions_ledger(path: Path) -> dict:
+    """``sessions.json`` -> ``{key: sid}``; unreadable yields ``{}``."""
+    return read_sessions_ledger(path)[0]
 
 
 def parse_server_list(path: Path) -> set[str]:
@@ -456,7 +449,7 @@ def reconcile(events_path: Path, sessions_path: Path,
     by_key = active_keys(state)
     archived = {sid for sid, rec in (state.get("sessions") or {}).items()
                 if rec.get("archived")}
-    ledger = load_sessions_ledger(sessions_path)
+    ledger, ledger_error = read_sessions_ledger(sessions_path)
 
     # A live binding the flat ledger does not list is a **known gap**, not
     # drift: ``sessions.json`` is written by the session tools and only ever
@@ -506,7 +499,11 @@ def reconcile(events_path: Path, sessions_path: Path,
         "live_unclaimed": live_unclaimed,
         "diff": diff_keys,
         "diff_non_empty": non_empty,
-        "ok": not non_empty and server_sids is not None,
+        "ledger_error": ledger_error,
+        # An unreadable ledger is not agreement: it is a run whose ledger could
+        # not be seen. Reporting ``ok`` there is the silent-error shape #129
+        # exists to remove, just pointing the other way (#129 QA 7145879381).
+        "ok": not non_empty and server_sids is not None and not ledger_error,
     }
 
 

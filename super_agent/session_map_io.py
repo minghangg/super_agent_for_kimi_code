@@ -171,16 +171,17 @@ def read_text_retry(path: Path) -> str | None:
     reporting an absent name as an empty ledger.
     """
     path = Path(path)
-    # No ``exists()`` pre-check: the writer can swap the name between the check
-    # and the open (TOCTOU), which is exactly the window this function exists to
-    # absorb. A genuinely absent file fails the very first attempt too, so the
-    # check bought nothing and cost a race.
     for attempt in range(READ_ATTEMPTS):
         try:
             return _read_bytes(path)
         except FileNotFoundError:
-            # Absent: either the file was never created, or the writer is in the
-            # middle of swapping it. Retry briefly, then report "unreadable".
+            # Same rule as :func:`read_json`, and it must stay the same: a map
+            # that is not on disk at all is a normal state (a fresh state dir
+            # has no ``issue_sessions.json``), and retrying it cost 61 ms per
+            # call in this hot path -- which is what held the suite at ~22 s
+            # (#129 QA 7145879381). Only a *present* read is worth retrying.
+            if not path.exists():
+                return None
             if attempt + 1 >= READ_ATTEMPTS:
                 break
             time.sleep(READ_BACKOFF_S * (attempt + 1))
@@ -201,3 +202,28 @@ def read_sessions_text(path: Path) -> str | None:
     the swap.
     """
     return read_text_retry(path)
+
+def read_ledger(path: Path) -> tuple[dict, str]:
+    """``(ledger, problem)``: ``{key: sid}`` plus why it could not be read.
+
+    ``problem`` is ``""`` when the map was read and a sentence when it was not.
+    The two answers must stay separate: an unreadable map is **not** an empty
+    one, and reporting it as empty let ``reconcile`` pass a run whose ledger it
+    could not see (#129 QA 7145879381). Kept here rather than in
+    ``session_events`` so that module does not grow.
+    """
+    text = read_sessions_text(path)
+    if text is None:
+        return {}, f"sessions.json 读不出：{path}"
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        return {}, f"sessions.json 解析失败：{path}（{type(exc).__name__}）"
+    if not isinstance(data, dict):
+        return {}, f"sessions.json 顶层不是对象：{path}"
+    out = {}
+    for key, item in data.items():
+        sid = str((item or {}).get("id") or "") if isinstance(item, dict) else ""
+        if sid:
+            out[key] = sid
+    return out, ""

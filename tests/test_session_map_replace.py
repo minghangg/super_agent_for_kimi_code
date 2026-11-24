@@ -447,5 +447,53 @@ class Counterexample9BareReaders(_StateDir):
 
 
 
+
+class Counterexample10UnreadableLedger(_StateDir):
+    """QA 7145879381: an unreadable ledger must not be reported as agreement."""
+
+    def _reconcile(self, sessions_text: str, live: set[str]):
+        from super_agent import session_events
+
+        events = self.state / "events.jsonl"
+        events.write_text("", encoding="utf-8")
+        self.sessions.write_text(sessions_text, encoding="utf-8")
+        return session_events.reconcile(events, self.sessions, server_sids=live)
+
+    def test_an_unreadable_ledger_is_not_ok(self):
+        report = self._reconcile("{ broken", {"session_x"})
+        self.assertTrue(report["ledger_error"], "不可读台账没有留下原因")
+        self.assertFalse(report["ok"], "不可读台账被报成 ok")
+
+    def test_an_absent_ledger_reports_the_problem(self):
+        """A missing map is reported, not silently treated as "no keys"."""
+        from super_agent import session_events
+
+        events = self.state / "events.jsonl"
+        events.write_text("", encoding="utf-8")
+        self.sessions.unlink()          # setUp created it; this case needs it gone
+        report = session_events.reconcile(events, self.sessions, server_sids={"session_x"})
+        self.assertTrue(report["ledger_error"])
+
+    def test_a_readable_ledger_has_no_error(self):
+        """Readable: the readable flag is clean; drift is decided by the diff."""
+        report = self._reconcile(json.dumps({"a": {"id": FULL_SID}}), {FULL_SID})
+        self.assertEqual(report["ledger_error"], "")
+        self.assertNotIn("ledger_error", report["diff"])
+
+    def test_an_absent_map_is_not_retried(self):
+        """QA P0-1: the hot path must not sleep on a file that never existed."""
+        import time as _time
+
+        from super_agent import session_map_io
+
+        missing = self.state / "never-created.json"
+        start = _time.perf_counter()
+        for _ in range(50):
+            self.assertIsNone(session_map_io.read_text_retry(missing))
+        elapsed = _time.perf_counter() - start
+        self.assertLess(elapsed, 0.5, f"缺失文件重试过慢：50 次 {elapsed:.2f}s")
+
+
+
 if __name__ == "__main__":
     unittest.main()
