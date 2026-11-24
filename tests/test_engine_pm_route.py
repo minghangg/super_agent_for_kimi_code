@@ -1326,20 +1326,28 @@ class ProjectPmTarget(Base):
         reasons = [row.get("reason") for row in
                    engine.store.load_index()["issues"][THREAD]["needs_person"]]
         self.assertIn("route.undeliverable", reasons)
+        alerts = [frame for frame in self.bus.payloads("event.agent.supervisor")
+                  if "投递失败" in frame.get("text", "")]
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("投递失败", alerts[0]["text"])
 
 
 class TwoRoundArbitration(Base):
     def test_second_consecutive_reject_reaches_the_supervisor(self):
         engine = self.engine()
         self.deliver()
-        for cid in (9100, 9200):
-            self.source.add(cid, "[QA] 退回 <!-- fix_needed: true -->",
-                            author="qa", session_key="qa-demo-3f7c1a90")
-            engine.run_once()
+        self.source.add(9100, "[QA] 退回 <!-- fix_needed: true -->",
+                        author="qa", session_key="qa-demo-3f7c1a90")
+        engine.run_once()
+        self.source.add(9200, "[WK:wk-probe-1] reworked", author="worker")
+        engine.run_once()
+        self.source.add(9300, "[QA] 退回 <!-- fix_needed: true -->",
+                        author="qa", session_key="qa-demo-3f7c1a90")
+        engine.run_once()
         frames = self.bus.payloads("event.agent.supervisor")
         self.assertEqual(len(frames), 1)
         self.assertIn("仲裁", frames[0]["text"])
-        self.assertIn("9200", frames[0]["text"])
+        self.assertIn("9300", frames[0]["text"])
         self.assertEqual(len(self.bus.payloads("event.agent.project_pm")), 2)
 
 

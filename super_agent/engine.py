@@ -1388,6 +1388,7 @@ class Engine:
                 "session_delivery": "failed",
                 "reason": "no project pm session resolved",
             })
+            self._route_pm_delivery_failure(index, thread, issue, cid, target)
             self._append_needs_person(index, thread, {
                 "comment_id": cid, "reason": "route.undeliverable", "at": _now()})
             return {"dispatched": False, "refused": True,
@@ -1432,16 +1433,9 @@ class Engine:
                                 comment: dict, assignment: dict) -> None:
         """Second consecutive QA reject asks the supervisor to arbitrate once."""
         cid = int(comment["id"])
-        try:
-            delivery = int(assignment.get("delivery_comment_id") or 0)
-        except (TypeError, ValueError):
-            delivery = 0
         streak = 0
         readings = assignment.get("review_readings") or {}
         for raw_cid, verdict in sorted(readings.items(), key=lambda item: int(item[0])):
-            review_cid = int(raw_cid)
-            if review_cid <= delivery:
-                continue
             if verdict == "reject":
                 streak += 1
             elif verdict == "pass":
@@ -1554,14 +1548,25 @@ class Engine:
                    "review_comment_id": int(cid),
                    "project": target["project"],
                    "verdict": str(review.get("verdict") or ""),
+                   "sid": target["pm_sid"], "pm_sid": target["pm_sid"],
+                   "text": self._qa_notice_text(
+                       target["project"], issue, cid,
+                       str(review.get("verdict") or "")),
                    "refused": True, "reason": reason,
                    "assignment": str(assignment.get("id") or ""),
                    "status": str(assignment.get("status") or ""),
                    "at": _now()}
-        result = self._dispatch(self._route_action(
-            thread, issue, cid, payload, "event.agent.project_pm",
-            target_role=target["target_role"], origin_role=markers.QA.lower(),
-            assignment_id=key))
+        if not target["pm_sid"]:
+            result = {"dispatched": False, "refused": True,
+                      "reason": "no project pm session resolved", "action_id": base}
+            self._route_pm_delivery_failure(index, thread, issue, cid, target)
+            self._append_needs_person(index, thread, {
+                "comment_id": cid, "reason": "route.undeliverable", "at": _now()})
+        else:
+            result = self._dispatch(self._route_action(
+                thread, issue, cid, payload, "event.agent.project_pm",
+                target_role=target["target_role"], origin_role=markers.QA.lower(),
+                assignment_id=key))
         routes[key] = {"thread": thread, "comment_id": int(cid), "at": _now(),
                        "verdict": payload["verdict"], "reason": reason,
                        "ok": (bool(result.get("ok"))
@@ -2116,6 +2121,27 @@ class Engine:
     @staticmethod
     def _qa_notice_text(project, issue, cid, verdict) -> str:
         return f"【QA 结论】{project}#{int(issue)} {verdict}，QA cid {cid}"
+
+    def _route_pm_delivery_failure(self, index: dict, thread: str, issue: int,
+                                   cid: int, target: dict) -> dict:
+        """Tell the supervisor a PM route has no recipient, through the real leg."""
+        sid = self._supervisor_sid(index)
+        if not sid:
+            return {"dispatched": False, "reason": "no supervisor sid"}
+        project = str(target.get("project") or "")
+        key = f"pm_delivery_failed:{thread}:{cid}"
+        base = action_id(key, "bus_inject", str(cid))
+        if self.store.action_attempted(base) > 0:
+            return {"dispatched": False, "reason": "already attempted",
+                    "action_id": base}
+        payload = {"thread": thread, "issue": int(issue),
+                   "review_comment_id": int(cid), "kind": "pm_delivery_failed",
+                   "project": project, "sid": sid, "at": _now(),
+                   "text": f"【投递失败】{project}#{int(issue)} 无项目 PM，QA cid {cid}"}
+        return self._dispatch(self._route_action(
+            thread, issue, cid, payload, "event.agent.supervisor",
+            target_role="supervisor", origin_role=markers.QA.lower(),
+            assignment_id=key))
 
     def _note_undeliverable(self, index: dict, thread: str, comment_id,
                             detail: str, *, issue=None, to="supervisor",

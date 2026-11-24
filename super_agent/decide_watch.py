@@ -988,12 +988,18 @@ def _notice_tick_tail(rows: dict, delivered: int) -> None:
     # 终态 indeterminate（rc=3/5，可能已投）与「等重试」是两件事：前者已经不能再发，
     # 后者还会再试。心跳分两个计数，免得把「已定的悬案」误读成「还在排队」。
     stuck = sum(1 for r in rows.values() if r.get("state") == "indeterminate")
+    failed = sum(1 for r in rows.values()
+                 if str(r.get("state") or "").startswith("refused_")
+                 or r.get("state") in ("undelivered", "probe_unknown"))
+    last = _notice_last_read()
     _notice_last_write(pending_indeterminate=pending)
     # 未注册时 wss_bus 的 write_heartbeat 直接 return ⇒ 心跳文件不生成；
     # 那种情况已被 notice_registration_problem() 在启动时拦死。
-    _write_hb(SUPERVISOR_NOTICE_HEARTBEAT, {"pending_indeterminate": pending,
-                                            "indeterminate": stuck,
-                                            "delivered": delivered})
+    _write_hb(SUPERVISOR_NOTICE_HEARTBEAT, {
+        "pending_indeterminate": pending, "indeterminate": stuck,
+        "delivered": delivered, "failed": failed,
+        "last_fail_state": last.get("last_fail_state"),
+        "last_fail_seq": last.get("last_fail_seq")})
 
 
 def notice_cursor_rollback(cursor_seq: int, daemon_seq: int) -> int | None:

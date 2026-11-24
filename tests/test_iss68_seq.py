@@ -674,6 +674,10 @@ class VariantE3_ReleaseEditAndUndo(Base):
         self.assertEqual(rec["status"], "waiting_release")
         self.assertIn("assignment.qa_refused_after_hold", types)
         self.assertIn("route.refused_decided", types)
+        frames = [p for e, p in self.bus.injected if e == "event.agent.project_pm"]
+        self.assertTrue(frames)
+        self.assertEqual(frames[-1]["sid"], "session_pm")
+        self.assertIn("9100", frames[-1]["text"])
         rows = (self.index(engine)["issues"][THREAD].get("needs_person") or [])
         mine = [r for r in rows if int(r.get("comment_id") or 0) == 9100]
         self.assertTrue(mine, "the undo must be queued for a person")

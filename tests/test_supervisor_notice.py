@@ -311,6 +311,10 @@ class CounterFour_Archived(NoticeFixture):
         self.assertEqual(self.sends, [])
         self.assertEqual(self.ledger_rows()[-1]["state"], "refused_archived")
         self.assertEqual(self.last()["last_fail_state"], "refused_archived")
+        heartbeat = [extra for name, extra in self.beats
+                     if name == "supervisor_notice"][-1]
+        self.assertEqual(heartbeat["failed"], 1)
+        self.assertEqual(heartbeat["last_fail_state"], "refused_archived")
 
 
 class CounterFive_Retired(NoticeFixture):
