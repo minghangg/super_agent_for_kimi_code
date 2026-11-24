@@ -119,3 +119,28 @@ def test_lock_path_override_wins(monkeypatch, tmp_path):
     target = tmp_path / "custom.lock"
     monkeypatch.setenv(g.ENV_LOCK_PATH, str(target))
     assert g.default_lock_path() == target
+
+
+# -- full vs targeted ------------------------------------------------------
+
+@pytest.mark.parametrize("args", [[], ["tests"], ["tests/"], ["tests"],
+                                  ["-q"], ["tests", "-q", "--timeout=60"]])
+def test_bare_suite_root_is_a_full_run(args):
+    assert g.is_full_suite_run(args) is True
+
+
+@pytest.mark.parametrize("args", [
+    ["tests/test_session_map_replace.py"],
+    ["tests/test_a.py", "tests/test_b.py", "-q"],
+    ["tests/test_iss127_incremental_read.py", "--timeout=120"],
+])
+def test_named_files_are_targeted(args):
+    assert g.is_full_suite_run(args) is False
+
+
+def test_targeted_run_is_never_blocked_by_the_lock(monkeypatch, isolated_lock):
+    """A worker running one file must not hit the single-runner lock."""
+    monkeypatch.setenv(g.ENV_SESSION_KEY, "wk-probe")
+    monkeypatch.setenv(g.ENV_LOCK_PATH, str(isolated_lock))
+    with g.FullSuiteRun(isolated_lock):
+        assert g.is_full_suite_run(["tests/test_one.py"]) is False

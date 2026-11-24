@@ -145,12 +145,33 @@ class _NoopRun:
         return False
 
 
-def install_pytest_hook() -> None:
-    """Install a ``pytest_collection`` hook that enforces the guard.
+def is_full_suite_run(args) -> bool:
+    """True when the invocation runs the whole suite, not a chosen subset.
 
-    Called from ``tests/conftest.py``. The hook runs before any test is
-    collected, so a refused run exits with a clear message instead of burning
-    minutes and then failing on a lock collision deep in the suite.
+    ``pytest`` with no path, ``pytest tests/``, or ``pytest tests`` is a full
+    run. ``pytest tests/test_x.py`` is targeted: it touches one file's runtime
+    state, so it neither needs the lock nor is it a role violation. A worker
+    running a targeted group is the normal case and must not be blocked.
+    """
+    paths = [str(a) for a in (args or []) if not str(a).startswith("-")]
+    if not paths:
+        return True
+    for raw in paths:
+        norm = raw.replace("\\", "/").rstrip("/")
+        if norm in ("", ".", "tests", "./tests"):
+            return True
+        # ``tests/`` with a subdirectory still covers many files but is a
+        # deliberate narrowing; treat only the bare suite root as full.
+    return False
+
+
+def install_pytest_hook() -> None:
+    """Install hooks that enforce the guard, on full runs only.
+
+    Called from ``tests/conftest.py``. A full run is refused before collection
+    starts, so a refused run exits with a clear message instead of burning
+    minutes and then failing on a lock collision deep in the suite. Targeted
+    runs pass through untouched: they are what a worker is supposed to run.
     """
     try:
         import pytest  # noqa: F401
@@ -160,6 +181,8 @@ def install_pytest_hook() -> None:
     state: dict = {}
 
     def pytest_configure(config):
+        if not is_full_suite_run(config.args):
+            return
         state["run"] = guard(wait_s=0.0)
         state["run"].__enter__()
 
