@@ -24,3 +24,15 @@ if str(ROOT) not in sys.path:
 # ``<checkout>/tests/no-such-agent.json``: inside the checkout only so the
 # name is self-explanatory in a traceback; it is never created.
 os.environ["SAFKC_AGENT_CONFIG"] = str(ROOT / "tests" / "no-such-agent.json")
+
+# One full run per machine, and not from a worker. The rule already existed in
+# the charters; nothing executed it, so a worker ran the full suite while a
+# scout was running the same suite and five pytest processes deadlocked on the
+# same temp dirs (2026-11-25). The hook is a no-op when no session key is set,
+# which keeps plain checkouts, CI and human shells working unchanged.
+if (os.environ.get("SAFKC_SKIP_FULL_SUITE_GUARD") or "").strip() not in ("1", "true", "yes"):
+    from super_agent import full_suite_guard as _guard
+
+    _hooks = _guard.install_pytest_hook()
+    if _hooks:
+        pytest_configure, pytest_unconfigure = _hooks
