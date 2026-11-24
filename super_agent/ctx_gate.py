@@ -42,6 +42,8 @@ content to stderr, so the dispatcher sees it immediately.
 """
 from __future__ import annotations
 
+
+from .session_map_io import read_json
 import argparse
 import datetime as dt
 import inspect
@@ -143,12 +145,11 @@ def _is_fixed_key(name: str) -> bool:
         return False
     return name in FIXED_KEYS or name.startswith(FIXED_PREFIXES)
 
-
 def _read_sessions(sessions_path: Path | None):
     if sessions_path is None:
         return None
     try:
-        return json.loads(Path(sessions_path).read_text(encoding="utf-8"))
+        return read_json(Path(sessions_path))
     except (OSError, ValueError):
         return None
 
@@ -221,7 +222,7 @@ def _pm_tiers_apply(sid: str, kind: str, sessions_path) -> bool:
     if kind == "one-shot" or not sessions_path:
         return False
     try:
-        data = json.loads(Path(sessions_path).read_text(encoding="utf-8"))
+        data = read_json(Path(sessions_path))
     except (OSError, ValueError):
         return False
     for key, rec in (data or {}).items():

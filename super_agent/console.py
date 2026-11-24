@@ -42,6 +42,7 @@ import time
 from pathlib import Path
 
 from . import api as kimi_api
+from .session_map_io import read_json
 from . import config as config_mod
 from . import bus as kimi_bus
 from . import cron_report as CRON
@@ -112,7 +113,6 @@ EV_ARCHIVED = "session.archived"
 EV_RESTORED = "session.restored"
 EV_TAKEN_OVER = "session.taken_over"
 
-
 def sessions_file() -> Path:
     """台账路径走 `sess_events` 的解析（隔离运行时读打桩目录）。"""
     return EV.sessions_path()
@@ -138,7 +138,7 @@ def resolve(arg):
     if arg.startswith("session_"):
         return arg
     try:
-        rec = json.loads(sessions_file().read_text(encoding="utf-8")).get(arg)
+        rec = (read_json(sessions_file()) or {}).get(arg)
     except Exception:  # noqa: BLE001
         rec = None
     return rec["id"] if isinstance(rec, dict) and rec.get("id") else arg

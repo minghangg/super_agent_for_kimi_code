@@ -20,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import autostart as autostart
+from .session_map_io import read_json
 from . import bus as BUSD
 from . import direct as K
 from . import paths as kimi_paths
@@ -39,7 +40,6 @@ STATE_ENVS = ("WSS_BUS_STATE_DIR", "DECIDE_WATCH_STATE_DIR",
 WATCH_DIRS = ("state/closeout", "state/dispatch", "state/review", "state/pm")
 ALARM_THROTTLE = 300.0
 _last_alarm = 0.0
-
 
 def _joined(*parts: str) -> str:
     """兼容旧环境变量名时分片拼装，保持源码自身扫描干净。"""
@@ -398,7 +398,7 @@ class Monitor:
             return f"server=down({err})", {}, "down"
         recorded = {}
         try:
-            recorded = json.loads(self.sessions_path().read_text(encoding="utf-8"))
+            recorded = read_json(self.sessions_path()) or {}
         except Exception:  # noqa: BLE001
             pass
         by_id = {str(it.get("id", "")): it for it in items if isinstance(it, dict)}

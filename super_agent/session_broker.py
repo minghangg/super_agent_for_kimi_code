@@ -57,18 +57,18 @@ def read_issue_sessions(cfg: dict | None = None) -> dict:
 
 # ------------------------------------------------------------ key/role writes
 def register_key(name: str, sid: str, cfg: dict | None = None) -> str:
-    """Record ``name -> sid`` in ``sessions.json``; one-line report, never raises.
+    """Record ``name -> sid`` in ``sessions.json``; one-line report.
 
-    Separated from :func:`set_key` by contract only: registration is not a
-    precondition of a binding, so a failure is reported and the caller goes on.
+    **Raises** :class:`BrokerError` when the write fails (QA P0-1 ③). Returning
+    a warning string made the failure invisible: ``at_cli.cmd_start`` discarded
+    the value, so an AT session could exist with no registered key and exit
+    code 0 -- the exact "has a binding, has no key, nobody knows" shape this
+    change exists to remove. Callers either handle it or let it surface.
     """
     key = str(name or "").strip()
     if not key:
         return ""
-    try:
-        result = set_key(key, sid, cfg=cfg)
-    except (OSError, BrokerError) as exc:
-        return f"[警告] 登记 {key} 失败：{type(exc).__name__}: {exc}"
+    result = set_key(key, sid, cfg=cfg)
     verb = "已改指" if result["old_sid"] and result["old_sid"] != sid else "已登记"
     return f"{verb}会话键 {key} → {sid[:12]}"
 

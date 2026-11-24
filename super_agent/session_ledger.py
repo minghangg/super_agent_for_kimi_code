@@ -9,9 +9,10 @@ loudly at the call instead of writing in the wrong place.
 ``bind`` records which session works on which issue, ``close`` archives those
 sessions, and ``comment`` keeps the ledger row. All three write into the **same
 session root the engine reads**: ``issue_sessions.json`` sits beside
-``sessions.json`` (``engine._issue_sessions_path``), and that root is resolved
-by :func:`super_agent.session_events.resolve_session_root` -- the one function
-the engine itself uses.
+``sessions.json``, and that root is resolved by
+:func:`super_agent.session_events.resolve_session_root` -- the one function the
+engine itself uses. Writes go through :mod:`super_agent.session_broker` (#129);
+the engine reads back through the same broker.
 
 Writing through a second resolution chain is how a binding lands where the
 engine never looks, and the symptom is silence: ``assignment.unmatched``, no
@@ -108,20 +109,28 @@ def events_path(cfg: dict | None = None) -> Path:
 
 
 # ------------------------------------------------------------------- reads
-def load_issue_sessions(cfg: dict | None = None) -> dict:
+def _read_map(path: Path) -> dict:
+    """Read via the broker's shared-open reader so a reader never blocks a write.
+
+    A plain ``open`` on Windows asks for no delete sharing, which makes
+    ``os.replace`` fail with ``WinError 5`` for as long as the handle is held
+    (#129 P0-1). Every reader of these maps goes through this one helper.
+    """
+    from . import session_map_store
+
     try:
-        data = json.loads(issue_sessions_path(cfg).read_text(encoding="utf-8"))
+        data = json.loads(session_map_store.read_text_shared(path))
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def load_issue_sessions(cfg: dict | None = None) -> dict:
+    return _read_map(issue_sessions_path(cfg))
 
 
 def load_sessions(cfg: dict | None = None) -> dict:
-    try:
-        data = json.loads(sessions_path(cfg).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    return _read_map(sessions_path(cfg))
 
 
 def register_session_key(name: str, sid: str, cfg: dict | None = None) -> str:

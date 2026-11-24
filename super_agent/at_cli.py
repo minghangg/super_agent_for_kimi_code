@@ -108,7 +108,17 @@ def cmd_start(args) -> int:
                        state_dir=str(session_ledger.root(cfg)), provider=args.provider,
                        model=args.model, effort=args.effort)
     sid = str(result["session_id"])
-    session_ledger.register_session_key(name, sid, cfg=cfg)
+    # Register before binding: a binding with no key is the silent state #129
+    # removes, so a failure here aborts the command (rc != 0) instead of
+    # leaving an AT running that nothing can address.
+    try:
+        session_ledger.register_session_key(name, sid, cfg=cfg)
+    except (OSError, RuntimeError) as exc:
+        print(f"[失败] AT 会话 {sid} 已创建，但会话键 {name} 未登记：{exc}",
+              file=sys.stderr)
+        print(f"       补救：python -m super_agent.sessions_ledger set {name} {sid}",
+              file=sys.stderr)
+        return 1
     session_ledger.bind_session(f"{args.project}#{args.issue}", "at", sid,
                                 name=name, extra={"awaiting": True}, cfg=cfg)
     session_ledger.emit("session.bound", cfg=cfg, issue=args.issue,

@@ -37,12 +37,13 @@
 """
 from __future__ import annotations
 
+
+from .session_map_io import read_json
 import argparse
 import json
 import os
 import sys
 from pathlib import Path
-
 
 def _joined(*parts: str) -> str:
     """把需要避讳的字面量拆片拼装（本文件要过隐私门禁的自身扫描）。"""
@@ -103,7 +104,7 @@ def check_key(key: str = DEFAULT_KEY, sessions: str = "", *, probe=None) -> dict
 
     # 1) 读登记表
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = read_json(path)
     except FileNotFoundError:
         out.update(state="unknown", reason=f"sessions.json 不存在：{path}")
         return out

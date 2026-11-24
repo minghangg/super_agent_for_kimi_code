@@ -81,7 +81,7 @@ from pathlib import Path
 
 from . import (at_serve, envelope, flow as flow_mod, github_source, health, issuekey,
                markers, needs, requirement_auth, requirements, session_broker,
-               session_events, session_ledger, sessionkeys)
+               session_events, session_ledger, session_map_store, sessionkeys)
 from . import assignments as asg_mod
 from .engine_parts import claims as walk_claims
 from .engine_parts import pause as read_pause_mod
@@ -909,7 +909,7 @@ class Engine:
                         keys.add(value)
         try:
             path = self._session_stream()[1]
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(session_map_store.read_text_shared(path))
         except (OSError, ValueError):
             data = {}
         if not isinstance(data, dict):
@@ -1031,7 +1031,7 @@ class Engine:
             return keys
         try:
             path = self._session_stream()[1]
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(session_map_store.read_text_shared(path))
         except (OSError, ValueError):
             data = {}
         if not isinstance(data, dict):
@@ -1119,7 +1119,7 @@ class Engine:
                     keys.add(value)
         try:
             path = self._session_stream()[1]
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(session_map_store.read_text_shared(path))
         except (OSError, ValueError):
             data = {}
         if not isinstance(data, dict):
@@ -1206,7 +1206,7 @@ class Engine:
         if not sid:
             try:
                 path = session_events.resolve_sessions_path(self.cfg)
-                data = json.loads(path.read_text(encoding="utf-8"))
+                data = json.loads(session_map_store.read_text_shared(path))
             except (OSError, ValueError):
                 data = {}
             scope = repo.rsplit("/", 1)[-1].lower() if repo else project
@@ -2033,7 +2033,7 @@ class Engine:
             keys = [keys]
         try:
             path = session_events.resolve_sessions_path(self.cfg)
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(session_map_store.read_text_shared(path))
         except (OSError, ValueError):
             return ""
         if not isinstance(data, dict):
