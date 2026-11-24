@@ -1741,6 +1741,10 @@ def _guardian_summary() -> dict:
                "threshold_s": threshold, "heartbeat": rel, "writer": writer,
                "pid": (hb or {}).get("pid"),
                "state_dir": (hb or {}).get("state_dir", "")}
+        for key in ("failed", "delivered", "pending_indeterminate", "indeterminate",
+                    "last_fail_state", "last_fail_seq"):
+            if hb is not None and key in hb:
+                rec[key] = hb[key]
         if read_error:
             rec["read_error"] = read_error
         out[name] = rec

@@ -193,6 +193,32 @@ class TestGuardianThreeStates(InjectionFixture):
         self.assertEqual(due, [])
         self.assertNotIn("delivery_watch", state)
 
+    def test_failure_fields_are_visible_on_healthz(self):
+        self.hb.write_text(json.dumps({
+            "ts": time.time(), "pid": 123, "state_dir": str(self.state),
+            "failed": 2, "delivered": 4, "pending_indeterminate": 1,
+            "indeterminate": 3, "last_fail_state": "refused_archived",
+            "last_fail_seq": 502, "token": "not-public"}), encoding="utf-8")
+        from aiohttp import test_utils
+        async def probe():
+            client = test_utils.TestClient(test_utils.TestServer(wb.make_app()))
+            await client.start_server()
+            try:
+                response = await client.get("/healthz")
+                return await response.json()
+            finally:
+                await client.close()
+        import asyncio
+        data = asyncio.run(probe())
+        guardian = data["guardians"]["delivery_watch"]
+        self.assertEqual(guardian["failed"], 2)
+        self.assertEqual(guardian["delivered"], 4)
+        self.assertEqual(guardian["pending_indeterminate"], 1)
+        self.assertEqual(guardian["indeterminate"], 3)
+        self.assertEqual(guardian["last_fail_state"], "refused_archived")
+        self.assertEqual(guardian["last_fail_seq"], 502)
+        self.assertNotIn("token", guardian)
+
     def test_dedup_window_and_recovery_reset(self):
         state = {}
         broken = {"a": {"state": "stale", "age_s": 999, "threshold_s": 1,
