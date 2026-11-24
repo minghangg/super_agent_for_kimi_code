@@ -32,7 +32,7 @@ from .session_map_store import FileLock
 
 #: Roles that may start the full suite. Mirrors ``rules/charters/worker.md`` §3
 #: (worker: L0/L1 only) and ``rules/charters/qa.md`` §3 (full run: phase 3).
-ALLOWED_PREFIXES = ("qa-", "supervisor-", "reed", "steward", "auditor",
+ALLOWED_PREFIXES = ("qa-", "supervisor-", "steward", "auditor",
                     "reviewer", "scout", "planner", "analyst")
 
 #: Roles that may never start it. Kept explicit so a new ``wk-``-like prefix
