@@ -104,14 +104,22 @@ def read_json(path: Path):
     last: Exception | None = None
     for attempt in range(READ_ATTEMPTS):
         try:
-            data = json.loads(_read_bytes(path))
+            return json.loads(_read_bytes(path))
+        except FileNotFoundError as exc:
+            # A map that is not on disk at all is a normal state (a fresh state
+            # dir has no issue_sessions.json). Retrying it slept 77 ms per call
+            # -- measured -- and the engine reads these maps several times per
+            # round, which is what made the suite hang (#129 supervisor
+            # 7145038778). Only the *swap* window is worth retrying, and a swap
+            # never leaves the name absent for longer than a rename; the first
+            # read after a real creation succeeds.
+            if not path.exists():
+                return None
+            last = exc
+            time.sleep(READ_BACKOFF_S * (attempt + 1))
         except (OSError, ValueError) as exc:
             last = exc
             time.sleep(READ_BACKOFF_S * (attempt + 1))
-            continue
-        return data
-    if isinstance(last, FileNotFoundError) and not path.exists():
-        return None
     return None
 
 
