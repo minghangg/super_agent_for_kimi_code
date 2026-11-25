@@ -402,7 +402,7 @@ class Counterexample9BareReaders(_StateDir):
                 text = session_map_io.read_sessions_text(self.sessions)
                 if text is None:
                     seen_empty.append("unreadable")
-                elif not session_events.load_sessions_ledger(self.sessions):
+                elif not session_events.read_sessions_ledger(self.sessions)[0]:
                     seen_empty.append("empty")
         finally:
             stop.set()

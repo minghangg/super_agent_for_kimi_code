@@ -81,10 +81,24 @@ from pathlib import Path
 
 from . import (at_serve, envelope, flow as flow_mod, github_source, health, issuekey,
                markers, needs, requirement_auth, requirements, session_broker,
-               session_events, session_ledger, session_map_store, sessionkeys)
+               session_events, session_ledger, sessionkeys)
 from . import assignments as asg_mod
 from .engine_parts import claims as walk_claims
+from .engine_parts import archive as archive_mod
+from .engine_parts import at_ledger as at_ledger_mod
+from .engine_parts import close as close_mod
+from .engine_parts import collect as collect_mod
+from .engine_parts import doctor as doctor_mod
+from .engine_parts import delivery as delivery_mod
 from .engine_parts import pause as read_pause_mod
+from .engine_parts import requirement_gate as requirement_gate_mod
+from .engine_parts import retry as retry_mod
+from .engine_parts import round as round_mod
+from .engine_parts import session_keys as session_key_mod
+from .engine_parts import triage as triage_mod
+from .engine_parts import watchdog as watchdog_mod
+from . import batch as batch_mod
+from . import batch_queue as queue_mod
 from .allowlist import ProjectAllowlist
 from .store import Store, action_id
 
@@ -128,8 +142,7 @@ REVIEW_TARGET_STATES = ("working", "waiting_review", "blocked",
 # The spelling is matched generously - case, half- and full-width brackets, and
 # both colons - because it is written by hand, and a prefix that only one
 # spelling can use is a prefix half the dispatches will miss.
-TASK_PREFIX_RE = re.compile(
-    r"^\s*[\[［]\s*(?:PM|supervisor)\s*[:：]\s*TASK\s*[\]］]\s*", re.I)
+TASK_PREFIX_RE = triage_mod.TASK_PREFIX_RE
 
 # A full session id: ``session_`` + a UUID. Anything shorter is a *truncated*
 # id, and a truncated id can never be delivered to - the server answers 40401
@@ -335,6 +348,12 @@ class Engine:
         # (``_session_state``). Round scoped: a release or an archive performed
         # during the round must be visible to the next one.
         self._session_state_cache: dict | None = None
+        # ``(stamp, map, problem)`` for ``sessions.json``, shared by the five
+        # readers (see ``_session_map``). Round scoped: a bind made during the
+        # round must be visible to the next one.
+        self._session_map_cache: tuple | None = None
+        # The current round's collection state (see ``engine_parts.round``).
+        self._round_state = None
 
     # ------------------------------------------------------------ allowlist
     def allowlist_allows(self, issue: int | None, action: str | None) -> tuple[bool, str]:
@@ -603,129 +622,20 @@ class Engine:
         return str(explicit) if explicit else str(action.get("kind") or "")
 
     def _triage(self, comment: dict) -> tuple[str, str]:
-        """Fixed rules, in this order:
+        """Fixed rules, in one order (see :func:`engine_parts.triage.triage`).
 
-        1. a delivery marker on the first line wins over everything - a worker
-           whose role is configured would otherwise have its own delivery
-           ignored as role-authored noise;
-        2. a ``[QA]`` review is the second marker: its verdict is a transition,
-           not discussion, and it must be read before role noise too;
-        3. a ``[PM:TASK]`` line is a dispatch by its own declaration, so it is
-           settled before the verdict branch is ever asked. It is always
-           ``ignored`` - not an unreadable verdict - and one ``warn`` event is
-           logged when its own first line reads like a conclusion, because a
-           reply that answers a task book is the reply somebody forgot to send
-           as a ``[PM]`` verdict (#ISS-85). The one exception is an escalation
-           marker: a task book that says ``[blocked]`` or ``[decision]`` is
-           asking for a person, and it goes down the ``[PM]`` frame path below
-           - the same prefix change must not turn a bell into silence;
-        4. a ``[PM]`` verdict is the fourth marker, read before role noise for
-           the same reason - the PM's own role is ``pm``, and a PM verdict from
-           the shared login must not be discarded as author noise. A ``[PM]``
-           line that is **not** a conclusion - a task book, a dispatch, a note
-           - is discussion and is ignored here; reading it as an unreadable
-           verdict is what filed 57 false exceptions (#75). Escalation markers
-           are still honoured on that path: a note that asks for a person is
-           not noise;
-        5. role-authored noise is ignored;
-        6. escalation markers ask for a person;
-        7. everything else is logged (the historical behaviour, unchanged).
-
-        ``parse_delivery``, ``parse_review`` and ``parse_pm_verdict`` only read
-        the first non-empty line, so a comment that quotes a delivery or a
-        verdict in its body stays ordinary discussion.
+        Forwarder: the classifier lives in :mod:`super_agent.engine_parts.triage`
+        so the whole order is readable in one place. The escalation markers are
+        configuration, so they are passed in rather than read here.
         """
-        body = str(comment.get("body") or "")
-        delivery = markers.parse_delivery(body)
-        if delivery:
-            return "delivery", f"marker {delivery['name']!r}"
-        review = markers.parse_review(body)
-        if review:
-            return "review", f"qa verdict {review['verdict'] or 'unreadable'!r}"
-        line = markers.first_line(body)
-        task_book = TASK_PREFIX_RE.match(line)
-        if task_book:
-            # The prefix declares it: a task book, a dispatch, a receipt. It is
-            # never a verdict, whatever the rest of the line says, so it is
-            # settled here - before ``parse_pm_verdict`` is asked - and it never
-            # reaches the "unreadable verdict" branch (#ISS-85).
-            #
-            # The guard below is the other half. A task book that *answers* -
-            # ``[PM:TASK] 可关单 #42`` - is a verdict written with the wrong
-            # prefix, and silence would lose it. The answer is still silence
-            # here (a task book must not change state), but it is **logged**:
-            # one ``warn`` to the doctor, no frame, no row. Logging it as an
-            # exception would be the noise #75 removed, under a new name.
-            #
-            # Only the prefix line's remainder is read, plus the next non-empty
-            # line when the prefix stands alone. A body that *explains*
-            # ``可关单`` is documentation, and the same first-line rule the
-            # other parsers follow applies here. The slice starts from ``line``
-            # and not from ``body``: ``TASK_PREFIX_RE`` matched the stripped
-            # first line, so ``body[end:]`` is off by the leading whitespace it
-            # no longer saw (#ISS-85 P2-3).
-            lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
-            rest = line[task_book.end():].strip()
-            if not rest and len(lines) > 1:
-                # A real task book writes the prefix alone and the title below
-                # it. Reading only the prefix line would make the guard blind
-                # to exactly the shape it exists for.
-                rest = lines[1]
-            if markers.is_pm_conclusion(rest):
-                self.store.log_event({
-                    "type": "pm.task_book_conclusion", "at": _now(),
-                    "comment_id": comment.get("id"), "level": "warn",
-                    "consumers": ["doctor"],
-                    "reason": "a [PM:TASK] line reads as a conclusion; "
-                              "use [PM] + verdict marker",
-                })
-            # A task book that *asks for a person* is not discussion. Returning
-            # ``ignored`` here answered ``[PM:TASK] 任务书 [blocked] 需要决策``
-            # with silence while the same words under ``[PM]`` rang the bell -
-            # a human-intervention signal downgraded by a prefix change
-            # (#ISS-85 P1-2). It goes down the same PM frame path as the
-            # ``[PM]`` branch below, with no new frame type.
-            escalated = self._escalation_marker(body)
-            if escalated:
-                return "pm_verdict", f"escalation marker {escalated!r}"
-            return "ignored", "pm task book"
-        pm_verdict = markers.parse_pm_verdict(body)
-        if pm_verdict and pm_verdict.get("candidate"):
-            return "pm_verdict", (f"pm verdict "
-                                  f"{pm_verdict['state'] or 'unreadable'!r}")
-        if pm_verdict:
-            # A ``[PM]`` line that is not a conclusion: a dispatch, a task
-            # book, a note. It used to fall through to ``pm_verdict`` with
-            # ``state == ""``, which the router reads as "the PM answered and
-            # the answer was unreadable" - 57 task books and 1251 frames later
-            # (#75). The answer is not "unreadable", it is "not an answer".
-            #
-            # The escalation markers are checked **first**. A note is quiet by
-            # default, but a note that says ``[blocked]`` or ``[decision]`` is
-            # asking for a person, and returning ``ignored`` here would answer
-            # that request with silence - the round-2 P0: a human-intervention
-            # signal downgraded to nothing visible at all.
-            #
-            # The escalation goes down the PM frame path (``state == ""``
-            # answers ``exception``), not the plain ``needs_person`` one: the
-            # bell the supervisor already listens to is the frame, and routing
-            # a request for a decision past it would leave the reading half
-            # unchanged from before this issue.
-            escalated = self._escalation_marker(body)
-            if escalated:
-                return "pm_verdict", f"escalation marker {escalated!r}"
-            return "ignored", "pm comment is not a verdict"
-        at_verdict = markers.parse_at_verdict(body)
-        if at_verdict:
-            return "at_verdict", (f"at verdict "
-                                  f"{at_verdict['state'] or 'unreadable'!r}")
-        author = str(comment.get("author") or "").strip().lower()
-        if self.role and author == self.role.lower():
-            return "ignored", "authored by configured role"
-        escalated = self._escalation_marker(body, first_line_only=False)
-        if escalated:
-            return "needs_person", f"marker {escalated!r}"
-        return "logged", ""
+        return triage_mod.triage(
+            comment, role=self.role, escalation=self._escalation_marker,
+            log_task_conclusion=lambda c: self.store.log_event({
+                "type": "pm.task_book_conclusion", "at": _now(),
+                "comment_id": c.get("id"), "level": "warn",
+                "consumers": ["doctor"],
+                "reason": "a [PM:TASK] line reads as a conclusion; "
+                          "use [PM] + verdict marker"}))
 
     def _envelope(self, thread: str, comment: dict, state: str) -> dict:
         """The message's envelope, built from the whitelist - **not from its body**.
@@ -900,37 +810,17 @@ class Engine:
         keys: set[str] = set()
         ledger = self._load_issue_sessions().get(thread) or {}
         if isinstance(ledger, dict):
-            for role, entry in ledger.items():
-                if str(role).lower() != "qa" or not isinstance(entry, dict):
-                    continue
-                for field in ("name", "session"):
-                    value = str(entry.get(field) or "")
-                    if value:
-                        keys.add(value)
-        try:
-            path = self._session_stream()[1]
-            data = json.loads(session_map_store.read_text_shared(path))
-        except (OSError, ValueError):
-            data = {}
-        if not isinstance(data, dict):
+            keys |= session_key_mod.ledger_keys(ledger, "qa")
+        data, problem = self._session_map()
+        if problem:
+            # An unreadable map is not an empty one: the explicit binding above
+            # still answers, and the fault is reported rather than folded into
+            # "this thread has no QA key" (ISS-130 addendum 2).
             return keys
         state = self._session_state()
-        released = set(state.get("released") or ())
-        sessions = state.get("sessions") or {}
-        for raw_name, item in data.items():
-            name = str(raw_name)
-            if sessionkeys.role_of(name) != "qa":
-                continue
-            if not sessionkeys.has_random_suffix(name):
-                # Guessable name: the published-only credential this issue is
-                # about. It stays in sessions.json; it stops being a check.
-                continue
-            if name in released:
-                continue
-            sid = str((item or {}).get("id") or "") if isinstance(item, dict) else ""
-            if (sessions.get(sid) or {}).get("archived"):
-                continue
-            keys.add(name)
+        keys |= session_key_mod.keys_from_map(
+            data, "qa", released=state.get("released") or (),
+            sessions=state.get("sessions") or {})
         return keys
 
     def _review_verified(self, thread: str, comment: dict) -> bool:
@@ -973,6 +863,45 @@ class Engine:
         if project:
             scopes.add(str(project).lower())
         return {s for s in scopes if s and not s.isdigit()}
+
+    def _session_map(self, path: Path | None = None) -> tuple[dict, str]:
+        """``(map, problem)`` for ``sessions.json`` - one read, one meaning.
+
+        Five call sites used to do ``json.loads(read_text_shared(path))`` inside
+        a ``try`` that folded **every** failure into ``data = {}``. Two very
+        different states came out identical: a genuinely empty ledger, and a
+        ledger the engine could not read. The second one silently emptied the
+        role key tables, so a bound AT/PM/QA looked like nobody had a key
+        (ISS-130 addendum 2).
+
+        So the problem sentence is returned, never swallowed. A caller that only
+        needs the explicit ledger binding ignores it; the ones whose answer
+        would otherwise read as "no keys" log one event per round per site, and
+        a genuinely empty file answers ``({}, "")`` - no fault, empty table.
+
+        Cached per round by ``(path, mtime_ns, size)`` so the five sites share
+        one read of a file that is read up to five times per issue.
+        """
+        if path is None:
+            try:
+                path = self._session_stream()[1]
+            except Exception:  # noqa: BLE001  undeclared stream = no session truth
+                # Nothing declared is the configured state, not a fault: the
+                # same answer the inline readers gave (#79). A *declared* path
+                # that cannot be read is the fault, and that is reported below.
+                return {}, ""
+        path = Path(path)
+        try:
+            stat = path.stat()
+            stamp = (str(path), stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            stamp = (str(path), 0, 0)
+        cache = getattr(self, "_session_map_cache", None)
+        if cache is not None and cache[0] == stamp:
+            return dict(cache[1]), cache[2]
+        data, problem = session_key_mod.read_session_map(path)
+        self._session_map_cache = (stamp, dict(data), problem)
+        return data, problem
 
     def _session_state(self) -> dict:
         """Replayed lifecycle state, cached for the round.
@@ -1029,35 +958,16 @@ class Engine:
         scopes = self._thread_scopes(thread)
         if not scopes:
             return keys
-        try:
-            path = self._session_stream()[1]
-            data = json.loads(session_map_store.read_text_shared(path))
-        except (OSError, ValueError):
-            data = {}
-        if not isinstance(data, dict):
+        data, problem = self._session_map()
+        if problem:
             return keys
         state = self._session_state()
-        released = set(state.get("released") or ())
-        sessions = state.get("sessions") or {}
-        for raw_name, item in data.items():
-            name = str(raw_name)
-            if sessionkeys.role_of(name) != "pm":
-                continue
-            if not any(sessionkeys.scoped_by(name, "pm", scope) for scope in scopes):
-                continue
-            if not sessionkeys.has_random_suffix(name):
-                # Guessable name: the credential this issue is about. The
-                # record stays in ``sessions.json``; it stops being a check.
-                continue
-            if name in released:
-                # The key was handed back; a session record may still hold it.
-                continue
-            sid = str((item or {}).get("id") or "") if isinstance(item, dict) else ""
-            if (sessions.get(sid) or {}).get("archived"):
-                # A rotation leaves the old key in ``sessions.json``; an
-                # archived session is not a credential any more.
-                continue
-            keys.add(name)
+        keys |= session_key_mod.keys_from_map(
+            data, "pm", released=state.get("released") or (),
+            sessions=state.get("sessions") or {},
+            accept=lambda name, sid: any(
+                sessionkeys.scoped_by(name, "pm", scope) for scope in scopes))
+        return keys
         return keys
 
     def _pm_verified(self, thread: str, comment: dict) -> bool:
@@ -1107,41 +1017,21 @@ class Engine:
         """
         keys: set[str] = set()
         ledger = self._issue_session_entry(thread)
-        for role, entry in ledger.items():
-            if str(role).lower() != "at" or not isinstance(entry, dict):
-                continue
-            bound_sid = str(entry.get("session") or "")
-            if bound_sid and self._sid_archived(bound_sid):
-                continue
-            for field in ("name", "session"):
-                value = str(entry.get(field) or "")
-                if value:
-                    keys.add(value)
-        try:
-            path = self._session_stream()[1]
-            data = json.loads(session_map_store.read_text_shared(path))
-        except (OSError, ValueError):
-            data = {}
-        if not isinstance(data, dict):
+        if isinstance(ledger, dict):
+            at_entry = ledger.get("at")
+            bound_sid = str((at_entry or {}).get("session") or "") \
+                if isinstance(at_entry, dict) else ""
+            if not (bound_sid and self._sid_archived(bound_sid)):
+                keys |= session_key_mod.ledger_keys({"at": at_entry}, "at")
+        data, problem = self._session_map()
+        if problem:
             return keys
         state = self._session_state()
-        released = set(state.get("released") or ())
-        sessions = state.get("sessions") or {}
-        for raw_name, item in data.items():
-            name = str(raw_name)
-            if sessionkeys.role_of(name) != "at":
-                continue
-            if not sessionkeys.has_random_suffix(name):
-                continue
-            if name in released:
-                continue
-            sid = str((item or {}).get("id") or "") if isinstance(item, dict) else ""
-            if (sessions.get(sid) or {}).get("archived"):
-                continue
-            if sid and getattr(self, "session_api", None) is not None \
-                    and self._live_archived(sid):
-                continue
-            keys.add(name)
+        keys |= session_key_mod.keys_from_map(
+            data, "at", released=state.get("released") or (),
+            sessions=state.get("sessions") or {},
+            accept=lambda name, sid: not (sid and getattr(self, "session_api", None)
+                                          is not None and self._live_archived(sid)))
         return keys
 
     def _at_sid(self, thread: str) -> str:
@@ -1204,11 +1094,13 @@ class Engine:
         repo, _number = issuekey.split_key(thread)
         project = self._project_for_repo(repo) or self._project_for(issue) or ""
         if not sid:
-            try:
-                path = session_events.resolve_sessions_path(self.cfg)
-                data = json.loads(session_map_store.read_text_shared(path))
-            except (OSError, ValueError):
-                data = {}
+            data, problem = self._session_map()
+            if problem:
+                # No explicit binding **and** an unreadable map: the answer is
+                # "no PM", stated as a fault rather than as an empty table.
+                self.store.log_event({
+                    "type": "session_map.unreadable", "at": _now(),
+                    "where": "_pm_target", "detail": problem})
             scope = repo.rsplit("/", 1)[-1].lower() if repo else project
             key = sessionkeys.preferred_key(data, "pm", scope)
             entry = (data.get(key) or {}) if key else {}
@@ -1267,15 +1159,11 @@ class Engine:
                       assignment_id: str) -> dict:
         """A dispatch record whose id is the route key, not a hash.
 
-        ``_dispatch`` derives the action id from ``assignment + verb +
-        input_ref``; naming the route as the "assignment" keeps the route's
-        attempt counter findable from ``index["routes"]``.
+        Forwarder: :func:`engine_parts.at_ledger.route_action`.
         """
-        return {"kind": "bus_inject", "event": event, "issue": issue,
-                "thread": thread, "input_ref": str(cid),
-                "assignment_id": assignment_id,
-                "origin_role": origin_role, "target_role": target_role,
-                "payload": payload}
+        return at_ledger_mod.route_action(
+            thread, issue, cid, payload, event, target_role=target_role,
+            origin_role=origin_role, assignment_id=assignment_id)
 
     def _route_review(self, index: dict, thread: str, issue: int, comment: dict,
                       review: dict, *, log_unverified: bool = True) -> dict:
@@ -1824,11 +1712,7 @@ class Engine:
             # have truncated. ``run_round`` calls this outside any try, so one
             # malformed record would take down the retry passes, the archiving
             # and both saves of the round. Skipping it keeps the round alive.
-            if not isinstance(route, dict):
-                continue
-            if route.get("ok"):
-                continue
-            if route.get("permanent"):
+            if not retry_mod.route_candidate(route):
                 continue
             base = str(route.get("action_id") or "")
             if base and self.store.action_attempted(base) > 0:
@@ -1843,25 +1727,12 @@ class Engine:
             if issue is None:
                 continue
             if self._issue_state(issue) == "closed":
-                route["skipped_closed_at"] = _now()
+                retry_mod.closed_route(route, _now())
                 self.store.log_event({
                     "type": "route.skipped_closed_issue", "at": _now(),
                     "thread": thread, "issue": int(issue), "comment_id": cid,
                     "level": "info", "consumers": ["doctor"],
                 })
-                # Closed is a business end state, not a transient refusal, so the
-                # route stops being a candidate: without this mark the same dead
-                # route is re-probed and re-logged every round forever (#84: 229
-                # identical events for one issue). Marking it here also means no
-                # cid or sid has to be named anywhere.
-                #
-                # **A reopened issue needs a person to clear these three keys.**
-                # The engine never clears them by itself: ``permanent`` keeps the
-                # route out of this loop before ``_issue_state`` is ever asked
-                # again, so a reopen cannot be noticed from inside the retry pass.
-                route["permanent"] = True
-                route["permanent_reason"] = "issue closed"
-                route["permanent_at"] = _now()
                 continue
             review = {"verdict": str(route.get("verdict") or "")}
             result = self._route_review(index, thread, int(issue),
@@ -1871,9 +1742,8 @@ class Engine:
                 sent += 1
                 self._supersede_route(index, thread, cid, base)
             elif self.is_permanent_refusal(str(result.get("reason") or "")):
-                route["permanent"] = True
-                route["permanent_reason"] = str(result.get("reason") or "")
-                route["permanent_at"] = _now()
+                retry_mod.permanent_route(
+                    route, str(result.get("reason") or ""), _now())
                 self.store.log_event({
                     "type": "route.refused_permanent", "at": _now(),
                     "thread": thread, "issue": int(issue), "comment_id": cid,
@@ -1917,23 +1787,10 @@ class Engine:
     def _sup_eligible(self, review: dict, record: dict | None) -> bool:
         """Does this verdict want the supervisor told?
 
-        ``fix_needed`` is the parser's answer and is recomputed on a fresh
-        parse; ``sup_eligible`` on the stored record is the **decision
-        snapshot**, and it is the only thing a retry may trust. The retry
-        re-enters with a stub review that carries the verdict and nothing else -
-        re-deriving from that stub would answer "not eligible" for a release the
-        first round already decided to announce, and the notice would be lost by
-        a re-check rather than by a decision.
-
-        Neither answer available means "do not send" - guessing here would
-        either withhold a release or send a false one.
+        Forwarder: :func:`engine_parts.delivery.sup_eligible` - the stored
+        ``sup_eligible`` is the decision snapshot a retry must trust.
         """
-        if "fix_needed" in (review or {}):
-            return (str(review.get("verdict") or "") == "pass"
-                    and review.get("fix_needed") is False)
-        if isinstance(record, dict) and "sup_eligible" in record:
-            return bool(record["sup_eligible"])
-        return False
+        return delivery_mod.sup_eligible(review, record)
 
     def _undecidable(self, thread: str, cid, sup_key: str) -> None:
         """A record without ``sup_eligible`` is not silently "do not send".
@@ -1982,29 +1839,15 @@ class Engine:
         The sid **value** is never logged; ``sid_len`` says "it was cut short"
         without copying a possibly-still-valid prefix into the event stream.
         """
-        if not sid or SID_RE.match(sid):
-            return
-        if not isinstance(index, dict):
-            return
-        meta = index.setdefault("meta", {})
-        if not isinstance(meta, dict):
-            meta = index["meta"] = {}
-        warned = meta.setdefault("warned", {})     # new key, see the docstring
-        if not isinstance(warned, dict):
-            warned = meta["warned"] = {}
-        key = self.SUPERVISOR_SID_MALFORMED_ROW
-        if key in warned:
-            return
-        warned[key] = _now()
-        try:
-            seen = any(row.get("type") == key for row in
-                       _tail_events(self.store.events_path, limit=500))
-        except OSError:
-            seen = False
-        if seen:
+        if not retry_mod.malformed_sid(
+                index, sid, full_sid=SID_RE.match, row=self.SUPERVISOR_SID_MALFORMED_ROW,
+                now=_now(),
+                tail=lambda limit: _tail_events(self.store.events_path,
+                                                limit=limit)):
             return
         self.store.log_event({
-            "type": key, "at": _now(), "sid_len": len(sid),
+            "type": self.SUPERVISOR_SID_MALFORMED_ROW, "at": _now(),
+            "sid_len": len(sid),
             "detail": "engine.supervisor_sid is not a full session UUID; "
                       "every frame to the supervisor will be refused",
             "level": "warn", "consumers": ["doctor"],
@@ -2033,10 +1876,16 @@ class Engine:
             keys = [keys]
         try:
             path = session_events.resolve_sessions_path(self.cfg)
-            data = json.loads(session_map_store.read_text_shared(path))
-        except (OSError, ValueError):
+        except OSError:
+            # No stream declared is the configured state, not a fault: the
+            # answer is "no supervisor sid", the same one the inline reader
+            # gave before the read moved behind ``_session_map``.
             return ""
-        if not isinstance(data, dict):
+        data, problem = self._session_map(path)
+        if problem:
+            self.store.log_event({
+                "type": "session_map.unreadable", "at": _now(),
+                "where": "_supervisor_sid", "detail": problem})
             return ""
         for key_name in keys:
             entry = data.get(str(key_name))
@@ -2068,14 +1917,9 @@ class Engine:
         sup_routes = index.setdefault("supervisor_routes", {})
         if not isinstance(sup_routes, dict):
             sup_routes = index["supervisor_routes"] = {}
-        record = sup_routes.get(sup_key)
-        record = dict(record) if isinstance(record, dict) else {
-            "thread": thread, "comment_id": cid, "at": _now(),
-            "verdict": str(review.get("verdict") or ""),
-            "fix_needed": review.get("fix_needed"),
-        }
-        record["sup_eligible"] = True
-        record["action_id"] = sup_base
+        record = at_ledger_mod.supervisor_record(
+            sup_routes.get(sup_key), thread=thread, cid=cid, review=review,
+            action_id=sup_base, now=_now())
         sup_routes[sup_key] = record
         if self.store.action_attempted(sup_base) > 0:
             return {"dispatched": False, "reason": "already attempted",
@@ -2184,16 +2028,12 @@ class Engine:
             })
         numbers = index.setdefault("issues", {}).setdefault(
             thread, {"state": "idle", "comments_seen": 0, "needs_person": []})
-        existing = [entry for entry in numbers.get("needs_person") or []
-                    if needs.cid_of(entry) == needs.cid_of(comment_id)
-                    and str(entry.get("reason") or "") == reason
-                    and str(entry.get("assignment") or "") == str(assignment or "")
-                    and str(entry.get("detail") or "") == str(detail or "")]
-        if existing:
-            return
-        numbers.setdefault("needs_person", []).append({
-            "comment_id": comment_id, "reason": reason, "at": _now(),
-            "assignment": str(assignment or ""), "detail": str(detail or "")})
+        row = retry_mod.undeliverable_row(
+            numbers.get("needs_person") or [], comment_id=comment_id,
+            reason=reason, assignment=assignment, detail=detail,
+            cid_of=needs.cid_of, now=_now())
+        if row is not None:
+            numbers.setdefault("needs_person", []).append(row)
 
     def _note_skipped(self, index: dict, assignment: str, thread: str,
                       comment_id, detail: str) -> None:
@@ -2223,17 +2063,15 @@ class Engine:
         """
         sent = 0
         for key, record in sorted((index.get("supervisor_routes") or {}).items()):
-            if not isinstance(record, dict) or record.get("ok"):
-                continue
-            if "sup_eligible" not in record:
+            decision = retry_mod.supervisor_candidate(
+                record, attempted=self.store.action_attempted)
+            if decision == "undecidable":
                 self._undecidable(str(record.get("thread") or ""),
                                   record.get("comment_id"), key)
                 continue
-            if record.get("sup_eligible") is not True:
+            if decision != "retry":
                 continue
             base = str(record.get("action_id") or "")
-            if not base or self.store.action_attempted(base) > 0:
-                continue
             thread = str(record.get("thread") or "")
             cid = record.get("comment_id")
             issue = None
@@ -2324,29 +2162,10 @@ class Engine:
         """
         if self._pm_verdict_ahead(index, thread):
             return True
-        delivery = 0
-        for aid, rec in (index.get("assignments") or {}).items():
-            if not isinstance(rec, dict) or str(rec.get("thread") or "") != thread:
-                continue
-            try:
-                delivery = max(delivery, int(rec.get("delivery_comment_id") or 0))
-            except (TypeError, ValueError):
-                continue
-        rows = ((index.get("issues") or {}).get(thread) or {}).get(
-            "needs_person") or []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            reason = str(row.get("reason") or "")
-            if not reason.startswith("pm.") or reason.startswith("pm.stall"):
-                continue
-            try:
-                cid = int(row.get("comment_id") or 0)
-            except (TypeError, ValueError):
-                continue
-            if cid > delivery:
-                return True
-        return False
+        return watchdog_mod.pm_spoke(
+            [rec for rec in (index.get("assignments") or {}).values()
+             if isinstance(rec, dict) and str(rec.get("thread") or "") == thread],
+            ((index.get("issues") or {}).get(thread) or {}).get("needs_person") or [])
 
     # --------------------------------------------------------- at verdicts
     def _at_verdict(self, index: dict, thread: str) -> dict | None:
@@ -2358,27 +2177,13 @@ class Engine:
                            cid) -> dict:
         """Commit the verdict to the **AT** ledger, newest comment wins.
 
-        Two books, and this function is the reason they stay two:
-        ``pm_verdicts`` is not read or written here, and ``pm_stall`` is not
-        touched. An AT answer that silently reset the PM watchdog would hide a
-        PM that never spoke, and the two silences are different facts.
-
-        The watchdog this *does* reset is ``at_stall`` - its own.
+        Forwarder: the ledger shape and the watchdog reset live in
+        :func:`engine_parts.at_ledger.record`. Two books, never one -
+        ``pm_verdicts`` is not read or written there, and ``pm_stall`` is not
+        touched: an AT answer that reset the PM watchdog would hide a PM that
+        never spoke.
         """
-        ledger = index.setdefault("at_verdicts", {})
-        if not isinstance(ledger, dict):
-            ledger = index["at_verdicts"] = {}
-        record = {"thread": thread, "comment_id": int(cid),
-                  "state": str(verdict.get("state") or ""),
-                  "matched": str(verdict.get("matched") or ""),
-                  "issue": verdict.get("issue"), "at": _now(),
-                  "requirement_id": verdict.get("requirement_id"),
-                  "revision": verdict.get("revision"),
-                  "requirement_hash": verdict.get("requirement_hash")}
-        ledger[thread] = record
-        if isinstance(index.get("at_stall"), dict):
-            index["at_stall"].pop(thread, None)
-        return record
+        return at_ledger_mod.record(index, thread, verdict, cid, now=_now())
 
     @staticmethod
     def _at_frame_key(thread: str, cid) -> str:
@@ -2582,15 +2387,13 @@ class Engine:
         frames = index.setdefault("at_frames", {})
         if not isinstance(frames, dict):
             frames = index["at_frames"] = {}
-        record = frames.get(key)
-        record = dict(record) if isinstance(record, dict) else {
-            "thread": thread, "comment_id": cid, "at": _now()}
-        record.update({"exception": bool(exception), "issue": int(issue),
-                       "kind": kind, "question_url": question_url,
-                       "text": body_text or self._at_frame_text(
-                           issue, cid, verdict, exception=exception, kind=kind,
-                           question_url=question_url),
-                       "action_id": base})
+        record = at_ledger_mod.frame_record(
+            frames.get(key), thread=thread, cid=cid, issue=issue,
+            kind=kind, exception=exception, question_url=question_url,
+            text=(body_text or self._at_frame_text(
+                issue, cid, verdict, exception=exception, kind=kind,
+                question_url=question_url)),
+            action_id=base, now=_now())
         frames[key] = record
         if self.store.action_attempted(base) > 0:
             return {"dispatched": False, "reason": "already attempted",
@@ -2679,73 +2482,19 @@ class Engine:
                       declared: int | None = None) -> int:
         """The delivery comment ``cid`` judges, or ``cid`` itself.
 
-        Five levels, strongest first::
-
-            1. the ``delivery:`` coordinate in the verdict   (exact)
-            2. cid IS a worker assignment's delivery
-            3. cid is that assignment's review (current or last)
-            4. time: the newest delivery not later than cid   (old format only)
-            5. nothing links it - the comment is its own identity
-
-        **Level 4 is a fallback for the old format, nothing else.** A verdict
-        written with ``delivery:`` never reaches it: the coordinate is exactly
-        what the time guess was standing in for, and a guess after an exact
-        statement is how the wrong issue gets closed. Levels 2 and 3 answer for
-        a QA pass, which names no delivery but is linked through its assignment.
-
-        An orphan comment (no assignment, no coordinate) is its own identity -
-        the only thing that can be said about it without guessing - and the miss
-        is recorded once so a loop cannot hide it.
+        Forwarder: the five-level ladder lives in
+        :func:`engine_parts.delivery.delivery_for`; the one-time
+        ``release.key_unlinked`` row is written here because it is a side effect.
         """
-        if declared is not None:
-            return int(declared)
-        try:
-            wanted = int(cid)
-        except (TypeError, ValueError):
-            wanted = -1
-        best = None
-        eligible = []
-        for rec in (index.get("assignments") or {}).values():
-            if not isinstance(rec, dict):
-                continue
-            if str(rec.get("thread") or "") != thread:
-                continue
-            if str(rec.get("role") or "") != "worker":
-                continue
-            delivery = rec.get("delivery_comment_id")
-            try:
-                delivery = int(delivery)
-            except (TypeError, ValueError):
-                continue
-            # The comment is either the delivery itself, or a verdict on it.
-            if wanted == delivery:
-                return delivery
-            related = [rec.get("review_comment_id"),
-                       rec.get("last_review_comment_id")]
-            related_ok = any(str(value) == str(wanted) for value in related
-                             if value is not None)
-            if related_ok and (best is None or delivery > best):
-                best = delivery
-            # A PM verdict names no delivery, so it is attributed by time: the
-            # release it is about is the newest delivery that already exists
-            # when the comment was written. A delivery **after** the comment
-            # cannot be what it judged, which is what keeps the rework case
-            # (delivery 9300 judged by a comment at 9200) on the first key.
-            if delivery <= wanted:
-                eligible.append(delivery)
-        if best is not None:
-            return best
-        if eligible:
-            return max(eligible)
-        key = f"{thread}|{wanted}"
-        if key not in self._release_key_missed:
-            self._release_key_missed.add(key)
+        found, unlinked = delivery_mod.delivery_for(
+            index, thread, cid, declared, missed=self._release_key_missed)
+        if unlinked:
             self.store.log_event({
                 "type": "release.key_unlinked", "at": _now(),
-                "thread": thread, "comment_id": wanted,
+                "thread": thread, "comment_id": found,
                 "detail": "no worker assignment links this comment to a "
                           "delivery; using the comment as its own release key"})
-        return wanted
+        return found
 
     def _release_announced(self, index: dict, thread: str, cid,
                            declared: int | None = None) -> dict | None:
@@ -2786,19 +2535,13 @@ class Engine:
 
     def _record_pm_verdict(self, index: dict, thread: str, verdict: dict,
                            cid) -> dict:
-        """Commit the verdict to the thread ledger, newest comment wins."""
-        ledger = index.setdefault("pm_verdicts", {})
-        if not isinstance(ledger, dict):
-            ledger = index["pm_verdicts"] = {}
-        record = {"thread": thread, "comment_id": int(cid),
-                  "state": str(verdict.get("state") or ""),
-                  "matched": str(verdict.get("matched") or ""),
-                  "issue": verdict.get("issue"), "at": _now()}
-        ledger[thread] = record
-        # A verdict is the answer the stall watchdog was waiting for.
-        if isinstance(index.get("pm_stall"), dict):
-            index["pm_stall"].pop(thread, None)
-        return record
+        """Commit the verdict to the thread ledger, newest comment wins.
+
+        Forwarder: :func:`engine_parts.at_ledger.record` with the PM table, so
+        the two books share one shape and keep separate names.
+        """
+        return at_ledger_mod.record(index, thread, verdict, cid, now=_now(),
+                                    table="pm_verdicts", stall="pm_stall")
 
     def _on_pm_verdict(self, index: dict, thread: str, issue: int,
                        comment: dict, verdict: dict) -> tuple[str, str]:
@@ -2852,52 +2595,24 @@ class Engine:
                 index, thread, cid, "pm.verdict[user]", delivery_error, verdict)
             return "needs_person", f"pm verdict: {delivery_error}"
         declared_delivery = verdict.get("delivery")
+        owner = None
         if declared_delivery is not None:
             wanted = int(declared_delivery)
             states = REVIEW_TARGET_STATES + ("close_reconcile",)
-            # Dirty data first, and before the target is located: if the target
-            # were found first, two live owners of one cid would let the newest
-            # one pass the ownership check, and ambiguity would be unreachable.
-            owners = asg_mod.owners_of_delivery(index, thread, wanted)
-            live = [rec for rec in owners
-                    if str(rec.get("status") or "") in states]
-            if len(live) > 1:
-                detail = (f"delivery #{wanted} belongs to {len(live)} live "
-                          "assignments: " + ", ".join(str(r.get("id")) for r in live))
+            check = delivery_mod.verify_declared(
+                index, thread, wanted, states,
+                owners_of=asg_mod.owners_of_delivery,
+                newest_owner=asg_mod.newest_delivery_owner,
+                output_cids=asg_mod.assignment_output_cids)
+            if not check["ok"]:
                 self.store.log_event({
-                    "type": "pm.delivery_ambiguous", "at": _now(), "thread": thread,
-                    "comment_id": cid, "delivery": wanted,
-                    "owners": [str(r.get("id")) for r in owners]})
+                    "type": f"pm.delivery_{check['kind']}", "at": _now(),
+                    "thread": thread, "comment_id": cid, "delivery": wanted,
+                    "owners": check.get("owners") or []})
                 self._pm_needs_person(index, thread, cid, "pm.verdict[user]",
-                                      detail, verdict)
-                return "needs_person", f"pm verdict: {detail}"
-            owner = asg_mod.newest_delivery_owner(index, thread, states)
-            if owner is None or wanted not in asg_mod.assignment_output_cids(owner):
-                # At most one live owner is left, so the failure has three
-                # shapes and the wording must say which one happened: "archived"
-                # printed for a live assignment is a contradiction a reader
-                # cannot resolve. A live owner wins the branch even when an
-                # archived one sorts first, for the same reason.
-                if not owners:
-                    detail = (f"delivery #{wanted} is not a delivery "
-                              "of this thread")
-                elif live:
-                    detail = (f"delivery #{wanted} belongs to another open "
-                              f"assignment {live[0].get('id')} "
-                              f"({live[0].get('status')}), which is not this "
-                              "thread's newest delivery")
-                else:
-                    detail = (f"delivery #{wanted} belongs to an archived "
-                              f"assignment {owners[0].get('id')} "
-                              f"({owners[0].get('status')})")
-                self.store.log_event({
-                    "type": "pm.delivery_unknown", "at": _now(),
-                    "thread": thread, "comment_id": cid,
-                    "delivery": wanted,
-                    "owners": [str(r.get("id")) for r in owners]})
-                self._pm_needs_person(index, thread, cid, "pm.verdict[user]",
-                                      detail, verdict)
-                return "needs_person", f"pm verdict: {detail}"
+                                      check["detail"], verdict)
+                return "needs_person", f"pm verdict: {check['detail']}"
+            owner = check.get("owner")
         if self._at_mode(issue):
             if declared_delivery is None:
                 detail = "AT-mode PM verdict requires an exact delivery coordinate"
@@ -3037,6 +2752,86 @@ class Engine:
                           append=self._append_needs_person,
                           log=self.store.log_event)
 
+    def rebuild_issue(self, thread, reason: str, *, collected=None) -> dict:
+        """Rebuild one thread from the full listing, **without moving the cursor**.
+
+        The counter-example this exists for: a rebuild that advances the cursor
+        before it has agreed that it read everything. A rebuild is a repair, and
+        the one state a repair must never leave behind is "the cursor moved, the
+        rows did not arrive" - that silently drops comments and nothing later
+        notices.
+
+        So the cursor is written **only** on the success path, and only after the
+        rebuilt prefix is complete:
+
+        * read the whole listing (``since_id=0``), not the unread prefix;
+        * if the walk cannot claim it reached page 1, write one ``needs_person``
+          row, pause the read, return ``{"ok": False}`` - and leave the cursor
+          byte for byte as it was;
+        * if it can, adopt the rebuilt rows as consumed and move the cursor to
+          what was actually read.
+
+        ``collected`` lets the caller pass the batch it already has, so a gap
+        found mid-round costs no second walk of the same listing.
+        """
+        thread = str(thread or "")
+        repo, number = issuekey.split_key(thread)
+        out = {"thread": thread, "issue": number, "ok": False, "reason": str(reason),
+               "rows": 0, "cursor_before": None, "cursor_after": None}
+        if number is None:
+            out["reason"] = f"{reason}: no issue number in {thread!r}"
+            return out
+        index = self.store.load_index()
+        cursor = self.store.load_cursor()
+        legacy = str(number)
+        cur = int(issuekey.read_both(cursor.get("issues") or {}, thread, legacy) or 0)
+        out["cursor_before"] = cur
+        if collected is None:
+            budget = int((self.cfg.get("github") or {}).get("max_comment_pages") or 10)
+            walk = github_source.paged_batch(self.source, number, cursor_before=0,
+                                             max_pages=budget, whole_listing=True)
+            collected = batch_mod.CollectedBatch(
+                thread, walk.rows, cursor_before=0,
+                pages=list(getattr(walk, "pages", []) or []),
+                complete=bool(getattr(walk, "pagination_complete", False)),
+                contiguous=bool(getattr(walk, "contiguous", False)),
+                reason=str(getattr(walk, "stop_reason", "") or ""))
+        out["rows"] = len(collected.rows)
+        complete = (collected.pagination_complete
+                    and collected.missing_page() is None)
+        if not complete:
+            # One row, one pause, no cursor movement. The reason names the fault
+            # so a person can see *why* the history is untrusted.
+            self._pause_read(index, thread, number, cur, len(collected.rows),
+                             int((self.cfg.get("github") or {}).get(
+                                 "max_comment_pages") or 10),
+                             {"needs_person": 0, "read_paused": 0})
+            self._append_needs_person(index, thread, {
+                "comment_id": 0, "reason": "rebuild.incomplete[user]",
+                "at": _now(),
+                "detail": (f"full rebuild could not read the listing "
+                           f"(rows={len(collected.rows)}, "
+                           f"missing_page={collected.missing_page()}, "
+                           f"reason={collected.reason}); the cursor was not "
+                           f"moved")})
+            self.store.save_index(index)
+            self.store.log_event({"type": "rebuild.incomplete", "at": _now(),
+                                  "thread": thread, "issue": number,
+                                  "rows": len(collected.rows),
+                                  "cursor": cur})
+            out["reason"] = f"{reason}: the whole listing could not be read"
+            return out
+        cursor.setdefault("issues", {})[thread] = round_mod.consumed_prefix(
+            cur, [int(row["id"]) for row in collected.rows])
+        out["cursor_after"] = cursor["issues"][thread]
+        self.store.save_cursor(cursor)
+        self.store.log_event({"type": "rebuild.done", "at": _now(),
+                              "thread": thread, "issue": number,
+                              "rows": len(collected.rows),
+                              "cursor": out["cursor_after"]})
+        out["ok"] = True
+        return out
+
     def resume_read(self, issue, *, by: str = "", max_pages: int | None = None,
                     detail: str = "") -> dict:
         """Lift a read pause for one issue - the manual way out of the hard cap.
@@ -3120,6 +2915,32 @@ class Engine:
         rows.append(row)
         return True
 
+    def _file_needs_person(self, index: dict, key: str, issue: int, cid,
+                           reason: str, rec: dict, summary: dict) -> bool:
+        """File one person-facing row and ring at most one bell.
+
+        Returns ``True`` when the caller should stop for this comment. Two rules
+        make the queue readable: a row the router already filed is not filed
+        again (its own ``reason`` is actionable prose, and a second copy is the
+        shape that put 179 rows under one comment in #68), and the bus bell keeps
+        its cooldown so a stuck comment cannot ring every round.
+        """
+        if self._pm_row_exists(index, key, cid):
+            return True
+        if not self._append_needs_person(index, key, {
+                "comment_id": cid, "reason": reason, "at": _now()}):
+            return True
+        summary["needs_person"] += 1
+        now = self.clock()
+        if self._cooldown_ok(rec, "needs_person", now):
+            self._mark_cooldown(rec, "needs_person", now)
+            self._dispatch({"kind": "bus_inject",
+                            "event": "event.agent.needs_person",
+                            "issue": issue,
+                            "payload": {"issue": issue, "comment_id": cid,
+                                        "reason": reason}})
+        return False
+
     def _pm_row_exists(self, index: dict, thread: str, cid) -> bool:
         """Is there already a row for this comment under this thread?
 
@@ -3176,14 +2997,12 @@ class Engine:
         frames = index.setdefault("pm_frames", {})
         if not isinstance(frames, dict):
             frames = index["pm_frames"] = {}
-        record = frames.get(key)
-        record = dict(record) if isinstance(record, dict) else {
-            "thread": thread, "comment_id": cid, "at": _now()}
-        record.update({"exception": bool(exception), "issue": int(issue),
-                       "delivery": verdict.get("delivery"),
-                       "text": body_text or self._pm_frame_text(
-                           issue, cid, verdict, exception=exception),
-                       "action_id": base})
+        record = at_ledger_mod.frame_record(
+            frames.get(key), thread=thread, cid=cid, issue=issue,
+            kind="pm_verdict", exception=exception, question_url="",
+            text=(body_text or self._pm_frame_text(
+                issue, cid, verdict, exception=exception)),
+            action_id=base, now=_now(), delivery=verdict.get("delivery"))
         frames[key] = record
         if self.store.action_attempted(base) > 0:
             return {"dispatched": False, "reason": "already attempted",
@@ -3263,26 +3082,11 @@ class Engine:
         """
         sent = 0
         for key, record in sorted((index.get("pm_frames") or {}).items()):
-            if not isinstance(record, dict) or record.get("ok"):
+            plan = retry_mod.pm_frame_candidate(
+                key, record, attempted=self.store.action_attempted)
+            if plan is None:
                 continue
-            if "exception" not in record:
-                continue
-            if record.get("refused"):
-                # A refused frame is a **decision**, not an unfinished send.
-                # The allowlist said no before the action was even begun, so no
-                # attempt counter was written and the old skip rule let every
-                # round retry it: 56 frames regenerating 56 ``route.decided``
-                # lines a minute, forever (#75 round 2, P1-2). Re-asking an
-                # allowlist would produce the same no, and a different answer
-                # needs a configuration change and a new verdict, not this
-                # loop.
-                continue
-            base = str(record.get("action_id") or "")
-            cid = record.get("comment_id")
-            if cid is None or (base and self.store.action_attempted(base) > 0):
-                continue
-            thread = str(record.get("thread") or "")
-            issue = record.get("issue")
+            thread, issue = plan["thread"], plan["issue"]
             if issue is None:
                 for rec in (index.get("assignments") or {}).values():
                     if str(rec.get("thread") or "") == thread:
@@ -3290,21 +3094,17 @@ class Engine:
                         break
             if issue is None:
                 continue
-            verdict = {"state": "blocked" if record.get("exception") else "ready",
+            cid = plan["cid"]
+            verdict = {"state": "blocked" if plan["exception"] else "ready",
                        "matched": ""}
-            declared = record.get("delivery")
-            try:
-                declared = int(declared) if declared is not None else None
-            except (TypeError, ValueError):
-                declared = None
             result = self._route_pm_frame(
                 index, thread, int(issue), {"id": cid}, verdict,
-                exception=bool(record.get("exception")), action_key=key,
-                body_text=str(record.get("text") or ""))
+                exception=plan["exception"], action_key=key,
+                body_text=plan["text"])
             self._settle_frame(index, thread, issue, cid, result,
-                               exception=bool(record.get("exception")),
-                               reason=str(record.get("reason") or ""),
-                               verdict={"delivery": declared}, state="",
+                               exception=plan["exception"],
+                               reason=plan["reason"],
+                               verdict={"delivery": plan["delivery"]}, state="",
                                key=key)
             # Write the outcome back **through the table**. ``_route_pm_frame``
             # stores a fresh ``dict`` under ``key``, so the loop's ``record``
@@ -3353,79 +3153,33 @@ class Engine:
             limit = 15
         if limit <= 0:
             return 0
-        stall = index.setdefault("pm_stall", {})
-        if not isinstance(stall, dict):
-            stall = index["pm_stall"] = {}
-        held = {}
-        for aid, rec in (index.get("assignments") or {}).items():
-            if not isinstance(rec, dict):
-                continue
-            if str(rec.get("status") or "") not in ("waiting_release",
-                                                    "close_reconcile"):
-                continue
-            thread = str(rec.get("thread") or "")
-            if not thread or str(rec.get("qa_verdict") or "") != "pass":
-                continue
-            # A closed issue is not stalled: the hold has reached its end state
-            # and only the archive is outstanding. Reading it as "PM went quiet"
-            # keeps a counter growing for a thread nobody can act on (#78 held
-            # 878 rounds while already closed).
-            issue = rec.get("issue")
-            if issue is not None and self._issue_state(issue) == "closed":
-                continue
-            held[thread] = (aid, rec)
+        stall = watchdog_mod.table(index, "pm_stall")
+        held = watchdog_mod.pm_held(index, issue_state=self._issue_state)
         for thread in list(stall):
             if thread not in held:
                 # Left the hold: the next hold is a new notice, so the seq
                 # moves and the old attempt counter no longer swallows it.
-                seqs = index.setdefault("pm_stall_seq", {})
-                if isinstance(seqs, dict) and thread in seqs:
-                    seqs[thread] = int(seqs[thread] or 0) + 1
+                watchdog_mod.bump_hold_seq(index, "pm_stall_seq", thread)
                 stall.pop(thread, None)
         fired = 0
         for thread, (aid, rec) in sorted(held.items()):
             if self._pm_answered(index, thread):
                 stall.pop(thread, None)
                 continue
-            entry = stall.get(thread)
-            entry = dict(entry) if isinstance(entry, dict) else {
-                "thread": thread, "rounds": 0, "fired": False,
-                "since": _now()}
-            entry["rounds"] = int(entry.get("rounds") or 0) + 1
+            entry = watchdog_mod.round_count(stall.get(thread), thread, _now())
             stall[thread] = entry
-            if entry.get("fired") or entry["rounds"] < limit:
+            if not watchdog_mod.due(entry, limit):
                 continue
             issue = rec.get("issue")
             comment_id = rec.get("delivery_comment_id")
-            seqs = index.setdefault("pm_stall_seq", {})
-            if not isinstance(seqs, dict):
-                seqs = index["pm_stall_seq"] = {}
-            seq = int(seqs.get(thread) or 1)
-            seqs[thread] = seq
-            action_key = f"pm_stall:{thread}:{seq}"
-            verdict = {"state": "blocked", "matched": "pm_stall"}
-            result = self._route_pm_frame(
-                index, thread, int(issue or 0), {"id": comment_id}, verdict,
-                exception=True, reason=f"no pm verdict in {entry['rounds']} rounds",
-                action_key=action_key,
-                body_text=self._pm_stall_text(thread, issue, entry["rounds"]))
-            entry["fired"] = True
-            entry["hold_seq"] = seq
-            entry["result"] = str(result.get("reason") or "dispatched")
-            self.store.log_event({
-                "type": "pm.stall", "at": _now(), "thread": thread,
-                "assignment": aid, "rounds": entry["rounds"], "hold_seq": seq,
-                "dispatched": bool(result.get("dispatched")),
-                "reason": result.get("reason") or ""})
-            if not result.get("dispatched"):
-                self._note_undeliverable(
-                    index, thread, comment_id,
-                    f"pm stall notice could not be delivered: "
-                    f"{result.get('reason') or 'unknown'}", issue=issue,
-                    assignment=aid, once_key=f"pmstall:{thread}:{seq}")
-            self._pm_needs_person(
-                index, thread, comment_id, "pm.stall[user]",
-                f"QA 通过后 {entry['rounds']} 轮无 PM 结论")
+            seq = watchdog_mod.hold_seq(index, "pm_stall_seq", thread)
+            stall[thread] = self._fire_stall(
+                index, thread, issue=issue, comment_id=comment_id, seq=seq,
+                table="pm_stall_seq", entry=entry, kind="pm",
+                assignment=aid,
+                body_text=self._pm_stall_text(thread, issue, entry["rounds"]),
+                row_reason="pm.stall[user]",
+                row_detail=f"QA 通过后 {entry['rounds']} 轮无 PM 结论")
             fired += 1
         return fired
 
@@ -3443,36 +3197,28 @@ class Engine:
         return False
 
     def _at_needs_answer(self, index: dict, thread: str, at_entry: dict) -> bool:
-        issue = at_entry.get("issue")
-        if issue is None:
-            _repo, issue = issuekey.split_key(thread)
-        if issue is not None:
+        """Is this AT registration still waiting for an answer?
+
+        Forwarder: the six refusals live in
+        :func:`engine_parts.watchdog.at_needs_answer`, so "what counts as an AT
+        silence" is readable in one place instead of inside a 30-line predicate.
+        """
+        def flow_of(issue):
             try:
-                selected = self.source.flow(issue) if callable(
-                    getattr(self.source, "flow", None)) else ""
+                return (self.source.flow(issue)
+                        if callable(getattr(self.source, "flow", None)) else "")
             except flow_mod.FlowError:
-                return False
-            if selected == flow_mod.STANDARD:
-                return False
-        live = getattr(self, "_live_issues", set())
-        if issue is not None and live and int(issue) not in live:
-            return False
-        if issue is not None and self._issue_state(issue) == "closed":
-            return False
-        if not self._at_sid(thread):
-            return False
-        current = self._requirement_current(index, thread)
-        if current and str(current.get("status")) in (
-                "ready", "approved", "dispatched", "completed"):
-            return False
-        verdict = self._at_verdict(index, thread)
-        if verdict:
-            if str(verdict.get("state") or "") == "questions":
-                return self._question_answered(thread, verdict.get("comment_id"))
-            return False
-        if current and current.get("open_questions"):
-            return self._question_answered(thread, current.get("source_comment_id"))
-        return bool(at_entry.get("awaiting") or current)
+                return flow_mod.STANDARD
+
+        return watchdog_mod.at_needs_answer(
+            issue=at_entry.get("issue"), thread=thread, at_entry=at_entry,
+            flow_of=flow_of, standard=flow_mod.STANDARD,
+            live=getattr(self, "_live_issues", set()),
+            issue_state=self._issue_state, at_sid=self._at_sid,
+            current=self._requirement_current(index, thread),
+            verdict=self._at_verdict(index, thread),
+            question_answered=self._question_answered,
+            split_key=issuekey.split_key)
 
     # ------------------------------------------------------- at stall watchdog
     def _check_at_stall(self, index: dict) -> int:
@@ -3504,40 +3250,19 @@ class Engine:
             limit = 15
         if limit <= 0:
             return 0
-        stall = index.setdefault("at_stall", {})
-        if not isinstance(stall, dict):
-            stall = index["at_stall"] = {}
-        registered: dict[str, dict] = {}
-        # The scan reads whatever spelling ``gh_issue.bind`` wrote
-        # (``<project>#<n>``) and normalises it through ``_thread_key``, so the
-        # watchdog's counter and ``_at_verdict`` speak one key space. Without
-        # this the binding is registered under a key nothing ever asks about,
-        # and the watchdog watches a thread that does not exist.
-        for raw_key, entry in (self._load_issue_sessions() or {}).items():
-            if not isinstance(entry, dict) or not isinstance(entry.get("at"), dict):
-                continue
-            _repo, number = issuekey.split_key(raw_key)
-            if number is None:
-                continue
-            registered[str(self._thread_key(number))] = entry["at"]
-        for thread in list(registered):
-            if not self._at_needs_answer(index, thread, registered[thread]):
-                registered.pop(thread, None)
+        stall = watchdog_mod.table(index, "at_stall")
+        registered = watchdog_mod.at_registered(
+            self._load_issue_sessions(), self._thread_key,
+            needs_answer=lambda t, e: self._at_needs_answer(index, t, e))
         for thread in list(stall):
             if thread not in registered:
-                seqs = index.setdefault("at_stall_seq", {})
-                if isinstance(seqs, dict) and thread in seqs:
-                    seqs[thread] = int(seqs[thread] or 0) + 1
+                watchdog_mod.bump_hold_seq(index, "at_stall_seq", thread)
                 stall.pop(thread, None)
         fired = 0
         for thread, at_entry in sorted(registered.items()):
-            entry = stall.get(thread)
-            if not isinstance(entry, dict):
-                entry = {"thread": thread, "rounds": 0, "fired": False,
-                         "since": _now()}
-            entry["rounds"] = int(entry.get("rounds") or 0) + 1
+            entry = watchdog_mod.round_count(stall.get(thread), thread, _now())
             stall[thread] = entry
-            if entry.get("fired") or entry["rounds"] < limit:
+            if not watchdog_mod.due(entry, limit):
                 continue
             issue = at_entry.get("issue")
             if issue is None:
@@ -3552,56 +3277,60 @@ class Engine:
                 # like a watchdog that never fired.
                 _repo, parsed = issuekey.split_key(thread)
                 issue = parsed
-            seqs = index.setdefault("at_stall_seq", {})
-            if not isinstance(seqs, dict):
-                seqs = index["at_stall_seq"] = {}
-            seq = int(seqs.get(thread) or 1)
-            seqs[thread] = seq
-            action_key = f"at_stall:{thread}:{seq}"
-            verdict = {"state": "blocked", "matched": "at_stall"}
-            result = self._route_at_frame(
-                index, thread, int(issue or 0), {"id": 0}, verdict,
-                exception=True, kind="at_stall",
-                reason=f"no at verdict in {entry['rounds']} rounds",
-                action_key=action_key,
-                body_text=(f"【AT 停摆】{thread} "
-                           f"{entry['rounds']} 轮无 AT 结论"))
-            entry["fired"] = True
-            entry["hold_seq"] = seq
-            entry["result"] = str(result.get("reason") or "dispatched")
-            self.store.log_event({
-                "type": "at.stall", "at": _now(), "thread": thread,
-                "rounds": entry["rounds"], "hold_seq": seq,
-                "dispatched": bool(result.get("dispatched")),
-                "reason": result.get("reason") or ""})
-            if not result.get("dispatched"):
-                self._note_undeliverable(
-                    index, thread, 0,
-                    "at stall notice could not be delivered: "
-                    f"{result.get('reason') or 'unknown'}", issue=issue,
-                    once_key=f"atstall:{thread}:{seq}")
-            self._pm_needs_person(
-                index, thread, 0, "at.stall[user]",
-                f"{entry['rounds']} 轮无 AT 结论")
+            seq = watchdog_mod.hold_seq(index, "at_stall_seq", thread)
+            stall[thread] = self._fire_stall(
+                index, thread, issue=issue, comment_id=0, seq=seq,
+                table="at_stall_seq", entry=entry, kind="at", assignment="",
+                body_text=f"【AT 停摆】{thread} {entry['rounds']} 轮无 AT 结论",
+                row_reason="at.stall[user]",
+                row_detail=f"{entry['rounds']} 轮无 AT 结论")
             fired += 1
         return fired
 
     # -------------------------------------------------- release-time reminders
-    def _release_start(self, index: dict, thread: str, assignment: dict) -> str:
-        """The stable start time of a held thread, or ``""`` when there is none.
+    def _fire_stall(self, index: dict, thread: str, *, issue, comment_id,
+                    seq: int, table: str, entry: dict, kind: str,
+                    assignment: str, body_text: str, row_reason: str,
+                    row_detail: str) -> dict:
+        """Send one stall notice and record it; PM and AT share this shape.
 
-        ``first_checked_at`` is written once by ``_reconcile_thread`` and kept;
-        ``updated_at`` is rewritten by ``enter_close_reconcile`` every round and
-        would keep pushing the deadline out forever. The fallbacks are the
-        archive record, and nothing else is guessed.
+        ``kind`` chooses the frame (``pm`` or ``at``) and the event name. The
+        record is written whether or not the frame landed, so one hold produces
+        one notice: a failed send leaves ``needs_person`` as the copy a person
+        can act on, and a retry loop cannot turn it into a bell every round.
         """
-        rec = (index.get("close_reconcile") or {}).get(thread)
-        if isinstance(rec, dict) and str(rec.get("first_checked_at") or ""):
-            return str(rec["first_checked_at"])
-        tombstone = assignment.get("tombstone")
-        if isinstance(tombstone, dict) and str(tombstone.get("at") or ""):
-            return str(tombstone["at"])
-        return str(assignment.get("archived_at") or "")
+        action_key = f"{kind}_stall:{thread}:{seq}"
+        verdict = {"state": "blocked", "matched": f"{kind}_stall"}
+        if kind == "pm":
+            result = self._route_pm_frame(
+                index, thread, int(issue or 0), {"id": comment_id}, verdict,
+                exception=True,
+                reason=f"no pm verdict in {entry['rounds']} rounds",
+                action_key=action_key, body_text=body_text)
+        else:
+            result = self._route_at_frame(
+                index, thread, int(issue or 0), {"id": 0}, verdict,
+                exception=True, kind="at_stall",
+                reason=f"no at verdict in {entry['rounds']} rounds",
+                action_key=action_key, body_text=body_text)
+        self.store.log_event({
+            "type": f"{kind}.stall", "at": _now(), "thread": thread,
+            "assignment": assignment or None, "rounds": entry["rounds"],
+            "hold_seq": seq, "dispatched": bool(result.get("dispatched")),
+            "reason": result.get("reason") or ""})
+        if not result.get("dispatched"):
+            self._note_undeliverable(
+                index, thread, comment_id,
+                f"{kind} stall notice could not be delivered: "
+                f"{result.get('reason') or 'unknown'}", issue=issue,
+                assignment=assignment or None,
+                once_key=f"{kind}stall:{thread}:{seq}")
+        self._pm_needs_person(index, thread, comment_id, row_reason, row_detail)
+        return watchdog_mod.remember(result, entry, seq)
+
+    def _release_start(self, index: dict, thread: str, assignment: dict) -> str:
+        """Forwarder: :func:`engine_parts.watchdog.release_start`."""
+        return watchdog_mod.release_start(index, thread, assignment)
 
     def _remind_release_timeouts(self, index: dict) -> int:
         """Remind the supervisor once about a thread held too long.
@@ -3638,13 +3367,12 @@ class Engine:
             if issue is not None and self._issue_state(issue) == "closed":
                 continue
             start = self._release_start(index, thread, rec)
-            parsed = _parse_ts(start)
-            if parsed is None:
+            due, seconds, problem = watchdog_mod.overdue(start, timeout)
+            if problem:
                 self._note_skipped(
-                    index, aid, thread, rec.get("delivery_comment_id"),
-                    "release timeout start time is unusable")
+                    index, aid, thread, rec.get("delivery_comment_id"), problem)
                 continue
-            if (now - parsed).total_seconds() < timeout:
+            if not due:
                 continue
             base = action_id(f"release_timeout:{aid}", "bus_inject", start)
             if self.store.action_attempted(base) > 0:
@@ -3668,7 +3396,7 @@ class Engine:
                             "status": str(rec.get("status") or ""),
                             "started_at": start, "sid": sid, "at": _now(),
                             "text": f"【超时未关】#{issue} 已滞留 "
-                                    f"{int((now - parsed).total_seconds())}s"
+                                    f"{int(seconds)}s"
                                     f"（起点 {start}）"},
             })
             if not result.get("dispatched"):
@@ -3706,38 +3434,31 @@ class Engine:
         # engine's own routing path (``_dispatch``); a process that talks to the
         # session API directly is outside this gate - see the module docstring
         # and the ``_archive_one`` note below.
-        origin = str(action.get("origin_role") or "")
-        target = str(action.get("target_role") or "")
-        if origin == markers.QA.lower() and target == "worker":
-            self.store.log_event({
-                "type": "route.refused", "at": _now(), "action": action.get("kind"),
-                "issue": action.get("issue"), "thread": action.get("thread"),
-                "origin_role": origin, "target_role": target,
-                "reason": "a qa verdict is never dispatched to a worker",
-            })
+        gate = delivery_mod.dispatch_refusal(
+            action, dispatch_enabled=self.dispatch_enabled, mode=self.mode,
+            sid_archived=self._sid_archived)
+        if gate is not None:
+            if gate["gate"] == "qa_to_worker":
+                self.store.log_event({
+                    "type": "route.refused", "at": _now(),
+                    "action": action.get("kind"), "issue": action.get("issue"),
+                    "thread": action.get("thread"),
+                    "origin_role": action.get("origin_role"),
+                    "target_role": action.get("target_role"),
+                    "reason": gate["reason"]})
+                return {"dispatched": False, "refused": True,
+                        "reason": gate["reason"]}
+            if gate["gate"] == "disabled":
+                self.store.log_event({
+                    "type": "dispatch.suppressed", "at": _now(),
+                    "mode": gate.get("mode"), "action": action.get("kind"),
+                    "issue": action.get("issue")})
+                return {"dispatched": False, "reason": gate["reason"]}
+            # Refused every round, but **logged once**: archive is a reversible
+            # operational act, so this is not a permanent refusal.
+            self._note_archived_sid(gate["sid"], action)
             return {"dispatched": False, "refused": True,
-                    "reason": "qa verdict routed to a worker"}
-        if not self.dispatch_enabled:
-            self.store.log_event({
-                "type": "dispatch.suppressed", "at": _now(),
-                "mode": self.mode, "action": action.get("kind"),
-                "issue": action.get("issue"),
-            })
-            return {"dispatched": False, "reason": "dispatch disabled"}
-
-        # Never deliver into a session that is already closed. Checked before
-        # the allowlist and before any counter moves, so a refusal here is not
-        # an external action and leaves no attempt behind.
-        payload_sid = str((action.get("payload") or {}).get("sid") or "")
-        if payload_sid and self._sid_archived(payload_sid):
-            # Refused every round, but **logged once**. Archive is a reversible
-            # operational act (RULES §33: restore first, then deliver), so this
-            # is not a permanent refusal: marking the record would kill a route
-            # that a restore makes deliverable again. The growth was never the
-            # check - it was one identical event per round (#84: 229).
-            self._note_archived_sid(payload_sid, action)
-            return {"dispatched": False, "refused": True,
-                    "reason": "target session is archived"}
+                    "reason": gate["reason"]}
 
         verb = str(action.get("kind") or "")
         issue = action.get("issue")
@@ -4104,14 +3825,8 @@ class Engine:
         return self._live_archived(sid)
 
     def _archived_noted_key(self, sid: str, action: dict) -> tuple:
-        """Identity of one archive refusal: sid, action kind and assignment.
-
-        Two different actions aimed at the same archived session are two facts,
-        so they are two rows; the same action refused again is one fact, so it
-        is not a second row.
-        """
-        return (str(sid), str(action.get("kind") or ""),
-                str(action.get("assignment_id") or ""))
+        """Forwarder: :func:`engine_parts.archive.refusal_key`."""
+        return archive_mod.refusal_key(sid, action)
 
     def _note_archived_sid(self, sid: str, action: dict) -> None:
         """Write ``dispatch.archived_sid`` at most once per refusal identity.
@@ -4123,9 +3838,8 @@ class Engine:
         identical log line every round was not (#84: 229 rows for one sid).
 
         The memory of "already written" is the event stream itself, read once
-        per process and then kept in :attr:`_archived_noted`. No new state file
-        and no new config key: the log already holds the answer, and a rotated
-        segment costs at most one repeated line, never a wrong decision.
+        per process and then kept in :attr:`_archived_noted` (see
+        :func:`engine_parts.archive.load_noted`).
         """
         key = self._archived_noted_key(sid, action)
         if self._archived_noted is None:
@@ -4139,32 +3853,9 @@ class Engine:
                               "assignment": action.get("assignment_id")})
 
     def _load_archived_noted(self) -> set:
-        """Every archive refusal the current ``events.jsonl`` already records.
-
-        Unreadable or absent log means "nothing written yet", which costs one
-        duplicate event and never a delivered frame - the fail-open side here is
-        the log, not the dispatch.
-        """
-        found: set = set()
-        try:
-            lines = self.store.events_path.read_text(encoding="utf-8").splitlines()
-        except (OSError, ValueError):
-            return found
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(row, dict) or row.get("type") != "dispatch.archived_sid":
-                continue
-            found.add(self._archived_noted_key(
-                str(row.get("sid") or ""),
-                {"kind": row.get("action"),
-                 "assignment_id": row.get("assignment")}))
-        return found
+        """Forwarder: :func:`engine_parts.archive.load_noted`."""
+        return archive_mod.load_noted(self.store.events_path,
+                                      self._archived_noted_key)
 
     def _live_archived(self, sid: str) -> bool:
         """Ask the server about one sid; cached for the round, fail-closed.
@@ -4225,18 +3916,12 @@ class Engine:
         try:
             events_path, _sessions = self._session_stream()
             events, missing = session_events.read_stream(events_path)
-            if missing or not events:
-                raise RuntimeError(f"session stream unavailable: {events_path.name}")
-            state = session_events.replay(events)
         except Exception:  # noqa: BLE001  unreadable means "assume archived"
-            self._archived_cache = {}
-            self._archived_unreadable = True
-            return {}
-        sessions = state.get("sessions") or {}
-        self._archived_cache = {sid: bool(rec.get("archived"))
-                                for sid, rec in sessions.items()}
-        self._archived_unreadable = False
-        return self._archived_cache
+            events, missing = [], True
+        cache, unreadable = archive_mod.from_stream(events, missing)
+        self._archived_cache = cache
+        self._archived_unreadable = unreadable
+        return cache
 
     def archive_thread(self, thread: str, index: dict | None = None) -> dict:
         """Archive a worker whose review passed, idempotently.
@@ -4266,48 +3951,28 @@ class Engine:
         for aid, rec in sorted((index.get("assignments") or {}).items()):
             if str(rec.get("thread") or "") != thread:
                 continue
-            if str(rec.get("status") or "") == "waiting_release" and \
-                    (rec.get("tombstone") or {}).get("archived"):
-                # Already archived (possibly in this same round): nothing left
-                # to do for this record here.
+            decision, detail = archive_mod.eligible(
+                aid, rec,
+                notify_attempted=lambda a, d: self.store.action_attempted(
+                    action_id(a, "bus_inject", str(d))),
+                archive_attempted=lambda a, d: self.store.action_attempted(
+                    action_id(a, "archive", str(d))))
+            if decision == "skip":
                 out["skipped"].append(aid)
-                continue
-            if str(rec.get("status") or "") not in ("waiting_review",
-                                                    "waiting_release"):
                 continue
             delivery = rec.get("delivery_comment_id")
-            if delivery is None:
-                out["skipped"].append(aid)
-                continue
-            notify_base = action_id(aid, "bus_inject", str(delivery))
-            if self.store.action_attempted(notify_base) < 1:
-                # The review notification has not been sent (refused, or
-                # dispatch disabled). Archiving now would drop the only chance
-                # to tell the supervisor, so it waits for the retry pass.
-                out["skipped"].append(aid)
-                continue
-            # An *attempt* is not a delivery: ``uncertain`` means the bus call
-            # raised, so the supervisor was never told. Archiving on the
-            # counter alone recorded those as "notified + archived" while the
-            # event never left the process. The archive still proceeds (a
-            # worker that delivered is done, and leaving it open keeps the
-            # thread permanently non-terminal), but the tombstone records
-            # ``notified: false`` and the loss is logged - the unsettled
-            # outbox entry is what makes it visible to a person.
-            notified = bool(str(rec.get("notified_at") or ""))
-            base = action_id(aid, "archive", str(delivery))
-            if self.store.action_attempted(base) > 0:
-                out["skipped"].append(aid)
-                continue
+            notified = decision != "unnotified"
             if not notified:
                 self.store.log_event({"type": "assignment.notify_unconfirmed",
                                       "at": _now(), "assignment": aid,
                                       "delivery_comment_id": delivery,
-                                      "action_id": notify_base})
-            # The gate, and its position: after the idempotency checks above,
-            # before ``begin_action`` below - which is the first side effect
-            # (a persisted ``prepared`` record and a bumped try counter). A gate
-            # placed after it would have written state it then refuses.
+                                      "action_id": action_id(
+                                          aid, "bus_inject", str(delivery))})
+            # The gate, and its position: after the idempotency checks in
+            # ``eligible``, before ``begin_action`` below - which is the first
+            # side effect (a persisted ``prepared`` record and a bumped try
+            # counter). A gate placed after it would have written state it then
+            # refuses.
             gate_ok, gate_why = asg_mod.qa_gate(rec)
             if not gate_ok:
                 self.store.log_event({
@@ -4323,6 +3988,7 @@ class Engine:
                 self._mark_blocked(rec, asg_mod.NO_SID_REASON)
                 out["blocked"].append(aid)
                 continue
+            base = action_id(aid, "archive", str(delivery))
             self.store.begin_action(base, verb="archive", kind="archive",
                                     assignment_id=aid, input_ref=str(delivery),
                                     payload={"sid": sid},
@@ -4331,11 +3997,8 @@ class Engine:
             archived = self._read_back_archived(sid)
             if ok and archived:
                 self.store.mark_done(base, sid=sid)
-                rec["status"] = "waiting_release"
-                rec["archived_at"] = _now()
-                rec["tombstone"] = {"archived": True, "read_back": True,
-                                    "notified": notified, "at": _now(),
-                                    "cid": delivery, "attempt": 1}
+                archive_mod.record_archived(rec, delivery=delivery,
+                                            notified=notified, now=_now())
                 # Only the archive counter is prunable here: the notification
                 # counter must survive so a late retry cannot re-send it.
                 self.store.prune_attempts(base)
@@ -4433,6 +4096,9 @@ class Engine:
         Every answer is a live read: ``_read_back_archived`` asks the server
         and is **not** cached, so two rounds that both say "archived" are two
         independent observations rather than one repeated from memory.
+
+        Forwarder: the decision lives in :func:`engine_parts.close.conditions`,
+        which takes the readers as arguments and never touches the store.
         """
         recs = [rec for rec in (index.get("assignments") or {}).values()
                 if str(rec.get("thread") or "") == thread]
@@ -4441,177 +4107,39 @@ class Engine:
             if rec.get("issue") is not None:
                 issue = int(rec.get("issue"))
                 break
-        issue_state = self._issue_state(issue) if issue is not None else "unknown"
-        binding_roles = self._binding_roles(thread)
-        unarchived, running, skipped = [], [], []
-        for rec in recs:
-            sid = str(rec.get("sid") or "")
-            if not sid:
-                continue
-            if not self._read_back_archived(sid):
-                unarchived.append(sid)
-                continue
-            tasks_running, why = self._running_tasks(sid)
-            if why:
-                skipped.append(f"{sid}:{why}")
-            running.extend(tasks_running)
-        return {
-            "conditions": {
-                "issue_closed": issue_state == "closed",
-                "binding_cleared": not binding_roles,
-                "sid_archived": not unarchived,
-                # Archived sids cannot be judged; the archive read-back is what
-                # carries concurrency, so an unjudgeable table is not a "false".
-                "no_running_task": not running,
-            },
-            "detail": {"issue_state": issue_state,
-                       "binding_roles": binding_roles,
-                       "unarchived_sids": sorted(unarchived),
-                       "running_tasks": sorted(running),
-                       "tasks_skipped": "; ".join(skipped)},
-        }
+        return close_mod.conditions(
+            recs,
+            issue_state=(self._issue_state(issue) if issue is not None
+                         else "unknown"),
+            binding_roles=self._binding_roles(thread),
+            archived_of=self._read_back_archived,
+            running_of=self._running_tasks)
 
     def _close_blocked_reason(self, snapshot: dict) -> str:
-        cond, detail = snapshot["conditions"], snapshot["detail"]
-        if not cond["issue_closed"]:
-            return f"issue_state={detail['issue_state']}"
-        if not cond["binding_cleared"]:
-            return f"binding still registered: {detail['binding_roles']}"
-        if not cond["sid_archived"]:
-            return f"unarchived sids: {detail['unarchived_sids']}"
-        if not cond["no_running_task"]:
-            return f"running tasks: {detail['running_tasks']}"
-        return ""
+        """Forwarder: :func:`engine_parts.close.blocked_reason`."""
+        return close_mod.blocked_reason(snapshot)
 
     def _cycle_start(self, rec: dict) -> str:
-        """The start of the **current** hold cycle, not of the thread's history.
-
-        The ``close_reconcile`` record outlives a completed thread (nothing
-        deletes it), so ``first_checked_at`` carried forward would date the
-        second release to the first release's start - a "held for 313 days"
-        reminder on the very first round of a fresh cycle, which is worse than
-        silence. A cycle begins whenever the previous round's status was not
-        ``pending``; from then on the start is kept, so a run of pending rounds
-        cannot keep pushing its own deadline out.
-
-        This is the single exception to "``_reconcile_thread`` is untouched":
-        the reset has to happen where the record is written, and the record is
-        written only here.
-        """
-        previous = str(rec.get("status") or "")
-        if previous and previous != "pending":
-            return _now()
-        return str(rec.get("first_checked_at") or "") or _now()
+        """Forwarder: :func:`engine_parts.close.cycle_start` - the current cycle."""
+        return close_mod.cycle_start(rec, _now())
 
     def _reconcile_thread(self, index: dict, thread: str) -> dict:
         """One observation of one held thread; the record lives in the index.
 
-        ``completed`` needs the **same** four conditions in two consecutive
-        rounds, and the second round must be a later ``run_round`` - the counter
-        is only ever advanced by a call from a new round, so a loop inside one
-        round cannot confirm itself. Any failed observation resets the streak
-        to zero and moves a release into ``close_reconcile``.
-
-        The record says ``completed`` only when the gate let every held
-        assignment through; a refusal keeps it ``pending`` with the refusing
-        id in ``blocked_reason``, so the next round checks the thread again.
+        Forwarder: the state machine (four conditions, two consecutive rounds,
+        a refusal that keeps the record ``pending``) lives in
+        :func:`engine_parts.close.reconcile`. The engine supplies only the two
+        readers and the side effects it owns, so a loop inside one round still
+        cannot confirm itself - ``run_count`` is read from the index, not held
+        here.
         """
-        records = index.setdefault("close_reconcile", {})
-        if not isinstance(records, dict):
-            records = index["close_reconcile"] = {}
-        snap = self.close_conditions(thread, index)
-        rec = records.get(thread) if isinstance(records.get(thread), dict) else {}
-        previous_ok = int(rec.get("consecutive_ok") or 0)
-        ok_now = all(snap["conditions"].values())
-        round_no = int((index.get("meta") or {}).get("run_count") or 0)
-        last_round = rec.get("last_checked_round")
-        streak = previous_ok + 1 if ok_now and (
-            previous_ok == 0 or last_round != round_no) else (1 if ok_now else 0)
-        record = {
-            "status": "pending", "attempts": int(rec.get("attempts") or 0) + 1,
-            "consecutive_ok": streak,
-            "first_checked_at": self._cycle_start(rec),
-            "checked_at": _now(), "last_checked_round": round_no,
-            "conditions": snap["conditions"], "detail": snap["detail"],
-            "blocked_reason": self._close_blocked_reason(snap),
-        }
-        records[thread] = record
-        if not ok_now:
-            for assignment in (index.get("assignments") or {}).values():
-                if str(assignment.get("thread") or "") != thread:
-                    continue
-                if str(assignment.get("status") or "") != "waiting_release":
-                    continue
-                moved = asg_mod.enter_close_reconcile(
-                    assignment, record["blocked_reason"])
-                self.store.log_event({
-                    "type": ("assignment.reopened" if moved.get("changed")
-                             else "close_reconcile.refused"),
-                    "at": _now(), "thread": thread,
-                    "assignment": assignment.get("id"),
-                    "reason": moved.get("reason") or "",
-                })
-            self.store.log_event({"type": "close_reconcile.blocked", "at": _now(),
-                                  "thread": thread,
-                                  "reason": record["blocked_reason"],
-                                  "streak": streak})
-            return {"thread": thread, "status": "pending", "completed": [],
-                    "reason": record["blocked_reason"], "conditions":
-                    snap["conditions"], "consecutive_ok": streak}
-        completed, refused = [], []
-        if streak >= 2:
-            for assignment in (index.get("assignments") or {}).values():
-                if str(assignment.get("thread") or "") != thread:
-                    continue
-                if str(assignment.get("status") or "") not in (
-                        "waiting_release", "close_reconcile"):
-                    continue
-                moved = asg_mod.complete(assignment)
-                if not moved.get("changed"):
-                    refused.append(str(assignment.get("id") or ""))
-                    self.store.log_event({
-                        "type": "assignment.qa_gate_refused", "at": _now(),
-                        "thread": thread, "assignment": assignment.get("id"),
-                        "reason": moved.get("reason") or "",
-                        "level": "info", "consumers": ["doctor"]})
-                    continue
-                completed.append(assignment["id"])
-                # A late event after this finds a terminal assignment, so it is
-                # audited by on_delivery/late_event and never restarts work.
-                self.store.log_event({
-                    "type": "assignment.completed", "at": _now(),
-                    "thread": thread, "assignment": assignment.get("id"),
-                    "reason": moved.get("reason") or ""})
-            # The thread record may only claim ``completed`` when every held
-            # assignment actually moved: a gate refusal leaves the assignments
-            # held, and a ``completed`` record would drop the thread out of
-            # ``_round_closed_threads`` - no later round would ever look again.
-            if completed and not refused:
-                record["status"] = "completed"
-                records[thread] = record
-                cleared = self._clear_refused(index, thread)
-                self.store.log_event({"type": "thread.completed", "at": _now(),
-                                      "thread": thread, "assignments": completed,
-                                      "conditions": snap["conditions"],
-                                      "refused_cleared": cleared})
-                return {"thread": thread, "status": "completed",
-                        "completed": completed, "reason": "",
-                        "conditions": snap["conditions"], "consecutive_ok": streak}
-            record["status"] = "pending"
-            record["blocked_reason"] = (
-                "qa_gate_refused: " + ", ".join(sorted(refused)) if refused
-                else "no held assignment to complete")
-            records[thread] = record
-            return {"thread": thread, "status": "pending",
-                    "completed": completed,
-                    "reason": record["blocked_reason"],
-                    "conditions": snap["conditions"], "consecutive_ok": streak}
-        self.store.log_event({"type": "close_reconcile.passed", "at": _now(),
-                              "thread": thread, "streak": streak,
-                              "conditions": snap["conditions"]})
-        return {"thread": thread, "status": "pending", "completed": [],
-                "reason": "waiting for a second round", "conditions":
-                snap["conditions"], "consecutive_ok": streak}
+        return close_mod.reconcile(
+            index, thread,
+            conditions=lambda: self.close_conditions(thread, index),
+            enter_reconcile=asg_mod.enter_close_reconcile,
+            complete=asg_mod.complete,
+            clear_refused=self._clear_refused,
+            log=self.store.log_event, now=_now())
 
     def _round_closed_threads(self, index: dict) -> list[dict]:
         """Check held releases only; never batch-close unfinished assignments."""
@@ -4881,6 +4409,25 @@ class Engine:
         return resolved
 
     def run_round(self) -> dict:
+        """One round = ``begin_round`` → ``run_issue_phase`` → ``run_global_phase``.
+
+        Kept as a wrapper so every caller (``cli once``, ``cli run``, the tests
+        that monkeypatch the round) keeps one entry point. The three phases are
+        separated because they answer different questions and fail differently:
+        the first decides whether the round may start at all, the second can lose
+        one issue without losing the round, and only the third decides whether
+        the round counts.
+        """
+        index, cursor, state, prep = self.begin_round()
+        self.run_issue_phase(index, cursor, state, prep)
+        return self.run_global_phase(index, cursor, state, prep)
+
+    def begin_round(self) -> tuple[dict, dict, round_mod.RoundState, dict]:
+        """Everything that must succeed before a single comment is read.
+
+        A refused cursor raises here, and that is the point: the refusal is not
+        a per-issue fault that the issue loop could swallow.
+        """
         index = self.store.load_index()
         # Checked before anything else so the health snapshot and the
         # ``index.unreadable`` event exist even when the write-back is refused
@@ -4914,6 +4461,7 @@ class Engine:
         self._archived_unreadable = False
         self._live_check = {}
         self._session_state_cache = None
+        self._session_map_cache = None
         gh_cfg = self.cfg.get("github") or {}
         max_issues = int(gh_cfg.get("max_issues") or 20)
         max_comments = int(gh_cfg.get("max_comments_per_issue") or 50)
@@ -4942,29 +4490,82 @@ class Engine:
                    "read_paused": 0, "errors": []}
         if allowlist_reload:
             summary["allowlist_reload"] = allowlist_reload
-        self.store.log_event({"type": "run.started", "at": _now(), "mode": self.mode})
+        # ``round_seq`` moves here, unconditionally, before anything is read: a
+        # round that later fails still has a number, so a stall can be dated and
+        # ``round.start``/``round.end`` stay countable. ``run_count`` is the
+        # other counter and only advances for a complete round (see
+        # ``engine_parts.round``).
+        policy = round_mod.round_policy(gh_cfg)
+        state = round_mod.RoundState.begin(index, cursor, policy)
+        state.summary = summary
+        self._round_state = state
+        self.store.log_event({"type": "run.started", "at": _now(),
+                              "mode": self.mode, "round_seq": state.seq})
+        prep = {"max_issues": max_issues, "max_comments": max_comments,
+                "max_pages": max_pages, "allowlist_reload": allowlist_reload}
+        return index, cursor, state, prep
 
+    def run_issue_phase(self, index: dict, cursor: dict,
+                        state: round_mod.RoundState, prep: dict) -> None:
+        """Read every live issue; one bad issue never ends the round.
+
+        ``source_ok`` is recorded here because the allowlist sync below is gated
+        on it: an issue list that came from a failed request is not "the live
+        set", and syncing it would empty the overlay - after which every frame
+        for every issue is refused until the source comes back.
+        """
+        summary = state.summary
         try:
-            issue_numbers = self.source.issues(limit=max_issues)
+            issue_numbers = self.source.issues(limit=int(prep["max_issues"]))
         except Exception as exc:  # noqa: BLE001  a dead source is a reportable state
             summary["errors"].append(f"issues: {type(exc).__name__}: {exc}")
             issue_numbers = []
+            state.source_ok = False
+            self.store.log_event({"type": "source.failed", "at": _now(),
+                                  "round_seq": state.seq,
+                                  "error": f"{type(exc).__name__}: {exc}"})
         self._live_issues = {int(issue) for issue in issue_numbers}
-
+        state.issues = [int(issue) for issue in issue_numbers]
         # The issue itself now says whether it is live (open, not on hold), so
         # the allowlist is kept in step with that instead of being a hand-kept
         # list. A failed sync is a warning: a read-only checkout must still run.
-        self._sync_allowlist_issues(issue_numbers, summary)
+        # A failed **source** is not a sync: leaving the overlay alone is what
+        # keeps the in-flight set from being emptied by a network blip.
+        if state.source_ok:
+            self._sync_allowlist_issues(issue_numbers, summary)
+        else:
+            summary["allowlist_kept"] = "source failed this round"
 
         for issue in issue_numbers:
+            thread = self._thread_key(issue)
             try:
-                self._round_issue(issue, index, cursor, max_comments, summary,
-                                  max_pages)
+                self._round_issue(issue, index, cursor, prep["max_comments"],
+                                  summary, prep["max_pages"])
             except Exception as exc:  # noqa: BLE001  isolate one bad issue
                 summary["errors"].append(f"issue {issue}: {type(exc).__name__}: {exc}")
+                state.fail(thread)
                 self.store.log_event({"type": "issue.error", "at": _now(),
                                       "issue": int(issue),
                                       "error": f"{type(exc).__name__}: {exc}"})
+        state.round_result.carry = round_mod.carry_remaining(state.round_result)
+
+    def run_global_phase(self, index: dict, cursor: dict,
+                         state: round_mod.RoundState, prep: dict) -> dict:
+        """Retries, archives and the write-back; decides whether the round counts.
+
+        The archive pass **skips a thread whose read failed this round**: its
+        state is partly read, so "nothing is waiting" is not a fact about it. A
+        thread that failed is not archived, not closed, and not counted.
+        """
+        summary = state.summary
+        round_result = state.round_result
+        summary["round_seq"] = state.seq
+        summary["collection_complete"] = round_result.collection_complete
+        summary["consumption_complete"] = round_result.consumption_complete
+        if round_result.carry:
+            summary["carry"] = round_mod.carry_remaining(round_result)
+        if state.queue.refused:
+            summary["backpressure"] = list(state.queue.refused)
 
         summary["notifications_retried"] = self._retry_waiting_review(index)
         self._retry_routes(index)
@@ -4977,7 +4578,7 @@ class Engine:
                               for rec in (index.get("assignments") or {}).values()
                               if str(rec.get("status") or "") in
                               ("waiting_review", "waiting_release")}):
-            if thread:
+            if thread and thread not in round_result.failed:
                 result = self.archive_thread(thread, index)
                 summary.setdefault("archived", []).extend(result["archived"])
                 summary.setdefault("archive_blocked", []).extend(result["blocked"])
@@ -4997,8 +4598,12 @@ class Engine:
             index["meta"].update({
                 "updated_at": _now(), "mode": self.mode, "role": self.role,
                 "dispatch_enabled": self.dispatch_enabled,
-                "run_count": int(index["meta"].get("run_count") or 0) + 1,
             })
+            # ``run_count`` moves only for a round that both collected and
+            # consumed everything. The close-reconcile streak and the stall
+            # watchdogs read this number, so a partial round that bumped it
+            # would advance both of them on evidence that does not exist.
+            round_mod.complete_round(index, round_result)
             self.store.save_index(index)
             self.store.save_cursor(cursor)
         # Close reconciliation last: the round's own archives are visible to it,
@@ -5012,12 +4617,17 @@ class Engine:
             needs.merge_into(index, self.store.load_index())
             self.store.save_index(index)
         self.store.log_event({"type": "run.completed", "at": _now(),
+                              "round_seq": state.seq,
+                              "round_complete": round_result.round_complete,
                               "processed": summary["processed"],
                               "needs_person": summary["needs_person"],
                               "external_actions": self.store.load_counters()
                               .get("external_actions", 0)})
         summary["external_actions"] = self.store.load_counters().get("external_actions", 0)
+        summary["round_complete"] = round_result.round_complete
+        summary["run_count"] = round_mod.run_count(index)
         health_errors = list(summary["errors"])
+        allowlist_reload = prep.get("allowlist_reload") or ""
         if allowlist_reload:
             health_errors.append(f"allowlist kept previous copy: {allowlist_reload}")
         # ISS-79 F: the stream fault is a round-level reason, so it belongs in
@@ -5028,16 +4638,94 @@ class Engine:
         self.write_health(error="; ".join(health_errors), degraded=self.degraded)
         return summary
 
-    def _round_issue(self, issue: int, index: dict, cursor: dict,
-                     max_comments: int, summary: dict,
-                     max_pages: int = 10) -> None:
-        issue = int(issue)
-        key = self._thread_key(issue)
-        legacy = str(issue)
-        summary["issues"] += 1
-        issues = index.setdefault("issues", {})
-        rec = issues.setdefault(key, {"state": "idle", "comments_seen": 0,
-                                      "needs_person": []})
+    def _note_collected(self, thread: str, batch, cursor_before: int,
+                        fresh, summary: dict) -> bool:
+        """Record one walk in the round's collection state, with backpressure.
+
+        Returns ``True`` when the batch was **accepted** (queued or already
+        queued) and ``False`` when the bounded queue refused it. The distinction
+        is the whole point of a refusal: the rows beyond the cap stay above the
+        cursor, the round is marked incomplete, and the next round reads them
+        again. Consuming anyway and moving the cursor would drop the refused
+        rows permanently.
+
+        ``complete``/``contiguous`` come from the walk itself; ``pages`` is the
+        page list it actually fetched, which is what makes "the ids jump" and "a
+        page is missing" different answers (see :mod:`super_agent.batch`).
+        """
+        state = getattr(self, "_round_state", None)
+        if state is None:
+            return True
+        collected = batch_mod.CollectedBatch(
+            thread, batch.rows, cursor_before=cursor_before,
+            pages=list(getattr(batch, "pages", []) or []),
+            complete=bool(getattr(batch, "pagination_complete", False)),
+            contiguous=bool(getattr(batch, "contiguous", False)),
+            reason=str(getattr(batch, "stop_reason", "") or ""))
+        state.round_result.add(thread, collected)
+        if collected.needs_rebuild():
+            summary.setdefault("rebuild_needed", []).append(thread)
+            self.store.log_event({
+                "type": "batch.gap", "at": _now(), "thread": str(thread),
+                "missing_page": collected.missing_page(),
+                "pagination_complete": collected.pagination_complete,
+                "reason": collected.reason})
+            self.rebuild_issue(str(thread), "batch.gap", collected=collected)
+        try:
+            state.queue.put(collected)
+        except queue_mod.Backpressure as exc:
+            summary.setdefault("backpressure", []).append(
+                {"thread": exc.thread, "rows": exc.refused, "reason": exc.reason})
+            self.store.log_event({
+                "type": "batch.backpressure", "at": _now(), "thread": exc.thread,
+                "rows": exc.refused, "reason": exc.reason,
+                "round_seq": state.seq})
+            return False
+        state.cursor.observe(thread, fresh)
+        return True
+
+    def _note_consumed(self, thread: str, consumed) -> None:
+        """Mark rows consumed on the batch **and** let the cursor prefix follow.
+
+        Both are needed and they answer different questions: the batch's own
+        ``consumed_ids`` is what makes ``consumption_complete`` true, the cursor
+        prefix is what the next round reads from. Marking only one of them is
+        how a round reports itself complete while the cursor stays behind (or
+        the reverse, which loses rows).
+        """
+        state = getattr(self, "_round_state", None)
+        if state is None:
+            return
+        ids = [int(c["id"]) for c in consumed]
+        batch = state.round_result.batches.get(str(thread))
+        if batch is not None:
+            batch.consume(ids)
+        state.cursor.consume(thread, ids)
+
+    def _save_requirement_projection(self, index: dict, key: str) -> None:
+        """Persist the projection; a write failure is logged, never raised."""
+        try:
+            requirements.save_projection(self.store.root, index["requirements"])
+        except OSError as exc:
+            self.store.log_event({
+                "type": "requirement.projection_write_failed",
+                "at": _now(), "thread": str(key),
+                "error": f"{type(exc).__name__}: {exc}"})
+
+    def _requirement_index(self) -> dict:
+        """The live ``requirements`` block of the index (loaded, never cached)."""
+        return self.store.load_index().get("requirements") or {}
+
+    def _flow_gate(self, issue: int, index: dict, key: str, rec: dict,
+                   summary: dict) -> bool:
+        """Does this issue pass the flow gate? ``False`` means "stop this issue".
+
+        A conflicting tag pair stops it (nobody may guess which branch applies),
+        and a **changed** flow pauses the unfinished assignments from the old
+        branch: an Assignment bound to one branch is not carried into the other.
+        The switch is reported once, with the paused ids, so a person can see
+        what stopped.
+        """
         selected_flow, flow_error = self._flow_selection(issue)
         previous_flow = str(rec.get("flow") or "")
         rec["flow"] = selected_flow
@@ -5050,7 +4738,7 @@ class Engine:
             self.store.log_event({"type": "flow.rejected", "at": _now(),
                                   "issue": issue, "reason": flow_error,
                                   "assignments_paused": paused})
-            return
+            return False
         if previous_flow in (flow_mod.AT, flow_mod.STANDARD) \
                 and previous_flow != selected_flow:
             reason = f"flow.changed:{previous_flow}->{selected_flow}"
@@ -5061,126 +4749,80 @@ class Engine:
                                   "assignments_paused": paused})
             self._append_needs_person(index, key, {
                 "comment_id": 0, "reason": "flow.switch_pause[user]", "at": _now()})
+        return True
+
+    def _round_issue(self, issue: int, index: dict, cursor: dict,
+                     max_comments: int, summary: dict,
+                     max_pages: int = 10) -> None:
+        """One issue: flow gate, read, requirement gate, consumption.
+
+        The flow gate comes first because a conflicting or switched flow must
+        stop this issue before a single comment is triaged: the branch decides
+        what the comments mean, so reading them under the wrong one would attach
+        them to the wrong state machine.
+        """
+        issue = int(issue)
+        key = self._thread_key(issue)
+        legacy = str(issue)
+        summary["issues"] += 1
+        issues = index.setdefault("issues", {})
+        rec = issues.setdefault(key, {"state": "idle", "comments_seen": 0,
+                                      "needs_person": []})
+        if not self._flow_gate(issue, index, key, rec, summary):
+            return
         rec["title"] = rec.get("title") or self.source.title(issue)
         # Qualified key first, legacy second: a mixed file converges instead of
         # re-reading comments already consumed under the old form.
         cur = int(issuekey.read_both(cursor.get("issues") or {}, key, legacy) or 0)
-        existing = [rec for rec in (index.get("assignments") or {}).values()
-                    if str(rec.get("thread") or "") == key]
-        worker_output = any(str(rec.get("role") or "") == "worker"
-                            and asg_mod.assignment_cids(rec) for rec in existing)
-        qa_recovery = not worker_output and any(
-            str(rec.get("role") or "") == "qa"
-            and str(rec.get("status") or "") not in asg_mod.TERMINAL_STATES
-            and rec.get("review_comment_id") is None for rec in existing)
-        read_pause = rec.get("read_paused")
-        read_paused = read_pause_mod.is_paused(rec)
-        # Did *this* round stop the read? A pause already writes one queue row,
-        # and the AT history gate below would write a second one for the same
-        # comment id (0) - two rows saying "a person must look at this" for one
-        # cause, and the second would stay open after a lift because ``needs``
-        # keys on ``(thread, cid)``.
-        paused_now = False
+        qa_recovery = collect_mod.qa_recovery(
+            [rec for rec in (index.get("assignments") or {}).values()
+             if str(rec.get("thread") or "") == key],
+            terminal=asg_mod.TERMINAL_STATES,
+            output_cids=asg_mod.assignment_cids)
         at_mode = self._at_mode(issue)
-        fresh: list[dict] = []
-        history_rows: list[dict] = []
-        history_done = False
-        # Rows this round walked. Defined before the branch on purpose: the AT
-        # gate below runs on two paths, and reading a local only one of them
-        # defined is how a NameError got swallowed into ``summary["errors"]``.
-        rows_read = 0
-        if read_paused:
-            # The hard cap was reached in an earlier round and nobody has lifted
-            # it yet: do not read this issue at all. Writing ``needs_person`` and
-            # then reading again would be the silent retry the issue forbids -
-            # the walk cannot prove its rows are contiguous, so every extra round
-            # risks consuming a slice that skips the rows below it.
-            summary["read_paused"] = int(summary.get("read_paused") or 0) + 1
-            self.store.log_event({
-                "type": "read.skipped", "at": _now(), "issue": issue,
-                "thread": str(key), "reason": str(read_pause.get("reason") or ""),
-                "since": str(read_pause.get("at") or ""),
-                "resume_with": f"python -m super_agent.cli resume-read --issue {issue}"})
-        else:
-            # A lifted pause may carry the page budget the operator chose when
-            # clearing it (``resume-read --max-pages``). That budget is what
-            # makes the lift a real "continue" instead of "pause again on the
-            # next round": without it a listing larger than the configured window
-            # re-pauses immediately, and the command would be lying about its own
-            # effect. It applies to this issue only and is spent once.
-            budget, pending_budget = read_pause_mod.read_budget(rec, max_pages)
-            if pending_budget:
-                rec["read_budget"] = {}
-            # AT needs the whole listing anyway (the projection is rebuilt from
-            # history every round), so that path reads it once with both uses in
-            # mind rather than walking the same listing twice.
-            #
-            # ``paged_batch`` is that one read: the rows the round may consume
-            # and the rows the projection is rebuilt from are the **same**
-            # snapshot, carrying the same ``cursor_before`` and the walk's own
-            # ``pagination_complete``. Two walks could straddle a comment
-            # arriving between them, and then the round would consume a row the
-            # projection never saw while both sides believe they agree.
-            batch = github_source.paged_batch(
-                self.source, issue, cursor_before=cur, max_pages=budget,
-                whole_listing=bool(qa_recovery or at_mode))
-            rows_read = len(batch.rows)
-            # One walk, two answers: the rows and whether the walk proved it
-            # reached the cursor.
-            if not self._walk_covers_cursor(batch, cur):
-                self._pause_read(index, key, issue, cur, rows_read, budget,
-                                 summary)
-                paused_now = True
-            else:
-                fresh = [c for c in batch.rows
-                         if int(c["id"]) > cur or (qa_recovery and markers.parse_review(
-                             str(c.get("body") or "")))][:max_comments]
+        read = collect_mod.read_issue(
+            self.source, issue, key, rec, cur, at_mode=at_mode,
+            qa_recovery=qa_recovery, max_comments=max_comments,
+            max_pages=max_pages, summary=summary,
+            pause_read=lambda rows, budget: self._pause_read(
+                index, key, issue, cur, rows, budget, summary),
+            log=self.store.log_event)
+        fresh = read.fresh
+        history_rows = read.history_rows
+        history_done = read.history_done
+        rows_read = read.rows_read
+        paused_now = read.paused_now
+        read_paused = read.skipped
+        accepted = True
+        if not read.skipped:
+            if not paused_now and read.batch is not None:
+                accepted = self._note_collected(key, read.batch, cur, fresh,
+                                                summary)
+            # A refused batch was not collected, so it may not be consumed: the
+            # rows stay above the cursor and the next round reads them again.
+            # Consuming here and advancing the cursor is exactly the loss the
+            # bound exists to prevent.
+            if accepted:
                 summary["comments_new"] += len(fresh)
-                if at_mode:
-                    history_rows = walk_claims.walk_rows(batch)
-                    history_done = walk_claims.history_is_complete(batch)
         if at_mode and not read_paused:
             # Rebuild from the Issue, not from the cursor: approval may predate
             # at_mode being enabled. The projection is only a disposable cache.
-            #
-            # The walk must have read the **whole** listing: the projection is
-            # rebuilt from it, so a package on a page that was never fetched
-            # would vanish from the projection and read as "nobody published
-            # it". When the walk cannot claim completeness the projection is left
-            # alone and the issue pauses with a manual way back - never a prefix
-            # written as if it were the listing.
-            if not history_done:
-                # One cause, one row: the page walk above already paused this
-                # issue for the same reason, and a second row under ``cid=0``
-                # would survive the lift (``needs`` keys on ``(thread, cid)``).
-                if not paused_now:
-                    read_pause_mod.pause_history(
-                        index, key, issue,
-                        len(history_rows) or len(fresh), summary,
-                        reason="the requirement history walk did not reach the "
-                               "last page",
-                        append=self._append_needs_person,
-                        log=self.store.log_event)
-                else:
-                    self.store.log_event({
-                        "type": "requirement.history_incomplete", "at": _now(),
-                        "thread": str(key), "issue": int(issue),
-                        "rows_read": rows_read,
-                        "reason": "the same round already paused the page walk, "
-                                  "so the projection is left untouched"})
-            else:
-                # Runs even with zero rows: ``history_scope`` records that this
-                # thread's history was read whole, and a thread whose first
-                # package is not published yet has no other place to carry it.
-                self._apply_requirement_comments(index, key, history_rows)
-                try:
-                    requirements.save_projection(self.store.root,
-                                                 index["requirements"])
-                except OSError as exc:
-                    self.store.log_event({
-                        "type": "requirement.projection_write_failed",
-                        "at": _now(), "thread": str(key),
-                        "error": f"{type(exc).__name__}: {exc}"})
+            # The gate (and why a prefix must never be written as if it were
+            # the listing) lives in ``engine_parts.requirement_gate``.
+            requirement_gate_mod.apply(
+                index, key, issue, history_done=history_done,
+                history_rows=history_rows, fresh=fresh, rows_read=rows_read,
+                paused_now=paused_now,
+                pause_history=lambda rows: read_pause_mod.pause_history(
+                    index, key, issue, rows, summary,
+                    reason="the requirement history walk did not reach the "
+                           "last page",
+                    append=self._append_needs_person, log=self.store.log_event),
+                apply_rows=lambda rows: self._apply_requirement_comments(
+                    index, key, rows),
+                save_projection=lambda: self._save_requirement_projection(
+                    index, key),
+                log=self.store.log_event)
         # Requirement projection precedes session discovery: a live binding is
         # not permission to work before the exact revision has been approved.
         synced = self._sync_assignments(index, key, issue)
@@ -5195,7 +4837,8 @@ class Engine:
         if key and any(markers.parse_pm_verdict(str(c.get("body") or ""))
                        for c in fresh):
             self._pm_pending.add(key)
-        for comment in fresh:
+        consumable = fresh if accepted else []
+        for comment in consumable:
             event_type = "issue_comment.created"
             if event_type not in self.allowlist:
                 continue
@@ -5261,34 +4904,21 @@ class Engine:
                     continue
             if state == "needs_person":
                 rec["state"] = "needs_person"
-                if self._pm_row_exists(index, key, cid):
-                    # The router already filed this comment, with a reason a
-                    # reader can act on. The loop's own ``reason`` is the prose
-                    # the router derived, so appending it would be a second row
-                    # for one failure - the shape that put 179 rows under one
-                    # comment in #68 (#75 B).
+                if self._file_needs_person(index, key, issue, cid, reason,
+                                           rec, summary):
                     continue
-                added = self._append_needs_person(index, key, {
-                    "comment_id": cid, "reason": reason, "at": _now()})
-                if not added:
-                    continue
-                summary["needs_person"] += 1
-                now = self.clock()
-                if self._cooldown_ok(rec, "needs_person", now):
-                    self._mark_cooldown(rec, "needs_person", now)
-                    self._dispatch({"kind": "bus_inject",
-                                    "event": "event.agent.needs_person",
-                                    "issue": issue,
-                                    "payload": {"issue": issue, "comment_id": cid,
-                                                "reason": reason}})
             elif rec.get("state") == "idle":
                 rec["state"] = "tracked"
 
-        if fresh:
+        if fresh and accepted:
             cursor.setdefault("issues", {})[key] = max(int(c["id"]) for c in fresh)
+            self._note_consumed(key, fresh)
         else:
             # Never move the cursor on a round that consumed nothing: a paused
-            # issue (no read at all) must keep its position byte for byte.
+            # issue (no read at all) must keep its position byte for byte, and a
+            # batch the queue **refused** was not consumed either - advancing
+            # here would put the refused rows below the cursor, and no later
+            # round would ever read them again.
             cursor.setdefault("issues", {}).setdefault(key, cur)
         # The window closes here: past this point only the committed ledger
         # speaks, so the stall watchdog cannot be silenced by a batch that was
@@ -5366,21 +4996,10 @@ class Engine:
 
         add(*self._check_process())
 
-        health = {}
-        if self.bus is not None:
-            health = self.bus.healthz()
-            connected = bool(health.get("connected"))
-            ready = bool(health.get("ready"))
-            add("bus", bool(health.get("ok")),
-                f"ok={health.get('ok')} ready={ready} connected={connected} "
-                f"boot_id={health.get('boot_id') or '-'} "
-                f"seq={health.get('seq')} "
-                f"{health.get('error') or ''}".strip(), label="bus-down")
-        else:
-            add("bus", False, "no bus client configured", level="warn",
-                label="bus-down")
-
         source_name = (self.cfg.get("github") or {}).get("source")
+
+        add(*doctor_mod.bus_check(self.bus))
+
         if source_name == "none":
             add("github", True, "source=none (skipped)")
         else:
@@ -5394,67 +5013,19 @@ class Engine:
 
         add(*self._check_config())
 
-        stuck = self.store.stuck_outbox()
-        if stuck:
-            detail = "; ".join(f"{r.get('action_id')} {r.get('status')} "
-                               f"age={r.get('age_s')}s" for r in stuck[:5])
-            add("outbox", False,
-                f"{len(stuck)} action(s) past {self.store.outbox_stale_s:g}s: {detail}",
-                label="outbox-stuck")
-        else:
-            add("outbox", True, "no prepared/in_flight/uncertain action is overdue")
-
-        # Reported separately on purpose: ``outbox-stuck`` means "nobody is
-        # looking", ``waiting-person`` means "a person has to decide". Merging
-        # the two would make a resolved-looking alarm hide a real queue.
-        waiting = self.store.waiting_person()
-        add("waiting-person", not waiting,
-            "none" if not waiting else
-            f"{len(waiting)} action(s) need a person: " + "; ".join(
-                f"{r.get('action_id')} ({r.get('reason') or 'no remote confirmation'})"
-                for r in waiting[:5]),
-            label="waiting-person")
+        add(*doctor_mod.outbox_check(self.store))
+        add(*doctor_mod.waiting_person_check(self.store))
 
         cursor = self.store.load_cursor()
-        bad_cursor = [k for k, v in (cursor.get("issues") or {}).items()
-                      if not isinstance(v, int) or v < 0
-                      or issuekey.issue_number(k) is None]
-        # A per-issue ``0`` is a fresh issue, not a fault (see
-        # ``Store.cursor_problem``), so the value check above and the emptiness
-        # check below are two different questions and are reported separately.
-        problem = self.store.cursor_problem()
-        add("cursor", not (bad_cursor or problem),
-            problem if problem else (
-                "cursor ok" if not bad_cursor
-                else f"invalid cursors: {bad_cursor}"))
+        add(*doctor_mod.cursor_check(cursor, self.store.cursor_problem(),
+                                     issuekey.issue_number))
 
-        # The ``[PM:TASK]`` guard writes ``pm.task_book_conclusion`` and nothing
-        # else reads it, so a conclusion written under the wrong prefix stayed
-        # as invisible as the silence it was meant to break (#ISS-85 P1-1).
-        # The doctor is the reader: it is already the queue of "a person should
-        # look", and the event is a one-line fact, not a new mechanism.
-        #
-        # Bounded on purpose - the tail, not the file. The live log passed 9000
-        # rows and grows every round; reading it whole in a health check would
-        # turn the check itself into the load.
         warn_rows = [r for r in _tail_events(self.store.events_path, limit=500)
                      if r.get("type") == "pm.task_book_conclusion"]
-        if warn_rows:
-            last = warn_rows[-1]
-            add("pm-task-book", False,
-                f"{len(warn_rows)} conclusion(s) written under [PM:TASK] in the "
-                f"last 500 events; latest comment_id={last.get('comment_id')} "
-                f"at={last.get('at')} - use [PM] + verdict marker instead",
-                level="warn", label="pm-task-book")
-        else:
-            add("pm-task-book", True,
-                "no conclusion under [PM:TASK] in the last 500 events")
+        add(*doctor_mod.task_book_check(warn_rows))
 
         index = self.store.load_index()
-        residual = asg_mod.active_assignments(index)
-        add("assignments", not residual,
-            "none" if not residual else f"non-terminal: {sorted(residual)}",
-            level="warn")
+        add(*doctor_mod.assignments_check(asg_mod.active_assignments(index)))
 
         add(*self._check_supervisor_visibility())
 
@@ -5467,174 +5038,23 @@ class Engine:
 
     # ------------------------------------------------------ doctor sub-checks
     def _check_charters(self) -> tuple:
-        """Fault 11: a charter that points at a rule file this package lacks.
-
-        ``charter_files`` refuses an **absent** charter, so that shape was
-        already visible. A charter that exists but says "see
-        ``rules/shared/rules/newtrack_common.md``" while that file was never
-        shipped reads as a working install: every check passed, the session was
-        created, and the rule it points at could not be opened (ISS-107).
-
-        Not a refusal, a report: the session still runs, and the reader is told
-        which charter is missing or unreadable, or which pointer is dead.
-        """
-        from . import agent_config as _agent_cfg
-        from . import charters
-
-        names = [prefix for prefix, _leaf in _agent_cfg.charter_map()]
-        broken = charters.broken_charters(names)
-        if not broken:
-            return ("charters", True,
-                    f"{len(names)} session prefixes resolve every rule reference",
-                    "warn", "charter-refs-broken")
-        detail = "; ".join(f"{name}: {', '.join(refs)}"
-                           for name, refs in sorted(broken.items()))
-        return ("charters", False,
-                f"charter-refs-broken: {detail}", "warn", "charter-refs-broken")
-
+        """Forwarder: :func:`engine_parts.doctor.charters`."""
+        return doctor_mod.charters()
 
     def _check_supervisor_visibility(self) -> tuple:
-        """Fault 10: a supervisor sid that no frame can reach.
-
-        The engine resolves ``engine.supervisor_sid`` from config first, so a
-        truncated id is *returned* and every frame built from it is refused -
-        each refusal is a route event about one frame, so the shape problem
-        itself stayed invisible (#74). This check turns the row
-        :meth:`_note_malformed_supervisor_sid` writes into a doctor line.
-
-        Three states, and two of them are ``ok``:
-
-        * a malformed row in the tail ⇒ ``ok=false`` with the count, label
-          ``supervisor-silent``: every frame is being refused right now;
-        * no sid at all ⇒ ``ok=true``: a deployment shape, not a fault. An
-          engine with no supervisor never resolves one, so ``warn`` here keeps
-          every such deployment off-green for good and buries the real fault -
-          configured first, then broken - in routine noise;
-        * a resolvable sid **and** no malformed row ⇒ ``ok=true``.
-
-        The ``level`` slot is consulted only when ``ok`` is false (``add``
-        writes ``"ok"`` otherwise), so both ``ok`` branches spell it ``"ok"``:
-        a literal ``"fail"`` beside ``ok=true`` reads as a contradiction the
-        code never acted on.
-
-        Reads the bounded tail for the same reason the ``[PM:TASK]`` check
-        does: ``events.jsonl`` grows every round.
-        """
-        sid = str(((self.cfg.get("engine") or {}).get("supervisor_sid")) or "").strip()
-        # Only the config field is read here on purpose: calling
-        # ``_supervisor_sid()`` would let a health check write an event, and a
-        # check that mutates the thing it measures is not a check. The session
-        # keys are a fallback the route path resolves; a config that only has
-        # those is reported as "no sid" until a frame actually resolves one.
-        resolved = bool(sid)
-        rows = [r for r in _tail_events(self.store.events_path, limit=500)
-                if r.get("type") == self.SUPERVISOR_SID_MALFORMED_ROW]
-        if rows:
-            return ("supervisor-visibility", False,
-                    f"ok=false {self.SUPERVISOR_SID_MALFORMED_ROW}="
-                    f"{len(rows)} sid_len={rows[-1].get('sid_len')} "
-                    f"resolved_sid={'yes' if resolved else 'no'} - every frame "
-                    f"to the supervisor is refused",
-                    "fail", "supervisor-silent")
-        if not resolved:
-            return ("supervisor-visibility", True,
-                    "ok=true no supervisor sid (engine.supervisor_sid empty and "
-                    "engine.supervisor_keys resolve nothing) - deployment shape, "
-                    "not a fault",
-                    "ok", "supervisor-silent")
-        return ("supervisor-visibility", True,
-                f"ok=true resolved_sid=yes {self.SUPERVISOR_SID_MALFORMED_ROW}=0",
-                "ok", "supervisor-silent")
+        """Forwarder: :func:`engine_parts.doctor.supervisor_visibility`."""
+        return doctor_mod.supervisor_visibility(
+            self.cfg, self.store.events_path, self.SUPERVISOR_SID_MALFORMED_ROW,
+            _tail_events)
 
     def _check_process(self) -> tuple:
-        """Fault 1: a dead pid lock, or a health record with no live engine."""
-        from .pidlock import process_alive
-        # Read the snapshot first: the real sequence for a failed startup is
-        # "startup failed -> process exits (rc=1) -> the lock was not cleaned
-        # up", so the stale pid lock and the startup-failed snapshot arrive
-        # together. Judging the lock first would answer "the next start takes
-        # it over" and never mention why the last start gave up.
-        snap = health.read(self.store.health_path)
-        startup_failed = (snap.get("phase") == "startup-failed"
-                          and not snap.get("running"))
-        try:
-            info = json.loads(self.store.pid_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            info = {}
-        if info.get("pid"):
-            pid = info.get("pid")
-            if process_alive(pid):
-                last_loop = _parse_ts(snap.get("last_loop_at"))
-                age_s = (int((datetime.now(timezone.utc) - last_loop).total_seconds())
-                         if last_loop else None)
-                if snap.get("running") and (age_s is None or age_s > 300):
-                    return ("process", False,
-                            f"stalled: pid={pid} alive but last_loop_at="
-                            f"{snap.get('last_loop_at')} age_s={age_s} threshold_s=300",
-                            "fail", "process-stalled")
-                head = _current_head()
-                running_commit = str(snap.get("code_commit") or "")
-                if head and running_commit and running_commit != head:
-                    return ("process", False,
-                            f"stale code: running={running_commit} HEAD={head} pid={pid}; "
-                            "restart the engine to activate the checkout",
-                            "fail", "process-version")
-                return ("process", True,
-                        f"engine.pid pid={pid} alive since={info.get('started_at')} "
-                        f"last_loop_age_s={age_s} code_commit={running_commit or 'unknown'} "
-                        f"HEAD={head or 'unknown'}",
-                        "fail", "process-dead")
-            if startup_failed:
-                return ("process", False,
-                        f"startup-failed with a stale engine.pid pid={pid}: "
-                        f"last_error={snap.get('last_error') or 'unknown'}; "
-                        f"the last start failed during startup and left the "
-                        f"lock behind", "fail", "startup-failed")
-            return ("process", False,
-                    f"engine.pid pid={pid} is not alive (stale lock; the next "
-                    f"start takes it over)", "fail", "process-dead")
-        if startup_failed:
-            # The process wrote its snapshot, failed during startup and exited
-            # (rc=1) before any round ran. It did not crash mid-loop, so the
-            # label says so and the detail carries the reason it gave up.
-            return ("process", False,
-                    f"startup-failed: the engine exited while starting up "
-                    f"(last_error={snap.get('last_error') or 'unknown'}, "
-                    f"pid={snap.get('pid')}); no round ran, so this is not a "
-                    f"crash of a running loop", "fail", "startup-failed")
-        if snap.get("running"):
-            return ("process", False,
-                    f"crashed: no pid lock but health.json is still running=true "
-                    f"(last_loop_at={snap.get('last_loop_at')}, pid={snap.get('pid')}); "
-                    f"the process died without a clean exit", "fail",
-                    "process-dead")
-        if snap.get("last_loop_at"):
-            return ("process", True,
-                    f"engine stopped cleanly (last_loop_at={snap.get('last_loop_at')}, "
-                    f"pid={snap.get('pid')})", "warn", "process-dead")
-        return ("process", True,
-                "engine not running (no pid lock, no health record)", "warn",
-                "process-dead")
+        """Forwarder: :func:`engine_parts.doctor.process`."""
+        return doctor_mod.process(self.store, current_head=_current_head,
+                                  parse_ts=_parse_ts)
 
     def _check_config(self) -> tuple:
-        """Fault 4: allowlist rejected; the previous copy is still in force."""
-        if self.projects is None:
-            return ("config", True, "no project allowlist configured", "fail",
-                    "config-bad")
-        snap = self.projects.summary()
-        if snap["valid"] and not snap["error"]:
-            return ("config", True,
-                    f"allowlist ok projects={snap['projects']} "
-                    f"allowlist={self.projects.source_label()} "
-                    f"generation={snap['generation']}", "fail", "config-bad")
-        if snap["valid"]:
-            return ("config", False,
-                    f"config-bad: {snap['error']} - still using the previous copy "
-                    f"(last-good cache, generation={snap['generation']})",
-                    "fail", "config-bad")
-        return ("config", False,
-                f"config-bad: {snap['error'] or 'no valid copy'}; nothing is allowed",
-                "fail", "config-bad")
+        """Forwarder: :func:`engine_parts.doctor.config`."""
+        return doctor_mod.config(self.projects)
 
     # -------------------------------------------------------------------- replay
     def replay(self, issue: int) -> dict:

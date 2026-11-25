@@ -378,11 +378,6 @@ def read_sessions_ledger(path: Path) -> tuple[dict, str]:
     return session_map_io.read_ledger(path)
 
 
-def load_sessions_ledger(path: Path) -> dict:
-    """``sessions.json`` -> ``{key: sid}``; unreadable yields ``{}``."""
-    return read_sessions_ledger(path)[0]
-
-
 def parse_server_list(path: Path) -> set[str]:
     """Live sids from a saved copy of ``sess.py list --json`` output."""
     try:

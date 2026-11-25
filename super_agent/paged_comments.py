@@ -107,12 +107,17 @@ class PagedBatch:
     """
 
     def __init__(self, rows, *, cursor_before: int = 0, complete: bool = False,
-                 contiguous: bool = False, reason: str = ""):
+                 contiguous: bool = False, reason: str = "",
+                 pages: list | None = None):
         self.rows = list(rows)
         self.cursor_before = int(cursor_before or 0)
         self.complete = bool(complete)
         self.contiguous = bool(contiguous)
         self.reason = str(reason)
+        #: The page entries the walk recorded. Needed by a consumer that decides
+        #: "a page is missing" rather than "the ids jump" - ``PagedComments``
+        #: carries them, and dropping them here made every gap invisible.
+        self.pages = list(pages or [])
 
     #: Same names ``PagedComments`` uses, so one claim reader serves both and a
     #: consumer cannot accidentally ask the batch a question it answers with
@@ -161,7 +166,7 @@ def paged_batch(source, issue: int, *, cursor_before: int = 0,
         return PagedBatch(walked, cursor_before=cursor_before,
                           complete=walked.pagination_complete,
                           contiguous=walked.contiguous,
-                          reason=walked.stop_reason)
+                          reason=walked.stop_reason, pages=walked.pages)
     rows = [row for row in walked if isinstance(row, dict)]
     return PagedBatch(rows, cursor_before=cursor_before, complete=True,
                       contiguous=True, reason="backend returned the whole list")
