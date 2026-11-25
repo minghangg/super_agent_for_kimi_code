@@ -21,3 +21,6 @@ config/roles.local.json
 config/dev_quota.json
 
 new_workbench/
+
+# 全量测试单套锁：运行态，随进程生灭，不入库。
+.full_suite.lock

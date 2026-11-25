@@ -9,7 +9,7 @@
     · `wss_bus.py`     —— 只 import 本文件，**永不 import kimi_api**（有断言钉死）。
 
 职责边界（重要）：
-  · 本文件**不读 daemon、不碰 state/wss_bus\***，也不做重试与降级决策；
+  · 本文件**不读 daemon、不碰 `state/wss_bus*`**，也不做重试与降级决策；
   · 「已受理要不要重发」这类**业务判据**属于 daemon 的 journal，不属于这里；
   · 本文件只回答「怎么把这一条请求发出去、怎么解读回复」。
 

@@ -155,21 +155,41 @@ def broken_charters(names) -> dict[str, list[str]]:
     return out
 
 
-#: Package-root rule references in code spans, Markdown links, or plain prose.
-#: Absolute paths are excluded by the left boundary: they are a private-path
-#: defect for the privacy gate, not a package-relative missing-reference claim.
+#: A private-workbench prefix. A path starting with this can never resolve in a
+#: public clone, so it is a dead pointer by construction, not by absence.
+PRIVATE_PREFIX = "lwa/"
+
+#: Rule references in code spans, Markdown links, or plain prose. Both forms are
+#: collected: a package-relative ``rules/...`` and a private ``lwa/rules/...``.
+#: Absolute paths are excluded by the left boundary -- those are a private-path
+#: defect for the privacy gate, not a missing-reference claim.
 REF_RE = re.compile(
-    r"(?<![A-Za-z0-9_./-])(rules/[A-Za-z0-9_./-]+\.md)"
+    r"(?<![A-Za-z0-9_./-])((?:lwa/)?rules/[A-Za-z0-9_./-]+\.md)"
     r"(?![A-Za-z0-9_./-])"
 )
 
 
 def unresolved_refs(text: str, root: Path | None = None) -> list[str]:
-    """Every package-root ``rules/...`` reference whose target is absent."""
+    """Every rule reference a charter makes that this package cannot answer.
+
+    Two defects, deliberately one function, because a reader who follows a
+    pointer cannot tell them apart -- both are "the file you were told to read
+    is not here":
+
+    * **``rules/...``** -- a package-relative path whose target is absent.
+      This is ISS-107: the charter shipped, the rule it named did not.
+    * **``lwa/...``** -- a pointer into the private workbench. A fresh clone has
+      no such directory, so the reference can never resolve. This is the shape
+      that hid behind prose in ``worker.md``: it read as an ordinary path and
+      no check looked at it.
+    """
     root = Path(root) if root is not None else Path(__file__).resolve().parents[1]
     missing = []
     for ref in REF_RE.findall(text):
-        if not (root / ref).is_file() and ref not in missing:
+        if ref.startswith(PRIVATE_PREFIX):
+            if ref not in missing:
+                missing.append(ref)
+        elif not (root / ref).is_file() and ref not in missing:
             missing.append(ref)
     return missing
 

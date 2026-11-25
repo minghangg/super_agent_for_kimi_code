@@ -354,6 +354,37 @@ class CrossReferences(unittest.TestCase):
                 self.assertEqual(charters.unresolved_refs(text),
                                  ["rules/shared/rules/gone.md"])
 
+    def test_a_private_workbench_pointer_is_a_dead_reference(self):
+        """A ``lwa/...`` pointer cannot resolve in a public clone, ever.
+
+        This is the shape that hid in ``worker.md`` and ``qa.md``: three rule
+        files were cited through the private workbench's path, so the reader was
+        told to open something a fresh clone does not have. The old check only
+        looked for ``rules/...`` and reported ``ok: True`` throughout -- a
+        pointer that *looks* like a path is exactly what a shape check misses.
+        """
+        for text in ("细则见 `lwa/rules/shared/skills/x.md`。",
+                     "真源是 `lwa/rules/shared/rules/y.md` §八",
+                     "[规则](lwa/rules/shared/rules/z.md)"):
+            with self.subTest(text=text):
+                missing = charters.unresolved_refs(text)
+                self.assertEqual(len(missing), 1, missing)
+                self.assertTrue(missing[0].startswith("lwa/"), missing)
+
+    def test_a_private_pointer_is_reported_even_if_the_file_exists(self):
+        """Absence is not the criterion here -- the prefix is.
+
+        A workbench checkout may well exist on this machine, so a
+        "does it resolve" test would pass locally and fail on every other
+        machine. The prefix alone is the defect.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "lwa" / "rules").mkdir(parents=True)
+            (root / "lwa" / "rules" / "here.md").write_text("x", encoding="utf-8")
+            self.assertEqual(charters.unresolved_refs("见 `lwa/rules/here.md`。", root),
+                             ["lwa/rules/here.md"])
+
 
 class DoctorReportsBrokenCharters(unittest.TestCase):
     """``broken_charters`` is what the doctor line reads, so it must go red.
