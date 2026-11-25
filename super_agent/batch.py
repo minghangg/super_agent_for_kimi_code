@@ -22,6 +22,29 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from . import page_coverage
+
+__all__ = ["PageRecord", "merge_spans", "spans_contiguous", "first_hole",
+           "ScanPolicy", "CollectedBatch", "CollectedRound", "BatchCursor",
+           "DEFAULT_MAX_BATCH_ROWS", "DEFAULT_MAX_ISSUE_ROWS"]
+
+
+def __getattr__(name: str):
+    """Names that moved out of this module but stay part of its surface.
+
+    ``BatchCursor`` now lives with consumption
+    (``engine_parts.consume``) and the interval helpers with the page-coverage
+    judgement (``page_coverage``). Every caller and every test spells them
+    ``batch.<name>``, so moving the code must not rename it for them. Imported
+    lazily so the modules do not form a cycle at import time.
+    """
+    if name == "BatchCursor":
+        from .engine_parts.consume import BatchCursor
+        return BatchCursor
+    if name in ("merge_spans", "spans_contiguous", "first_hole"):
+        return getattr(page_coverage, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 #: The two row caps' defaults, named here because this is the module that owns
 #: the budget and :func:`engine_parts.round.round_policy` reads them. Two
 #: literals in two modules is how the delivery text and the code drifted apart
@@ -61,45 +84,6 @@ class PageRecord:
             return cls(page=0, status="malformed")
 
 
-def merge_spans(spans) -> list[tuple[int, int]]:
-    """Merge inclusive intervals; overlapping or abutting ones become one.
-
-    ``[(5, 7), (7, 3), (9, 9)]`` → ``[(3, 9)]``. Adjacency counts: page 4 and
-    page 5 are one run of pages, because there is no page between them.
-    """
-    cleaned: list[tuple[int, int]] = []
-    for low, high in spans:
-        low, high = int(low), int(high)
-        if low > high:
-            low, high = high, low          # (7, 3) is the same run as (3, 7)
-        cleaned.append((low, high))
-    cleaned.sort()
-    merged: list[tuple[int, int]] = []
-    for low, high in cleaned:
-        if merged and low <= merged[-1][1] + 1:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], high))
-        else:
-            merged.append((low, high))
-    return merged
-
-
-def spans_contiguous(spans) -> bool:
-    """Do these intervals form exactly one run?"""
-    return len(merge_spans(spans)) <= 1
-
-
-def first_hole(spans) -> int | None:
-    """The lowest page number missing between two observed runs, or ``None``.
-
-    A hole is only reported **between** pages the walk did return: the pages
-    below a walk that stopped at the cursor were never claimed to exist, so
-    their absence is not evidence of anything.
-    """
-    merged = merge_spans(spans)
-    for (_low, high), (next_low, _n) in zip(merged, merged[1:]):
-        if next_low > high + 1:
-            return high + 1
-    return None
 
 
 @dataclass(frozen=True)
@@ -187,86 +171,35 @@ class CollectedBatch:
     def remaining(self) -> int:
         return len(self.pending_rows)
 
+    # ------------------------------------------------------- page coverage
+    # The judgement lives in :mod:`super_agent.page_coverage`: it changes when
+    # the page-walk contract changes, which is not when row identity or merging
+    # changes. These forwarders keep the call sites - and the tests that pin the
+    # behaviour - reading the same names.
+
     def page_spans(self) -> list[tuple[int, int]]:
-        return [(rec.page, rec.page) for rec in self.pages if rec.page > 0]
+        return page_coverage.page_spans(self.pages)
 
     def stop_page(self) -> int | None:
-        """The page the walk stopped on, or ``None`` when it walked to page 1."""
-        stopped = [rec.page for rec in self.pages if rec.stopped and rec.page > 0]
-        return min(stopped) if stopped else None
+        return page_coverage.stop_page(self.pages)
 
     def last_page(self) -> int:
-        """The listing's newest page number, as the walk observed it."""
-        return max((rec.page for rec in self.pages if rec.page > 0), default=0)
+        return page_coverage.last_page(self.pages)
 
     def observed_pages(self) -> set[int]:
-        """Pages that actually carried rows.
-
-        A page that answered with nothing did not arrive: in a listing of
-        ``last`` pages every page below ``last`` is full by construction, so a
-        zero-row page in the middle is the shape a lost request takes. Counting
-        its bare entry as "seen" would hide exactly the hole a rebuild exists
-        for.
-        """
-        return {rec.page for rec in self.pages if rec.page > 0 and rec.rows > 0}
+        return page_coverage.observed_pages(self.pages)
 
     def observed_spans(self) -> list[tuple[int, int]]:
-        """The pages that carried rows, as inclusive intervals."""
-        return [(page, page) for page in sorted(self.observed_pages())]
+        return page_coverage.observed_spans(self.pages)
 
     def missing_page(self) -> int | None:
-        """The lowest page number this walk should have read and did not.
-
-        Which pages a walk "should have read" is the whole question, and the
-        answer changed with #130 QA P0-1. The real walk is ``[1, last, last-1,
-        …, k]``: page 1 is the probe that finds ``rel="last"``, then it walks
-        back and halts on the first page at/below the cursor. Pages ``2..k-1``
-        were **never needed** - every row on them is below the cursor, already
-        consumed - so calling them holes reported a fault on every listing of
-        three pages or more, which is every active issue.
-
-        So the claim is an **interval with a floor**, never the observed set:
-
-        * the walk stopped at ``k`` - the pages ``k+1 … last`` are needed, and
-          any of them without rows is a hole;
-        * the walk reached page 1 - ``1 … last`` are needed;
-        * the walk ran out of ``max_pages`` - it claims nothing either way.
-          "I stopped looking" is not "a page is missing", and inventing a hole
-          there would rebuild a listing nobody proved broken.
-        """
-        last = self.last_page()
-        if last <= 0:
-            return None
-        stop = self.stop_page()
-        if stop is not None:
-            floor = stop + 1                  # above the stop: needed
-        elif self.pagination_complete or self.cursor_before <= 0:
-            floor = 1                         # the whole listing was in scope
-        else:
-            # An incremental walk that spent its budget before reaching the
-            # cursor: the pages it skipped may all be below it, so no page
-            # number can be called missing. The read is already paused for this
-            # shape (``walk_covers_cursor``), which is the honest answer.
-            return None
-        seen = self.observed_pages()
-        missing = [page for page in range(floor, last + 1) if page not in seen]
-        return missing[0] if missing else None
+        return page_coverage.missing_page(
+            self.pages, self.cursor_before, self.pagination_complete)
 
     def needs_rebuild(self) -> bool:
-        """Is this batch evidence that the incremental read cannot be trusted?
+        return page_coverage.needs_rebuild(
+            self.pages, self.cursor_before, self.pagination_complete)
 
-        **Ids are never consulted.** A listing whose ids jump (a deleted
-        comment) is read perfectly well, and treating that as a gap is the
-        counter-example this issue names.
-
-        The answer is exactly "a page this walk needed had no rows", never a
-        separate reading of ``pagination_complete``. Those two used to disagree:
-        a walk that reached page 1 while one middle page came back empty claims
-        completeness **and** is missing data, and letting the claim win meant the
-        pause a rebuild exists for was never written (#130 QA P0-2). Page 1 is
-        always needed, so a complete walk has no floor to excuse anything.
-        """
-        return self.missing_page() is not None
 
     # ------------------------------------------------------------ rows
     def consume(self, ids) -> int:
@@ -313,71 +246,6 @@ def _dedupe(rows) -> list[dict]:
         seen.setdefault(cid, dict(row, id=cid))
     return [seen[cid] for cid in sorted(seen)]
 
-
-class BatchCursor:
-    """How far consumption got: one prefix per thread, never a max.
-
-    The cursor may only name ids that every observed row at or below it was
-    consumed. So it is ``min(pending) - 1`` while anything is pending (or the
-    highest observed id once nothing is), never ``max(consumed)`` - the latter
-    jumps over a row the queue refused and loses it forever.
-    """
-
-    def __init__(self, prefix: dict[str, int] | None = None) -> None:
-        self.prefix: dict[str, int] = {str(k): int(v or 0)
-                                       for k, v in (prefix or {}).items()}
-        self._pending: dict[str, dict[int, int]] = {}
-        self._observed: dict[str, int] = {}
-
-    def pending(self, thread: str) -> dict[int, int]:
-        return self._pending.setdefault(str(thread), {})
-
-    def observe(self, thread: str, rows) -> int:
-        """Record rows as seen-but-unconsumed; returns how many were new."""
-        thread = str(thread)
-        base = max(self.prefix.get(thread, 0), 0)
-        pending = self.pending(thread)
-        added = 0
-        for row in rows or []:
-            try:
-                cid = int(row["id"])
-            except (TypeError, ValueError, KeyError):
-                continue
-            if cid <= base or cid in pending:
-                continue
-            pending[cid] = 1
-            added += 1
-        if pending:
-            self._observed[thread] = max(self._observed.get(thread, 0), max(pending))
-        return added
-
-    def consume(self, thread: str, ids) -> int:
-        """Consume rows, then advance the prefix only over the consumed prefix."""
-        thread = str(thread)
-        pending = self.pending(thread)
-        hit = 0
-        for cid in ids or []:
-            try:
-                key = int(cid)
-            except (TypeError, ValueError):
-                continue
-            if pending.pop(key, None) is not None:
-                hit += 1
-        if pending:
-            candidate = min(pending) - 1
-        else:
-            candidate = self._observed.get(thread, 0)
-        if candidate > self.prefix.get(thread, 0):
-            self.prefix[thread] = candidate
-        return hit
-
-    def value(self, thread: str, fallback: int = 0) -> int:
-        """Where the cursor stands: the prefix, raised to ``fallback`` if given."""
-        return max(int(fallback or 0), int(self.prefix.get(str(thread), 0) or 0))
-
-    def snapshot(self) -> dict:
-        return {"prefix": dict(self.prefix),
-                "pending": {k: sorted(v) for k, v in self._pending.items() if v}}
 
 
 class CollectedRound:

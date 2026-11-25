@@ -24,8 +24,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ..batch import (BatchCursor, CollectedRound, DEFAULT_MAX_BATCH_ROWS,
+from ..batch import (CollectedRound, DEFAULT_MAX_BATCH_ROWS,
                      DEFAULT_MAX_ISSUE_ROWS, ScanPolicy)
+from .consume import BatchCursor
 from ..batch_queue import BoundedBatchQueue
 
 

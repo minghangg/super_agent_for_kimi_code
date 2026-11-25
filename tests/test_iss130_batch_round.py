@@ -381,8 +381,52 @@ class GapDetection(Base):
         self.assertTrue(batch.collection_complete,
                         "the unread prefix was proved gap-free")
 
+class EmptyIssueIsNotAFault(Base):
+    """Counter-example 2's blind spot: a listing with no comments at all.
+
+    ``walk_listing`` always probes page 1, so an issue nobody has commented on
+    produces one legitimate, complete empty read. The first delivery of the
+    page-gap judgement treated every zero-row page as a lost request, so a fresh
+    issue paused itself on the very first round: ``read.paused`` was written, and
+    the comments that arrived afterwards were never read until a person lifted
+    the pause by hand. "New issue, no comments yet" is one of the most common
+    states there is (#130 QA P0-A).
+    """
+
+    def test_an_empty_listing_is_complete(self):
+        source = Source([])
+        walked = source.paged(1, since_id=0)
+        self.assertEqual([(p["page"], p["rows"]) for p in walked.pages],
+                         [(1, 0)], "the walk must produce the real empty read")
+        self.assertTrue(walked.pagination_complete)
+        batch = CollectedBatch(THREAD, list(walked), cursor_before=0,
+                              pages=list(walked.pages),
+                              complete=walked.pagination_complete,
+                              contiguous=walked.contiguous)
+        self.assertIsNone(batch.missing_page())
+        self.assertFalse(batch.needs_rebuild())
+        self.assertTrue(batch.collection_complete)
+
+    def test_an_empty_issue_stays_idle_and_reads_what_arrives_next(self):
+        """The production path: empty round 1 must not pause round 2 out."""
+        source = Source([])
+        engine = self.engine(source)
+        out = engine.run_once()
+        self.assertEqual(out.get("rebuild_needed") or [], [],
+                         "an empty listing is not evidence of a gap")
+        rec = engine.store.load_index()["issues"][THREAD]
+        self.assertFalse(rec.get("read_paused"),
+                         "an issue with no comments is not a fault")
+        self.assertNotEqual(rec.get("state"), "needs_person")
+
+        source.ids.append(9001)
+        out = engine.run_once()
+        self.assertEqual(out["processed"], 1,
+                         "the comment that arrived must be read")
+        self.assertEqual(self.cursor_of(engine), 9001)
+
     def test_a_page_that_never_arrived_is_still_a_hole(self):
-        """Counter-example 3 on the same real walk: page 3 answers with nothing.
+        """The empty-last-page exception must not excuse a middle page.
 
         Every page below ``last`` is full by construction, so a zero-row page in
         the middle is a lost request - not an empty tail. The floor the stop

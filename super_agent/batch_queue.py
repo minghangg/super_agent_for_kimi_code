@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import queue
 
-from .batch import CollectedBatch, ScanPolicy, merge_spans, spans_contiguous
+from .batch import CollectedBatch, ScanPolicy
+from .page_coverage import merge_spans, spans_contiguous
 
 
 class Backpressure(RuntimeError):

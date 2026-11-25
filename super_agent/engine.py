@@ -96,6 +96,7 @@ from .engine_parts import requirement_gate as requirement_gate_mod
 from .engine_parts import retry as retry_mod
 from .engine_parts import round as round_mod
 from .engine_parts.review_routes import ReviewRoutes
+from .engine_parts.refusal_ledger import RefusedRoutes
 from .engine_parts import session_keys as session_key_mod
 from .engine_parts import triage as triage_mod
 from .engine_parts import triage_batch as triage_batch_mod
@@ -258,7 +259,7 @@ def _default_allowlist_path() -> Path:
     return Path(__file__).resolve().parent.parent / "config" / "allowlist.json"
 
 
-class Engine(ReviewRoutes):
+class Engine(ReviewRoutes, RefusedRoutes):
     def __init__(self, cfg: dict, store: Store, source, bus=None, *, clock=_now_ts,
                  project_allowlist: ProjectAllowlist | None = None,
                  adapter=None, session_api=None):

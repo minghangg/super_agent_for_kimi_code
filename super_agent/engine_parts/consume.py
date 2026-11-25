@@ -26,12 +26,77 @@ from __future__ import annotations
 
 from .. import batch as batch_mod
 from .. import batch_queue as queue_mod
-from . import round as round_mod
 
 
 def now() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+class BatchCursor:
+    """How far consumption got: one prefix per thread, never a max.
+
+    The cursor may only name ids that every observed row at or below it was
+    consumed. So it is ``min(pending) - 1`` while anything is pending (or the
+    highest observed id once nothing is), never ``max(consumed)`` - the latter
+    jumps over a row the queue refused and loses it forever.
+    """
+
+    def __init__(self, prefix: dict[str, int] | None = None) -> None:
+        self.prefix: dict[str, int] = {str(k): int(v or 0)
+                                       for k, v in (prefix or {}).items()}
+        self._pending: dict[str, dict[int, int]] = {}
+        self._observed: dict[str, int] = {}
+
+    def pending(self, thread: str) -> dict[int, int]:
+        return self._pending.setdefault(str(thread), {})
+
+    def observe(self, thread: str, rows) -> int:
+        """Record rows as seen-but-unconsumed; returns how many were new."""
+        thread = str(thread)
+        base = max(self.prefix.get(thread, 0), 0)
+        pending = self.pending(thread)
+        added = 0
+        for row in rows or []:
+            try:
+                cid = int(row["id"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if cid <= base or cid in pending:
+                continue
+            pending[cid] = 1
+            added += 1
+        if pending:
+            self._observed[thread] = max(self._observed.get(thread, 0), max(pending))
+        return added
+
+    def consume(self, thread: str, ids) -> int:
+        """Consume rows, then advance the prefix only over the consumed prefix."""
+        thread = str(thread)
+        pending = self.pending(thread)
+        hit = 0
+        for cid in ids or []:
+            try:
+                key = int(cid)
+            except (TypeError, ValueError):
+                continue
+            if pending.pop(key, None) is not None:
+                hit += 1
+        if pending:
+            candidate = min(pending) - 1
+        else:
+            candidate = self._observed.get(thread, 0)
+        if candidate > self.prefix.get(thread, 0):
+            self.prefix[thread] = candidate
+        return hit
+
+    def value(self, thread: str, fallback: int = 0) -> int:
+        """Where the cursor stands: the prefix, raised to ``fallback`` if given."""
+        return max(int(fallback or 0), int(self.prefix.get(str(thread), 0) or 0))
+
+    def snapshot(self) -> dict:
+        return {"prefix": dict(self.prefix),
+                "pending": {k: sorted(v) for k, v in self._pending.items() if v}}
 
 
 def note_collected(host, thread: str, batch, cursor_before: int, fresh,
@@ -124,7 +189,7 @@ def advance_cursor(host, key: str, cursor: dict, cur: int, fresh) -> None:
     if state is not None:
         prefix = state.cursor.value(key, fallback=cur)
     else:
-        prefix = round_mod.consumed_prefix(cur, ids)
+        prefix = max(int(cur or 0), max(ids, default=0))
     cursor.setdefault("issues", {})[key] = max(int(cur or 0), int(prefix or 0))
 
 
