@@ -16,6 +16,7 @@ from ..paged_comments import (PagedBatch, PagedComments, comments_from,
                              paged_batch, paged_result, walk_complete)
 from ..paged_walk import link_last_page, locate_last_page, walk_listing
 from . import client
+from . import token as token_mod
 from .cached import CachedLiveSource
 
 API = "https://api.github.com"
@@ -139,7 +140,16 @@ class LiveSource:
         if not repo or "/" not in repo:
             raise SourceError("github.repo must be 'owner/name' for source=live")
         self.repo = repo
-        self.token = token if token is not None else (os.environ.get("GITHUB_TOKEN") or "")
+        if token is not None:
+            self.token = token
+        else:
+            # 2026-11-25 (#134 regression): the env var alone is not enough.
+            # The engine runs under a scheduled task with no GITHUB_TOKEN,
+            # so every read became anonymous -- and GitHub answers that with
+            # 404 for a private repo, which the engine read as "unreadable"
+            # and turned into a permanent read.paused. The token chain lives
+            # in github/token.py now, shared with issue_cli.
+            self.token = token_mod.read_token_or_empty()
         self.timeout_s = timeout_s
         self.on_hold_labels = tuple(
             str(x) for x in (on_hold_labels or ()) if str(x or "").strip())
