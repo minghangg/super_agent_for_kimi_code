@@ -12,6 +12,7 @@ from pathlib import Path
 
 from super_agent import batch_queue, config
 from super_agent.batch import CollectedBatch, ScanPolicy
+from super_agent.engine_parts import doctor
 from super_agent.github import cache, cached
 
 ROWS = [{"id": 1, "body": "a"}, {"id": 2, "body": "b"}]
@@ -48,10 +49,12 @@ class Backend:
 class FlakyIssues:
     """A backend whose listing changes between rounds, and can fail."""
 
-    def __init__(self, rounds, labels=None):
+    def __init__(self, rounds, labels=None, state="open"):
         self.rounds = list(rounds)
         self.labels = labels or {}
         self.fail = False
+        self.fail_state = False
+        self.state = state
         self.calls = 0
         self.detail_calls = 0
 
@@ -76,7 +79,9 @@ class FlakyIssues:
         return ""
 
     def issue_state(self, issue):
-        return "open"
+        if self.fail_state:
+            raise RuntimeError("offline")
+        return self.state
 
     def flow(self, issue):
         self.detail_calls += 1
@@ -172,6 +177,33 @@ class CacheTests(unittest.TestCase):
         src.issues(20)
         self.assertEqual(src.flow(1), "at")
         self.assertEqual(lead.detail_calls, 0)
+
+    # ---- QA P0-4: doctor 直调 github_check 的契约 ----
+
+    def test_p0_4_github_check_consumes_the_probe_state(self):
+        """``doctor`` reads a state string; ``int()`` made every live check fail."""
+        for state in ("open", "closed", "unknown"):
+            with self.subTest(state=state):
+                backend = FlakyIssues([[1]], state=state)
+                src = cached.CachedLiveSource(backend, root=self.root)
+                row = doctor.github_check(src, "live")
+                self.assertEqual(row[0], "github")
+                self.assertTrue(row[1], row)
+                self.assertIn(state, row[2])
+
+    def test_p0_4_github_check_reports_a_broken_probe_as_down(self):
+        backend = FlakyIssues([[1]])
+        backend.fail_state = True
+        src = cached.CachedLiveSource(backend, root=self.root)
+        row = doctor.github_check(src, "live")
+        self.assertFalse(row[1])
+        self.assertEqual(row[4], "github-down")
+
+    def test_p0_4_github_check_does_not_touch_the_snapshot(self):
+        backend = FlakyIssues([[1, 2, 3]])
+        src = cached.CachedLiveSource(backend, root=self.root)
+        doctor.github_check(src, "live")
+        self.assertFalse((self.root / "issues.json").exists())
 
     def test_p1_2_replay_listing_is_not_cached(self):
         backend = Backend()

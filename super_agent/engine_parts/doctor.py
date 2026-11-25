@@ -280,13 +280,20 @@ def github_check(source, source_name: str) -> tuple:
     the listing snapshot on every ``issues()`` call, so one probe row stood in
     for the whole listing and narrowed the next round to a single issue
     (#134 P0-1). ``probe()`` answers the same question without writing.
+
+    ``probe()`` reports the **state of one issue**, which is the question doctor
+    asks: "can we read GitHub, and does it answer with a known state?". Coercing
+    that answer with ``int()`` turned every live check into
+    ``ValueError: invalid literal … 'open'`` (#134 P0-4), so the state string is
+    consumed as-is.
     """
     try:
         probe = getattr(source, "probe", None)
         if callable(probe):
-            sample = [int(probe(1))]
-        else:
-            sample = source.issues(limit=1)
+            state = str(probe(1) or "unknown")
+            return ("github", True,
+                    f"source={source_name} reachable, issue 1 is {state}")
+        sample = source.issues(limit=1)
     except Exception as exc:  # noqa: BLE001  reported, never raised
         return ("github", False, f"source={source_name} error: "
                                  f"{type(exc).__name__}: {exc}",
