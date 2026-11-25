@@ -62,6 +62,8 @@ DEFAULTS: dict = {
         # no filter (fail open) - missing an issue silently hides its frames,
         # which is worse than looking at one too many.
         "on_hold_labels": ["stage:on-hold"],
+        # #134 step 2: HTTP client policy; see super_agent.github.client.
+        "etag_cache": True, "local_cache_ttl_s": 300, "max_concurrent": 3,
     },
     "store": {
         "max_event_lines": 10_000,

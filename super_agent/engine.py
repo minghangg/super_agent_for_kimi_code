@@ -358,6 +358,11 @@ class Engine(ReviewRoutes, RefusedRoutes):
         self._session_map_cache: tuple | None = None
         # The current round's collection state (see ``engine_parts.round``).
         self._round_state = None
+        # Process-lifetime closed terminal state (#134 step 5). Only ``closed``
+        # is cached: ``unknown`` and ``open`` stay fresh, since a failed probe
+        # must never become permanent and a reopened issue must re-enter the
+        # live set on the next ``issues()`` read.
+        self._closed_issues: set[int] = set()
 
     # ------------------------------------------------------------ allowlist
     def allowlist_allows(self, issue: int | None, action: str | None) -> tuple[bool, str]:
@@ -3620,14 +3625,20 @@ class Engine(ReviewRoutes, RefusedRoutes):
         Fail closed for the caller: an unreadable probe must never look like a
         closed Issue, or a broken network would complete threads by itself.
         """
+        number = int(issue)
+        if number in self._closed_issues:
+            return "closed"
         try:
-            state = self.source.issue_state(int(issue))
+            state = self.source.issue_state(number)
         except Exception as exc:  # noqa: BLE001  reported as unknown, never closed
             self.store.log_event({"type": "issue.state_unreadable", "at": _now(),
-                                  "issue": int(issue),
+                                  "issue": number,
                                   "error": f"{type(exc).__name__}: {exc}"})
             return "unknown"
-        return str(state or "unknown")
+        state = str(state or "unknown")
+        if state == "closed":
+            self._closed_issues.add(number)
+        return state
 
     # ------------------------------------------------- close reconciliation
     def _binding_roles(self, thread: str) -> list[str]:

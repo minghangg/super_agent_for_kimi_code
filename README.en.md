@@ -65,7 +65,7 @@ See the [AT operations guide](docs/at_mode.md) for the schema, commands, T1/T2 f
 
 ## Try it
 
-No dependencies beyond Python 3.10+. Nothing to install, no credentials needed.
+No dependencies beyond Python 3.10+ and `aiohttp`. Nothing else to install, no credentials needed.
 
 ```bash
 git clone <this repo> && cd super_agent_for_kimi_code
@@ -123,7 +123,7 @@ config/                allowlist: which project, which issue, which action is pe
 
 Three properties worth knowing before you read the code:
 
-- **No dependencies.** Standard library only. `pyproject.toml` declares none.
+- **One dependency.** `aiohttp`, declared in `pyproject.toml`, and only for the GitHub HTTP client; every other module is standard library.
 - **Observe is the default.** `--mode observe` performs zero external actions; the counter is asserted to stay at 0. Nothing happens until you explicitly allow it.
 - **Two allowlists, two questions.** One says *which issues may this engine touch*; the other says *which actions may it take*. They are checked separately, in that order.
 

@@ -73,7 +73,7 @@ python -m super_agent.requirements approve --role supervisor --project <项目> 
 
 ## 想试
 
-Python 3.10+ 之外没有依赖。不用装包，不需要任何凭据。
+Python 3.10+ 与 `aiohttp` 之外没有依赖。不用装别的包，不需要任何凭据。
 
 ```bash
 git clone <this repo> && cd super_agent_for_kimi_code
@@ -131,7 +131,7 @@ config/                白名单：允许碰哪个项目、哪张单、哪个动
 
 读代码前值得知道的三件事：
 
-- **零依赖。** 只用标准库，`pyproject.toml` 里一个依赖都没有。
+- **只依赖一个包。** `aiohttp`（写在 `pyproject.toml` 里），只给 GitHub HTTP 客户端用；其余模块都用标准库。
 - **observe 是默认值。** `--mode observe` 不执行任何外部动作，计数器被断言恒为 0。你不明确放行，它什么都不会做。
 - **两张白名单，两个不同的问题。** 一张说「这个引擎能碰哪些单」，另一张说「它能做哪些动作」。分开检查，按这个顺序。
 

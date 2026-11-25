@@ -47,9 +47,7 @@ import os
 import re
 import subprocess
 import sys
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
 
 from . import agent_config
@@ -395,19 +393,12 @@ def _call(method: str, path: str, payload: dict | None = None, *,
             if len(lines) > 1:
                 print(f"  body[-1]: {lines[-1]}")
         return {"dry_run": True}
-    data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(url, data=data, method=method)
-    for key, value in _headers(env_file, table or roles_mod.load(DEFAULT_ROLES)).items():
-        req.add_header(key, value)
-    if data:
-        req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = resp.read().decode("utf-8", "replace")
-            return json.loads(body) if body.strip() else {}
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:400]
-        raise SystemExit(f"GitHub API {exc.code} {method} {path}：{detail}")
+    headers = _headers(env_file, table or roles_mod.load(DEFAULT_ROLES))
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    from .github import write_client
+    return write_client.request_or_exit(
+        url, method=method, path=path, headers=headers, payload=payload)
 
 
 def _call_raw(method: str, path: str, payload: dict | None = None, *,
@@ -418,37 +409,26 @@ def _call_raw(method: str, path: str, payload: dict | None = None, *,
     if dry_run:
         print(f"[dry-run] {method} {url}  body_keys={list((payload or {}))}")
         return {"dry_run": True}
-    data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(url, data=data, method=method)
-    for key, value in _headers(env_file, table or roles_mod.load(DEFAULT_ROLES)).items():
-        req.add_header(key, value)
-    if data:
-        req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = resp.read().decode("utf-8", "replace")
-            out = json.loads(body) if body.strip() else {}
-            if isinstance(out, dict):
-                out.setdefault("_status", resp.status)
-            return out
-    except urllib.error.HTTPError as exc:
-        return {"_status": exc.code,
-                "_error": exc.read().decode("utf-8", "replace")[:400]}
+    headers = _headers(env_file, table or roles_mod.load(DEFAULT_ROLES))
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    from .github import write_client
+    result = write_client.request(
+        url, method=method, headers=headers, payload=payload)
+    out = result["body"] if isinstance(result["body"], dict) else {}
+    out.setdefault("_status", result["_status"])
+    if result["error"]:
+        out.setdefault("_error", result["error"])
+    return out
 
 
 def _file_get(url: str, *, env_file: str | None = None,
               table: roles_mod.RoleConfig | None = None) -> dict:
     full = url if str(url).startswith("http") else f"{API}{url}"
-    req = urllib.request.Request(full, method="GET")
-    for key, value in _headers(env_file, table or roles_mod.load(DEFAULT_ROLES)).items():
-        req.add_header(key, value)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = resp.read().decode("utf-8", "replace")
-            return json.loads(body) if body.strip() else {}
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:400]
-        raise SystemExit(f"GitHub API {exc.code} GET {url}：{detail}")
+    from .github import write_client
+    return write_client.request_or_exit(
+        full, method="GET", path=url,
+        headers=_headers(env_file, table or roles_mod.load(DEFAULT_ROLES)))
 
 
 def _rows(rows) -> list:
