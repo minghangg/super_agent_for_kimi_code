@@ -77,6 +77,50 @@ python -m super_agent.dispatch_cli --session <目标 sid> \
 
 **实证（2026-11-25）**：#134 发了派单评论 cid `7159480980` 与授权 cid `7159504523`，以为 PM 收到了，实际**一条帧都没产生**，PM 完全没动；补跑 `dispatch_cli` 后 `busy=True`。
 
+## 2.2 重启引擎的标准动作（2026-11-26，代价：5 次无效重启）
+
+**三条判据，缺一条就会白试一轮。**
+
+### 一、`health.json` 的 pid 必须等于你刚起的那个 pid
+
+引擎自己写 `health.json`，进程一死就停止更新——**`last_loop_at` 是死者遗言**。看到「last_loop 距今 40 秒」不代表活着，可能那是 40 秒前死的进程留下的。
+
+**pid 变了才算新进程活了；pid 没变说明根本没起来。**
+
+### 二、怀疑启动失败时，立刻改用前台启动一次
+
+`start_engine.ps1` 用 `-WindowStyle Hidden` 起 `pythonw.exe`，**启动失败时没有任何输出**。2026-11-25 夜连续起了 4 次，每次都以为成功，实际新进程立刻退出。
+
+```bash
+# 前台启动，直接看报错（不要继续 Hidden 盲试）
+SAFKC_AGENT_CONFIG=<工作台>/new_workbench/config/agent.json \
+  "D:/program files/python310/python.exe" -m super_agent.cli run \
+  --mode assist --interval 60 --source live \
+  --state-dir <工作台>/new_workbench/data \
+  --config <工作台>/new_workbench/engine.json \
+  --allowlist <工作台>/new_workbench/allowlist.json
+```
+
+### 三、凭据必须走配置文件，不走环境变量
+
+常驻进程由 `Start-Process`／计划任务／服务启动，**三种方式都不保证环境继承**。
+
+判据：
+
+```bash
+python -c "from super_agent.github import token; print(token.token_origin())"
+# 必须是文件路径；"env" 或空都不合格
+```
+
+**规则**：常驻进程读凭据一律「**配置文件优先，环境变量兜底**」，不许反过来。
+
+### 排查顺序
+
+1. `health.json` 的 pid 变了吗？没变 → 进程没起来，转 2
+2. 前台启动看报错
+3. 看 `new_workbench/data/events.jsonl` 最后一条是不是 `run.failed`
+4. 是 403 且报文含「API rate limit exceeded for <ip>」→ **凭据没生效**，转 3 的判据
+
 ## 3. 批准
 
 AT READY 不等于批准。先同步并核对 objective、范围、验收、反例、风险级别和 review_policy：
