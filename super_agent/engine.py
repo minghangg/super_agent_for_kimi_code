@@ -773,10 +773,25 @@ class Engine(ReviewRoutes):
         The legacy fallthrough passes ``False``: there the whole-body scan is
         the behaviour every other author already had, and narrowing it would
         trade one silence for a different one outside this issue.
+
+        **2026-11-25 fix: the five-part action word counts too.** The charters
+        require every role comment to open with
+        ``[who]-[do]-[notify]-[project]-[cid]`` (``session_contract.md`` §6),
+        and ``告警`` is one of the twelve legal actions. Before this fix the
+        PM escalated with ``--do 告警`` and the engine saw nothing: no verdict
+        marker (so ``state=""``), no configured marker (so ``escalated=""``),
+        therefore no frame and no ``pm.escalation`` row. A request for a
+        supervisor sat in GitHub for 82 minutes while the supervisor waited.
+        Now a first line whose action is ``告警`` rings the same bell as
+        ``[decision]``/``[blocked]``; ``交接要求`` is deliberately excluded
+        because it names a peer handoff, not a person's decision.
         """
         text = str(body or "")
         if first_line_only:
             text = markers.first_line(text)
+            five = markers.parse_five(text)
+            if five and five.get("action_ok") and five.get("do") == "告警":
+                return "[告警]"
         lowered = text.lower()
         for marker in self.markers:
             if marker and marker in lowered:

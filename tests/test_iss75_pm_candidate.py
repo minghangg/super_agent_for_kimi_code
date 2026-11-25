@@ -580,3 +580,43 @@ class Dedupe(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FivePartEscalationRings(Base):
+    """2026-11-25: a PM escalates with ``--do 告警`` under the five-part title.
+
+    ``session_contract.md`` §6 makes the five-part header the only legal shape
+    for a role comment, and ``告警`` is one of its twelve actions. Before this
+    fix such a comment had no verdict marker (``state=""``) and no configured
+    marker (``escalated=""``), so the engine produced neither a frame nor a
+    ``pm.escalation`` row: a request for a supervisor sat in GitHub while the
+    supervisor waited. Measured on #130 cid 7154622252 - 82 minutes, no frame.
+    """
+
+    _PM = "pm-demo-3f7c1a90"
+
+    ALERT = ("[" + _PM + "]-[告警]-[supervisor-3a1bf73b]-[proj] "
+             "#130 连续两轮 QA 不过，上升 supervisor 拍板")
+
+    def test_the_alert_action_rings_and_leaves_a_row(self):
+        engine = self.engine()
+        self.source.add(9200, self.ALERT)
+        engine.run_once()
+        frames = self.bus.payloads("event.agent.supervisor")
+        self.assertEqual(len(frames), 1, "告警 must produce exactly one frame")
+        self.assertTrue(frames[0]["exception"])
+        reasons = [r.get("reason") for r in self.rows(engine)]
+        self.assertIn("pm.escalation[user]", reasons)
+
+    def test_the_alert_action_rings_only_from_the_first_line(self):
+        engine = self.engine()
+        self.source.add(9201, "[" + self._PM + "]-[派单]-[wk-x]-[proj] 干活\n\n"
+                             "正文里提到 [告警] 不算请求")
+        engine.run_once()
+        self.assertEqual(self.bus.payloads("event.agent.supervisor"), [])
+
+    def test_a_handoff_request_is_not_a_person_decision(self):
+        engine = self.engine()
+        self.source.add(9202, "[" + self._PM + "]-[交接要求]-[steward]-[proj] 交接")
+        engine.run_once()
+        self.assertEqual(self.bus.payloads("event.agent.supervisor"), [])

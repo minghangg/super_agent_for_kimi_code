@@ -1006,6 +1006,24 @@ def parse_pm_verdict(body: str) -> dict | None:
         # ``ready``/``blocked``/``working`` is three-state and no single action
         # word can express it.
         if five["do"] != "裁决":
+            # 2026-11-25: ``告警`` is the charters' own word for "a person has
+            # to decide this" (``session_contract.md`` §6, twelve legal
+            # actions). It is not a verdict -- it declares no state and carries
+            # no delivery -- but it must not be invisible either: the caller
+            # reads it as an escalation and rings the exception frame. Returning
+            # ``None`` here made ``[pm-x]-[告警]-[supervisor]-…`` vanish, and a
+            # real request for a supervisor sat unanswered for 82 minutes
+            # (#130 cid 7154622252). ``escalation_only`` says "this is a
+            # request, not a verdict", so the caller cannot mistake it for one.
+            if five["do"] == "告警" and _is_pm_or_supervisor_key(five["who"]):
+                return {
+                    "marker": "PM", "state": "", "matched": "",
+                    "line": line, "issue": None, "coords_ok": False,
+                    "coords_error": "", "delivery": None, "delivery_error": "",
+                    "structured": False, "source": "escalation",
+                    "candidate": True, "escalation_only": True,
+                    "five": five,
+                }
             return None
         if not _is_pm_or_supervisor_key(five["who"]):
             return None
