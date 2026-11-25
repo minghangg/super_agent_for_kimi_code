@@ -2077,14 +2077,30 @@ class Engine(ReviewRoutes, RefusedRoutes):
         escalated = self._escalation_marker(str(comment.get("body") or ""))
         if escalated and not state:
             # A ``[PM]`` note that asks for a decision. It rings the exception
-            # frame below and it also leaves a row: the frame is delivered to a
+            # frame and it also leaves a row: the frame is delivered to a
             # session, and a session that is not listening would otherwise be
             # the only copy of a request for a person (#75 round 2, P0-2).
+            #
+            # 2026-11-25: the record keeps ``state=""`` (the frame is an
+            # exception, not a verdict - the #75 behaviour the stall watchdog
+            # depends on), and the frame is sent here instead of falling
+            # through. Falling through used to *also* file a
+            # ``pm.verdict[user]`` row, so one request produced two rows: the
+            # right one and "the PM's answer could not be read". Measured on
+            # #130 cid 7157168563. One request, one row, one frame.
             self.store.log_event({
                 "type": "pm.escalation", "at": _now(), "thread": thread,
                 "comment_id": cid, "marker": escalated})
             self._pm_needs_person(index, thread, cid, "pm.escalation[user]",
                                   f"escalation marker {escalated!r}", verdict)
+            self._record_pm_verdict(index, thread, verdict, cid)
+            result = self._route_pm_frame(
+                index, thread, issue, comment, verdict, exception=True,
+                reason=f"escalation marker {escalated!r}")
+            return self._settle_frame(index, thread, issue, cid, result,
+                                      exception=True,
+                                      reason=f"escalation marker {escalated!r}",
+                                      verdict=verdict, state="")
         if not self._pm_verified(thread, comment):
             # An unverified verdict does not ring. A QA verdict that cannot be
             # attributed still moves an assignment; a PM ``ready`` wakes a
