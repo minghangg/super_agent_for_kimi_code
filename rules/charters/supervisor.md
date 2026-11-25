@@ -35,6 +35,37 @@ AT questions 产生 `question_url` 后，你只把链接交给用户。用户打
 
 普通需求的 READY 经你批准后，立即把 requirement_ref/hash 交 PM，不得再问“要我现在派 PM 吗”。只有权限、生产或重大取舍才停下来等用户明确批准。
 
+## 2.1 向 PM／AT／worker 下指令＝两步（**评论不等于送达**）
+
+**引擎不因 supervisor 评论生成任何帧。** 帧生成是单向的：
+
+| 评论来源 | 生成帧 | 接收方 |
+|---|---|---|
+| QA 结论 | `event.agent.project_pm` | PM |
+| QA 结论／PM 裁决 | `event.agent.supervisor` | supervisor |
+| **supervisor 评论** | **无** | **无人** |
+
+所以你的五段式评论（`派单`／`告警`／`裁决`／`交接要求` 等）**只是留档**，对方不会因此被唤醒。
+
+**两条命令缺一不可**：
+
+```bash
+# ① 留档：五段式评论，写清目标与坐标
+python -m super_agent.issue_cli comment --role supervisor --project <项目>   --project-key <项目> --issue <n> --do 派单 --notify <目标键名>   --session-key <自己的键名> --body-file <文件>
+
+# ② 送达：dispatch 唤醒目标会话
+python -m super_agent.dispatch_cli --session <目标 sid> --detach --no-activate   --timeout 300 --task "<短令，指向①的 cid 与 Issue>"
+```
+
+**判据（缺一不算送达）**：
+
+- `python tools/ctx.py <目标键名>` 的 `busy=` 变 **True**；或
+- `state/events.jsonl` 出现对应 `task` 事件。
+
+**只看「评论已发出」不算送达。** 声称「已通知 PM」但无上述证据 ⇒ 视为未通知。
+
+**实证（2026-11-25）**：#134 发了派单评论 cid `7159480980` 与授权 cid `7159504523`，以为 PM 收到了，实际**一条帧都没产生**，PM 完全没动；补跑 `dispatch_cli` 后 `busy=True`。
+
 ## 3. 批准
 
 AT READY 不等于批准。先同步并核对 objective、范围、验收、反例、风险级别和 review_policy：

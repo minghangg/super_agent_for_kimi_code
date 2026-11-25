@@ -104,6 +104,10 @@ python -m super_agent.issue_cli comment --role <自己> --project <项目> --iss
   --do <动作> --notify <接收方> --session-key <自己的键名> --body-file <文件>
 ```
 
+**评论不等于送达。** `--notify` 只决定首行写谁，**不产生任何投递**：引擎的帧生成只认 QA 结论与 PM 裁决，supervisor 的五段式评论（`派单`／`告警`／`裁决` 等）**不生成帧**。要对方立即收到，必须另跑 `dispatch_cli --session <目标 sid>`。
+
+判据：`ctx.py <目标键名>` 的 `busy=` 变 True，或 `events.jsonl` 出现对应 `task` 事件。**只看「评论已发出」不算送达。** supervisor 侧细则见 `supervisor.md` §2.1。
+
 ## 7. 会话创建与复用
 
 手工创建新会话分两步：先 warmup 读契约和角色章程，再用 `--session --no-activate` 发任务。`at start` 封装 AT 的创建、绑定和首个任务。
