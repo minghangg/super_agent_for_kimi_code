@@ -51,14 +51,21 @@ def read_token_or_empty(env_file: str | None = None) -> str:
 
 def _read(env_file: str | None, *, allow_empty: bool) -> str:
     env_name, default_file = agent_config.token_source()
-    value = (os.environ.get(env_name) or "").strip()
-    if value:
-        return value
+    # File first, environment second -- the reverse of issue_cli, on purpose.
+    # The engine is launched by Start-Process under a scheduled task, and
+    # whether the GITHUB_TOKEN variable survives that handoff is not something this
+    # module can verify. A 93-character value in the configured file is a fact;
+    # an inherited variable is a hope. Measured 2026-11-26: the engine fell back
+    # to anonymous requests (403 "API rate limit exceeded for <ip>") while the
+    # same file gave issue_cli an authenticated 200.
     path = env_file or default_file
     if path:
         found = _from_file(path, env_name)
         if found:
             return found
+    value = (os.environ.get(env_name) or "").strip()
+    if value:
+        return value
     if allow_empty:
         return ""
     raise TokenMissing(
@@ -67,13 +74,13 @@ def _read(env_file: str | None, *, allow_empty: bool) -> str:
 
 
 def token_origin(env_file: str | None = None) -> str:
-    """``"env"``, the file path, or ``""`` -- never the value itself."""
+    """The file path, "env", or "" -- never the value itself."""
     env_name, default_file = agent_config.token_source()
-    if (os.environ.get(env_name) or "").strip():
-        return "env"
     path = env_file or default_file
     if path and _from_file(path, env_name):
         return str(path)
+    if (os.environ.get(env_name) or "").strip():
+        return "env"
     return ""
 
 
