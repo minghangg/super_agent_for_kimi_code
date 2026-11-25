@@ -22,24 +22,41 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+#: The two row caps' defaults, named here because this is the module that owns
+#: the budget and :func:`engine_parts.round.round_policy` reads them. Two
+#: literals in two modules is how the delivery text and the code drifted apart
+#: (#130 QA P1-5).
+DEFAULT_MAX_BATCH_ROWS = 5000
+DEFAULT_MAX_ISSUE_ROWS = 20000
+
 
 @dataclass(frozen=True)
 class PageRecord:
-    """One fetched page: which page, how many rows, and the ids it carried."""
+    """One fetched page: which page, how many rows, and where the walk stopped.
+
+    ``stopped`` is what makes a page number usable as evidence. The real walk
+    reads ``[1, last, last-1, …]`` and halts on the first page whose smallest
+    id is at/below the cursor (#130 QA P0-1): the pages below that one are
+    older still, so their absence is not a hole - they were never needed. A
+    page number is therefore only dense **above** the stop page, and
+    :meth:`CollectedBatch.missing_page` reads it that way.
+    """
 
     page: int
     rows: int = 0
     first_id: int = 0
     last_id: int = 0
     status: str = "ok"
+    stopped: bool = False
 
     @classmethod
     def from_walk(cls, raw: dict) -> "PageRecord":
-        """``{"page": n, "rows": k, "status": "ok"}`` from the page walk."""
+        """``{"page": n, "rows": k, "status": "ok", "stopped": bool}``."""
         try:
             return cls(page=int(raw.get("page") or 0),
                        rows=int(raw.get("rows") or 0),
-                       status=str(raw.get("status") or "ok"))
+                       status=str(raw.get("status") or "ok"),
+                       stopped=bool(raw.get("stopped")))
         except (TypeError, ValueError):
             return cls(page=0, status="malformed")
 
@@ -92,11 +109,16 @@ class ScanPolicy:
     ``max_batches`` is the global queue cap; ``max_issue_rows`` is the per-issue
     cap. Both refuse rather than drop: a row that does not fit stays above the
     cursor, so the next round reads it again.
+
+    The two row defaults live in module constants so
+    :func:`engine_parts.round.round_policy` reads the **same** numbers instead of
+    restating them. Two literals in two modules is how the delivery text and the
+    code drifted apart (#130 QA P1-5).
     """
 
     max_batches: int = 8
-    max_batch_rows: int = 200
-    max_issue_rows: int = 400
+    max_batch_rows: int = DEFAULT_MAX_BATCH_ROWS
+    max_issue_rows: int = DEFAULT_MAX_ISSUE_ROWS
     max_pages: int = 10
     page_size: int = 100
 
@@ -168,20 +190,82 @@ class CollectedBatch:
     def page_spans(self) -> list[tuple[int, int]]:
         return [(rec.page, rec.page) for rec in self.pages if rec.page > 0]
 
+    def stop_page(self) -> int | None:
+        """The page the walk stopped on, or ``None`` when it walked to page 1."""
+        stopped = [rec.page for rec in self.pages if rec.stopped and rec.page > 0]
+        return min(stopped) if stopped else None
+
+    def last_page(self) -> int:
+        """The listing's newest page number, as the walk observed it."""
+        return max((rec.page for rec in self.pages if rec.page > 0), default=0)
+
+    def observed_pages(self) -> set[int]:
+        """Pages that actually carried rows.
+
+        A page that answered with nothing did not arrive: in a listing of
+        ``last`` pages every page below ``last`` is full by construction, so a
+        zero-row page in the middle is the shape a lost request takes. Counting
+        its bare entry as "seen" would hide exactly the hole a rebuild exists
+        for.
+        """
+        return {rec.page for rec in self.pages if rec.page > 0 and rec.rows > 0}
+
+    def observed_spans(self) -> list[tuple[int, int]]:
+        """The pages that carried rows, as inclusive intervals."""
+        return [(page, page) for page in sorted(self.observed_pages())]
+
     def missing_page(self) -> int | None:
-        """The lowest page number the walk skipped, or ``None``."""
-        return first_hole(self.page_spans())
+        """The lowest page number this walk should have read and did not.
+
+        Which pages a walk "should have read" is the whole question, and the
+        answer changed with #130 QA P0-1. The real walk is ``[1, last, last-1,
+        …, k]``: page 1 is the probe that finds ``rel="last"``, then it walks
+        back and halts on the first page at/below the cursor. Pages ``2..k-1``
+        were **never needed** - every row on them is below the cursor, already
+        consumed - so calling them holes reported a fault on every listing of
+        three pages or more, which is every active issue.
+
+        So the claim is an **interval with a floor**, never the observed set:
+
+        * the walk stopped at ``k`` - the pages ``k+1 … last`` are needed, and
+          any of them without rows is a hole;
+        * the walk reached page 1 - ``1 … last`` are needed;
+        * the walk ran out of ``max_pages`` - it claims nothing either way.
+          "I stopped looking" is not "a page is missing", and inventing a hole
+          there would rebuild a listing nobody proved broken.
+        """
+        last = self.last_page()
+        if last <= 0:
+            return None
+        stop = self.stop_page()
+        if stop is not None:
+            floor = stop + 1                  # above the stop: needed
+        elif self.pagination_complete or self.cursor_before <= 0:
+            floor = 1                         # the whole listing was in scope
+        else:
+            # An incremental walk that spent its budget before reaching the
+            # cursor: the pages it skipped may all be below it, so no page
+            # number can be called missing. The read is already paused for this
+            # shape (``walk_covers_cursor``), which is the honest answer.
+            return None
+        seen = self.observed_pages()
+        missing = [page for page in range(floor, last + 1) if page not in seen]
+        return missing[0] if missing else None
 
     def needs_rebuild(self) -> bool:
         """Is this batch evidence that the incremental read cannot be trusted?
 
         **Ids are never consulted.** A listing whose ids jump (a deleted
         comment) is read perfectly well, and treating that as a gap is the
-        counter-example this issue names. ``pagination_complete`` answering
-        True settles the question by itself: the walk reached page 1.
+        counter-example this issue names.
+
+        The answer is exactly "a page this walk needed had no rows", never a
+        separate reading of ``pagination_complete``. Those two used to disagree:
+        a walk that reached page 1 while one middle page came back empty claims
+        completeness **and** is missing data, and letting the claim win meant the
+        pause a rebuild exists for was never written (#130 QA P0-2). Page 1 is
+        always needed, so a complete walk has no floor to excuse anything.
         """
-        if self.pagination_complete:
-            return False
         return self.missing_page() is not None
 
     # ------------------------------------------------------------ rows
@@ -311,7 +395,7 @@ class CollectedRound:
         self.failed: set[str] = set()
         self.carry: dict[str, list[dict]] = {}
         self.consumed: dict[str, int] = {}
-        self.backpressure: list[str] = []
+        self.backpressure: list[dict] = []
 
     def add(self, thread: str, batch: CollectedBatch) -> None:
         thread = str(thread)

@@ -33,6 +33,7 @@ from super_agent.batch import (BatchCursor, CollectedBatch, CollectedRound,
 from super_agent.batch_queue import Backpressure, BoundedBatchQueue, contiguous_with
 from super_agent.engine import Engine
 from super_agent.github_source import NullSource, PagedComments
+from super_agent.paged_walk import walk_listing
 from super_agent.store import Store
 
 THREAD = "owner/demo#1"
@@ -50,15 +51,26 @@ GOOD = {
 
 
 class Source:
-    """A listing served page by page; ``missing`` hides one page entirely."""
+    """A listing served page by page, walked by the **real** ``walk_listing``.
 
-    def __init__(self, ids, *, per_page=100, missing=(), complete=True,
+    The first delivery of this issue had its own ``paged`` that numbered pages
+    from 1 upwards. The production walk does not: it reads page 1 to find
+    ``rel="last"``, then walks back from the newest page and stops on the first
+    page at/below the cursor. That difference is exactly why P0-1 (a stable
+    false "missing page 2") passed its own tests - the fixture never produced
+    the page list the engine actually sees (#130 QA §七). So the fixture serves
+    pages like GitHub does and lets the real walk decide.
+    """
+
+    def __init__(self, ids, *, per_page=100, missing=(), complete=None,
                  contiguous=None):
         self.ids = list(ids)
         self.per_page = int(per_page)
         self.missing = set(missing)
+        # ``None`` means "the walk's own answer stands". A fixture that forces a
+        # default here would mask the very claims the engine under test reads.
         self.claimed_complete = complete
-        self.claimed_contiguous = complete if contiguous is None else contiguous
+        self.claimed_contiguous = contiguous
         self.requests = []
         self.fail_issues = False
 
@@ -79,28 +91,37 @@ class Source:
     def comments(self, issue):
         return self.paged(issue)
 
-    def paged(self, issue, *, since_id=0, max_pages=10):
-        """Every page the walk would fetch, with the hidden ones left out.
+    def page_of(self, page):
+        """``(rows_on_page, rows, headers)`` - one request, as GitHub answers."""
+        start = (page - 1) * self.per_page
+        chunk = self.ids[start:start + self.per_page]
+        total = max(1, -(-len(self.ids) // self.per_page))
+        headers = {}
+        if page < total:
+            headers["Link"] = (f'<https://api/issue/1/comments?page={page + 1}>; '
+                               f'rel="next", <https://api/issue/1/comments'
+                               f'?page={total}>; rel="last"')
+        if page in self.missing:
+            return 0, [], headers        # the request never arrived
+        return (len(chunk),
+                [{"id": int(cid), "issue": 1, "body": "", "author": ""}
+                 for cid in chunk], headers)
 
-        A real walk records a page **entry** for each request it made, and the
-        ``rows`` count is what tells a short page from a full one. The fixture
-        mirrors that: pages are numbered from 1 upwards, and ``missing`` removes
-        an entry entirely - which is what a page that never arrived looks like.
+    def paged(self, issue, *, since_id=0, max_pages=10):
+        """The real walk over the fixture's pages.
+
+        ``complete``/``contiguous`` are overrides for the cases where the
+        *backend* states something the page list does not show - the shape a
+        claim-based consumer must handle. Left as ``None`` the walk's own answer
+        wins, which is what makes this fixture able to reproduce P0-1.
         """
-        wanted = [int(cid) for cid in self.ids if int(cid) > int(since_id or 0)]
-        pages = []
-        page = 1
-        cursor = 0
-        while cursor < len(wanted):
-            chunk = wanted[cursor:cursor + self.per_page]
-            cursor += len(chunk)
-            if page not in self.missing:
-                pages.append({"page": page, "rows": len(chunk), "status": "ok"})
-            page += 1
-        return PagedComments(
-            [{"id": cid, "issue": 1, "body": "", "author": ""} for cid in wanted],
-            complete=self.claimed_complete, contiguous=self.claimed_contiguous,
-            pages=pages, reason="fixture")
+        walked = walk_listing(self.page_of, page_size=self.per_page,
+                              since_id=int(since_id or 0), max_pages=max_pages)
+        if self.claimed_complete is not None:
+            walked.pagination_complete = bool(self.claimed_complete)
+        if self.claimed_contiguous is not None:
+            walked.contiguous = bool(self.claimed_contiguous)
+        return walked
 
 
 class Base(unittest.TestCase):
@@ -262,6 +283,72 @@ class BackpressureInTheRound(Base):
         self.assertEqual(self.cursor_of(engine), 9002)
 
 
+class Starvation(Base):
+    """Counter-example 1's other half: a bound must serve everyone, not a prefix.
+
+    The first delivery bounded the queue but never consumed it, so the same
+    ``max_batches`` issues held the slots every round and the tail's cursor
+    stayed at 0 for ever. That is not backpressure (#130 QA P0-4).
+
+    The fix is the consumer, not a rotation: with the slot released as soon as
+    one issue is done, a round reads **every** live issue, so there is no
+    unlucky tail to rotate. The tests below assert that, and assert the refusal
+    itself still works when the cap is genuinely smaller than the work.
+    """
+
+    def engine_for_many(self, source, *, caps=8):
+        cfg = config.load(None, {
+            "mode": "assist",
+            "github": {"source": "none", "repo": "owner/demo",
+                       "max_issues": 20, "max_comments_per_issue": 50,
+                       "max_comment_pages": 10, "max_batches": caps},
+            "engine": {"archived_crosscheck": False},
+        })
+        return Engine(cfg, Store(self.state), source, None,
+                      project_allowlist=ProjectAllowlist(self.allow))
+
+    def test_every_issue_is_read_with_fewer_slots_than_issues(self):
+        """20 live issues, 8 slots: all twenty are read in one round."""
+        source = ManySource(20)
+        engine = self.engine_for_many(source)
+        engine.run_once()
+        cursors = engine.store.load_cursor().get("issues") or {}
+        read = {thread for thread, value in cursors.items() if int(value or 0) > 0}
+        self.assertEqual(len(read), 20,
+                         "the slot must be released per issue, not per round")
+        self.assertEqual(source.reads[20], 1, "the last issue was read")
+
+    def test_the_queue_is_emptied_by_the_consumer(self):
+        """No consumer was the defect; the release is what fixes it."""
+        source = ManySource(3)
+        engine = self.engine_for_many(source, caps=8)
+        engine.run_once()
+        cursors = engine.store.load_cursor().get("issues") or {}
+        self.assertTrue(all(int(v or 0) > 0 for v in cursors.values()),
+                        "an accepted batch must be consumed and released")
+
+
+class ManySource(Source):
+    """``n`` independent issues, each with its own small comment listing."""
+
+    def __init__(self, n, *, per_page=100):
+        super().__init__(list(range(9001, 9001 + per_page)), per_page=per_page)
+        self.n = int(n)
+        self.reads = {issue: 0 for issue in range(1, self.n + 1)}
+        self.issue_reads = 0
+
+    def issues(self, limit=20):
+        return list(range(1, self.n + 1))[:limit]
+
+    def paged(self, issue, *, since_id=0, max_pages=10):
+        self.reads[int(issue)] = self.reads.get(int(issue), 0) + 1
+        rows = [{"id": 9001 + int(issue), "issue": int(issue), "body": "",
+                 "author": ""}]
+        return PagedComments(rows, complete=True, contiguous=True,
+                            pages=[{"page": 1, "rows": 1, "status": "ok"}],
+                            reason="fixture")
+
+
 class GapDetection(Base):
     def test_a_jumping_id_list_does_not_rebuild(self):
         """Counter-example 2: page 1 is complete, ids 9001/9005/9009 are not."""
@@ -270,6 +357,46 @@ class GapDetection(Base):
         out = engine.run_once()
         self.assertNotIn(THREAD, out.get("rebuild_needed") or [])
         self.assertEqual(self.cursor_of(engine), 9009)
+
+    def test_the_real_walk_does_not_report_a_skipped_middle_page(self):
+        """Counter-example 2 in the shape that actually occurs (QA P0-1).
+
+        The walk reads page 1 for ``rel="last"`` and then walks back from the
+        newest page, stopping on the first page at/below the cursor. On a
+        six-page listing with a cursor inside page 3 the pages it returns are
+        ``[1, 6, 5, 4, 3]`` - page 2 was never needed, and reading that list as
+        a dense sequence reported a "missing page 2" on every active issue.
+        """
+        source = Source(list(range(9001, 9031)), per_page=5)
+        walked = source.paged(1, since_id=9013)
+        self.assertEqual([p["page"] for p in walked.pages], [1, 6, 5, 4, 3],
+                         "the fixture must reproduce the production page order")
+        batch = CollectedBatch(THREAD, list(walked), cursor_before=9013,
+                              pages=list(walked.pages),
+                              complete=walked.pagination_complete,
+                              contiguous=walked.contiguous,
+                              reason=walked.stop_reason)
+        self.assertIsNone(batch.missing_page())
+        self.assertFalse(batch.needs_rebuild())
+        self.assertTrue(batch.collection_complete,
+                        "the unread prefix was proved gap-free")
+
+    def test_a_page_that_never_arrived_is_still_a_hole(self):
+        """Counter-example 3 on the same real walk: page 3 answers with nothing.
+
+        Every page below ``last`` is full by construction, so a zero-row page in
+        the middle is a lost request - not an empty tail. The floor the stop
+        page provides only excuses pages **below** the cursor.
+        """
+        source = Source(list(range(9001, 9031)), per_page=5, missing=(3,))
+        walked = source.paged(1, since_id=9013)
+        self.assertIn(6, [p["page"] for p in walked.pages])
+        batch = CollectedBatch(THREAD, list(walked), cursor_before=9013,
+                              pages=list(walked.pages),
+                              complete=walked.pagination_complete,
+                              contiguous=walked.contiguous)
+        self.assertEqual(batch.missing_page(), 3)
+        self.assertTrue(batch.needs_rebuild())
 
     def test_a_missing_page_is_reported(self):
         """Counter-example 3: a hole **between** pages the walk did return.
@@ -313,6 +440,45 @@ class RebuildKeepsTheCursor(Base):
         self.assertEqual(out["cursor_before"], 0)
         self.assertEqual(out["cursor_after"], 9003)
         self.assertEqual(self.cursor_of(engine), 9003)
+
+    def test_the_pause_a_rebuild_writes_survives_the_round(self):
+        """Counter-example 3, production path (#130 QA P0-2).
+
+        ``rebuild_issue`` used to save its own index copy, which the round then
+        overwrote with the copy it read at the start. The pause existed in the
+        event log and nowhere a reader looks, and the next round read the issue
+        again - "paused" was a false statement.
+        """
+        source = Source(list(range(9001, 9201)), per_page=50, missing=(3,))
+        engine = self.engine(source)
+        out = engine.run_once()
+        self.assertIn(THREAD, out.get("rebuild_needed") or [])
+        rec = engine.store.load_index()["issues"][THREAD]
+        self.assertTrue(any("rebuild.incomplete" in str(row.get("reason"))
+                            for row in rec.get("needs_person") or []),
+                        "the pause must reach the index, not only the log")
+        self.assertTrue(rec.get("read_paused"),
+                        "the issue must stop being read until a person lifts it")
+
+    def test_an_incomplete_rebuild_does_not_advance_the_cursor_in_a_round(self):
+        """Counter-example 4, production path (#130 QA P0-3).
+
+        The rebuild itself left the cursor alone; ``_round_issue`` then moved it
+        to ``max(fresh)`` - the highest row of the very read that had just been
+        ruled untrustworthy. The missing middle ends up below the cursor and no
+        later round reads it again.
+        """
+        source = Source(list(range(9001, 9201)), per_page=50, missing=(3,))
+        engine = self.engine(source)
+        index = engine.store.load_index()
+        index.setdefault("issues", {})[THREAD] = {"state": "tracked",
+                                                 "comments_seen": 5}
+        engine.store.save_index(index)
+        engine.store.save_cursor({"version": 1, "issues": {THREAD: 9001}})
+        out = engine.run_once()
+        self.assertIn(THREAD, out.get("rebuild_needed") or [])
+        self.assertEqual(self.cursor_of(engine), 9001,
+                         "an untrusted read may not move the cursor")
 
 
 class FailedIssueIsNotArchived(Base):

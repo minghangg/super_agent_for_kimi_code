@@ -27,18 +27,27 @@ def read_session_map(path: Path) -> tuple[dict, str]:
     """``(map, problem)``. ``problem == ""`` means the map was actually read.
 
     A missing file is **not** a problem: a fresh state dir has no
-    ``sessions.json``, and that is the normal empty case. Only "the file is
-    there and I could not get a whole one out of it" is a problem.
+    ``sessions.json``, and that is the normal empty case - ``({}, "")``, the same
+    answer a genuinely empty file gives. Only "the file is there and I could not
+    get a whole one out of it" is a problem.
+
+    The two used to be the same answer on the *problem* side as well: an absent
+    file returned "读不出", so a fresh state dir logged one false
+    ``session_map.unreadable`` per round from ``_supervisor_sid`` while an empty
+    ledger logged none (#130 QA P1-4).
     """
-    text = session_map_io.read_text_retry(Path(path))
+    path = Path(path)
+    if not path.exists():
+        return {}, ""
+    text = session_map_io.read_text_retry(path)
     if text is None:
-        return {}, f"{Path(path).name} 读不出：{path}"
+        return {}, f"{path.name} 读不出：{path}"
     try:
         data = json.loads(text)
     except ValueError as exc:
-        return {}, f"{Path(path).name} 解析失败（{type(exc).__name__}）"
+        return {}, f"{path.name} 解析失败（{type(exc).__name__}）"
     if not isinstance(data, dict):
-        return {}, f"{Path(path).name} 顶层不是对象"
+        return {}, f"{path.name} 顶层不是对象"
     return data, ""
 
 

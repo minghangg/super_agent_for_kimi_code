@@ -113,6 +113,10 @@ def walk_listing(page_of, *, page_size: int, since_id: int = 0,
         if since_id and rows and min(int(c["id"]) for c in rows) <= since_id:
             contiguous = True
             reason = "whole page at or below the cursor"
+            # Every page below this one is older still, so it was never needed
+            # and its absence is not a hole. Marking the stop here is what lets
+            # the consumer tell "not needed" from "missing" (#130 P0-1).
+            pages[-1]["stopped"] = True
             break
     else:
         complete = True

@@ -126,6 +126,24 @@ class BoundedBatchQueue:
         """
         self._batches.pop(str(thread), None)
 
+    def reoffer(self, batch: CollectedBatch) -> None:
+        """Put a taken batch back, so its unconsumed rows stay visible.
+
+        Used by the consumer when a batch it took still has rows above the
+        cursor: returning it keeps ``remaining`` (and therefore
+        ``round_complete``) honest, and the slot is reused rather than lost.
+        Takes no queue slot - it is put back into the same per-issue map, and
+        the order deque still holds nothing for it.
+        """
+        thread = batch.thread
+        held = self._batches.get(thread)
+        self._batches[thread] = held.merge(batch) if held else batch
+        if not self._order.full():
+            try:
+                self._order.put_nowait(self._batches[thread])
+            except queue.Full:      # raced with another put: the map is the truth
+                pass
+
     def threads(self) -> list[str]:
         return [batch.thread for batch in list(self._order.queue)]
 

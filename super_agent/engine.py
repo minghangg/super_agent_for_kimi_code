@@ -88,14 +88,17 @@ from .engine_parts import archive as archive_mod
 from .engine_parts import at_ledger as at_ledger_mod
 from .engine_parts import close as close_mod
 from .engine_parts import collect as collect_mod
+from .engine_parts import consume as consume_mod
 from .engine_parts import doctor as doctor_mod
 from .engine_parts import delivery as delivery_mod
 from .engine_parts import pause as read_pause_mod
 from .engine_parts import requirement_gate as requirement_gate_mod
 from .engine_parts import retry as retry_mod
 from .engine_parts import round as round_mod
+from .engine_parts.review_routes import ReviewRoutes
 from .engine_parts import session_keys as session_key_mod
 from .engine_parts import triage as triage_mod
+from .engine_parts import triage_batch as triage_batch_mod
 from .engine_parts import watchdog as watchdog_mod
 from . import batch as batch_mod
 from . import batch_queue as queue_mod
@@ -255,7 +258,7 @@ def _default_allowlist_path() -> Path:
     return Path(__file__).resolve().parent.parent / "config" / "allowlist.json"
 
 
-class Engine:
+class Engine(ReviewRoutes):
     def __init__(self, cfg: dict, store: Store, source, bus=None, *, clock=_now_ts,
                  project_allowlist: ProjectAllowlist | None = None,
                  adapter=None, session_api=None):
@@ -781,6 +784,18 @@ class Engine:
         return ""
 
     # ------------------------------------------------------------ qa routing
+    def _session_map_problem(self, where: str, problem: str) -> None:
+        """Report an unreadable ``sessions.json`` from a role key table.
+
+        The three key tables used to return their explicit-binding answer and
+        say nothing, which made "the map could not be read" and "nobody has a
+        key" the same value (#130 QA P1-3). Addendum 2's rule is that the fault
+        must be observable, so it is logged exactly where it is discovered.
+        """
+        if problem:
+            self.store.log_event({"type": "session_map.unreadable", "at": _now(),
+                                  "where": where, "detail": problem})
+
     def _qa_session_keys(self, thread: str) -> set[str]:
         """Session keys that count as *this thread's* QA.
 
@@ -816,6 +831,7 @@ class Engine:
             # An unreadable map is not an empty one: the explicit binding above
             # still answers, and the fault is reported rather than folded into
             # "this thread has no QA key" (ISS-130 addendum 2).
+            self._session_map_problem("_qa_session_keys", problem)
             return keys
         state = self._session_state()
         keys |= session_key_mod.keys_from_map(
@@ -960,6 +976,7 @@ class Engine:
             return keys
         data, problem = self._session_map()
         if problem:
+            self._session_map_problem("_pm_session_keys", problem)
             return keys
         state = self._session_state()
         keys |= session_key_mod.keys_from_map(
@@ -967,7 +984,6 @@ class Engine:
             sessions=state.get("sessions") or {},
             accept=lambda name, sid: any(
                 sessionkeys.scoped_by(name, "pm", scope) for scope in scopes))
-        return keys
         return keys
 
     def _pm_verified(self, thread: str, comment: dict) -> bool:
@@ -1025,6 +1041,7 @@ class Engine:
                 keys |= session_key_mod.ledger_keys({"at": at_entry}, "at")
         data, problem = self._session_map()
         if problem:
+            self._session_map_problem("_at_session_keys", problem)
             return keys
         state = self._session_state()
         keys |= session_key_mod.keys_from_map(
@@ -1165,525 +1182,6 @@ class Engine:
             thread, issue, cid, payload, event, target_role=target_role,
             origin_role=origin_role, assignment_id=assignment_id)
 
-    def _route_review(self, index: dict, thread: str, issue: int, comment: dict,
-                      review: dict, *, log_unverified: bool = True) -> dict:
-        """Send one verdict to the project PM and record the attempt.
-
-        The route record lives in ``index["routes"]`` keyed by thread and
-        comment, so a refused or suppressed dispatch can be retried next round
-        under the **same** action id - at-most-once is the attempt counter, not
-        the record's presence.
-
-        A shippable verdict also goes to the supervisor. That decision is taken
-        **before** the PM early return below, under its own action id and in its
-        own table: the PM attempt counter must never be the reason the
-        supervisor never hears about a release.
-        """
-        cid = int(comment["id"])
-        key = f"route:{thread}:{cid}"
-        target = self._pm_target(thread, issue)
-        verified = self._review_verified(thread, comment)
-        if not verified and log_unverified:
-            # Doctor is the only consumer on purpose: a key miss is a warning
-            # to look at, not a reason to wake the PM twice for one verdict.
-            self.store.log_event({
-                "type": "review.unverified", "at": _now(), "thread": thread,
-                "comment_id": cid, "level": "warn", "consumers": ["doctor"],
-                "detail": "the verdict did not name a qa session key of this thread",
-            })
-        sup_key = f"sup:{thread}:{cid}"
-        sup_routes = index.setdefault("supervisor_routes", {})
-        if not isinstance(sup_routes, dict):
-            sup_routes = index["supervisor_routes"] = {}
-        sup_rec = sup_routes.get(sup_key)
-        sup_rec = sup_rec if isinstance(sup_rec, dict) else None
-        if (sup_rec is not None and "sup_eligible" not in sup_rec
-                and "fix_needed" not in review):
-            self._undecidable(thread, cid, sup_key)
-        if self._sup_eligible(review, sup_rec) and not (
-                sup_rec is not None and sup_rec.get("ok")):
-            # A release rings **once**, and the question is whether this
-            # release already rang - not whether a PM verdict exists right now.
-            # The QA pass and the PM answer to it are two comments about one
-            # delivery, so both gates read the same ledger and the second one
-            # is silent whether it lands in this batch or a later round.
-            announced = self._release_announced(index, thread, cid)
-            if announced is not None:
-                # Record the decision, not just the log line: the retry pass
-                # reads ``sup_eligible`` from this table, and a record that is
-                # merely absent would be re-sent by it next round.
-                if sup_rec is None:
-                    sup_routes[sup_key] = {
-                        "thread": thread, "comment_id": cid, "at": _now(),
-                        "verdict": str(review.get("verdict") or ""),
-                        "sup_eligible": False, "skipped": "release announced",
-                        "ok": False}
-                self.store.log_event({
-                    "type": "route.supervisor_skipped", "at": _now(),
-                    "thread": thread, "comment_id": cid, "to": "supervisor",
-                    "reason": "this release already rang",
-                    "announced_by": str(announced.get("source") or "")})
-            else:
-                result = self._route_supervisor(
-                    index, thread, issue, comment, review,
-                    sup_key, action_id(sup_key, "bus_inject", str(cid)))
-                # The ledger means "this happened", so it is written only when
-                # the frame landed. A crash between dispatch and this line
-                # costs one duplicate, never a lost release with nothing to
-                # read; an unwritten ledger lets the next round retry.
-                if result.get("dispatched") and result.get("ok"):
-                    self._mark_release(index, thread, cid, source="qa",
-                                       comment_id=cid)
-                # Not delivered: ``_route_supervisor`` already recorded why, in
-                # the ``[user]`` bucket, once per record. Repeating it here
-                # would be a second row for one failure.
-
-        if (review.get("fix_structured") is False
-                and str(review.get("verdict") or "") == "pass"):
-            # An unmarked *pass* answers the safe side (work is left) and so
-            # tells the supervisor nothing - which is *safe* but *silent*: the
-            # absence of a notice is not observable. Say it out loud once per
-            # verdict, in the same ``[user]`` bucket as every other "this could
-            # not be sent" row.
-            #
-            # A reject is excluded on purpose: it never reaches the supervisor
-            # whatever the marker says, so "please add the marker" would be
-            # advice with no effect - one ``[user]`` row per reject, piling up
-            # in the bucket a person reads.
-            #
-            # A retry stub carries no ``fix_structured`` key, so the strict
-            # identity test (never ``not``) keeps the re-sends quiet.
-            self._note_undeliverable(
-                index, thread, cid,
-                "QA 结论未带 fix_needed 标记，已按「有必修项」处理并暂不通知 "
-                "supervisor；请 QA 补标记",
-                issue=issue, to="supervisor",
-                once_key=f"unmarked:{thread}:{cid}")
-        payload = {"thread": thread, "issue": int(issue),
-                   "review_comment_id": cid,
-                   "verdict": str(review.get("verdict") or ""),
-                   "project": target["project"], "pm_sid": target["pm_sid"],
-                   "sid": target["pm_sid"],
-                   "text": self._qa_notice_text(
-                       target["project"], issue, cid,
-                       str(review.get("verdict") or "")),
-                   "unverified": not verified}
-        base = action_id(key, "bus_inject", str(cid))
-        routes = index.setdefault("routes", {})
-        if routes is None or not isinstance(routes, dict):
-            routes = index["routes"] = {}
-        if key not in routes:
-            routes[key] = {"thread": thread, "comment_id": cid, "at": _now(),
-                           "verdict": payload["verdict"], "ok": None,
-                           "action_id": base}
-        route = routes[key]
-        if not target["pm_sid"]:
-            route.update(ok=False, refused=True, session_delivery="failed")
-            self.store.log_event({
-                "type": "route.decided", "at": _now(), "thread": thread,
-                "comment_id": cid, "to": "project_pm",
-                "project": target["project"], "verdict": payload["verdict"],
-                "dispatched": False, "refused": True,
-                "session_delivery": "failed",
-                "reason": "no project pm session resolved",
-            })
-            self._route_pm_delivery_failure(index, thread, issue, cid, target)
-            self._append_needs_person(index, thread, {
-                "comment_id": cid, "reason": "route.undeliverable", "at": _now()})
-            return {"dispatched": False, "refused": True,
-                    "reason": "no project pm session resolved", "action_id": base}
-        if self.store.action_attempted(base) > 0:
-            return {"dispatched": False, "reason": "already attempted",
-                    "action_id": base}
-        result = self._dispatch(self._route_action(
-            thread, issue, cid, payload, "event.agent.project_pm",
-            target_role=target["target_role"], origin_role=markers.QA.lower(),
-            assignment_id=key))
-        route["ok"] = bool(result.get("ok")) if result.get("dispatched") else False
-        route["refused"] = bool(result.get("refused"))
-        route["session_delivery"] = "ring" if result.get("dispatched") else "failed"
-        route["action_id"] = result.get("action_id") or base
-        # The one place a round learns whether this route was refused. Reading
-        # the returned flag, never the wording, keeps the count honest when the
-        # refusal text changes; a delivered dispatch ends the run.
-        if result.get("dispatched"):
-            self._clear_route_refusal(route)
-        elif result.get("refused") is True:
-            self._count_route_refusal(index, route, thread, cid, result)
-        self.store.log_event({
-            "type": "route.decided", "at": _now(), "thread": thread,
-            "comment_id": cid, "to": "project_pm", "project": target["project"],
-            "verdict": payload["verdict"],
-            "dispatched": bool(result.get("dispatched")),
-            "refused": bool(result.get("refused")),
-            "session_delivery": "ring" if result.get("dispatched") else "failed",
-            "reason": result.get("reason") or "",
-        })
-        if not result.get("dispatched"):
-            self._append_needs_person(index, thread, {
-                "comment_id": cid, "reason": "route.undeliverable", "at": _now()})
-            self.store.log_event({
-                "type": "route.undeliverable", "at": _now(), "thread": thread,
-                "comment_id": cid, "reason": result.get("reason") or "",
-            })
-        return result
-
-    def _maybe_arbitrate_review(self, index: dict, thread: str, issue: int,
-                                comment: dict, assignment: dict) -> None:
-        """Second consecutive QA reject asks the supervisor to arbitrate once."""
-        cid = int(comment["id"])
-        streak = 0
-        readings = assignment.get("review_readings") or {}
-        for raw_cid, verdict in sorted(readings.items(), key=lambda item: int(item[0])):
-            if verdict == "reject":
-                streak += 1
-            elif verdict == "pass":
-                streak = 0
-        if streak != 2:
-            return
-        action_key = f"qa_arbitration:{assignment.get('id')}:{cid}"
-        text = (f"【QA 仲裁】#{int(issue)} 连续 2 轮退回，最新 QA cid {cid}，"
-                "请 supervisor 仲裁")
-        self._route_pm_frame(
-            index, thread, issue, comment,
-            {"state": "blocked", "delivery": assignment.get("delivery_comment_id")},
-            exception=True, reason="two consecutive QA rejects",
-            action_key=action_key, body_text=text)
-
-    def _on_review(self, index: dict, thread: str, issue: int, comment: dict,
-                   review: dict, summary: dict) -> str:
-        """Apply a verdict, then route it. Returns the triage state."""
-        cid = int(comment["id"])
-        assignment, requirement_error = self._review_target(
-            index, thread, issue, comment)
-        if assignment is None:
-            reason = requirement_error or "no active worker assignment"
-            self.store.log_event({"type": "review.unmatched", "at": _now(),
-                                  "thread": thread, "comment_id": cid,
-                                  "reason": reason})
-            return "needs_person", reason
-        verified = self._review_verified(thread, comment)
-        moved = asg_mod.on_review(assignment, review, review_cid=cid,
-                                  verified=verified)
-        if moved["changed"]:
-            self.store.log_event({
-                "type": "assignment.qa_review", "at": _now(),
-                "assignment": assignment["id"], "thread": thread,
-                "comment_id": cid, "status": moved.get("status"),
-                "verdict": str(review.get("verdict") or ""),
-                "verified": verified,
-            })
-            # A verdict that was refused earlier and is applied now settles its
-            # own refusal. Leaving the row in place would keep telling a person
-            # to decide something the engine has just decided - and #65's
-            # repaired comment is exactly that case.
-            self._clear_refused(index, thread, comment_id=cid)
-            self._maybe_arbitrate_review(index, thread, issue, comment, assignment)
-        elif moved.get("refused"):
-            # A verdict that landed and was **not** applied. Three things are
-            # needed here, and none existed before this issue:
-            #
-            # * the ``review.stale`` reason keeps its own event (doctor reads
-            #   it) *and* lands in the refused bucket. Making it an either/or
-            #   was how a stale pass stayed half-invisible: a doctor row is not
-            #   a person's queue.
-            # * the refusal becomes a ``needs_person`` row. A ``consumers`` key
-            #   is a routing hint, not a queue - ``brief``/``status`` read
-            #   ``index.needs_person``, so a ``[user]`` event with no row was
-            #   readable only in the raw log.
-            # * the PM hears about it, as a **refusal**. The supervisor does
-            #   not: the bell stays silent, which is the part that must not
-            #   regress.
-            #
-            # The row and the event are deduped per ``(thread, cid, reason)``:
-            # a refused verdict is re-read every round while the comment stays
-            # in the window, and N identical rows is noise, not N problems -
-            # but two *different* reasons are two problems.
-            reason = str(moved.get("reason") or "")
-            if reason == "review.stale":
-                self.store.log_event({"type": "review.stale", "at": _now(),
-                                      "assignment": assignment["id"],
-                                      "thread": thread, "comment_id": cid})
-            self._note_refused_after_hold(index, assignment, thread, cid,
-                                          review, moved)
-        if not moved.get("refused"):
-            # Routing a refused verdict is what made the deadlock complete:
-            # the frame said "ready to release" while ``qa_gate`` still had no
-            # pass, so the bell rang for a thread that could never complete.
-            # Only an **applied** verdict speaks for the thread.
-            #
-            # A replay speaks for nothing either: same comment, same reading,
-            # already answered. Routing it again would ring the PM once per
-            # round for a batch that was read before.
-            if moved.get("reason") == "same review already recorded":
-                return "review", ""
-            self._route_review(index, thread, issue, comment, review)
-        return "review", ""
-
-    def _route_refused_review(self, index: dict, thread: str, issue: int,
-                              assignment: dict, cid: int, review: dict,
-                              reason: str) -> dict:
-        """Tell the project PM that a verdict landed and was not applied.
-
-        Goes to ``event.agent.project_pm`` with ``refused: true`` under its own
-        action key, so it can never be mistaken for - or suppress - the release
-        route of the same comment. ``release_frames`` is untouched by design:
-        that ledger answers "has this release rung", and a refusal is the
-        opposite answer.
-        """
-        key = f"refused_route:{thread}:{cid}"
-        routes = index.setdefault("refused_routes", {})
-        if not isinstance(routes, dict):
-            routes = index["refused_routes"] = {}
-        route = routes.get(key)
-        if isinstance(route, dict) and route.get("ok"):
-            return {"dispatched": False, "reason": "already sent"}
-        base = action_id(key, "bus_inject", str(cid))
-        if self.store.action_attempted(base) > 0:
-            return {"dispatched": False, "reason": "already attempted",
-                    "action_id": base}
-        target = self._pm_target(thread, issue)
-        payload = {"thread": thread, "issue": int(issue),
-                   "review_comment_id": int(cid),
-                   "project": target["project"],
-                   "verdict": str(review.get("verdict") or ""),
-                   "sid": target["pm_sid"], "pm_sid": target["pm_sid"],
-                   "text": self._qa_notice_text(
-                       target["project"], issue, cid,
-                       str(review.get("verdict") or "")),
-                   "refused": True, "reason": reason,
-                   "assignment": str(assignment.get("id") or ""),
-                   "status": str(assignment.get("status") or ""),
-                   "at": _now()}
-        if not target["pm_sid"]:
-            result = {"dispatched": False, "refused": True,
-                      "reason": "no project pm session resolved", "action_id": base}
-            self._route_pm_delivery_failure(index, thread, issue, cid, target)
-            self._append_needs_person(index, thread, {
-                "comment_id": cid, "reason": "route.undeliverable", "at": _now()})
-        else:
-            result = self._dispatch(self._route_action(
-                thread, issue, cid, payload, "event.agent.project_pm",
-                target_role=target["target_role"], origin_role=markers.QA.lower(),
-                assignment_id=key))
-        routes[key] = {"thread": thread, "comment_id": int(cid), "at": _now(),
-                       "verdict": payload["verdict"], "reason": reason,
-                       "ok": (bool(result.get("ok"))
-                              if result.get("dispatched") else False),
-                       "action_id": result.get("action_id") or base}
-        self.store.log_event({
-            "type": "route.refused_decided", "at": _now(), "thread": thread,
-            "comment_id": int(cid), "to": "project_pm",
-            "project": target["project"], "verdict": payload["verdict"],
-            "reason": reason,
-            "dispatched": bool(result.get("dispatched")),
-            "refused": bool(result.get("refused")),
-        })
-        return result
-
-    def _note_refused_after_hold(self, index: dict, assignment: dict,
-                                 thread: str, cid: int, review: dict,
-                                 moved: dict) -> None:
-        """Record one refused verdict: log, queue row, PM frame, dedupe.
-
-        The identity is ``(thread, cid, reason)``. Reason is part of it on
-        purpose: one comment can be refused for two different reasons on
-        different rounds ("not newer", then "stale"), and swallowing the second
-        is how a real problem stays invisible. The ``needs`` dismissal key
-        stays ``(thread, cid)`` - that is how a person dismisses a *comment*,
-        not a diagnosis - so a dismissal still suppresses every row for it.
-        """
-        cid = int(cid)
-        reason = str(moved.get("reason") or "")
-        key = f"refused:{thread}:{cid}:{reason}"
-        seen = index.setdefault("review_refused", {})
-        if not isinstance(seen, dict):
-            seen = index["review_refused"] = {}
-        if seen.get(key):
-            return
-        seen[key] = {"thread": thread, "comment_id": cid,
-                     "assignment": str(assignment.get("id") or ""),
-                     "status": str(assignment.get("status") or ""),
-                     "verdict": str(review.get("verdict") or ""),
-                     "reason": reason, "at": _now()}
-        self.store.log_event({
-            "type": "assignment.qa_refused_after_hold", "at": _now(),
-            "assignment": assignment.get("id"), "thread": thread,
-            "comment_id": cid, "status": str(assignment.get("status") or ""),
-            "verdict": str(review.get("verdict") or ""),
-            "reason": reason, "level": "warn", "consumers": ["user"],
-        })
-        numbers = index.setdefault("issues", {}).setdefault(
-            thread, {"state": "idle", "comments_seen": 0, "needs_person": []})
-        numbers.setdefault("needs_person", []).append({
-            "comment_id": cid,
-            # ``brief`` files an entry under "4. 等用户的事项" only when the
-            # reason matches its ``[user]`` markers. The old row carried no
-            # marker, so it landed in "3. 等 supervisor 裁决" - the opposite of
-            # what the code comment claimed.
-            "reason": "review.refused_after_hold [user]",
-            "detail": reason, "at": _now()})
-        issue = assignment.get("issue")
-        if issue is not None:
-            self._route_refused_review(index, thread, int(issue), assignment,
-                                       cid, review, reason)
-
-    def _clear_refused(self, index: dict, thread: str,
-                       *, comment_id=None) -> int:
-        """Drop refused-verdict bookkeeping for a thread, or for one comment.
-
-        ``review_refused`` and its ``needs_person`` rows describe work still
-        waiting on a person. Two things end that wait, and both used to leave
-        the rows behind:
-
-        * the **comment itself** is applied later (``comment_id`` given) - the
-          refusal was about a reading that has since been corrected, so the row
-          now asks a person to decide something the engine already decided;
-        * the **thread completes** (no ``comment_id``) - nothing on it waits for
-          a person any more.
-
-        The original ``needs_person`` rows stay append-only; supersession marks
-        hide them from the open queue. Returns cleared ``review_refused`` entries.
-        """
-        def wanted(rec) -> bool:
-            if not isinstance(rec, dict):
-                return False
-            if str(rec.get("thread") or "") != thread:
-                return False
-            if comment_id is None:
-                return True
-            try:
-                return int(rec.get("comment_id")) == int(comment_id)
-            except (TypeError, ValueError):
-                return False
-
-        seen = index.get("review_refused")
-        cleared = 0
-        if isinstance(seen, dict):
-            for key in [k for k, rec in seen.items() if wanted(rec)]:
-                del seen[key]
-                cleared += 1
-        numbers = (index.get("issues") or {}).get(thread)
-        if isinstance(numbers, dict):
-            from . import needs as needs_mod
-            rows = numbers.get("needs_person")
-            if isinstance(rows, list):
-                for row in rows:
-                    if not isinstance(row, dict) or not str(
-                            row.get("reason") or "").startswith("review.refused_after_hold"):
-                        continue
-                    if comment_id is not None and str(row.get("comment_id")) != str(comment_id):
-                        continue
-                    cid = needs_mod.cid_of(row)
-                    if cid is not None:
-                        needs_mod.mark(index, thread, cid, state=needs_mod.SUPERSEDED,
-                                       by="engine", reason="review refusal cleared",
-                                       by_comment=comment_id)
-        if cleared:
-            self.store.log_event({
-                "type": "review.refused_cleared", "at": _now(),
-                "thread": thread, "entries": cleared,
-                "comment_id": comment_id,
-            })
-        return cleared
-
-    # A refusal is permanent only when no retry can ever succeed: the creation
-    # mode forbids the session, so asking again is asking the same question.
-    # Every other refusal is transient and the next round must be able to win -
-    # an issue that is not listed yet becomes listed on its next sync, a
-    # project that is not listed yet becomes listed on a one-line edit, a
-    # ``target session is archived`` record can be replaced.
-    #
-    # The wording is not the criterion. ``allowlist.check`` owns it and may
-    # rephrase without changing what happened, and ``issue #N not allowlisted``
-    # is unreachable through ``_dispatch`` anyway: ``_project_for`` answers
-    # ``None`` before ``check`` is asked, so that prefix only ever matched dead
-    # code. "Not in this table" therefore means "transient", not "unknown".
-    PERMANENT_REFUSAL_PREFIXES = ("creation_mode_forbidden",)
-
-    # How many refused rounds in a row earn one visible alert, and the event
-    # type that alert carries. Three matches the E61 liveness window, so a
-    # person hears about a stuck verdict on the same rhythm they hear about a
-    # stuck session.
-    REFUSED_RETRY_ROUNDS = 3
-    REFUSED_RETRY_ROW = "route.refused_retryable"
-
-    @classmethod
-    def is_permanent_refusal(cls, reason: str) -> bool:
-        """Is this refusal permanent for *this comment*, whatever happens next?
-
-        Only one answer qualifies: the creation mode forbids session creation.
-        Everything else - an issue or a project that is not listed yet, an
-        action that is not listed yet, a network error, ``target session is
-        archived`` - can clear on its own or by a one-line edit, so those keep
-        retrying. The text is read as a prefix only because that is the shape
-        the engine itself emits for the creation mode; no other wording is
-        load-bearing.
-        """
-        text = str(reason or "").strip()
-        return any(text.startswith(p) for p in cls.PERMANENT_REFUSAL_PREFIXES)
-
-    @staticmethod
-    def _round_token(index: dict) -> int:
-        """The round a write belongs to.
-
-        ``run_count`` is bumped at the end of the round, after the retry pass,
-        so every write inside one round (the inline triage call and the retry
-        call) reads the same value. A crash before ``save_index`` leaves the
-        token unchanged, which merges that refusal into the next round instead
-        of counting it twice - late, never early.
-        """
-        return int((index.get("meta") or {}).get("run_count") or 0)
-
-    def _count_route_refusal(self, index: dict, route: dict, thread: str,
-                             cid, result: dict | None = None) -> None:
-        """One increment per round for a route whose dispatch was refused.
-
-        The criterion is the returned ``refused`` flag, never the reason text:
-        the wording belongs to ``allowlist.check`` and may change without
-        changing what happened. Nothing here is kept in memory - the streak
-        lives in the route record so a restart resumes it.
-
-        The alert says what was observed (a run of refusals, this comment) and
-        carries the refusal's own reason for evidence. It deliberately does not
-        guess a cause: three of the four refusal shapes are unrelated to the
-        allowlist, and an alert that names the wrong file is worse than none.
-        """
-        streak = route.get("refusal_streak")
-        if not isinstance(streak, dict):
-            streak = route["refusal_streak"] = {"rounds": 0, "last_round": None}
-        token = self._round_token(index)
-        if streak.get("last_round") == token:
-            return
-        streak["last_round"] = token
-        streak["rounds"] = int(streak.get("rounds") or 0) + 1
-        if streak["rounds"] < self.REFUSED_RETRY_ROUNDS:
-            return
-        if streak.get("alerted_at"):
-            return
-        streak["alerted_at"] = _now()
-        reason = (f"{self.REFUSED_RETRY_ROW}[user]: verdict on cid {cid} of "
-                  f"{thread} was refused {streak['rounds']} rounds in a row; "
-                  "see route.decided for what each round answered")
-        self._append_needs_person(index, thread, {
-            "comment_id": cid, "reason": reason, "at": _now()})
-        self.store.log_event({
-            "type": self.REFUSED_RETRY_ROW, "at": _now(), "thread": thread,
-            "comment_id": cid, "rounds": streak["rounds"],
-            "reason": str((result or {}).get("reason") or ""),
-            "level": "warn", "consumers": ["doctor"],
-        })
-
-    @staticmethod
-    def _clear_route_refusal(route: dict) -> None:
-        """A landed dispatch ends the streak.
-
-        ``alerted_at`` stays as the one-shot proof, so the same comment can
-        never alert twice even if it is refused again afterwards.
-        """
-        streak = route.get("refusal_streak")
-        if isinstance(streak, dict):
-            streak["rounds"] = 0
 
     def _retry_routes(self, index: dict) -> int:
         """Re-send verdicts a refused/suppressed dispatch never delivered.
@@ -2752,7 +2250,9 @@ class Engine:
                           append=self._append_needs_person,
                           log=self.store.log_event)
 
-    def rebuild_issue(self, thread, reason: str, *, collected=None) -> dict:
+    def rebuild_issue(self, thread, reason: str, *, collected=None,
+                      index: dict | None = None,
+                      cursor: dict | None = None) -> dict:
         """Rebuild one thread from the full listing, **without moving the cursor**.
 
         The counter-example this exists for: a rebuild that advances the cursor
@@ -2773,6 +2273,15 @@ class Engine:
 
         ``collected`` lets the caller pass the batch it already has, so a gap
         found mid-round costs no second walk of the same listing.
+
+        ``index``/``cursor`` are the round's own copies. Passing them is not an
+        optimisation: a round holds its index in memory and writes it once at
+        the end, so a rebuild that loaded its own copy had every row it wrote
+        (``needs_person``, ``read_paused``) overwritten by that final write -
+        the pause existed in the event log and nowhere a reader looks, and the
+        next round read the issue again (#130 QA P0-2). Without them this is a
+        standalone repair that writes through, which is what the tests and the
+        CLI use.
         """
         thread = str(thread or "")
         repo, number = issuekey.split_key(thread)
@@ -2781,8 +2290,9 @@ class Engine:
         if number is None:
             out["reason"] = f"{reason}: no issue number in {thread!r}"
             return out
-        index = self.store.load_index()
-        cursor = self.store.load_cursor()
+        in_round = index is not None
+        index = index if index is not None else self.store.load_index()
+        cursor = cursor if cursor is not None else self.store.load_cursor()
         legacy = str(number)
         cur = int(issuekey.read_both(cursor.get("issues") or {}, thread, legacy) or 0)
         out["cursor_before"] = cur
@@ -2797,8 +2307,14 @@ class Engine:
                 contiguous=bool(getattr(walk, "contiguous", False)),
                 reason=str(getattr(walk, "stop_reason", "") or ""))
         out["rows"] = len(collected.rows)
+        # Two facts, both required: the walk reached page 1, **and** the page
+        # intervals it read form one unbroken run from page 1. The second one is
+        # ``contiguous_with`` - the issue names it as the real interval check,
+        # and reading only the first let a rebuild adopt a listing whose middle
+        # page came back empty (#130 QA P1-2).
         complete = (collected.pagination_complete
-                    and collected.missing_page() is None)
+                    and queue_mod.contiguous_with(collected.observed_spans(),
+                                                  expect_from=1))
         if not complete:
             # One row, one pause, no cursor movement. The reason names the fault
             # so a person can see *why* the history is untrusted.
@@ -2814,7 +2330,12 @@ class Engine:
                            f"missing_page={collected.missing_page()}, "
                            f"reason={collected.reason}); the cursor was not "
                            f"moved")})
-            self.store.save_index(index)
+            if in_round:
+                # The round's write-back persists this index; saving here would
+                # just be overwritten by it (#130 QA P0-2).
+                self._block_cursor(thread)
+            else:
+                self.store.save_index(index)
             self.store.log_event({"type": "rebuild.incomplete", "at": _now(),
                                   "thread": thread, "issue": number,
                                   "rows": len(collected.rows),
@@ -2824,13 +2345,27 @@ class Engine:
         cursor.setdefault("issues", {})[thread] = round_mod.consumed_prefix(
             cur, [int(row["id"]) for row in collected.rows])
         out["cursor_after"] = cursor["issues"][thread]
-        self.store.save_cursor(cursor)
+        if not in_round:
+            self.store.save_cursor(cursor)
         self.store.log_event({"type": "rebuild.done", "at": _now(),
                               "thread": thread, "issue": number,
                               "rows": len(collected.rows),
                               "cursor": out["cursor_after"]})
         out["ok"] = True
         return out
+
+    def _block_cursor(self, thread: str) -> None:
+        """Refuse to advance this thread's cursor for the rest of the round.
+
+        The cursor write lives in ``_round_issue`` while the fault is found in
+        ``rebuild_issue``, so the two must agree explicitly. A rebuild that
+        could not prove its rows makes the rows just read untrustworthy, and
+        advancing to them would put the missing middle below the cursor - the
+        loss is permanent and nothing later notices (#130 QA P0-3).
+        """
+        state = getattr(self, "_round_state", None)
+        if state is not None:
+            state.block_cursor(str(thread))
 
     def resume_read(self, issue, *, by: str = "", max_pages: int | None = None,
                     detail: str = "") -> dict:
@@ -4536,6 +4071,10 @@ class Engine:
         else:
             summary["allowlist_kept"] = "source failed this round"
 
+        # Whoever the bound refused last round is served first this round. A
+        # fixed order plus a fixed cap is not backpressure, it is starvation:
+        # the same first ``max_batches`` issues take the slots every round and
+        # the tail's cursor never moves (#130 QA P0-4).
         for issue in issue_numbers:
             thread = self._thread_key(issue)
             try:
@@ -4639,68 +4178,16 @@ class Engine:
         return summary
 
     def _note_collected(self, thread: str, batch, cursor_before: int,
-                        fresh, summary: dict) -> bool:
-        """Record one walk in the round's collection state, with backpressure.
-
-        Returns ``True`` when the batch was **accepted** (queued or already
-        queued) and ``False`` when the bounded queue refused it. The distinction
-        is the whole point of a refusal: the rows beyond the cap stay above the
-        cursor, the round is marked incomplete, and the next round reads them
-        again. Consuming anyway and moving the cursor would drop the refused
-        rows permanently.
-
-        ``complete``/``contiguous`` come from the walk itself; ``pages`` is the
-        page list it actually fetched, which is what makes "the ids jump" and "a
-        page is missing" different answers (see :mod:`super_agent.batch`).
-        """
-        state = getattr(self, "_round_state", None)
-        if state is None:
-            return True
-        collected = batch_mod.CollectedBatch(
-            thread, batch.rows, cursor_before=cursor_before,
-            pages=list(getattr(batch, "pages", []) or []),
-            complete=bool(getattr(batch, "pagination_complete", False)),
-            contiguous=bool(getattr(batch, "contiguous", False)),
-            reason=str(getattr(batch, "stop_reason", "") or ""))
-        state.round_result.add(thread, collected)
-        if collected.needs_rebuild():
-            summary.setdefault("rebuild_needed", []).append(thread)
-            self.store.log_event({
-                "type": "batch.gap", "at": _now(), "thread": str(thread),
-                "missing_page": collected.missing_page(),
-                "pagination_complete": collected.pagination_complete,
-                "reason": collected.reason})
-            self.rebuild_issue(str(thread), "batch.gap", collected=collected)
-        try:
-            state.queue.put(collected)
-        except queue_mod.Backpressure as exc:
-            summary.setdefault("backpressure", []).append(
-                {"thread": exc.thread, "rows": exc.refused, "reason": exc.reason})
-            self.store.log_event({
-                "type": "batch.backpressure", "at": _now(), "thread": exc.thread,
-                "rows": exc.refused, "reason": exc.reason,
-                "round_seq": state.seq})
-            return False
-        state.cursor.observe(thread, fresh)
-        return True
+                        fresh, summary: dict, index: dict | None = None,
+                        cursor: dict | None = None) -> bool:
+        """Forwarder: the six decisions live in :mod:`engine_parts.consume`."""
+        return consume_mod.note_collected(self, thread, batch, cursor_before,
+                                          fresh, summary, index=index,
+                                          cursor=cursor)
 
     def _note_consumed(self, thread: str, consumed) -> None:
-        """Mark rows consumed on the batch **and** let the cursor prefix follow.
-
-        Both are needed and they answer different questions: the batch's own
-        ``consumed_ids`` is what makes ``consumption_complete`` true, the cursor
-        prefix is what the next round reads from. Marking only one of them is
-        how a round reports itself complete while the cursor stays behind (or
-        the reverse, which loses rows).
-        """
-        state = getattr(self, "_round_state", None)
-        if state is None:
-            return
-        ids = [int(c["id"]) for c in consumed]
-        batch = state.round_result.batches.get(str(thread))
-        if batch is not None:
-            batch.consume(ids)
-        state.cursor.consume(thread, ids)
+        """Forwarder: batch and cursor prefix move together (see ``consume``)."""
+        consume_mod.note_consumed(self, thread, consumed)
 
     def _save_requirement_projection(self, index: dict, key: str) -> None:
         """Persist the projection; a write failure is logged, never raised."""
@@ -4768,6 +4255,21 @@ class Engine:
         issues = index.setdefault("issues", {})
         rec = issues.setdefault(key, {"state": "idle", "comments_seen": 0,
                                       "needs_person": []})
+        try:
+            self._read_and_consume(issue, index, cursor, max_comments, summary,
+                                   max_pages, key, legacy, rec)
+        finally:
+            # The queue is drained per issue, always - including on the path
+            # where this issue produced nothing. The first delivery only ever
+            # ``put``, so the bound filled with the first ``max_batches`` issues
+            # and every later one was refused for ever; that is starvation, not
+            # backpressure (#130 QA P0-4).
+            consume_mod.drain_queue(self, key, summary)
+
+    def _read_and_consume(self, issue: int, index: dict, cursor: dict,
+                          max_comments: int, summary: dict, max_pages: int,
+                          key: str, legacy: str, rec: dict) -> None:
+        """The read → gate → triage → cursor chain for one issue."""
         if not self._flow_gate(issue, index, key, rec, summary):
             return
         rec["title"] = rec.get("title") or self.source.title(issue)
@@ -4797,7 +4299,8 @@ class Engine:
         if not read.skipped:
             if not paused_now and read.batch is not None:
                 accepted = self._note_collected(key, read.batch, cur, fresh,
-                                                summary)
+                                                summary, index=index,
+                                                cursor=cursor)
             # A refused batch was not collected, so it may not be consumed: the
             # rows stay above the cursor and the next round reads them again.
             # Consuming here and advancing the cursor is exactly the loss the
@@ -4828,91 +4331,11 @@ class Engine:
         synced = self._sync_assignments(index, key, issue)
         summary["assignments"] += len(synced.get("created") or [])
 
-        seen_this_round: set[int] = set()
-        # The window the double-ring guard reads: a PM verdict anywhere in this
-        # issue's new comments counts, even when it comes after the QA pass in
-        # id order. Built from the same list the loop walks, so the window is
-        # exactly the batch - never a guess about future comments.
-        self._pm_pending = set()
-        if key and any(markers.parse_pm_verdict(str(c.get("body") or ""))
-                       for c in fresh):
-            self._pm_pending.add(key)
-        consumable = fresh if accepted else []
-        for comment in consumable:
-            event_type = "issue_comment.created"
-            if event_type not in self.allowlist:
-                continue
-            cid = int(comment["id"])
-            if cid in seen_this_round:          # in-run dedupe only
-                continue
-            seen_this_round.add(cid)
-            state, reason = self._triage(comment)
-            delivery = markers.parse_delivery(str(comment.get("body") or ""))
-            review = markers.parse_review(str(comment.get("body") or ""))
-            pm_verdict = markers.parse_pm_verdict(str(comment.get("body") or ""))
-            at_verdict = markers.parse_at_verdict(str(comment.get("body") or ""))
-            summary["processed"] += 1
-            rec["comments_seen"] = int(rec.get("comments_seen") or 0) + 1
-            rec["last_comment_id"] = cid
-            rec["last_event_ts"] = _now()
-            self.store.log_event({"type": "comment.processed", "at": _now(),
-                                  "issue": issue, "comment_id": cid, "state": state,
-                                  "reason": reason})
-            # The envelope is built here, on the production path, from the
-            # whitelist result - never from the body (#92 §A.4／§D.3). A refusal
-            # or an unknown marker logs its own event; either way this runs once
-            # per triaged comment, inside the round.
-            self._record_envelope(key, comment, state)
-            if state == "delivery":
-                state, reason = self._on_delivery(index, key, issue, comment,
-                                                  delivery, summary)
-                summary["deliveries"] += 1
-                if state != "needs_person":
-                    summary["processed"] += 0
-                    if rec.get("state") == "idle":
-                        rec["state"] = "tracked"
-                    continue
-            if state == "review":
-                state, reason = self._on_review(index, key, issue, comment,
-                                                review, summary)
-                summary["reviews"] = int(summary.get("reviews") or 0) + 1
-                if state != "needs_person":
-                    if rec.get("state") == "idle":
-                        rec["state"] = "tracked"
-                    continue
-            if state == "pm_verdict":
-                # A ``[PM:TASK]`` escalation never reaches ``parse_pm_verdict``
-                # - the prefix is deliberate - so the router is handed the empty
-                # verdict, the same shape an unmarked ``[PM]`` note produces:
-                # no state, fail-closed, one exception frame (#ISS-85 P1-2).
-                verdict = pm_verdict or {"state": "", "matched": "",
-                                         "issue": None, "candidate": False}
-                state, reason = self._on_pm_verdict(index, key, issue, comment,
-                                                    verdict)
-                summary["pm_verdicts"] = int(summary.get("pm_verdicts") or 0) + 1
-                if state != "needs_person":
-                    if rec.get("state") == "idle":
-                        rec["state"] = "tracked"
-                    continue
-            if state == "at_verdict":
-                state, reason = self._on_at_verdict(index, key, issue,
-                                                    comment, at_verdict)
-                summary["at_verdicts"] = int(summary.get("at_verdicts") or 0) + 1
-                if state != "needs_person":
-                    if rec.get("state") == "idle":
-                        rec["state"] = "tracked"
-                    continue
-            if state == "needs_person":
-                rec["state"] = "needs_person"
-                if self._file_needs_person(index, key, issue, cid, reason,
-                                           rec, summary):
-                    continue
-            elif rec.get("state") == "idle":
-                rec["state"] = "tracked"
+        triage_batch_mod.triage_batch(self, index, issue, key, rec, fresh,
+                                      accepted=accepted, summary=summary)
 
         if fresh and accepted:
-            cursor.setdefault("issues", {})[key] = max(int(c["id"]) for c in fresh)
-            self._note_consumed(key, fresh)
+            self._advance_cursor(key, cursor, cur, fresh)
         else:
             # Never move the cursor on a round that consumed nothing: a paused
             # issue (no read at all) must keep its position byte for byte, and a
@@ -4920,10 +4343,10 @@ class Engine:
             # here would put the refused rows below the cursor, and no later
             # round would ever read them again.
             cursor.setdefault("issues", {}).setdefault(key, cur)
-        # The window closes here: past this point only the committed ledger
-        # speaks, so the stall watchdog cannot be silenced by a batch that was
-        # already read and answered.
-        self._pm_pending = set()
+
+    def _advance_cursor(self, key: str, cursor: dict, cur: int, fresh) -> None:
+        """Forwarder: the prefix rule lives in :meth:`consume.advance_cursor`."""
+        consume_mod.advance_cursor(self, key, cursor, cur, fresh)
 
     # ------------------------------------------------------------- status/doctor
     def status(self, *, outbox: bool = False, all: bool = False) -> dict:

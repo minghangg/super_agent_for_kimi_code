@@ -24,7 +24,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ..batch import BatchCursor, CollectedRound, ScanPolicy
+from ..batch import (BatchCursor, CollectedRound, DEFAULT_MAX_BATCH_ROWS,
+                     DEFAULT_MAX_ISSUE_ROWS, ScanPolicy)
 from ..batch_queue import BoundedBatchQueue
 
 
@@ -65,8 +66,8 @@ def round_policy(gh_cfg: dict | None) -> ScanPolicy:
 
     return ScanPolicy(
         max_batches=_int("max_batches", 8),
-        max_batch_rows=_int("max_batch_rows", 5000),
-        max_issue_rows=_int("max_issue_rows", 20000),
+        max_batch_rows=_int("max_batch_rows", DEFAULT_MAX_BATCH_ROWS),
+        max_issue_rows=_int("max_issue_rows", DEFAULT_MAX_ISSUE_ROWS),
         max_pages=_int("max_comment_pages", 10),
         page_size=_int("page_size", 100))
 
@@ -120,6 +121,11 @@ class RoundState:
     source_ok: bool = True
     issues: list[int] = field(default_factory=list)
     summary: dict = field(default_factory=dict)
+    #: Threads whose cursor may not advance this round. A failed rebuild names
+    #: one: the rows it could not prove it read are exactly what a cursor move
+    #: would bury (#130 QA P0-3). Kept on the state rather than passed around so
+    #: the two write sites cannot disagree about it.
+    cursor_blocked: set[str] = field(default_factory=set)
 
     @classmethod
     def begin(cls, index: dict, cursor_doc: dict,
@@ -132,6 +138,12 @@ class RoundState:
                    round_result=CollectedRound(seq, policy=policy),
                    queue=BoundedBatchQueue(policy),
                    cursor=BatchCursor(prefix))
+
+    def block_cursor(self, thread: str) -> None:
+        self.cursor_blocked.add(str(thread))
+
+    def cursor_allowed(self, thread: str) -> bool:
+        return str(thread) not in self.cursor_blocked
 
     def fail(self, thread: str) -> None:
         self.round_result.fail(thread)
