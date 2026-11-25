@@ -51,19 +51,49 @@ def _write(path: Path, payload) -> None:
 
 
 def read_issues(root: Path | None = None) -> list | None:
-    """The last full issues listing, or ``None`` when no good copy exists."""
+    """The last full issues listing, or ``None`` when no good copy exists.
+
+    Kept for callers that only need the last successful snapshot. The live path
+    does **not** read it to answer ``issues()``: #134 §3 says the listing is
+    refreshed every round, and a cached answer here would freeze the live set.
+    """
     payload = _read((root or cache_root()) / "issues.json")
     return payload if isinstance(payload, list) else None
 
 
-def write_issues(rows: list, *, etags: dict | None = None,
-                 root: Path | None = None) -> None:
-    """Store a full issues listing after a successful network read."""
+def write_issues(rows: list, *, labels: dict | None = None,
+                 etags: dict | None = None, root: Path | None = None) -> None:
+    """Store the **full** issues listing after a successful network read.
+
+    Callers must pass the whole listing, never a ``limit``-truncated answer:
+    ``doctor()`` asks for ``issues(limit=1)``, and letting that one row become
+    the snapshot would narrow every later round to a single issue (#134 P0-1).
+
+    ``labels`` is the ``{number: labels}`` map from the same request. It is
+    stored beside the numbers so a ``flow()`` answer needs no second request
+    (#134 P1-1).
+    """
     base = root or cache_root()
     _write(base / "issues.json", list(rows))
+    _write(base / "labels.json", {str(k): list(v or [])
+                                 for k, v in (labels or {}).items()})
     _write(base / "meta.json", {
         "fetched_at": time.time(), "count": len(rows), "etags": dict(etags or {}),
     })
+
+
+def read_labels(root: Path | None = None) -> dict:
+    """``{number: labels}`` from the last issues read; ``{}`` when absent."""
+    payload = _read((root or cache_root()) / "labels.json")
+    if not isinstance(payload, dict):
+        return {}
+    out = {}
+    for key, value in payload.items():
+        try:
+            out[int(key)] = list(value or [])
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def read_comments(issue: int, ttl_s: float, *,

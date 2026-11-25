@@ -61,9 +61,19 @@ def request(url: str, *, method: str = "GET", headers: dict | None = None,
 def request_or_exit(url: str, *, method: str = "GET", path: str = "",
                     headers: dict | None = None, payload: dict | None = None,
                     timeout_s: float = 30.0):
-    """Return the parsed body, or raise the CLI's historical ``SystemExit``."""
+    """Return the parsed body, or raise the CLI's historical ``SystemExit``.
+
+    A **transport** failure (``_status == 0``: proxy down, timeout, DNS) raises
+    exactly like an HTTP error does. Returning ``{}`` there was the P0-2 fault:
+    the caller's success branch ran, printed ``commented … id=None`` and wrote a
+    ledger row for a comment that was never sent. ``urllib`` raised ``URLError``
+    before this rewrite, and the behaviour is restored rather than relaxed.
+    """
     out = request(url, method=method, headers=headers, payload=payload,
                   timeout_s=timeout_s)
+    if out["_status"] == 0:
+        raise SystemExit(f"GitHub API 请求未完成（{method} {path or url}）："
+                         f"{out['error']}")
     if out["_status"] >= 400:
         raise SystemExit(f"GitHub API {out['_status']} {method} {path or url}"
                          f"：{out['error']}")

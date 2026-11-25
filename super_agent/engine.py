@@ -101,6 +101,7 @@ from .engine_parts import session_keys as session_key_mod
 from .engine_parts import triage as triage_mod
 from .engine_parts import triage_batch as triage_batch_mod
 from .engine_parts import watchdog as watchdog_mod
+from .engine_parts import issue_state as issue_state_mod
 from . import batch as batch_mod
 from . import batch_queue as queue_mod
 from .allowlist import ProjectAllowlist
@@ -358,11 +359,8 @@ class Engine(ReviewRoutes, RefusedRoutes):
         self._session_map_cache: tuple | None = None
         # The current round's collection state (see ``engine_parts.round``).
         self._round_state = None
-        # Process-lifetime closed terminal state (#134 step 5). Only ``closed``
-        # is cached: ``unknown`` and ``open`` stay fresh, since a failed probe
-        # must never become permanent and a reopened issue must re-enter the
-        # live set on the next ``issues()`` read.
-        self._closed_issues: set[int] = set()
+        # Closed-only terminal memo (#134 step 5); see engine_parts/issue_state.
+        self._closed_states = issue_state_mod.ClosedStates()
 
     # ------------------------------------------------------------ allowlist
     def allowlist_allows(self, issue: int | None, action: str | None) -> tuple[bool, str]:
@@ -3620,25 +3618,14 @@ class Engine(ReviewRoutes, RefusedRoutes):
         asg_mod.mark_blocked(rec, reason, cid=cid, at=_now())
 
     def _issue_state(self, issue) -> str:
-        """``source.issue_state(issue)`` with every failure folded to unknown.
+        """``source.issue_state(issue)``, failures folded to ``unknown``.
 
-        Fail closed for the caller: an unreadable probe must never look like a
-        closed Issue, or a broken network would complete threads by itself.
+        Fail closed: an unreadable probe must never look like a closed Issue.
         """
         number = int(issue)
-        if number in self._closed_issues:
-            return "closed"
-        try:
-            state = self.source.issue_state(number)
-        except Exception as exc:  # noqa: BLE001  reported as unknown, never closed
-            self.store.log_event({"type": "issue.state_unreadable", "at": _now(),
-                                  "issue": number,
-                                  "error": f"{type(exc).__name__}: {exc}"})
-            return "unknown"
-        state = str(state or "unknown")
-        if state == "closed":
-            self._closed_issues.add(number)
-        return state
+        return self._closed_states.state(
+            number, lambda: issue_state_mod.read_state(
+                self.source, number, self.store.log_event, _now))
 
     # ------------------------------------------------- close reconciliation
     def _binding_roles(self, thread: str) -> list[str]:
@@ -4469,13 +4456,7 @@ class Engine(ReviewRoutes, RefusedRoutes):
         if source_name == "none":
             add("github", True, "source=none (skipped)")
         else:
-            try:
-                issues = self.source.issues(limit=1)
-                add("github", True, f"source={source_name} reachable, sample={issues}")
-            except Exception as exc:  # noqa: BLE001
-                add("github", False, f"source={source_name} error: "
-                                     f"{type(exc).__name__}: {exc}",
-                    label="github-down")
+            add(*doctor_mod.github_check(self.source, str(source_name)))
 
         add(*self._check_config())
 
@@ -4536,7 +4517,9 @@ class Engine(ReviewRoutes, RefusedRoutes):
         rec.update({"state": "needs_person" if kept else "idle", "comments_seen": 0,
                     "needs_person": kept, "title": self.source.title(issue),
                     "rebuilt_at": _now()})
-        comments = self.source.comments(issue)
+        # ``paged()`` is never cached (#134 P1-2).
+        comments = collect_mod.replay_rows(self.source, issue,
+                                           github_source.paged_batch)
         for comment in comments:
             cid = int(comment["id"])
             rec["comments_seen"] += 1

@@ -45,6 +45,44 @@ class Backend:
         return "standard"
 
 
+class FlakyIssues:
+    """A backend whose listing changes between rounds, and can fail."""
+
+    def __init__(self, rounds, labels=None):
+        self.rounds = list(rounds)
+        self.labels = labels or {}
+        self.fail = False
+        self.calls = 0
+        self.detail_calls = 0
+
+    def issues(self, limit=20):
+        return self.issues_with_labels(limit)[0]
+
+    def issues_with_labels(self, limit=20):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("offline")
+        rows = self.rounds[min(self.calls, len(self.rounds)) - 1]
+        out = [int(x) for x in rows]
+        return out[:max(0, int(limit))], dict(self.labels)
+
+    def comments(self, issue):
+        return []
+
+    def paged(self, issue, *, since_id=0, max_pages=10):
+        return []
+
+    def title(self, issue):
+        return ""
+
+    def issue_state(self, issue):
+        return "open"
+
+    def flow(self, issue):
+        self.detail_calls += 1
+        return ""
+
+
 class CacheTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -99,6 +137,48 @@ class CacheTests(unittest.TestCase):
         src = cached.CachedLiveSource(backend, root=self.root)
         self.assertEqual(src.issue_state(1), "closed")
         self.assertFalse((self.root / "issues.json").exists())
+
+    # ---- QA 退回 cid 7162406901 的 P0-1 / P1-1 回归 ----
+
+    def test_p0_1_issues_refreshes_every_round(self):
+        """A cached listing must never answer a later round."""
+        lead = FlakyIssues([[1, 2, 3], [1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6]])
+        src = cached.CachedLiveSource(lead, root=self.root)
+        self.assertEqual(src.issues(20), [1, 2, 3])
+        self.assertEqual(src.issues(20), [1, 2, 3, 4, 5, 6])
+        self.assertEqual(lead.calls, 2)
+
+    def test_p0_1_a_limit_probe_cannot_narrow_the_snapshot(self):
+        """``doctor()``'s ``issues(limit=1)`` must not write one row."""
+        lead = FlakyIssues([[7, 8, 9]])
+        src = cached.CachedLiveSource(lead, root=self.root)
+        self.assertEqual(src.issues(limit=1), [7])
+        self.assertEqual(cache.read_issues(self.root), [7, 8, 9])
+        self.assertEqual(src.issues(limit=20), [7, 8, 9])
+
+    def test_p0_1_a_failed_refresh_keeps_the_previous_snapshot(self):
+        lead = FlakyIssues([[1, 2]])
+        src = cached.CachedLiveSource(lead, root=self.root)
+        src.issues(20)
+        before = (self.root / "issues.json").read_bytes()
+        lead.fail = True
+        with self.assertRaises(RuntimeError):
+            src.issues(20)
+        self.assertEqual((self.root / "issues.json").read_bytes(), before)
+
+    def test_p1_1_flow_uses_snapshot_labels_without_a_detail_request(self):
+        lead = FlakyIssues([[1]], labels={1: [{"name": "flow:at"}]})
+        src = cached.CachedLiveSource(lead, root=self.root)
+        src.issues(20)
+        self.assertEqual(src.flow(1), "at")
+        self.assertEqual(lead.detail_calls, 0)
+
+    def test_p1_2_replay_listing_is_not_cached(self):
+        backend = Backend()
+        src = cached.CachedLiveSource(backend, root=self.root)
+        src.comments(1)
+        src.paged(1, since_id=0, max_pages=10)
+        self.assertEqual(backend.paged_calls, 1)
 
 
 if __name__ == "__main__":

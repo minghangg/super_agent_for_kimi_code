@@ -117,3 +117,14 @@ def qa_recovery(assignments, *, terminal, output_cids) -> bool:
         str(rec.get("role") or "") == "qa"
         and str(rec.get("status") or "") not in terminal
         and rec.get("review_comment_id") is None for rec in assignments)
+
+
+def replay_rows(source, issue: int, paged_batch):
+    """The full listing for ``replay`` via ``paged()`` (#134 P1-2).
+
+    ``source.comments()`` is served by the cache, so rebuilding from it would
+    read stale rows inside the TTL. ``paged()`` is never cached by design, and
+    ``whole_listing=True`` asks for the history a package may predate.
+    """
+    return paged_batch(source, int(issue), cursor_before=0, max_pages=10,
+                       whole_listing=True).rows

@@ -271,3 +271,24 @@ def assignments_check(residual) -> tuple:
     return ("assignments", not residual,
             "none" if not residual else f"non-terminal: {sorted(residual)}",
             "warn", "assignments")
+
+
+def github_check(source, source_name: str) -> tuple:
+    """Fault 5: GitHub is unreachable. A reachability probe, never a snapshot.
+
+    ``issues(limit=1)`` was the historical probe, but the cached source writes
+    the listing snapshot on every ``issues()`` call, so one probe row stood in
+    for the whole listing and narrowed the next round to a single issue
+    (#134 P0-1). ``probe()`` answers the same question without writing.
+    """
+    try:
+        probe = getattr(source, "probe", None)
+        if callable(probe):
+            sample = [int(probe(1))]
+        else:
+            sample = source.issues(limit=1)
+    except Exception as exc:  # noqa: BLE001  reported, never raised
+        return ("github", False, f"source={source_name} error: "
+                                 f"{type(exc).__name__}: {exc}",
+                "fail", "github-down")
+    return ("github", True, f"source={source_name} reachable, sample={sample}")

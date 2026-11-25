@@ -188,19 +188,32 @@ class LiveSource:
         the ``stage:`` prefix. An empty set means "no filter" (fail open): a
         missed issue is a frame nobody sees, which is worse than an extra one.
         """
+        return self.issues_with_labels(limit)[0]
+
+    def issues_with_labels(self, limit: int = 20) -> tuple[list[int], dict]:
+        """``(issue numbers, {number: labels})`` from **one** list request.
+
+        The labels ride along because the caller that caches the listing must
+        also cache them: ``flow()`` answers from ``_labels_by_issue``, and a
+        cached listing without them would make every cached round fetch one
+        detail request per issue (#134 P1-1). The dict holds the whole page,
+        not just the returned prefix, so a later ``flow()`` for an issue the
+        ``limit`` cut off is still answerable from the same read.
+        """
         rows = self._get(f"/repos/{self.repo}/issues",
                          {"state": "open", "per_page": 100})
         if not isinstance(rows, list):
             raise SourceError("unexpected issues payload")
         held = set(self.on_hold_labels)
-        out = []
+        out, labels = [], {}
         for row in rows:
             if not isinstance(row, dict) or not row.get("number"):
                 continue
             if row.get("pull_request") is not None:
                 continue
             number = int(row["number"])
-            self._labels_by_issue[number] = list(row.get("labels") or [])
+            labels[number] = list(row.get("labels") or [])
+            self._labels_by_issue[number] = labels[number]
             if held:
                 names = {str((x or {}).get("name") or "")
                          for x in (row.get("labels") or []) if isinstance(x, dict)}
@@ -209,7 +222,7 @@ class LiveSource:
             out.append(number)
             if len(out) >= int(limit):
                 break
-        return out
+        return out, labels
 
     def flow(self, issue: int) -> str:
         number = int(issue)

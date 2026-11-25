@@ -835,7 +835,9 @@ def cmd_label(args, ctx) -> int:
             path = (f"/repos/{repo}/issues/{args.issue}/labels/"
                     f"{urllib.parse.quote(name)}")
             out = _call_raw("DELETE", path, dry_run=args.dry_run, **ctx.call)
-            status = out.get("_status", 200) if isinstance(out, dict) else 200
+            # No status means the request never settled, not "it worked": the
+            # default must not turn a transport failure into a success (#134 P0-2).
+            status = out.get("_status", 0) if isinstance(out, dict) else 0
             if status == 404:
                 print(f"labeled #{args.issue} -{name}（本就不存在）")
                 continue
