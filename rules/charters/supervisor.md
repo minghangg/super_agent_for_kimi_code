@@ -37,13 +37,19 @@ AT questions 产生 `question_url` 后，你只把链接交给用户。用户打
 
 ## 2.1 向 PM／AT／worker 下指令＝两步（**评论不等于送达**）
 
-**引擎不因 supervisor 评论生成任何帧。** 帧生成是单向的：
+**投递是不对称的。** 完整矩阵（实测 `event.agent.supervisor` 帧的来源）：
 
 | 评论来源 | 生成帧 | 接收方 |
 |---|---|---|
 | QA 结论 | `event.agent.project_pm` | PM |
-| QA 结论／PM 裁决 | `event.agent.supervisor` | supervisor |
+| QA 结论 | `event.agent.supervisor` | supervisor |
+| **PM 告警（`[告警]` 五段式）** | `event.agent.supervisor` | **supervisor** ✅ |
+| PM 裁决 | `event.agent.supervisor` | supervisor |
 | **supervisor 评论** | **无** | **无人** |
+
+**方向不可逆，这是设计而非缺陷**：
+- **PM → supervisor 自动**：PM 是被调度方，产出走 Issue 评论；需要叫人时发 `[告警]`，引擎自动路由到 supervisor。**不给 PM dispatch 权限**（用户 2026-11-25 令）。
+- **supervisor → PM 需显式 dispatch**：supervisor 是调度方，主动派活是显式操作，不是评论的副作用。
 
 所以你的五段式评论（`派单`／`告警`／`裁决`／`交接要求` 等）**只是留档**，对方不会因此被唤醒。
 
@@ -51,10 +57,15 @@ AT questions 产生 `question_url` 后，你只把链接交给用户。用户打
 
 ```bash
 # ① 留档：五段式评论，写清目标与坐标
-python -m super_agent.issue_cli comment --role supervisor --project <项目>   --project-key <项目> --issue <n> --do 派单 --notify <目标键名>   --session-key <自己的键名> --body-file <文件>
+python -m super_agent.issue_cli comment --role supervisor \
+  --project <项目> --project-key <项目> --issue <n> \
+  --do 派单 --notify <目标键名> \
+  --session-key <自己的键名> --body-file <文件>
 
 # ② 送达：dispatch 唤醒目标会话
-python -m super_agent.dispatch_cli --session <目标 sid> --detach --no-activate   --timeout 300 --task "<短令，指向①的 cid 与 Issue>"
+python -m super_agent.dispatch_cli --session <目标 sid> \
+  --detach --no-activate --timeout 300 \
+  --task "<短令，指向①的 cid 与 Issue>"
 ```
 
 **判据（缺一不算送达）**：
