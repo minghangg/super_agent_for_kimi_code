@@ -496,8 +496,33 @@ def _live_issue_numbers(repo: str, **kw) -> list[int]:
 
 
 def _has_qa_comment(repo: str, issue: int, **kw) -> bool:
+    """True when a QA conclusion exists, in either of the two legal shapes.
+
+    Two shapes are legal and both appear in history:
+
+    1. **Five-part header** (``session_contract.md`` §6, the current rule):
+       ``[qa-<key>]-[完工|退回]-[notify]-[project]-[cid] [QA] 结论：…``.
+       Here ``[QA]`` sits on the header line but is not the first token.
+    2. **Bare marker** (the older rule): the body starts with ``[QA]``.
+
+    Checking only shape 2 made every QA conclusion written under the current
+    contract invisible to ``close``, so a correctly reviewed issue could not be
+    closed (#129, 2026-11-25). The fix accepts the marker anywhere on the first
+    non-empty line; it still does not accept a mention buried in prose, because
+    only the first line is examined.
+    """
     rows = _call("GET", f"/repos/{repo}/issues/{issue}/comments?per_page=100", **kw)
-    return any(str(r.get("body", "")).lstrip().startswith("[QA]") for r in _rows(rows))
+    for row in _rows(rows):
+        first = ""
+        for line in str(row.get("body", "")).splitlines():
+            if line.strip():
+                first = line.lstrip()
+                break
+        if not first:
+            continue
+        if "[QA]" in first:
+            return True
+    return False
 
 
 # ------------------------------------------------------------------- ledger
