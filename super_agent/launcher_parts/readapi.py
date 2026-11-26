@@ -21,10 +21,18 @@ proves nothing on a machine that lacks it. ``http.server`` is stdlib, so this
 module has **no third-party import at all** - and it is verified by constructing
 and querying a real server, not by reading a heartbeat file (counter-example 6).
 
-Two endpoints, both GET, both read-only:
+Three endpoints, all GET, all read-only:
 
 * ``GET /healthz`` -> ``{ok, ready, phase, components, failures, ...}``
 * ``GET /sessions`` -> the read-only session list, ``capabilities`` included
+* ``GET /issues`` -> canonical ``owner/repo#N`` keys beside their provider
+
+The third is what gives :class:`~super_agent.launcher_parts.backends.IssueBackend`
+a production caller (ISS-132 QA P1-3). It publishes the key **and** the provider
+side by side, which is the shape the backend exists to enforce: the provider is
+metadata, never part of the key. Without this route the backend was only reached
+by tests, and a module reached only by tests is a module nobody can tell apart
+from a counter-example prop.
 
 No POST, no PUT, no DELETE: a launcher read API that can mutate is a second
 writer, which is the split brain the single-instance lock exists to prevent.
@@ -172,8 +180,11 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/sessions":
             self._send(200, self.server.sessions())
             return
+        if path == "/issues":
+            self._send(200, self.server.issues())
+            return
         self._send(404, {"error": "not found",
-                         "paths": ["/healthz", "/sessions"]})
+                         "paths": ["/healthz", "/sessions", "/issues"]})
 
     def do_HEAD(self):                         # noqa: N802
         if self._refuse_host():
@@ -200,9 +211,10 @@ class ReadApiServer(ThreadingHTTPServer):
     allow_reuse_address = False
     daemon_threads = True
 
-    def __init__(self, address, *, snapshot, sessions=None) -> None:
+    def __init__(self, address, *, snapshot, sessions=None, issues=None) -> None:
         self._snapshot = snapshot
         self._sessions = sessions
+        self._issues = issues
         super().__init__(address, _Handler)
 
     def snapshot(self) -> dict:
@@ -220,8 +232,33 @@ class ReadApiServer(ThreadingHTTPServer):
                 "restore": "unsupported",
                 "sessions": [ref.as_dict() for ref in refs]}
 
+    def issues(self) -> dict:
+        """Canonical keys beside their provider - the ``IssueBackend`` contract.
 
-def serve(*, host: str, port: int, snapshot, sessions=None,
+        ``([] , "why")`` is how the caller says "no issue table in this root"; the
+        route then publishes the reason instead of an empty list, because ``[]``
+        reads as "no issues" and would hide a missing index.
+        """
+        if self._issues is None:
+            return {"provider": "", "issues": [],
+                    "unsupported": ["list"], "reason": "未注入 issue 读取器"}
+        try:
+            rows, reason = self._issues()
+        except Exception as exc:                # noqa: BLE001  a read failure is a field
+            return {"provider": "", "issues": [],
+                    "error": f"{type(exc).__name__}: {exc}"}
+        out = {"provider": "", "capabilities": ["key"],
+               "read": "unsupported", "issues": []}
+        for ref in rows:
+            row = ref.as_dict()
+            out["provider"] = out["provider"] or row["provider"]
+            out["issues"].append(row)
+        if reason:
+            out["reason"] = str(reason)
+        return out
+
+
+def serve(*, host: str, port: int, snapshot, sessions=None, issues=None,
           ready: threading.Event | None = None):
     """Bind now, serve on a daemon thread, return ``(server, thread)``.
 
@@ -230,7 +267,8 @@ def serve(*, host: str, port: int, snapshot, sessions=None,
     joins. The thread is a daemon: a stuck request must not keep the process
     alive past its stop budget.
     """
-    server = ReadApiServer((host, int(port)), snapshot=snapshot, sessions=sessions)
+    server = ReadApiServer((host, int(port)), snapshot=snapshot, sessions=sessions,
+                           issues=issues)
     thread = threading.Thread(target=server.serve_forever, name="readapi",
                               daemon=True)
     thread.start()

@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -639,3 +640,369 @@ class TestAtServiceIsBoundToThisRoot(Base):
 
         off = dict(engine={"at_service": "off"})
         self.assertEqual(components.build_at_service(off, self.store)[0], None)
+
+
+# ------------------------------------------------------- C2 leg: the four guards
+class TestC2LegKeepsTheLoopGuards(Base):
+    """The four guards ``decide_watch._loop`` has, each measured on a real round.
+
+    QA cid 7183374306 returned the delivery for exactly this: the tick copied the
+    consumption **order** and dropped the guards, and every dropped guard turns a
+    visible fault into a silent one.
+
+    * the supervisor probe never runs -> nobody learns the supervisor is dead;
+    * no own heartbeat -> the built-in guardian reports ``missing`` forever;
+    * no liveness gate -> the patrol runs once per long poll, not per interval;
+    * the ``supervisor`` override never reaches the patrol -> rescue is impossible.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(self._restore)
+        self.beats = []
+        self.probes = []
+
+    def _restore(self):
+        from super_agent import decide_watch as dw
+
+        dw.configure(dw.DecideWatchConfig())
+
+    def _configure(self, *, liveness_interval=60.0):
+        from super_agent import decide_watch as dw
+
+        class Bus:
+            PORT = 58800
+
+            def bus_get(self, path, timeout=0, port=0):
+                return {"events": [], "next_seq": 1, "seq": 1,
+                        "oldest_seq": 1, "boot_id": "b1"}
+
+            def bus_health(self, port=0):
+                return {"boot_id": "b1", "seq": 1}
+
+            def bus_post(self, path, body, port=0):
+                return {"ok": True}
+
+            def guardian_thresholds(self):
+                return {"decide_watch": ("heartbeat/decide.json", 900.0, "主循环"),
+                        "delivery_watch": ("heartbeat/delivery.json", 900.0, "收单哨"),
+                        "supervisor_notice": ("heartbeat/supervisor_notice.json",
+                                              900.0, "投递哨")}
+
+        self.bus = Bus()
+        (self.state / "sessions.json").write_text(
+            json.dumps({"supervisor": {"id": "session_sup"}}), encoding="utf-8")
+        (self.state / "issue_sessions.json").write_text("{}", encoding="utf-8")
+        (self.state / "ledger.jsonl").write_text("", encoding="utf-8")
+        (self.state / "supervisor_health_state.json").write_text(
+            json.dumps({"state": "ok", "ts": 0}), encoding="utf-8")
+        (self.state / "decide_watch_cursor.json").write_text(
+            json.dumps({"seq": 0, "boot_id": "b1"}), encoding="utf-8")
+        dw.configure(dw.DecideWatchConfig(
+            state_root=self.state,
+            workspace_root=self.state,
+            event_source=self.bus,
+            heartbeat=lambda name, extra: self.beats.append(name),
+            inject_event=lambda path, body, port=0: None,
+            ps_json=lambda script, timeout=60.0: (0, {}, ""),
+            windowless_python=lambda: (sys.executable, ""),
+            probe_session=lambda sid: self.probes.append(sid) or (
+                True, {"sid": "session_sup", "archived": False}),
+            send_transport=lambda sid, text, timeout=60.0: None,
+            liveness={"enabled": True, "rounds": 2,
+                      "interval_s": float(liveness_interval)},
+            liveness_state_path=self.state / "worker_liveness_state.json",
+            sessions_path=self.state / "sessions.json",
+            bind_path=self.state / "issue_sessions.json",
+            ledger_path=self.state / "ledger.jsonl",
+            cursor_path=self.state / "decide_watch_cursor.json",
+            lock_path=self.state / "decide_watch.lock",
+            delivery_state_path=self.state / "delivery_watch_state.json",
+            delivery_stats_path=self.state / "delivery_watch_stats.jsonl",
+            delivery_log_path=self.state / "delivery_watch.log",
+            undelivered_path=self.state / "delivery_undelivered.log",
+            health_state_path=self.state / "supervisor_health_state.json",
+            log_path=self.state / "decision_watch.log",
+            supervisor_key="supervisor"))
+
+    def leg(self, **kwargs):
+        from super_agent import decide_watch as dw
+        from super_agent.launcher_parts.c2 import C2Leg
+
+        # The rig passes the boundary it configured. Without that seam the leg
+        # re-derives one per round and discards the rig's injections - the same
+        # mechanism that made the first delivery's guards untestable.
+        return C2Leg({"engine": {"decide_watch_wait_s": 0.0}}, self.store,
+                     bus=self.bus, decide_watch_config=dw._cfg(),
+                     wait_override=0.0, **kwargs)
+
+    def test_guard_1_supervisor_health_is_probed_every_round(self):
+        """P0-1: a dead supervisor key must be noticed by the leg, not only by ``_loop``."""
+        from super_agent import decide_watch as dw
+
+        self._configure()
+        calls = []
+        original = dw.check_supervisor_health
+        dw.check_supervisor_health = lambda port=0: calls.append(port) or {}
+        try:
+            self.leg()()
+        finally:
+            dw.check_supervisor_health = original
+        self.assertEqual(len(calls), 1, "C2 腿没有探测 supervisor 键死活")
+
+    def test_guard_2_own_heartbeat_is_written_every_round(self):
+        """P0-2: ``decide_watch`` is a built-in guardian; no beat = permanent ``missing``."""
+        self._configure()
+        self.leg()()
+        self.assertIn("decide_watch", self.beats,
+                      "C2 腿没写自身进程心跳，guardian 会持续报 missing")
+
+    def test_guard_3_liveness_patrol_is_interval_gated(self):
+        """P0-3: rounds are long polls, so counting rounds multiplies the patrol."""
+        from super_agent import decide_watch as dw
+
+        self._configure(liveness_interval=60.0)
+        calls = []
+        original = dw.worker_liveness_tick
+        dw.worker_liveness_tick = lambda **kw: calls.append(kw) or 0
+        try:
+            leg = self.leg()
+            for _ in range(3):
+                leg()
+        finally:
+            dw.worker_liveness_tick = original
+        self.assertEqual(len(calls), 1,
+                         f"3 轮跑了 {len(calls)} 次巡检，间隔门控失效")
+
+    def test_guard_4_supervisor_override_reaches_the_patrol(self):
+        """P0-3b: ``--supervisor`` must reach the patrol, or rescue is impossible."""
+        from super_agent import decide_watch as dw
+
+        self._configure()
+        calls = []
+        original = dw.worker_liveness_tick
+        dw.worker_liveness_tick = lambda **kw: calls.append(kw) or 0
+        try:
+            self.leg(supervisor="session_rescue")()
+        finally:
+            dw.worker_liveness_tick = original
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].get("supervisor"), "session_rescue",
+                         "supervisor 参数没有传到活性巡检")
+
+    def test_one_leg_instance_shares_state_across_rounds(self):
+        """The gate only works if the instance survives between calls."""
+        from super_agent import decide_watch as dw
+
+        self._configure(liveness_interval=3600.0)
+        calls = []
+        original = dw.worker_liveness_tick
+        dw.worker_liveness_tick = lambda **kw: calls.append(kw) or 0
+        try:
+            leg = self.leg()
+            leg()
+            before = leg.liveness_next
+            leg()
+            self.assertEqual(len(calls), 1)
+            self.assertGreater(before, 0.0)
+            self.assertEqual(leg.liveness_next, before, "第二轮改动了门控时间")
+        finally:
+            dw.worker_liveness_tick = original
+
+
+class TestC2FailureHandling(Base):
+    """P1-1 and P1-2: eviction rescans, and an unreachable daemon backs off."""
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        from super_agent import decide_watch as dw
+
+        dw.configure(dw.DecideWatchConfig())
+
+    def _configure(self, bus):
+        from super_agent import decide_watch as dw
+
+        (self.state / "supervisor_health_state.json").write_text(
+            json.dumps({"state": "ok", "ts": 0}), encoding="utf-8")
+        (self.state / "sessions.json").write_text("{}", encoding="utf-8")
+        (self.state / "issue_sessions.json").write_text("{}", encoding="utf-8")
+        (self.state / "ledger.jsonl").write_text("", encoding="utf-8")
+        (self.state / "decide_watch_cursor.json").write_text(
+            json.dumps({"seq": 10, "boot_id": "b1"}), encoding="utf-8")
+        dw.configure(dw.DecideWatchConfig(
+            state_root=self.state, workspace_root=self.state, event_source=bus,
+            heartbeat=lambda name, extra: None,
+            inject_event=lambda path, body, port=0: None,
+            ps_json=lambda script, timeout=60.0: (0, {}, ""),
+            windowless_python=lambda: (sys.executable, ""),
+            probe_session=lambda sid: (True, {"sid": "s", "archived": False}),
+            send_transport=lambda sid, text, timeout=60.0: None,
+            liveness={"enabled": False, "rounds": 2, "interval_s": 60.0},
+            sessions_path=self.state / "sessions.json",
+            bind_path=self.state / "issue_sessions.json",
+            ledger_path=self.state / "ledger.jsonl",
+            cursor_path=self.state / "decide_watch_cursor.json",
+            lock_path=self.state / "decide_watch.lock",
+            delivery_state_path=self.state / "delivery_watch_state.json",
+            delivery_stats_path=self.state / "delivery_watch_stats.jsonl",
+            delivery_log_path=self.state / "delivery_watch.log",
+            undelivered_path=self.state / "delivery_undelivered.log",
+            health_state_path=self.state / "supervisor_health_state.json",
+            log_path=self.state / "decision_watch.log",
+            supervisor_key="supervisor"))
+
+    def test_evicted_cursor_triggers_a_rescan_and_a_log_line(self):
+        """P1-1: ``since + 1 < oldest_seq`` means rows were evicted. Say so, rescan."""
+        from super_agent.launcher_parts.c2 import C2Leg
+
+        class Bus:
+            PORT = 58800
+
+            def bus_get(self, path, timeout=0, port=0):
+                return {"events": [], "next_seq": 105, "seq": 104,
+                        "oldest_seq": 104, "boot_id": "b1"}
+
+            def bus_health(self, port=0):
+                return {"boot_id": "b1", "seq": 104}
+
+            def bus_post(self, path, body, port=0):
+                return {}
+
+            def guardian_thresholds(self):
+                return {"decide_watch": ("heartbeat/decide.json", 900.0, "x"),
+                        "delivery_watch": ("heartbeat/delivery.json", 900.0, "y"),
+                        "supervisor_notice": ("heartbeat/notice.json", 900.0, "z")}
+
+        from super_agent import decide_watch as dw
+
+        bus = Bus()
+        self._configure(bus)
+        out = C2Leg({"engine": {}}, self.store, bus=bus,
+                    decide_watch_config=dw._cfg(), wait_override=0.0)()
+        self.assertEqual(out.get("rescan"), "evicted", out)
+        self.assertEqual(out.get("since"), 0)
+        log_text = (self.state / "decision_watch.log").read_text(encoding="utf-8")
+        self.assertIn("早于环形缓冲起点", log_text, "淘汰没有留下任何痕迹")
+
+    def test_unreachable_daemon_backs_off_instead_of_raising(self):
+        """P1-2: a daemon blip is the daemon's fault, not a permanent leg error."""
+        from super_agent.launcher_parts.c2 import C2Leg
+
+        class Down:
+            PORT = 58800
+
+            def bus_get(self, path, timeout=0, port=0):
+                raise OSError("daemon unreachable")
+
+            def bus_health(self, port=0):
+                raise OSError("daemon unreachable")
+
+            def bus_post(self, path, body, port=0):
+                raise OSError("daemon unreachable")
+
+            def guardian_thresholds(self):
+                return {"decide_watch": ("heartbeat/decide.json", 900.0, "x"),
+                        "delivery_watch": ("heartbeat/delivery.json", 900.0, "y"),
+                        "supervisor_notice": ("heartbeat/notice.json", 900.0, "z")}
+
+        from super_agent import decide_watch as dw
+
+        down = Down()
+        self._configure(down)
+        leg = C2Leg({"engine": {}}, self.store, bus=down,
+                    decide_watch_config=dw._cfg(), wait_override=0.0)
+        first = leg()
+        self.assertTrue(first.get("unreachable"), first)
+        self.assertEqual(first.get("backoff_s"), 1.0)
+        second = leg()
+        self.assertEqual(second.get("backoff_s"), 2.0, "退避没有翻倍")
+
+
+class TestIssueBackendHasAProductionCaller(Base):
+    """P1-3: ``IssueBackend`` was reachable only from tests; now ``GET /issues``."""
+
+    def test_issues_route_publishes_canonical_keys(self):
+        (self.state / "index.json").write_text(json.dumps({
+            "issues": {"Owner/Demo#7": {}, "other/r#2": {}}}), encoding="utf-8")
+        from super_agent.launcher_parts import host
+
+        refs, reason = host._issue_reader({"github": {"repo": "x/y"}}, self.store)
+        self.assertEqual(reason, "")
+        self.assertEqual([ref.key for ref in refs], ["other/r#2", "owner/demo#7"])
+        self.assertTrue(all(ref.provider == "github" for ref in refs))
+
+    def test_issues_route_reports_why_it_is_empty(self):
+        from super_agent.launcher_parts import host
+
+        refs, reason = host._issue_reader({"github": {}}, self.store)
+        self.assertEqual(refs, [])
+        self.assertTrue(reason, "空列表读成「没有问题单」，与别处的静默零同类")
+
+    def test_issues_route_over_real_http(self):
+        (self.state / "index.json").write_text(json.dumps({
+            "issues": {"owner/demo#7": {}}}), encoding="utf-8")
+        from super_agent.launcher_parts import host, readapi
+
+        port = free_port()
+        refs, _reason = host._issue_reader({"github": {}}, self.store)
+        server, thread = readapi.serve(
+            host="127.0.0.1", port=port,
+            snapshot=lambda: {"running": True, "components": {}},
+            issues=lambda: (refs, ""))
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/issues",
+                                        timeout=5) as response:
+                payload = json.loads(response.read())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+        self.assertEqual(payload["issues"][0]["key"], "owner/demo#7")
+        self.assertEqual(payload["read"], "unsupported")
+
+
+class TestReporterLegFollowsTheConfig(Base):
+    """P1-4: the resident page must not silently override ``github.source``."""
+
+    def page(self, cfg) -> str:
+        from super_agent.launcher_parts import reporter_leg
+
+        (self.state / "index.json").write_text(json.dumps({"issues": {
+            "owner/demo#7": {"needs_person": [
+                {"comment_id": 11, "reason": "x", "at": 1700000000.0}]}}}),
+            encoding="utf-8")
+        return reporter_leg.render_reporter_page(cfg, self.store).read_text(
+            encoding="utf-8")
+
+    def test_none_names_the_real_reason_not_no_quotes(self):
+        text = self.page({"github": {"source": "none"}, "role": "supervisor"})
+        self.assertNotIn("--no-quotes", text,
+                         "常驻腿没有这个开关，却把「没联网」说成用户指定")
+        self.assertIn("github.source=none", text)
+
+    def test_a_broken_source_reports_its_own_error(self):
+        text = self.page({"github": {"source": "fixture",
+                                     "fixture": str(self.root / "nope.json")},
+                          "role": "supervisor"})
+        self.assertIn("数据源不可用", text)
+        self.assertIn("nope.json", text, "真实原因被吞成了空泛说明")
+        self.assertNotIn("--no-quotes", text)
+
+    def test_live_config_really_builds_a_live_source(self):
+        from super_agent import github_source
+
+        built = github_source.build({"github": {"source": "live",
+                                                "repo": "owner/demo"}})
+        self.assertNotIsInstance(built, github_source.NullSource,
+                                 "github.source=live 被无声覆盖成离线")
+
+    def test_pages_differ_between_none_and_a_broken_fixture(self):
+        offline = self.page({"github": {"source": "none"}, "role": "supervisor"})
+        broken = self.page({"github": {"source": "fixture",
+                                       "fixture": str(self.root / "nope.json")},
+                            "role": "supervisor"})
+        self.assertNotEqual(offline, broken,
+                            "两种数据源配置产出同一页面：配置被覆盖了")

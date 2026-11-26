@@ -31,9 +31,18 @@ async def _null_service(stop_event) -> None:
     await stop_event.wait()
 
 
-def register_c2(cfg, store, rn, *, runner_mod, bus, interval, budget, enable) -> None:
-    """The decide_watch consumer leg, or a disabled row naming what is missing."""
+def register_c2(cfg, store, rn, *, runner_mod, bus, interval, budget, enable,
+                supervisor=None) -> None:
+    """The decide_watch consumer leg, or a disabled row naming what is missing.
+
+    A **single** :class:`launcher_parts.c2.C2Leg` is registered, not a fresh
+    closure: the backoff and the liveness clock live on the instance and only mean
+    anything across rounds. Building a new one per call - which the previous
+    ``lambda`` did - reset both every round, which is how the liveness interval
+    gate and the backoff stopped existing without anything going red.
+    """
     from . import components as parts
+    from .c2 import C2Leg
 
     if enable is False:
         row = rn.register("decide_watch", _null_body, kind=runner_mod.THREAD,
@@ -49,8 +58,9 @@ def register_c2(cfg, store, rn, *, runner_mod, bus, interval, budget, enable) ->
                           interval=interval, budget=budget, enabled=False)
         row.health.last_error = f"未注入 {', '.join(missing)}"
         return
-    rn.register("decide_watch", lambda: parts.decide_watch_tick(cfg, store, bus=bus),
-                kind=runner_mod.THREAD, interval=interval, budget=budget)
+    leg = C2Leg(cfg, store, bus=bus, supervisor=supervisor)
+    rn.register("decide_watch", leg, kind=runner_mod.THREAD,
+                interval=interval, budget=budget)
 
 
 def register_at(cfg, store, rn, *, runner_mod, budget, enable, transport) -> None:
@@ -105,9 +115,10 @@ def register_readapi(cfg, store, rn, *, runner_mod, budget, enable,
         from . import backends
 
         sessions = backends.KimiSessionBackend.for_root(store.root)
+        issues = _issue_reader(cfg, store)
         server, _thread = await asyncio.to_thread(
             readapi.serve, host=host, port=port,
-            snapshot=get_health, sessions=sessions.list)
+            snapshot=get_health, sessions=sessions.list, issues=issues)
         if keep is not None:
             keep["readapi"] = server
         try:
@@ -117,3 +128,39 @@ def register_readapi(cfg, store, rn, *, runner_mod, budget, enable,
             await asyncio.to_thread(server.server_close)
 
     rn.register("readapi", readapi_body, kind=runner_mod.SERVICE, budget=budget)
+
+
+def _issue_reader(cfg, store):
+    """``(refs, reason)`` for ``GET /issues`` - the ``IssueBackend`` production caller.
+
+    The keys come from ``index.json``, which is the only place this repository
+    already stores an issue identity, and each one is turned into an
+    :class:`~super_agent.launcher_parts.backends.IssueRef` by the backend. That is
+    the whole point of routing through the backend instead of echoing the key: the
+    provider is attached **beside** the canonical ``owner/repo#N`` here, so a
+    second provider could never change a key that every cursor is keyed on.
+
+    A missing or unreadable index returns a **reason**, not ``[]``: an empty list
+    reads as "no issues", which is the same silent-zero this repository refuses
+    everywhere else.
+    """
+    from . import backends
+
+    try:
+        index = store.load_index()
+    except Exception as exc:                      # noqa: BLE001  a read failure is a field
+        return [], f"index.json 读取失败：{type(exc).__name__}: {exc}"
+    repo = str((cfg.get("github") or {}).get("repo") or "")
+    backend = backends.issue_backend("github")
+    refs = []
+    for key in (index.get("issues") or {}):
+        name, number = str(key).rsplit("#", 1) if "#" in str(key) else ("", str(key))
+        refs.append(backend.ref(name or repo, number))
+    if not refs:
+        return [], "index.json 里没有 issue"
+    # Sorted **after** normalisation, not before: the raw keys sort by case
+    # (``Owner/...`` before ``other/...``), so sorting the source dict would put a
+    # canonical ``owner/...`` row in the wrong place. The page order is stability
+    # for a human, and canonical order is the only one that does not move when a
+    # repo name changes case in one file.
+    return sorted(refs, key=lambda ref: ref.key), ""
