@@ -1,4 +1,8 @@
-"""Audit a launcher/legacy switch snapshot before declaring it complete."""
+"""Audit a launcher/legacy switch snapshot before declaring it complete.
+
+Port values are snapshot claims, not an ownership probe; a foreign process on a
+port must be rejected by the PowerShell preflight, not inferred from this JSON.
+"""
 from __future__ import annotations
 
 import argparse
@@ -28,13 +32,19 @@ def process_role(command: str) -> str:
 
 def audit(snapshot: dict, expected: str) -> list[str]:
     roles = []
-    for row in snapshot.get("processes") or []:
-        role = str(row.get("role") or process_role(row.get("command") or ""))
-        if role:
-            roles.append((role, int(row.get("pid") or 0)))
     errors = []
-    counts = {role: sum(1 for item, _pid in roles if item == role)
-              for role in {item for item, _pid in roles}}
+    for row in snapshot.get("processes") or []:
+        command = str(row.get("command") or "")
+        role = process_role(command)
+        declared = str(row.get("role") or "")
+        if declared and declared != role:
+            errors.append(f"role field disagrees with command: {declared} != {role or 'unknown'}")
+        if role:
+            roles.append((role, int(row.get("pid") or 0), command))
+        if role and "pythonw" not in command.lower():
+            errors.append(f"console window risk: {role} is not pythonw")
+    counts = {role: sum(1 for item, _pid, _cmd in roles if item == role)
+              for role in {item for item, _pid, _cmd in roles}}
     for role, count in sorted(counts.items()):
         if count != 1:
             errors.append(f"duplicate daemon: {role} count={count}")
@@ -51,7 +61,7 @@ def audit(snapshot: dict, expected: str) -> list[str]:
         enabled = [name for name, on in tasks.items() if on]
         if enabled != [LAUNCHER_TASK]:
             errors.append(f"launcher task set must be [{LAUNCHER_TASK}], got {enabled}")
-        launcher_pid = next((pid for role, pid in roles if role == "launcher"), 0)
+        launcher_pid = next((pid for role, pid, _cmd in roles if role == "launcher"), 0)
         if not lock_pid or lock_pid != launcher_pid:
             errors.append(f"engine lock does not belong to launcher: {lock_pid}")
     elif expected == "legacy":
@@ -63,7 +73,7 @@ def audit(snapshot: dict, expected: str) -> list[str]:
         enabled = sorted(name for name, on in tasks.items() if on)
         if enabled != sorted(LEGACY_TASKS):
             errors.append(f"legacy task set must be {sorted(LEGACY_TASKS)}, got {enabled}")
-        engine_pid = next((pid for role, pid in roles if role == "engine"), 0)
+        engine_pid = next((pid for role, pid, _cmd in roles if role == "engine"), 0)
         if not lock_pid or lock_pid != engine_pid:
             errors.append(f"engine lock does not belong to legacy engine: {lock_pid}")
     else:

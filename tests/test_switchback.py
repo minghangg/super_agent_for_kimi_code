@@ -53,6 +53,25 @@ class SwitchAudit(unittest.TestCase):
         data = self.snapshot(["launcher"], ["KimiSafkcLauncher"], 999)
         self.assertTrue(any("lock" in error for error in
                             switchback.audit(data, "launcher")))
+    def test_python_exe_launcher_is_a_console_window_failure(self):
+        data = self.snapshot(["launcher"], ["KimiSafkcLauncher"], 100)
+        data["processes"][0]["command"] = "python.exe -m super_agent.launcher run"
+        self.assertTrue(any("console window" in error for error in
+                            switchback.audit(data, "launcher")))
+
+    def test_declared_role_cannot_hide_the_real_command(self):
+        data = self.snapshot(["launcher"], ["KimiSafkcLauncher"], 100)
+        data["processes"][0] = {"pid": 100, "role": "launcher",
+                                "command": "pythonw -m super_agent.cli run"}
+        errors = switchback.audit(data, "launcher")
+        self.assertTrue(any("disagrees" in error for error in errors))
+        self.assertIn("old writer still running: engine", errors)
+    def test_blank_command_cannot_be_promoted_by_a_declared_role(self):
+        data = self.snapshot(["launcher"], ["KimiSafkcLauncher"], 100)
+        data["processes"][0] = {"pid": 100, "role": "launcher", "command": ""}
+        errors = switchback.audit(data, "launcher")
+        self.assertIn("expected exactly one launcher process", errors)
+        self.assertTrue(any("disagrees" in error for error in errors))
 
 
 if __name__ == "__main__":
