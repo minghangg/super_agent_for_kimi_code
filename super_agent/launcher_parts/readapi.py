@@ -53,8 +53,10 @@ COMPONENT_FIELDS = ("enabled", "running", "kind", "started", "last_started_at",
 #: Published **only when the row carries it**. A recipient is a property of the
 #: one leg that resolves one, so a whitelist-wide ``null`` would claim the other
 #: components have a recipient field at all (ISS-136 §三 甲: the rescue override
-#: must be visible on ``/healthz``).
-OPTIONAL_COMPONENT_FIELDS = ("supervisor",)
+#: must be visible on ``/healthz``). ``heartbeat_problem`` follows the same rule
+#: (#138): only the ``decide_watch`` leg has a supervisor-notice heartbeat, and an
+#: empty string on every other row would claim they all have one.
+OPTIONAL_COMPONENT_FIELDS = ("supervisor", "heartbeat_problem")
 
 #: Top-level fields. ``failures`` is derived, never a stored dict.
 TOP_FIELDS = ("pid", "running", "phase", "started_at", "stalled")

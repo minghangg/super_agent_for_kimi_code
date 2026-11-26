@@ -71,6 +71,11 @@ def register_c2(cfg, store, rn, *, runner_mod, bus, interval, budget, enable,
     row = rn.register("decide_watch", leg, kind=runner_mod.THREAD,
                       interval=interval, budget=budget)
     row.health.supervisor = _supervisor_label(supervisor)
+    # The leg only learns about an unregistered heartbeat on its first round, so
+    # it is handed its own row and writes the reason there itself (#138). The
+    # alternative - guessing here - would mean re-deriving the registry lookup in
+    # a second place, which is how the two answers start to disagree.
+    leg.health_row = row.health
 
 
 def _supervisor_label(supervisor) -> str:

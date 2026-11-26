@@ -54,6 +54,11 @@ class ComponentHealth:
     #: ``decide_watch`` leg today). Absent - not empty - for every other row:
     #: ``""`` would read as "no recipient", which is a different and false story.
     supervisor: str = ""
+    #: Why this leg's ``supervisor_notice`` heartbeat is unregistered, or ``""``.
+    #: Present only on a row that carries one (#138), for the same reason as
+    #: ``supervisor``: the leg stays healthy, so this cannot go in ``last_error``,
+    #: yet the missing heartbeat must not be silent.
+    heartbeat_problem: str = ""
 
     def as_dict(self) -> dict:
         row = {"enabled": bool(self.enabled), "running": bool(self.running),
@@ -65,6 +70,8 @@ class ComponentHealth:
                "stalled": bool(self.stalled), "runs": int(self.runs)}
         if self.supervisor:
             row["supervisor"] = self.supervisor
+        if self.heartbeat_problem:
+            row["heartbeat_problem"] = self.heartbeat_problem
         return row
 
 

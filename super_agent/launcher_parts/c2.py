@@ -113,10 +113,38 @@ class C2Leg:
         self.liveness_next = 0.0          # first round patrols immediately
         self.backoff = 1.0
         self._prepared = False
+        #: One WARN per process, not one per round: the leg runs every interval,
+        #: and a registration gap is a standing condition, not an event.
+        self._registration_warned = False
+        #: Why the ``supervisor_notice`` heartbeat is unregistered, or ``""`` when
+        #: it is. Kept **beside** ``last_error`` on purpose (#138): the leg is
+        #: healthy and must read ``last_error=""``, while the missing heartbeat
+        #: must still be visible. One field cannot carry both stories.
+        self.heartbeat_problem = ""
+        #: The host's health row for this leg, set by ``register_c2``. ``None``
+        #: when the leg is built directly (tests, or the legacy one-shot path),
+        #: in which case the reason still reaches ``delivery_log`` and the patrol.
+        self.health_row = None
 
     # ------------------------------------------------------------------ setup
     def prepare(self) -> tuple[float, int]:
-        """Configure the module and return ``(wait, port)``. Idempotent."""
+        """Configure the module and return ``(wait, port)``. Idempotent.
+
+        The two startup assertions are **not** treated alike (#138, ruling
+        ``7199016601``):
+
+        * ``gate_check()`` is the fixture gate - a wrong config must not send, so
+          it still refuses;
+        * ``notice_registration_problem()`` is about a **missing heartbeat name**,
+          and refusing on it took the whole collection leg down. Measured on the
+          live launcher: ``runs`` 134 → 135 with ``running=false`` and
+          ``last_error`` repeating "refused to run" every round, so
+          ``delivery_tick()`` never executed once. A missing heartbeat makes one
+          leg invisible to the watchdog; killing the leg makes the feature stop.
+          The lighter fault wins: WARN and continue, and the name is registered
+          for the patrol (see :func:`_ensure_heartbeat_visible`) so ``/healthz``
+          still reports it ``missing`` instead of dropping it.
+        """
         from .. import decide_watch as dw
 
         if self._config is not None:
@@ -130,11 +158,50 @@ class C2Leg:
                 wait=self.wait_override)
             self._resolved_port = resolved_port
         dw.configure(config_obj)
-        refused = dw.gate_check() or dw.notice_registration_problem()
+        refused = dw.gate_check()
         if refused:
             raise RuntimeError(f"decide_watch refused to run: {refused}")
+        unregistered = dw.notice_registration_problem()
+        if unregistered:
+            self._ensure_heartbeat_visible(dw, unregistered)
         self._prepared = True
         return waits, resolved_port
+
+    def _ensure_heartbeat_visible(self, dw, problem: str) -> None:
+        """WARN once, and keep the unregistered name visible on **both** surfaces.
+
+        Three halves, all required by the ruling (``7199016601`` §2.2):
+
+        * **the WARN** goes to ``delivery_log`` - it names the missing heartbeat
+          and the file to register it in, so an operator has the fix in hand;
+        * **the patrol's view** (``wss_bus`` ``/healthz.guardians``): with the name
+          absent from the registry, ``write_heartbeat`` returns early and the
+          patrol never iterates it, so it would not be listed at all - the silent
+          disappearance the original refusal existed to prevent. Registering the
+          name makes the patrol read a file nobody writes and report
+          ``state="missing"``, which is exactly the truth;
+        * **the host's view** (``runner`` ``/healthz.components.decide_watch``):
+          ``last_error`` must stay **empty** (the leg is healthy - it runs), so
+          the reason cannot live there. :attr:`heartbeat_problem` carries it on
+          the row instead, which is why this is not a silent degrade.
+        """
+        name = dw.SUPERVISOR_NOTICE_HEARTBEAT
+        self.heartbeat_problem = problem
+        if self.health_row is not None:
+            self.health_row.heartbeat_problem = problem
+        if self._registration_warned:
+            return
+        self._registration_warned = True
+        dw.delivery_log(f"WARN 心跳未注册，收单腿继续运行（不再拒绝启动）：{problem}")
+        ensure = getattr(self.bus, "register_guardian", None)
+        if callable(ensure):
+            try:
+                ensure(name, f"heartbeat/{name}.json", 900.0,
+                       "decide_watch 主管投递哨（运行时补注册）")
+            except Exception as exc:      # noqa: BLE001  visibility is best-effort
+                dw.delivery_log(
+                    f"WARN 心跳 {name!r} 补注册失败（{type(exc).__name__}: {exc}）"
+                    f"⇒ /healthz 看不到它缺失")
 
     # ------------------------------------------------------------------- round
     def __call__(self) -> dict:
