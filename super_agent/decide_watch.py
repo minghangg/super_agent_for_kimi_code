@@ -1788,54 +1788,19 @@ EXIT_LOCKED = 2                     # 已有实例在跑（与老址 tools/decid
 DELIVERY_SINK = None                # 自检用：非 None 时只记录不发送（生产恒 None）
 
 # --------------------------------------------------------------------------------------
-# 三道夹具闸（issue #15 第一笔退修 U1）
-#
-# 2026-11-07 14:17 事故：本文件**声称**实现了这三道闸，实际一个都没有（grep 零命中）
-# ⇒ QA 的「隔离跑」根本没隔离，一条【收单】真发进了live supervisor session（wire `turnId=206`）。
-# 教训：**安全闸必须自己能被验**——`delivery_gate_selftest()` 就是那条反向断言。
-#
-# 语义（Q1 结论）：**默认通、显式断**
-#   · 未设任何变量          ⇒ 生产真发（默认通；绝不因为「某个变量没设」而静默）
-#   · DELIVERY_FIXTURE=1    ⇒ 夹具模式：收件人强制换成假 sid，且**必须**同时给 SINK，否则拒绝运行
-#   · DELIVERY_SEND_SINK=p  ⇒ 每条本会发出的消息先写 p（sid/ts/via/正文）
-#   · DELIVERY_ALLOW_SEND=1 ⇒ sink 存在时，只有显式给这个变量才真发；否则只写 sink
-# --------------------------------------------------------------------------------------
-DELIVERY_FAKE_PREFIX = "session_5e55a000-"
+# 三道夹具闸（issue #15 第一笔退修 U1）住在 :mod:`decide_watch_parts.gates`。
+# 2026-11-07 14:17 的事故与「默认通、显式断」的语义见该模块 docstring；名字在这里
+# 保持可调，因为 `main()` 与自检都按名寻址，workbench 也一样。
+from .decide_watch_parts import gates as _gates
+from .decide_watch_parts import state as _state_part
 
-
-def gate_fixture() -> bool:
-    return (os.environ.get("DELIVERY_FIXTURE") or "").strip() == "1"
-
-
-def gate_sink() -> str:
-    return (os.environ.get("DELIVERY_SEND_SINK") or "").strip()
-
-
-def gate_allow_send() -> bool:
-    return (os.environ.get("DELIVERY_ALLOW_SEND") or "").strip() == "1"
-
-
-def gate_check() -> str:
-    """启动即校验；返回错误描述（空串＝可运行）。"""
-    if gate_fixture() and not gate_sink():
-        return ("DELIVERY_FIXTURE=1 但未设 DELIVERY_SEND_SINK —— 夹具而不落 sink 等于白测，"
-                "且会退化成真发。拒绝运行。")
-    return ""
-
-
-def _fake_sid(name: str) -> str:
-    import hashlib
-    h = hashlib.md5(str(name).encode("utf-8")).hexdigest()[:12]
-    return f"{DELIVERY_FAKE_PREFIX}0000-4000-8000-{h}"
-
-
-def gate_rewrite(sid: str, name: str = "") -> str:
-    """夹具模式下把任何 sid 换成假 sid（**不只是 stub 判活**）。"""
-    if not gate_fixture():
-        return sid
-    if sid.startswith(DELIVERY_FAKE_PREFIX):
-        return sid
-    return _fake_sid(name or sid)
+DELIVERY_FAKE_PREFIX = _gates.DELIVERY_FAKE_PREFIX
+gate_fixture = _gates.fixture
+gate_sink = _gates.sink
+gate_allow_send = _gates.allow_send
+gate_check = _gates.check
+_fake_sid = _gates.fake_sid
+gate_rewrite = _gates.rewrite
 
 
 
@@ -1873,72 +1838,32 @@ def _date_of(ts: float) -> str:
 
 
 def _default_state() -> dict:
-    return {
-        "v": 1,
-        "baseline_established": False,
-        # 方案 A（issue #15 V1 补修）：默认 **None** 而非 0。
-        # 旧写法预填 0 ⇒ `"offset" not in st` 恒为假（死代码）⇒ state 只写
-        # `{"baseline_established": true}` 时会**从 0 读、回放全部历史**。
-        # 用 None 才能区分「默认值（从未写过）」与「显式写入的 0（空台账，合法）」。
-        "offset": None,
-        "line_no": 0,
-        "pending_partial": "",
-        "last_partial": "",
-        "seen": {},
-        "last_nudge": {},
-        "day_nudges": {},
-        "breakers": {},
-        "pending": {},
-        "summaries": {},
-        "stats": {},
-        "last_heartbeat": 0.0,
-        "last_pending_check": 0.0,
-        "undelivered_offset": 0,
-    }
+    return _state_part.default()
 
 
 def load_delivery_state() -> dict:
-    st = _default_state()
-    try:
-        raw = json.loads(_delivery_paths()["state"].read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        st["_baseline_reason"] = "no_state"
-        return st
-    except (OSError, ValueError):
-        st["_baseline_reason"] = "bad_json"
-        return st
-    if not isinstance(raw, dict):
-        st["_baseline_reason"] = "bad_json"
-        return st
-    st.update(raw)
-    if raw.get("baseline_established") is not True:
-        st["_baseline_reason"] = "no_flag"
-    elif "undelivered_offset" not in raw:
-        st["_baseline_reason"] = "offset_missing"
-    return st
+    _state_seams()
+    return _state_part.load()
 
 
+# The latch is **this module's**: ``delivery_tick`` reads it and the self-test
+# writes it directly, so its storage stays where its owner reads it.
 _DELIVERY_WRITE_FAILED = False
 
 
-def save_delivery_state(st: dict) -> None:
+def _set_write_failed(value: bool) -> None:
     global _DELIVERY_WRITE_FAILED
-    p = _delivery_state_path()
-    tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        clean = {k: v for k, v in st.items() if not k.startswith("_")}
-        tmp.write_text(json.dumps(clean, ensure_ascii=False, indent=1), encoding="utf-8")
-        os.replace(tmp, p)
-        _DELIVERY_WRITE_FAILED = False
-    except OSError as exc:
-        _DELIVERY_WRITE_FAILED = True
-        delivery_log(f"状态写盘失败（停止后续收单发送；修复后重启）：{exc}")
-    finally:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
+    _DELIVERY_WRITE_FAILED = bool(value)
+
+
+def _state_seams() -> None:
+    _state_part.bind(state_path=_delivery_state_path, log=delivery_log,
+                     set_write_failed=_set_write_failed)
+
+
+def save_delivery_state(st: dict) -> None:
+    _state_seams()
+    _state_part.save(st)
 
 
 def _stats(st: dict, now: float) -> dict:
@@ -3049,116 +2974,48 @@ def _loop(args, port: int, since: int, boot_now: str, backoff: float) -> int:
 
 
 # --------------------------------------------------------------------- 自启（issue #17 项 7）
-# 复用 the injected autostart implementation（994ca72 的 pythonw + 0bc089e 的回读验证）：
-#   · 动作程序必须 `pythonw.exe`（无窗口）；拿不到就降级并**明确告警**，不假装。
-#   · 注册后 `Get-ScheduledTask` 回读 Execute/Arguments/WorkingDirectory，
-#     不符即非零退出（不能只信自己打印的 registered）。
+# 250 lines of scheduler work moved to :mod:`decide_watch_parts.autostart_install`
+# (ISS-132 C2). It shares no state with the three consumer legs, and the workbench
+# resolves these names **on this module**, so the forwarders stay here.
+from .decide_watch_parts import autostart_install as _autostart_install
+
+EXIT_REGISTER_FAILED = _autostart_install.EXIT_REGISTER_FAILED
+EXIT_VERIFY_FAILED = _autostart_install.EXIT_VERIFY_FAILED
+EXIT_UNINSTALL_FAILED = _autostart_install.EXIT_UNINSTALL_FAILED
+EXIT_OK = _autostart_install.EXIT_OK
+EXIT_STARTUP_INSTALL_FAILED = _autostart_install.EXIT_STARTUP_INSTALL_FAILED
+EXIT_STARTUP_UNINSTALL_FAILED = _autostart_install.EXIT_STARTUP_UNINSTALL_FAILED
+
 AUTOSTART_NAME = lambda: _cfg().autostart_name
-EXIT_REGISTER_FAILED = 3      # 注册动作本身失败（多为权限不足，需 UAC）
-EXIT_VERIFY_FAILED = 4        # 注册返回成功但回读校验不通过
-EXIT_UNINSTALL_FAILED = 5     # 卸载后仍能查到任务
-EXIT_OK = 0                    # 成功（issue #18：与 autostart 模块同口径）
-EXIT_STARTUP_INSTALL_FAILED = autostart.EXIT_STARTUP_INSTALL_FAILED   # 10（issue #18，QA18-3：8 让给 --send-mode）
-EXIT_STARTUP_UNINSTALL_FAILED = autostart.EXIT_STARTUP_UNINSTALL_FAILED  # 11
 
 
-def _this_spec() -> autostart.Spec:
-    """本进程的自启定义（startup 后端用；两个后端共用同一份 name/script/workdir）。"""
-    exe, note = _windowless()
-    return autostart.Spec(name=AUTOSTART_NAME(), script=Path(__file__).resolve(),
-                          args=[], workdir=_workspace_root(), execute_note=note)
+def _autostart_seams() -> None:
+    """Hand the parts module this module's four seams, on every entry point."""
+    _autostart_install.bind(config=_cfg, windowless=_windowless,
+                            ps_json=_ps_bridge, module_path=Path(__file__))
+
+
+def _this_spec():
+    _autostart_seams()
+    return _autostart_install._this_spec()
 
 
 def _norm_backend(backend: str) -> str:
-    """归一化后端名；空＝默认 startup（issue #18）。"""
-    b = (backend or "").strip().lower()
-    if not b:
-        return autostart.DEFAULT_BACKEND
-    if b not in autostart.BACKENDS:
-        print(f"[autostart] 未知后端 {backend!r}（可选：{'/'.join(autostart.BACKENDS)}）",
-              file=sys.stderr)
-        return autostart.DEFAULT_BACKEND
-    return b
+    _autostart_seams()
+    return _autostart_install._norm_backend(backend)
 
 
 def startup_install(dry_run: bool = False) -> int:
-    """startup 后端安装（幂等 ＋ 回读校验 ＋ 失败非零）。"""
-    spec = _this_spec()
-    exe, note = _windowless()
-    if note:
-        print(f"[autostart] 警告：{note}", file=sys.stderr)
-    text = autostart.render_vbs(spec, exe)
-    path = spec.startup_file
-    if dry_run:
-        print(f"[autostart] backend=startup（干跑，未落盘）")
-        print(f"  target : {path}")
-        print(f"  encode : UTF-16LE + BOM")
-        print("  content:")
-        for ln in text.splitlines():
-            print("    " + ln)
-        exists = path.is_file()
-        print(f"[autostart] 当前状态：{'已存在' if exists else '未安装'}")
-        return EXIT_OK
-
-    if path.is_file():
-        try:
-            old = autostart.read_vbs(path)
-        except OSError as exc:
-            old = ""
-            print(f"[autostart] 读取现有文件失败（将覆盖）：{exc}", file=sys.stderr)
-        if old == text:
-            print("[autostart] 已安装（内容一致，跳过）")
-            return EXIT_OK
-        print("[autostart] 已安装但内容不一致 ⇒ 覆盖，变更点：")
-        for d in autostart.diff_summary(old, text):
-            print("  " + d)
-
-    try:
-        autostart.write_vbs(path, text)
-    except OSError as exc:
-        print(f"[autostart] 写盘失败：{type(exc).__name__}: {exc}", file=sys.stderr)
-        return EXIT_STARTUP_INSTALL_FAILED
-
-    fails = autostart.verify_vbs(spec, exe)
-    if fails:
-        print("[autostart] 写入后回读校验失败：", file=sys.stderr)
-        for f in fails:
-            print("  x " + f, file=sys.stderr)
-        return EXIT_STARTUP_INSTALL_FAILED
-    print(f"[autostart] 安装成功并已回读验证：{path}")
-    return EXIT_OK
+    _autostart_seams()
+    return _autostart_install.startup_install(dry_run=dry_run)
 
 
 def startup_uninstall(dry_run: bool = False) -> int:
-    """startup 后端卸载（幂等 ＋ 回读查无）。
-
-    QA18-4：`--uninstall-autostart --dry-run` 曾**仍真删**。现在 dry_run
-    只打印将删除的路径，不落盘。
-    """
-    spec = _this_spec()
-    path = spec.startup_file
-    if dry_run:
-        print("[autostart] backend=startup（干跑，不删除）")
-        print(f"  would remove : {path}")
-        print(f"[autostart] 当前状态：{'存在（真跑会删）' if path.is_file() else '不存在（无需删）'}")
-        return EXIT_OK
-    if not path.is_file():
-        print("[autostart] 未安装（文件不存在），无需卸载")
-        return EXIT_OK
-    try:
-        path.unlink()
-    except OSError as exc:
-        print(f"[autostart] 删除失败：{type(exc).__name__}: {exc}", file=sys.stderr)
-        return EXIT_STARTUP_UNINSTALL_FAILED
-    if path.is_file():
-        print(f"[autostart] 卸载后文件仍存在：{path}", file=sys.stderr)
-        return EXIT_STARTUP_UNINSTALL_FAILED
-    print(f"[autostart] 已卸载（回读确认查无）：{path}")
-    return EXIT_OK
+    _autostart_seams()
+    return _autostart_install.startup_uninstall(dry_run=dry_run)
 
 
 def _ps_json(script: str, timeout: float = 60.0):
-    """跑 PowerShell 并把 stdout 解析成 JSON（复用 wss_bus 的实现）。"""
     return _ps_bridge(script, timeout)
 
 
@@ -3167,146 +3024,33 @@ def windowless_python() -> tuple[str, str]:
 
 
 def task_spec() -> dict:
-    """本消费者的计划任务定义（单一来源：注册与回读校验都用它）。"""
-    exe, note = _windowless()
-    cfg = _cfg()
-    script = str(cfg.startup_script or Path(__file__).resolve())
-    return {
-        "name": cfg.autostart_name,
-        "execute": exe,
-        "arguments": '"%s"' % script,
-        "workdir": str(BASE),
-        "script": script,
-        "execute_note": note,
-        "execute_is_windowless": not note,
-    }
+    _autostart_seams()
+    return _autostart_install.task_spec()
 
 
 def query_task():
-    """回读本任务；不存在返回 None。"""
-    ps = (
-        "$ErrorActionPreference='Stop';"
-        "$t = Get-ScheduledTask -TaskName '%s' -ErrorAction SilentlyContinue;"
-        "if (-not $t) { Write-Output 'null'; exit 0 };"
-        "$a = $t.Actions[0];"
-        "$o = [ordered]@{ name=$t.TaskName; state=[string]$t.State;"
-        " execute=$a.Execute; arguments=$a.Arguments; workdir=$a.WorkingDirectory };"
-        "Write-Output ($o | ConvertTo-Json -Compress)"
-    ) % AUTOSTART_NAME()
-    rc, obj, _raw = _ps_json(ps)
-    return obj if rc == 0 and isinstance(obj, dict) else None
+    _autostart_seams()
+    return _autostart_install.query_task()
 
 
 def verify_task(spec: dict) -> list[str]:
-    """校验已注册任务等于 spec；返回失败项（空＝全过）。WorkingDirectory 不可读时降级。"""
-    actual = query_task()
-    if not actual:
-        return ["任务未注册（Get-ScheduledTask 查无）"]
-    fails = []
-    if str(actual.get("execute") or "").strip().lower() != spec["execute"].strip().lower():
-        fails.append("Execute 不符：期望 %r，实际 %r" % (spec["execute"], actual.get("execute")))
-    args = str(actual.get("arguments") or "")
-    if spec["script"] not in args:
-        fails.append("Arguments 缺脚本路径：期望含 %r，实际 %r" % (spec["script"], args))
-    wd = actual.get("workdir")
-    if wd is None or str(wd).strip() == "":
-        fails.append("__workdir_unverifiable__")
-    elif str(wd).strip().lower() != spec["workdir"].strip().lower():
-        fails.append("WorkingDirectory 不符：期望 %r，实际 %r" % (spec["workdir"], wd))
-    return fails
+    _autostart_seams()
+    return _autostart_install.verify_task(spec)
 
 
 def print_spec(spec: dict) -> None:
-    """干跑输出（第 7 项要求：不注册也要能看清将建什么）。"""
-    print("[autostart] 计划任务定义（干跑，未注册）：")
-    print("  name       : %s" % spec["name"])
-    print("  Execute    : %s" % spec["execute"])
-    print("  Arguments  : %s" % spec["arguments"])
-    print("  WorkingDir : %s" % spec["workdir"])
-    print("  Trigger    : AtLogOn（登录时）")
-    print("  Settings   : AllowStartIfOnBatteries / DontStopIfGoingOnBatteries / Restart×3")
-    if spec.get("execute_note"):
-        print("  ⚠ %s" % spec["execute_note"], file=sys.stderr)
+    _autostart_install.print_spec(spec)
 
 
 def install_autostart(dry_run: bool = False, backend: str = "") -> int:
-    """注册登录自启；`dry_run=True` 只打印定义（不落盘）。
-
-    issue #18：**双后端**。`startup`（默认，零提权，写启动文件夹 `.vbs`）
-    或 `scheduled`（原 UAC 计划任务路径，行为一行不改）。
-    """
-    backend = _norm_backend(backend)
-    if backend == "startup":
-        return startup_install(dry_run=dry_run)
-    spec = task_spec()
-    if spec.get("execute_note"):
-        print("[autostart] 警告：%s" % spec["execute_note"], file=sys.stderr)
-    if dry_run:
-        print_spec(spec)
-        cur = query_task()
-        print("[autostart] 当前注册状态：%s" % ("已存在" if cur else "未注册"))
-        print("[autostart] 真实注册需 UAC 提升权限的终端（由调用方授权），本命令到此为止。")
-        return 0
-
-    ps = (
-        "$ErrorActionPreference='Stop';"
-        "try {"
-        " $a = New-ScheduledTaskAction -Execute '%s' -Argument '%s' -WorkingDirectory '%s';"
-        " $t = New-ScheduledTaskTrigger -AtLogOn;"
-        " $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries"
-        " -DontStopIfGoingOnBatteries -RestartCount 3"
-        " -RestartInterval (New-TimeSpan -Minutes 1);"
-        " Register-ScheduledTask -TaskName '%s' -Action $a -Trigger $t -Settings $s -Force | Out-Null;"
-        " Write-Output '{\"ok\":true}'"
-        "} catch {"
-        " Write-Output ('{\"ok\":false,\"err\":' + (ConvertTo-Json ([string]$_.Exception.Message)) + '}')"
-        "}"
-    ) % (spec["execute"], spec["arguments"], spec["workdir"], spec["name"])
-    rc, obj, raw = _ps_json(ps)
-    if rc != 0 or not isinstance(obj, dict) or not obj.get("ok"):
-        err = (obj or {}).get("err") if isinstance(obj, dict) else raw
-        print("[autostart] 注册失败：%s" % err, file=sys.stderr)
-        if "denied" in str(err).lower():
-            print("[autostart] 提示：注册计划任务需要管理员权限（UAC 由调用方处理）。", file=sys.stderr)
-        return EXIT_REGISTER_FAILED
-
-    fails = verify_task(spec)
-    hard = [f for f in fails if f != "__workdir_unverifiable__"]
-    if hard:
-        print("[autostart] 注册返回成功，但回读校验失败：", file=sys.stderr)
-        for f in hard:
-            print("  x %s" % f, file=sys.stderr)
-        print("[autostart] 请手工清理：schtasks /Delete /TN %s /F" % spec["name"], file=sys.stderr)
-        return EXIT_VERIFY_FAILED
-    actual = query_task() or {}
-    print("[autostart] 注册成功并已回读验证：")
-    for k in ("name", "state", "execute", "arguments", "workdir"):
-        print("  %-11s: %s" % (k, actual.get(k)))
-    return 0
+    _autostart_seams()
+    return _autostart_install.install_autostart(dry_run=dry_run, backend=backend)
 
 
 def uninstall_autostart(backend: str = "", dry_run: bool = False) -> int:
-    """卸载自启（issue #18：双后端；QA18-4 / R2-1：两个后端都支持 dry-run）。"""
-    backend = _norm_backend(backend)
-    if backend == "startup":
-        return startup_uninstall(dry_run=dry_run)
-    # R2-1（QA 二轮）：scheduled 分支此前**没有** dry_run 判断，`--dry-run` 仍会
-    # 执行 `Unregister-ScheduledTask` —— 而目标 the injected task name 是**在役任务**，
-    # 一旦误用等于把正在跑的自启拆掉。干跑必须早退，绝不能走到 _ps_json。
-    if dry_run:
-        print("[autostart] backend=scheduled（干跑，未卸载）："
-              "将执行 Unregister-ScheduledTask -TaskName '%s'" % AUTOSTART_NAME())
-        print("[autostart] 当前注册状态：%s" % ("已存在" if query_task() else "未注册"))
-        return EXIT_OK
-    ps = ("$ErrorActionPreference='Stop';"
-          "Unregister-ScheduledTask -TaskName '%s' -Confirm:$false -ErrorAction SilentlyContinue;"
-          "Write-Output '{}'") % AUTOSTART_NAME()
-    _ps_json(ps)
-    if query_task():
-        print("[autostart] 卸载后仍能查到任务 %s" % AUTOSTART_NAME()(), file=sys.stderr)
-        return EXIT_UNINSTALL_FAILED
-    print("[autostart] 已卸载（回读确认查无）")
-    return 0
+    _autostart_seams()
+    return _autostart_install.uninstall_autostart(backend=backend, dry_run=dry_run)
+
 
 
 # --------------------------------------------------------------------- 自检（issue #15 第一笔，A–O 十五项）

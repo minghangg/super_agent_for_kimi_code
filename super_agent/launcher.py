@@ -80,7 +80,12 @@ def build_wss_service(cfg: dict, store=None):
 
 def build_runner(cfg: dict, store, *, engine=None, bus=None, session_api=None,
                  enable_wss: bool | None = None,
-                 wss_service=None, keep=None) -> runner_mod.Runner:
+                 wss_service=None, keep=None,
+                 enable_decide_watch: bool | None = None,
+                 enable_at: bool | None = None,
+                 enable_reporter: bool | None = None,
+                 enable_readapi: bool | None = None,
+                 at_transport=None) -> runner_mod.Runner:
     """Assemble the component set. Tests pass ``engine`` / ``wss_service``.
 
     ``keep`` is an out-parameter dict: the caller needs the engine object for the
@@ -90,6 +95,18 @@ def build_runner(cfg: dict, store, *, engine=None, bus=None, session_api=None,
     ``enable_wss=None`` means "enable it when it could actually run": the daemon
     needs six injections, and registering a component that can only raise would
     put a permanent red row in every health summary.
+
+    The four legs added by ISS-132 follow the same rule (``None`` = decide from
+    the config), because each one has a failure that must not be silent:
+
+    * ``decide_watch`` refuses to start when its injections are incomplete, so it
+      is registered **disabled with the reason in its row** rather than left out -
+      a missing row reads as "this launcher does not have that leg", which is a
+      different and wrong story;
+    * ``at`` needs a port; a bind failure must be a visible row, not a traceback
+      that takes the host down;
+    * ``reporter`` writes a page into the state dir, which is always possible;
+    * ``readapi`` binds loopback, and a port already held is a refusal to report.
     """
     gh = cfg.get("github") or {}
     try:
@@ -120,7 +137,23 @@ def build_runner(cfg: dict, store, *, engine=None, bus=None, session_api=None,
         row = rn.register("wss", _noop_service, kind=runner_mod.SERVICE,
                           budget=budget, enabled=False)
         row.health.last_error = reason
+
+    from .launcher_parts import host as host_parts
+
+    host_parts.register_c2(cfg, store, rn, runner_mod=runner_mod, bus=bus,
+                           interval=interval, budget=budget,
+                           enable=enable_decide_watch)
+    host_parts.register_at(cfg, store, rn, runner_mod=runner_mod, budget=budget,
+                           enable=enable_at, transport=at_transport)
+    host_parts.register_reporter(cfg, store, rn, runner_mod=runner_mod,
+                                 interval=interval, budget=budget,
+                                 enable=enable_reporter)
+    host_parts.register_readapi(cfg, store, rn, runner_mod=runner_mod,
+                                budget=budget, enable=enable_readapi,
+                                get_health=rn.health, keep=keep)
     return rn
+
+
 
 
 async def _noop_service(stop_event) -> None:
