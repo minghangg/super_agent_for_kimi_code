@@ -48,6 +48,15 @@ class TestThreadIsolation(Base):
     this test's "A answered while B was blocked" assertion goes red the moment
     the isolation is removed. That is the point: the pass condition is a
     *measured* overlap, not the absence of a keyword.
+
+    **A1's C leg is covered here, deliberately not by a test of its own.** C has
+    no independent component: ``source.issues()`` is called from
+    ``run_issue_phase`` on the engine thread, so there is no separate leg to
+    inject a block into. Splitting C into a ``C_loop`` component - and with it a
+    test that injects at ``source.issues`` - belongs to the ticket that shrinks
+    ``engine.py``, per the supervisor's ruling on #124 (cid ``7196929770``) and
+    the scope note on #137: this file's blocking body goes through the same
+    ``to_thread`` boundary, so an inline round still turns this test red.
     """
 
     async def test_blocking_thread_component_does_not_block_the_loop(self):

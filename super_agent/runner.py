@@ -29,13 +29,14 @@ from __future__ import annotations
 
 import asyncio
 
+from .engine_parts import round as round_mod
 from .runner_parts.components import SERVICE, THREAD, Component, now
 
 
 class Runner:
     """Registry plus the one place a component is started, stopped or probed."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, round_source=None) -> None:
         self._components: dict[str, Component] = {}
         self._tasks: dict[str, asyncio.Task] = {}
         self._stop = asyncio.Event()
@@ -43,6 +44,10 @@ class Runner:
         self._phase = "stopped"
         self._stalled: list[str] = []
         self._started_at = ""
+        #: Where the last round's four A2 fields are read from (#137). ``None``
+        #: means "this host has no engine leg", and health then publishes no
+        #: round fields at all - see :func:`engine_parts.round.round_fields`.
+        self._round_source = round_source
 
     # ---------------------------------------------------------------- registry
     def register(self, name: str, body, *, kind: str = THREAD,
@@ -175,7 +180,19 @@ class Runner:
 
     # ----------------------------------------------------------------- health
     def health(self) -> dict:
-        return {
+        """The aggregate snapshot ``/healthz`` publishes.
+
+        ``round_fields`` carries the four fields A2 requires when a round is
+        incomplete (#124 A2, exposed in #137): collection, consumption, the rows
+        left queued, and the threads whose read failed. They come from
+        :func:`super_agent.engine_parts.round.last_round_fields` reading the
+        engine's own last round, so the runner **copies** them rather than
+        deciding them - the round judgement stays in one place.
+
+        Empty before the first round: "no round yet" is not "an incomplete
+        round", and publishing ``False``/``[]`` there would claim one ran.
+        """
+        out = {
             "pid": __import__("os").getpid(),
             "running": bool(self._running),
             "phase": self._phase,
@@ -184,3 +201,5 @@ class Runner:
             "components": {name: comp.health.as_dict()
                            for name, comp in self._components.items()},
         }
+        out.update(round_mod.last_round_fields(self._round_source))
+        return out

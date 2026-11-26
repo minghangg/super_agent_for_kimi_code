@@ -104,6 +104,44 @@ def carry_remaining(round_result: CollectedRound) -> dict:
     return out
 
 
+#: The four fields an incomplete round has to publish (#124 A2, exposed in #137).
+#: Named **once**: the runner copies them onto its health dict and the read API
+#: whitelists them, and two hand-kept tuples is how one side starts publishing a
+#: field the other drops.
+ROUND_FIELDS = ("collection_complete", "consumption_complete", "carry", "failed")
+
+
+def round_fields(round_result) -> dict:
+    """The four fields of one round result, in the shape ``/healthz`` publishes.
+
+    ``{}`` for ``None``: before the first round there is no answer, and filling in
+    ``False``/``[]`` would claim a round ran and came back incomplete - a false
+    story the operator cannot tell apart from a real one.
+
+    ``failed`` is ``round_result.failed``, the field's **real** name: the set of
+    thread keys whose read failed this round. ``summary["errors"]`` is a list of
+    formatted strings for a different reader and is deliberately not used here.
+    """
+    if round_result is None:
+        return {}
+    return {"collection_complete": bool(round_result.collection_complete),
+            "consumption_complete": bool(round_result.consumption_complete),
+            "carry": carry_remaining(round_result),
+            "failed": sorted(str(thread) for thread in round_result.failed)}
+
+
+def last_round_fields(host) -> dict:
+    """``round_fields`` for the round ``host`` ran last; ``{}`` before the first.
+
+    ``_round_state`` is the round's own handle - the same attribute
+    :mod:`super_agent.engine_parts.consume` already reads - so this needs no new
+    state on the engine and no import of the engine class. It stays set after the
+    round returns, which is exactly what "the most recent round" means.
+    """
+    state = getattr(host, "_round_state", None)
+    return round_fields(getattr(state, "round_result", None))
+
+
 @dataclass
 class RoundState:
     """What one round carries between its three phases.

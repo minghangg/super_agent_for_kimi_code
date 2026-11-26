@@ -44,6 +44,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
+from ..engine_parts.round import ROUND_FIELDS
+
 #: Every field ``/healthz`` may publish, per component. Anything else stays home.
 COMPONENT_FIELDS = ("enabled", "running", "kind", "started", "last_started_at",
                     "last_success_at", "last_error", "overrun", "stalled", "runs")
@@ -123,9 +125,18 @@ def health_payload(health: dict, *, failures: list | None = None) -> dict:
     failure signals are the ones that mean something is wrong right now - a
     component switched off (`enabled=false`), a stalled one, a crash
     (`last_error`), or a service that started and returned.
+
+    The four ``ROUND_FIELDS`` are published **as a group, only when the snapshot
+    carries all of them** (#124 A2, #137). ``runner.health()`` fills them from the
+    last round, so they are absent only before the first one - and then "no round
+    yet" must not be spelled ``collection_complete=false``, which reads as a round
+    that ran and failed. Once a round has run they stay, complete or not: the
+    confirmation reading is a value, not an absence.
     """
     snap = health or {}
     out = {name: snap.get(name) for name in TOP_FIELDS}
+    if all(name in snap for name in ROUND_FIELDS):
+        out.update({name: snap[name] for name in ROUND_FIELDS})
     out["ok"] = not (snap.get("stalled") or False)
     components = {}
     bad: list[dict] = []

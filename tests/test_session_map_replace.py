@@ -388,10 +388,19 @@ class Counterexample9BareReaders(_StateDir):
             n = 0
             while not stop.is_set():
                 n += 1
-                session_map_store.write_atomic(
-                    self.sessions,
-                    json.dumps({"a": {"id": FULL_SID}, "b": {"id": FULL_SID},
-                                "n": n}))
+                try:
+                    session_map_store.write_atomic(
+                        self.sessions,
+                        json.dumps({"a": {"id": FULL_SID}, "b": {"id": FULL_SID},
+                                    "n": n}))
+                except session_map_store.BrokerError:
+                    # The reader in this test holds the file open, so on Windows
+                    # the replace is refused (``WinError 5``) - an expected
+                    # branch, not a defect: a refused replace leaves the previous
+                    # file intact, which is the property under test. Uncaught it
+                    # escaped the thread and pytest recorded it as
+                    # ``PytestUnhandledThreadExceptionWarning`` (#137 §2.2).
+                    continue
 
         thread = threading.Thread(target=writer, daemon=True)
         thread.start()
@@ -423,7 +432,16 @@ class Counterexample9BareReaders(_StateDir):
             while not stop.is_set():
                 n += 1
                 payload = dict(big, n=n)
-                session_map_store.write_atomic(self.sessions, json.dumps(payload))
+                try:
+                    session_map_store.write_atomic(self.sessions, json.dumps(payload))
+                except session_map_store.BrokerError:
+                    # The reader below holds the file open, so on Windows the
+                    # replace is refused (``WinError 5``). Expected: a refused
+                    # replace writes nothing, which is what keeps the bare read
+                    # point from ever seeing a half write. Uncaught it escaped
+                    # the thread as ``PytestUnhandledThreadExceptionWarning``
+                    # (#137 §2.2).
+                    continue
 
         thread = threading.Thread(target=writer, daemon=True)
         thread.start()

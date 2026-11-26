@@ -126,7 +126,7 @@ def build_runner(cfg: dict, store, *, engine=None, bus=None, session_api=None,
     if keep is not None:
         keep["engine"] = engine
 
-    rn = runner_mod.Runner()
+    rn = runner_mod.Runner(round_source=engine)
     rn.register("engine", engine.run_once, kind=runner_mod.THREAD,
                 interval=interval, budget=budget)
 
