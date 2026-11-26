@@ -5,13 +5,11 @@ a local event daemon, a session client and a set of fixed runtime files. The
 package port must take all of those as explicit injections, must never silently
 reach production, and must keep the self-test green (30 cases after ISS-83 added 7).
 
-Target interpreters: **3.10 and 3.13**, both green. The import blockers below use
-``find_spec`` (PEP 451, Python 3.4+) and never ``find_module``/``load_module``:
-CPython 3.12 removed the legacy meta-path protocol, and a 3.13 run silently
-*ignores* a legacy finder, so the import succeeds and the blocker proves nothing
-(ISS-136 §一; measured ``1 failed`` on 3.13 against ``25 passed`` on 3.10).
+Target interpreters: **3.10 and 3.13**, both green. The shim's import-blocker
+tests (and the ``find_spec`` reason they use) live in
+``tests/test_shim_fallback.py`` after the ISS-136 line-count split.
 
-Run: ``python -m pytest tests/test_decide_watch.py -q``
+Run: ``python -m pytest tests/test_decide_watch.py tests/test_shim_fallback.py -q``
       ``./.venv/Scripts/python.exe -m pytest tests/test_decide_watch.py -q``  (3.13)
       ``D:/myenv/Scripts/python.exe -m pytest tests/test_decide_watch.py -q``  (3.10)
 """
@@ -31,10 +29,6 @@ from types import SimpleNamespace
 from unittest import mock
 
 from super_agent import decide_watch as dw
-
-# ``tests/`` has no ``__init__.py``, so pytest puts it on ``sys.path``: the shared
-# blocker is imported as a sibling module, not as ``tests.support_import_blocker``.
-from support_import_blocker import blocker_source
 
 ROOT = Path(__file__).resolve().parent.parent
 PRIVATE = ("re" + "ed", "lai" + "ke", "yuan" + "hai",
@@ -442,50 +436,6 @@ if ok:
             except subprocess.TimeoutExpired:
                 first.kill()
                 first.wait(timeout=10)
-
-
-class ShimFallback(Fixture):
-    def test_inner_dependency_missing_must_raise_out_of_loader(self):
-        code = (
-            "import sys, importlib\n"
-            + blocker_source(
-                "fullname.startswith('super_agent') and fullname != 'super_agent'",
-                message="inner missing")
-            + "try:\n"
-            "    importlib.import_module('super_agent.decide_watch')\n"
-            "except ModuleNotFoundError as e:\n"
-            "    print('RAISED', e.name)\n"
-            "    raise SystemExit(0)\n"
-            "raise SystemExit(3)\n"
-        )
-        proc = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT),
-                              capture_output=True, text=True)
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("RAISED super_agent.", proc.stdout)
-
-    def test_whole_package_missing_falls_back_to_legacy_exports(self):
-        lwa_tools = Path("D:/github/" + ("lai" + "ke") + "_work_with_agent/tools")
-        shim = lwa_tools / "decide_watch.py"
-        legacy = lwa_tools / "decide_watch_legacy.py"
-        if not shim.is_file() or not legacy.is_file():
-            self.skipTest("phase B shim not present yet")
-        code = (
-            "import sys\n"
-            + blocker_source(
-                "fullname == 'super_agent' or fullname.startswith('super_agent.')",
-                name="'super_agent'", message="package missing")
-            + "sys.path.insert(0, %r)\n"
-            "import decide_watch\n"
-            "print('LEGACY', decide_watch.LEGACY_FALLBACK_PATH)\n"
-            "print('HASH', decide_watch.LEGACY_FALLBACK_HASH[:12])\n"
-            "print('SELFTEST', hasattr(decide_watch, 'self_test'))\n"
-        ) % str(lwa_tools)
-        proc = subprocess.run([sys.executable, "-c", code], cwd=str(lwa_tools.parent),
-                              capture_output=True, text=True)
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("decide_watch_legacy.py", proc.stdout)
-        self.assertIn("HASH ", proc.stdout)
-        self.assertIn("SELFTEST True", proc.stdout)
 
 
 if __name__ == "__main__":
