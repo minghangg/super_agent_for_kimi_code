@@ -5,7 +5,15 @@ a local event daemon, a session client and a set of fixed runtime files. The
 package port must take all of those as explicit injections, must never silently
 reach production, and must keep the self-test green (30 cases after ISS-83 added 7).
 
+Target interpreters: **3.10 and 3.13**, both green. The import blockers below use
+``find_spec`` (PEP 451, Python 3.4+) and never ``find_module``/``load_module``:
+CPython 3.12 removed the legacy meta-path protocol, and a 3.13 run silently
+*ignores* a legacy finder, so the import succeeds and the blocker proves nothing
+(ISS-136 §一; measured ``1 failed`` on 3.13 against ``25 passed`` on 3.10).
+
 Run: ``python -m pytest tests/test_decide_watch.py -q``
+      ``./.venv/Scripts/python.exe -m pytest tests/test_decide_watch.py -q``  (3.13)
+      ``D:/myenv/Scripts/python.exe -m pytest tests/test_decide_watch.py -q``  (3.10)
 """
 from __future__ import annotations
 
@@ -23,6 +31,10 @@ from types import SimpleNamespace
 from unittest import mock
 
 from super_agent import decide_watch as dw
+
+# ``tests/`` has no ``__init__.py``, so pytest puts it on ``sys.path``: the shared
+# blocker is imported as a sibling module, not as ``tests.support_import_blocker``.
+from support_import_blocker import blocker_source
 
 ROOT = Path(__file__).resolve().parent.parent
 PRIVATE = ("re" + "ed", "lai" + "ke", "yuan" + "hai",
@@ -435,15 +447,11 @@ if ok:
 class ShimFallback(Fixture):
     def test_inner_dependency_missing_must_raise_out_of_loader(self):
         code = (
-            "import sys, types, importlib\n"
-            "class Blocker:\n"
-            "    def find_module(self, fullname, path=None):\n"
-            "        if fullname.startswith('super_agent') and fullname != 'super_agent':\n"
-            "            return self\n"
-            "    def load_module(self, fullname):\n"
-            "        raise ModuleNotFoundError(\"inner missing\", name=fullname)\n"
-            "sys.meta_path.insert(0, Blocker())\n"
-            "try:\n"
+            "import sys, importlib\n"
+            + blocker_source(
+                "fullname.startswith('super_agent') and fullname != 'super_agent'",
+                message="inner missing")
+            + "try:\n"
             "    importlib.import_module('super_agent.decide_watch')\n"
             "except ModuleNotFoundError as e:\n"
             "    print('RAISED', e.name)\n"
@@ -463,14 +471,10 @@ class ShimFallback(Fixture):
             self.skipTest("phase B shim not present yet")
         code = (
             "import sys\n"
-            "class Blocker:\n"
-            "    def find_module(self, fullname, path=None):\n"
-            "        if fullname == 'super_agent' or fullname.startswith('super_agent.'):\n"
-            "            return self\n"
-            "    def load_module(self, fullname):\n"
-            "        raise ModuleNotFoundError(\"package missing\", name='super_agent')\n"
-            "sys.meta_path.insert(0, Blocker())\n"
-            "sys.path.insert(0, %r)\n"
+            + blocker_source(
+                "fullname == 'super_agent' or fullname.startswith('super_agent.')",
+                name="'super_agent'", message="package missing")
+            + "sys.path.insert(0, %r)\n"
             "import decide_watch\n"
             "print('LEGACY', decide_watch.LEGACY_FALLBACK_PATH)\n"
             "print('HASH', decide_watch.LEGACY_FALLBACK_HASH[:12])\n"

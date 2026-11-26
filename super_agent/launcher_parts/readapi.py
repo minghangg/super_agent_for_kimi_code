@@ -48,6 +48,12 @@ from urllib.parse import urlsplit
 COMPONENT_FIELDS = ("enabled", "running", "kind", "started", "last_started_at",
                     "last_success_at", "last_error", "overrun", "stalled", "runs")
 
+#: Published **only when the row carries it**. A recipient is a property of the
+#: one leg that resolves one, so a whitelist-wide ``null`` would claim the other
+#: components have a recipient field at all (ISS-136 §三 甲: the rescue override
+#: must be visible on ``/healthz``).
+OPTIONAL_COMPONENT_FIELDS = ("supervisor",)
+
 #: Top-level fields. ``failures`` is derived, never a stored dict.
 TOP_FIELDS = ("pid", "running", "phase", "started_at", "stalled")
 
@@ -127,6 +133,8 @@ def health_payload(health: dict, *, failures: list | None = None) -> dict:
         if not isinstance(row, dict):
             continue
         kept = {field: row.get(field) for field in COMPONENT_FIELDS}
+        kept.update({field: row[field] for field in OPTIONAL_COMPONENT_FIELDS
+                     if row.get(field)})
         components[str(name)] = kept
         reason = ""
         if not kept.get("enabled"):

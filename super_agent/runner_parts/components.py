@@ -50,15 +50,22 @@ class ComponentHealth:
     overrun: int = 0
     stalled: bool = False
     runs: int = 0
+    #: The recipient override only a leg that resolves one carries (the
+    #: ``decide_watch`` leg today). Absent - not empty - for every other row:
+    #: ``""`` would read as "no recipient", which is a different and false story.
+    supervisor: str = ""
 
     def as_dict(self) -> dict:
-        return {"enabled": bool(self.enabled), "running": bool(self.running),
-                "kind": self.kind, "budget": float(self.budget),
-                "started": bool(self.started),
-                "last_started_at": self.last_started_at,
-                "last_success_at": self.last_success_at,
-                "last_error": self.last_error, "overrun": int(self.overrun),
-                "stalled": bool(self.stalled), "runs": int(self.runs)}
+        row = {"enabled": bool(self.enabled), "running": bool(self.running),
+               "kind": self.kind, "budget": float(self.budget),
+               "started": bool(self.started),
+               "last_started_at": self.last_started_at,
+               "last_success_at": self.last_success_at,
+               "last_error": self.last_error, "overrun": int(self.overrun),
+               "stalled": bool(self.stalled), "runs": int(self.runs)}
+        if self.supervisor:
+            row["supervisor"] = self.supervisor
+        return row
 
 
 class Component:

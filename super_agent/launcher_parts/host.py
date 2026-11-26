@@ -40,6 +40,13 @@ def register_c2(cfg, store, rn, *, runner_mod, bus, interval, budget, enable,
     anything across rounds. Building a new one per call - which the previous
     ``lambda`` did - reset both every round, which is how the liveness interval
     gate and the backoff stopped existing without anything going red.
+
+    ``supervisor`` is the ``launcher run --supervisor`` rescue override (ISS-136
+    §三: without this parameter the flag had no production injection point and the
+    leg was permanently ``""``). Empty means "resolve the way ``decide_watch``
+    does": ``engine.supervisor_sid`` -> ``sessions.json`` -> ``supervisor_keys``.
+    Either way the row says which one is in force, because an empty field reads as
+    "no recipient" - a different and false story.
     """
     from . import components as parts
     from .c2 import C2Leg
@@ -48,6 +55,7 @@ def register_c2(cfg, store, rn, *, runner_mod, bus, interval, budget, enable,
         row = rn.register("decide_watch", _null_body, kind=runner_mod.THREAD,
                           interval=interval, budget=budget, enabled=False)
         row.health.last_error = "disabled"
+        row.health.supervisor = _supervisor_label(supervisor)
         return
     from .. import decide_watch as dw
 
@@ -57,10 +65,18 @@ def register_c2(cfg, store, rn, *, runner_mod, bus, interval, budget, enable,
         row = rn.register("decide_watch", _null_body, kind=runner_mod.THREAD,
                           interval=interval, budget=budget, enabled=False)
         row.health.last_error = f"未注入 {', '.join(missing)}"
+        row.health.supervisor = _supervisor_label(supervisor)
         return
     leg = C2Leg(cfg, store, bus=bus, supervisor=supervisor)
-    rn.register("decide_watch", leg, kind=runner_mod.THREAD,
-                interval=interval, budget=budget)
+    row = rn.register("decide_watch", leg, kind=runner_mod.THREAD,
+                      interval=interval, budget=budget)
+    row.health.supervisor = _supervisor_label(supervisor)
+
+
+def _supervisor_label(supervisor) -> str:
+    """The health-row wording for the recipient override. Never empty."""
+    text = str(supervisor or "").strip()
+    return text or "config-chain"
 
 
 def register_at(cfg, store, rn, *, runner_mod, budget, enable, transport) -> None:
@@ -143,7 +159,14 @@ def _issue_reader(cfg, store):
     A missing or unreadable index returns a **reason**, not ``[]``: an empty list
     reads as "no issues", which is the same silent-zero this repository refuses
     everywhere else.
+
+    A key that is not an ``owner/repo#N`` identity (or a legacy bare number) is
+    **skipped and named in the reason**, never published as an empty key: a row
+    whose ``key`` is ``""`` and ``issue`` is ``0`` reads as "there is a ticket,
+    numbered zero", which is the same silent-zero in another costume (ISS-136 §二,
+    reproduced with ``{"owner/demo": {}}``).
     """
+    from .. import issuekey
     from . import backends
 
     try:
@@ -153,14 +176,25 @@ def _issue_reader(cfg, store):
     repo = str((cfg.get("github") or {}).get("repo") or "")
     backend = backends.issue_backend("github")
     refs = []
+    skipped = []
     for key in (index.get("issues") or {}):
-        name, number = str(key).rsplit("#", 1) if "#" in str(key) else ("", str(key))
-        refs.append(backend.ref(name or repo, number))
+        name, number = issuekey.split_key(key)
+        if number is None:
+            skipped.append(str(key))
+            continue
+        ref = backend.ref(name or repo, number)
+        if not ref.key:
+            skipped.append(str(key))
+            continue
+        refs.append(ref)
+    note = ""
+    if skipped:
+        note = f"跳过 {len(skipped)} 个无法解析成 owner/repo#N 的键：{', '.join(skipped)}"
     if not refs:
-        return [], "index.json 里没有 issue"
+        return [], note or "index.json 里没有 issue"
     # Sorted **after** normalisation, not before: the raw keys sort by case
     # (``Owner/...`` before ``other/...``), so sorting the source dict would put a
     # canonical ``owner/...`` row in the wrong place. The page order is stability
     # for a human, and canonical order is the only one that does not move when a
     # repo name changes case in one file.
-    return sorted(refs, key=lambda ref: ref.key), ""
+    return sorted(refs, key=lambda ref: ref.key), note

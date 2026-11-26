@@ -60,5 +60,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help="force the WSS component on (default: on when injected)")
     run.add_argument("--no-wss", dest="wss", action="store_false",
                      help="force the WSS component off")
+    run.add_argument("--supervisor", default=None,
+                     help="rescue override for the recipient sid (default: the "
+                          "config chain, i.e. engine.supervisor_sid -> "
+                          "sessions.json); it reaches the supervisor probe, the "
+                          "delivery and the liveness patrol")
     sub.add_parser("status", help="print the lock and the engine health snapshot")
     return ap

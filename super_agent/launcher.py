@@ -85,7 +85,8 @@ def build_runner(cfg: dict, store, *, engine=None, bus=None, session_api=None,
                  enable_at: bool | None = None,
                  enable_reporter: bool | None = None,
                  enable_readapi: bool | None = None,
-                 at_transport=None) -> runner_mod.Runner:
+                 at_transport=None, supervisor: str | None = None
+                 ) -> runner_mod.Runner:
     """Assemble the component set. Tests pass ``engine`` / ``wss_service``.
 
     ``keep`` is an out-parameter dict: the caller needs the engine object for the
@@ -107,6 +108,11 @@ def build_runner(cfg: dict, store, *, engine=None, bus=None, session_api=None,
       that takes the host down;
     * ``reporter`` writes a page into the state dir, which is always possible;
     * ``readapi`` binds loopback, and a port already held is a refusal to report.
+
+    ``supervisor`` is the rescue override ``decide_watch`` takes (ISS-136 §三). It
+    is threaded here rather than read from the config so ``launcher run
+    --supervisor`` has a real production injection point; empty keeps the
+    configuration chain, which is the normal case.
     """
     gh = cfg.get("github") or {}
     try:
@@ -142,7 +148,7 @@ def build_runner(cfg: dict, store, *, engine=None, bus=None, session_api=None,
 
     host_parts.register_c2(cfg, store, rn, runner_mod=runner_mod, bus=bus,
                            interval=interval, budget=budget,
-                           enable=enable_decide_watch)
+                           enable=enable_decide_watch, supervisor=supervisor)
     host_parts.register_at(cfg, store, rn, runner_mod=runner_mod, budget=budget,
                            enable=enable_at, transport=at_transport)
     host_parts.register_reporter(cfg, store, rn, runner_mod=runner_mod,
@@ -211,7 +217,8 @@ def cmd_run(args) -> int:
     held: dict = {}
     health: dict = {}
     try:
-        rn = build_runner(cfg, store, enable_wss=args.wss, keep=held)
+        rn = build_runner(cfg, store, enable_wss=args.wss, keep=held,
+                          supervisor=args.supervisor)
         _state(store, "started", components=rn.names(),
                pid=os.getpid(), runner="launcher")
         health = asyncio.run(_serve_with_signals(rn))
