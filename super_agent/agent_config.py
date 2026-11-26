@@ -64,13 +64,13 @@ ENV_FILE = "SAFKC_AGENT_CONFIG"
 
 # Per-key environment overrides. A key listed here is read from the variable
 # first and from the JSON file second; a key not listed here is file-only.
+# ``github.token_env`` is absent on purpose: see tests/test_token_env_collision.py (#135).
 ENV = {
     "paths.state_dir": "SESS_EVENTS_STATE_DIR",
     "paths.engine_state_dir": "SAFKC_ENGINE_STATE_DIR",
     "paths.project_env_dir": "SAFKC_PROJECT_ENV_DIR",
     "paths.sessions_dir": "SESS_WIRE_ROOT",
     "github.projects_file": "SAFKC_PROJECTS_FILE",
-    "github.token_env": "GITHUB_TOKEN",
     "github.allowlist_file": "SAFKC_ALLOWLIST",
     "quota.config_file": "DEV_QUOTA_CONFIG",
     "quota.cores_dir": "DEV_QUOTA_CORES_DIR",

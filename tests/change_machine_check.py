@@ -381,10 +381,10 @@ def gate8(gate: Gate, clone: Path, outside: Path, py: str,
                 encoding="utf-8")
             cfg = work / f"cfg_{mode}.json"
             _write_gate8_cfg(cfg, state, tmpl)
-            # A token file rather than $GITHUB_TOKEN: ``github.token_env`` is
-            # itself read through the same env layer, so exporting GITHUB_TOKEN
-            # makes the *value* come back as the variable name. One fake file
-            # keeps this gate about the archive path.
+            # A token file rather than $GITHUB_TOKEN: this gate is about the
+            # archive path, so one fake file keeps $GITHUB_TOKEN out of it.
+            # (ISS-135: ``github.token_env`` no longer reads a same-named
+            # variable, so exporting one is harmless either way.)
             creds = work / "creds.env"
             creds.write_text("GITHUB_TOKEN=stub-token\n", encoding="utf-8")
             env = gate_env(clone, outside, {
