@@ -156,5 +156,26 @@ class TestLauncherStartsRecovery(Base):
         self.assertIn("outbox stuck", str(ctx.exception))
 
 
+class TestEntryPointParity(Base):
+    def test_same_issue_has_the_same_result_through_cli_and_launcher(self):
+        from super_agent import cli
+        from super_agent.store import Store
+
+        old_store = Store(self.root / "old")
+        new_store = Store(self.root / "new")
+        old = cli._engine(self.cfg, old_store, None)
+        new = launcher.build_engine_component(self.cfg, new_store)
+        old.startup()
+        old.run_once()
+        new.run_once()
+        self.assertEqual(old_store.load_index().get("issues"),
+                         new_store.load_index().get("issues"))
+        self.assertEqual(old_store.load_cursor(), new_store.load_cursor())
+        def event_types(store):
+            return [json.loads(line)["type"] for line in
+                    store.events_path.read_text(encoding="utf-8").splitlines() if line]
+        self.assertEqual(event_types(old_store), event_types(new_store))
+
+
 if __name__ == "__main__":
     unittest.main()
