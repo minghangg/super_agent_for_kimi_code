@@ -39,6 +39,8 @@ from . import session_ledger
 from . import assignments as asg_mod
 from . import issuekey
 from . import needs as needs_mod
+from . import runloop
+from . import stopcontrol
 from . import store as store_mod
 from .bus_client import BusClient
 from .github_source import FixtureSource, LiveSource
@@ -305,139 +307,28 @@ def _wait(stop_event: threading.Event, seconds: float, sleep) -> None:
 
 
 def _install_stop_handlers(stop_event: threading.Event) -> dict:
-    previous = {}
-    for name in ("SIGINT", "SIGTERM"):
-        signum = getattr(signal, name, None)
-        if signum is None:
-            continue
-        try:
-            previous[signum] = signal.getsignal(signum)
-            signal.signal(signum, lambda *_: stop_event.set())
-        except (OSError, ValueError):        # not the main thread
-            previous.pop(signum, None)
-    return previous
+    """Forwarder: the one implementation is :func:`stopcontrol.install_stop_handlers`."""
+    return stopcontrol.install_stop_handlers(stop_event)
 
 
 def _restore_handlers(previous: dict) -> None:
-    for signum, handler in previous.items():
-        try:
-            signal.signal(signum, handler)
-        except (OSError, ValueError):
-            pass
+    """Forwarder: see :func:`stopcontrol.restore_handlers`."""
+    stopcontrol.restore_handlers(previous)
 
 
 def _flush_state(store: Store) -> None:
-    """Re-persist cursor and index so stopping between rounds leaves valid files.
-
-    ``IndexRefused`` is the point of this guard: ``save_index(load_index())``
-    is the second path that writes an empty index over a file that could not be
-    read. A Ctrl-C during the fault must leave the bytes alone, so the refusal
-    is reported and the stop continues.
-    """
-    try:
-        store.save_cursor(store.load_cursor())
-        store.save_index(store.load_index())
-    except store_mod.IndexRefused as exc:
-        print(f"warning: index not flushed on exit: {exc}", file=sys.stderr)
-    except OSError as exc:
-        print(f"warning: could not persist state on exit: {exc}", file=sys.stderr)
+    """Forwarder: see :func:`stopcontrol.flush_state`."""
+    stopcontrol.flush_state(store)
 
 
-def run_loop(engine, store: Store, *, interval: float = 60.0,
+def run_loop(engine, store, *, interval: float = 60.0,
              max_failures: int = DEFAULT_MAX_FAILURES, max_rounds: int = 0,
              stop_event: threading.Event | None = None,
              sleep=time.sleep, now=_now) -> dict:
-    """Run ``engine.run_once()`` until stopped.
-
-    A round counts as failed when it raises or when it reports errors; a clean
-    round resets the counter. Every round overwrites the heartbeat with the
-    latest ``{ts, round, ok, external_actions}``. ``stop_event`` (set by a
-    signal or by a test) ends the loop with exit code 0 after the round in
-    flight; ``max_failures`` consecutive failures end it with exit code 1.
-    """
-    stop = stop_event if stop_event is not None else threading.Event()
-    interval = float(interval)
-    max_failures = max(1, int(max_failures))
-    rounds = 0
-    consecutive = 0
-    reason = "max_rounds"
-    external = int(store.load_counters().get("external_actions") or 0)
-
-    while max_rounds <= 0 or rounds < max_rounds:
-        if stop.is_set():
-            reason = "signal"
-            break
-        rounds += 1
-        summary: dict = {}
-        ok, err = True, ""
-        try:
-            summary = engine.run_once()
-        except KeyboardInterrupt:            # no handler installed (embedded use)
-            rounds -= 1
-            stop.set()
-            reason = "signal"
-            break
-        except Exception as exc:             # noqa: BLE001  a bad round is not fatal
-            ok, err = False, f"{type(exc).__name__}: {exc}"
-        else:
-            errors = summary.get("errors") or []
-            if errors:
-                ok, err = False, "; ".join(str(e) for e in errors)
-
-        external = int(store.load_counters().get("external_actions") or 0)
-        try:
-            store.save_heartbeat({"ts": now(), "round": rounds, "ok": ok,
-                                  "external_actions": external})
-        except OSError as exc:
-            print(f"warning: heartbeat write failed: {exc}", file=sys.stderr)
-
-        if ok:
-            consecutive = 0
-            print(f"round={rounds} ok={summary.get('mode')} "
-                  f"issues={summary.get('issues', 0)} "
-                  f"new_comments={summary.get('comments_new', 0)} "
-                  f"processed={summary.get('processed', 0)} "
-                  f"external_actions={external}", flush=True)
-        else:
-            consecutive += 1
-            store.log_event({"type": "run.failed", "at": now(), "round": rounds,
-                             "error": err})
-            print(f"round={rounds} failed ({consecutive}/{max_failures}): {err}",
-                  file=sys.stderr, flush=True)
-
-        if consecutive >= max_failures:
-            reason = "max_failures"
-            break
-
-        if max_rounds > 0 and rounds >= max_rounds:
-            break
-
-        try:
-            _wait(stop, interval, sleep)
-        except KeyboardInterrupt:
-            stop.set()
-            reason = "signal"
-            break
-        if stop.is_set():
-            reason = "signal"
-            break
-
-    exit_code = 1 if reason == "max_failures" else 0
-    store.log_event({"type": "run.stopped", "at": now(), "reason": reason,
-                     "rounds": rounds, "external_actions": external})
-    # A clean stop must not look like a crash: the pid lock is about to go, so
-    # flip the health snapshot to running=false. A killed process never gets
-    # here and leaves running=true, which is exactly what doctor reports.
-    write_health = getattr(engine, "write_health", None)
-    if callable(write_health):
-        try:
-            write_health(running=False)
-        except OSError as exc:
-            print(f"warning: health write failed: {exc}", file=sys.stderr)
-    _flush_state(store)
-    return {"rounds": rounds, "consecutive_failures": consecutive,
-            "external_actions": external, "reason": reason,
-            "exit_code": exit_code}
+    """Forwarder: the loop lives in :func:`runloop.run_loop` (ISS-131 收尾)."""
+    return runloop.run_loop(engine, store, interval=interval,
+                            max_failures=max_failures, max_rounds=max_rounds,
+                            stop_event=stop_event, sleep=sleep, now=now)
 
 
 def cmd_run(args) -> int:

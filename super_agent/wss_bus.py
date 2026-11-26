@@ -1542,115 +1542,58 @@ def _guardian_state_save(state: dict) -> None:
         log(f"guardian: 状态落盘失败（不影响本轮）：{exc}")
 
 
+# ISS-131: the heartbeat read/write pair moved to ``wss_heartbeat`` so this
+# module could shed the lines its lock change cost. The names stay callable here:
+# ``/healthz`` builds its guardians block from them.
+from . import wss_heartbeat as _hb                    # noqa: E402
+
+# Bound lazily: ``current_state_root`` is defined further down, and binding at
+# import time would capture a half-built module. Every forwarder calls this first.
+#: Kept as module names: the self-test asserts on them, and a caller sizing the
+#: retry window should not have to import the moved module to read a constant.
+HEARTBEAT_WRITE_BACKOFF = _hb.HEARTBEAT_WRITE_BACKOFF
+HEARTBEAT_WRITEFAIL_PREFIX = _hb.HEARTBEAT_WRITEFAIL_PREFIX
+
+
+def _hb_bind() -> None:
+    _hb.bind(thresholds=guardian_thresholds, state_root=current_state_root,
+             boot_id=lambda: STATE.seq.boot_id, log=log)
+
+
 def read_heartbeat(name: str) -> dict | None:
-    """Read one guarded party's heartbeat; returns ``{ts, ...}``, None, or a marker.
-
-    The three failures are kept apart on purpose:
-      * ``FileNotFoundError`` ⇒ ``None`` (state=missing, the original meaning);
-      * any other ``OSError`` (``PermissionError``, …) ⇒ ``{"_read_error": "<class>"}``
-        (state=unknown — on Windows a concurrent read during ``os.replace`` must
-        never be mistaken for "file does not exist");
-      * ``ValueError`` (bad JSON) ⇒ ``None`` (still missing; unchanged here).
-    """
-    rel = guardian_thresholds().get(name, ("", 0.0, ""))[0]
-    if not rel:
-        return None
-    try:
-        d = json.loads((current_state_root() / rel).read_text(encoding="utf-8"))
-        return d if isinstance(d, dict) else None
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        return {"_read_error": type(exc).__name__}
-    except ValueError:
-        return None
-
-
-HEARTBEAT_WRITE_BACKOFF = (0.0, 0.02, 0.05, 0.1)   # 0/20/50/100ms, ~170ms total
-HEARTBEAT_WRITEFAIL_PREFIX = "_writefail_"          # `<state_root>/heartbeat/_writefail_<name>.json`
-
-
-def _writefail_path(name: str) -> Path:
-    return current_state_root() / "heartbeat" / f"{HEARTBEAT_WRITEFAIL_PREFIX}{name}.json"
-
-
-def _mark_write_fail(name: str, attempts: int, err: BaseException) -> None:
-    """Terminal-failure marker: **visible** in `/healthz.guardians.<name>.write_fail`.
-
-    Why a file and not just a log line (ISS-102 M5): the daemon's own stderr is
-    not where anyone looks, and a heartbeat that never lands is indistinguishable
-    from a party that is simply idle. The marker turns "silently not written"
-    into a field a caller can assert on, and it is deleted the moment a write
-    succeeds so it cannot outlive the fault.
-    """
-    try:
-        p = _writefail_path(name)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({"ts": time.time(),
-                                 "iso": datetime.now().isoformat(timespec="seconds"),
-                                 "attempts": attempts,
-                                 "err": f"{type(err).__name__}: {err}",
-                                 "pid": os.getpid()}, ensure_ascii=False),
-                     encoding="utf-8")
-    except OSError as exc:
-        log(f"guardian: 写 {name} 的写失败标记也没写成（就剩日志这一条线索）：{exc}")
-
-
-def _clear_write_fail(name: str) -> None:
-    try:
-        _writefail_path(name).unlink()
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        log(f"guardian: 清 {name} 的写失败标记失败（下次成功会再试）：{exc}")
-
-
-def _read_write_fail(name: str) -> dict | None:
-    """The marker for `/healthz`; ``None`` when the last write succeeded."""
-    try:
-        return json.loads(_writefail_path(name).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
+    """Forwarder: see :func:`wss_heartbeat.read_heartbeat`."""
+    _hb_bind()
+    return _hb.read_heartbeat(name)
 
 
 def write_heartbeat(name: str, extra: dict | None = None) -> None:
-    """Write a heartbeat (single writer per name, see the third column above).
+    """Forwarder: see :func:`wss_heartbeat.write_heartbeat`."""
+    _hb_bind()
+    _hb.write_heartbeat(name, extra)
 
-    **Unconditional every round**: "no change" must not look stale.
-    **Which root**: ``current_state_root()`` — same source as the read side,
-    otherwise an isolated instance writes production and production reads
-    production, looking "healthy" on someone else's heartbeat.
-    **Failure is visible** (ISS-102 M5): `os.replace` retries at 0/20/50/100ms;
-    if all four fail, the marker written by `_mark_write_fail` shows up as
-    `/healthz.guardians.<name>.write_fail`, and the next successful write
-    deletes it. The atomic-write semantics are unchanged (tmp + `os.replace`);
-    what changed is that a permanent failure no longer ends as one log line.
-    """
-    rel = guardian_thresholds().get(name, ("", 0.0, ""))[0]
-    if not rel:
-        return
-    root = current_state_root()
-    body = {"ts": time.time(), "iso": datetime.now().isoformat(timespec="seconds"),
-            "pid": os.getpid(), "boot_id": STATE.seq.boot_id, "state_dir": str(root)}
-    if extra:
-        body.update(extra)
-    p = root / rel
-    tmp = p.with_suffix(".json.tmp")
-    last: BaseException | None = None
-    for delay in HEARTBEAT_WRITE_BACKOFF:
-        if delay:
-            time.sleep(delay)
-        try:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
-            os.replace(tmp, p)
-        except OSError as exc:
-            last = exc
-            continue
-        _clear_write_fail(name)
-        return
-    log(f"guardian: 写 {name} 心跳失败（已重试 {len(HEARTBEAT_WRITE_BACKOFF)} 次）：{last}")
-    _mark_write_fail(name, len(HEARTBEAT_WRITE_BACKOFF), last)
+
+def _writefail_path(name: str):
+    """Forwarder: see :func:`wss_heartbeat.writefail_path`."""
+    _hb_bind()
+    return _hb.writefail_path(name)
+
+
+def _mark_write_fail(name: str, attempts: int, err: BaseException) -> None:
+    """Forwarder: see :func:`wss_heartbeat.mark_write_fail`."""
+    _hb_bind()
+    _hb.mark_write_fail(name, attempts, err)
+
+
+def _clear_write_fail(name: str) -> None:
+    """Forwarder: see :func:`wss_heartbeat.clear_write_fail`."""
+    _hb_bind()
+    _hb.clear_write_fail(name)
+
+
+def _read_write_fail(name: str) -> dict | None:
+    """Forwarder: see :func:`wss_heartbeat.read_write_fail`."""
+    _hb_bind()
+    return _hb.read_write_fail(name)
 
 
 def current_state_root() -> Path:
@@ -2836,8 +2779,20 @@ def _cmdline_of(pid: int) -> str:
         return ""
 
 
+#: Command-line fragments that name a holder of this state directory. The
+#: launcher hosts the WSS in-process (ISS-131), so its command line says
+#: ``super_agent.launcher`` and never ``wss_bus`` - checking only the latter let
+#: the old ``--daemon`` start next to a live launcher and both write the ring.
+_LOCK_HOLDERS = ("wss_bus", "super_agent.launcher", "super_agent/launcher")
+
+
+def _names_a_holder(text: str) -> bool:
+    low = str(text or "").lower().replace("\\", "/")
+    return any(name in low for name in _LOCK_HOLDERS)
+
+
 def acquire_lock() -> bool:
-    """Single-instance lock: pid alive **and** its command line names this script."""
+    """Single-instance lock: pid alive **and** its command line names a holder."""
     PATHS.mkdir()
     if PATHS.lock.is_file():
         try:
@@ -2846,7 +2801,7 @@ def acquire_lock() -> bool:
             cmd = d.get("cmdline") or ""
             if pid and _pid_alive(pid):
                 live = _cmdline_of(pid)
-                if ("wss_bus" in live) or (not live and "wss_bus" in cmd):
+                if _names_a_holder(live) or (not live and _names_a_holder(cmd)):
                     print(f"已有实例在跑：pid={pid} port={d.get('port')} "
                           f"state_dir={d.get('state_dir')}")
                     return False
@@ -2869,292 +2824,92 @@ def release_lock() -> None:
 
 
 # --------------------------------------------------------------------- autostart
-AUTOSTART_EXIT_OK = 0
-AUTOSTART_EXIT_REGISTER_FAILED = 3      # the registration itself failed
-AUTOSTART_EXIT_VERIFY_FAILED = 4        # registered, but the read-back mismatched
-AUTOSTART_EXIT_UNINSTALL_FAILED = 5     # still present after uninstall
+# ISS-131: the register/read-back/unregister body moved to ``wss_autostart`` so
+# this file could shed the lines the launcher's lock change cost. Every public
+# name stays here as a **live forwarder** because the workbench's
+# ``decide_watch.py`` resolves them by name on this module, and this module's own
+# self-test patches ``query_task`` right here to simulate read-back failures.
+from . import wss_autostart as _autostart_mod          # noqa: E402
+
+AUTOSTART_EXIT_OK = _autostart_mod.AUTOSTART_EXIT_OK
+AUTOSTART_EXIT_REGISTER_FAILED = _autostart_mod.AUTOSTART_EXIT_REGISTER_FAILED
+AUTOSTART_EXIT_VERIFY_FAILED = _autostart_mod.AUTOSTART_EXIT_VERIFY_FAILED
+AUTOSTART_EXIT_UNINSTALL_FAILED = _autostart_mod.AUTOSTART_EXIT_UNINSTALL_FAILED
+
+
+def _autostart_bind() -> None:
+    """Hand the config accessor and the read-back seam to the moved module."""
+    _autostart_mod.bind(_cfg)
+    _autostart_mod.bind_query_task(lambda: query_task())
 
 
 def AUTOSTART_NAME() -> str:
-    return str(_cfg().autostart_name or "WssBus")
-
-
-def _ps_json(script: str, timeout: float = 60.0):
-    """Run PowerShell and parse its JSON output. Returns ``(rc, obj, raw)``."""
-    bridge = _cfg().ps_json
-    if bridge is not None:
-        return bridge(script, timeout)
-    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                       capture_output=True, text=True, timeout=timeout)
-    raw = (r.stdout or "").strip()
-    obj = None
-    if raw:
-        try:
-            obj = json.loads(raw)
-        except ValueError:
-            obj = None
-    return r.returncode, obj, raw or (r.stderr or "").strip()
+    _autostart_bind()
+    return _autostart_mod.AUTOSTART_NAME()
 
 
 def windowless_python() -> tuple[str, str]:
-    """``pythonw.exe`` next to the current interpreter; returns ``(path, note)``.
-
-    Registering the autostart with ``python.exe`` pops a console window whenever
-    the trigger fires. ``pythonw.exe`` is the same interpreter with the GUI
-    subsystem: identical behaviour, no console. Logs already go to
-    ``<state root>/wss_bus.log``, so stdout is not needed.
-
-    Degradation: when the sibling ``pythonw.exe`` is missing (very old or trimmed
-    distributions) the function returns ``python.exe`` and puts the reason in the
-    note — the caller **prints a warning**, nothing is hidden.
-    """
-    inject = _cfg().windowless_python
-    if inject is not None:
-        return inject()
-    exe = Path(sys.executable).resolve()
-    cand = exe.with_name("pythonw.exe")
-    if cand.is_file():
-        return str(cand), ""
-    return str(exe), ("同目录未找到 pythonw.exe（%s），降级用 python.exe —— "
-                      "触发时**会弹控制台窗口**" % cand)
+    _autostart_bind()
+    return _autostart_mod.windowless_python()
 
 
 def task_spec() -> dict:
-    """Expected scheduled-task definition — one source for register and verify.
-
-    ``arguments`` depends on what the target *is*, and getting that wrong is
-    silent: the task registers fine and only fails when it fires at logon.
-
-      · a plain script (the workbench shim, or any file outside this package) ⇒
-        ``"<script>" --daemon``;
-      · this module itself ⇒ ``-m super_agent.wss_bus --daemon`` with the workdir
-        set to the checkout. Running ``python super_agent/wss_bus.py`` fails with
-        "attempted relative import with no known parent package" — it is a module
-        inside a package, not a script (ISS-102 M3).
-
-    The injection decides which branch runs: a caller that sets
-    ``autostart_script`` to its own shim gets the first form, which is what the
-    production switch uses.
-    """
-    cfg = _cfg()
-    script = Path(cfg.autostart_script) if cfg.autostart_script else Path(__file__).resolve()
-    workdir = Path(cfg.autostart_workdir) if cfg.autostart_workdir else script.parent.parent
-    exe, note = windowless_python()
-    own = Path(__file__).resolve()
-    as_module = Path(script).resolve() == own
-    return {
-        "name": AUTOSTART_NAME(),
-        "execute": exe,
-        "arguments": ("-m super_agent.wss_bus --daemon" if as_module
-                      else '"%s" --daemon' % Path(script).resolve()),
-        "workdir": str(Path(workdir).resolve()),
-        "script": str(Path(script).resolve()),
-        "execute_note": note,
-        "execute_is_windowless": not note,
-    }
+    _autostart_bind()
+    return _autostart_mod.task_spec()
 
 
 def query_task():
-    """Read back the registered task; None when it does not exist."""
-    ps = (
-        "$ErrorActionPreference='Stop';"
-        "$t = Get-ScheduledTask -TaskName '%s' -ErrorAction SilentlyContinue;"
-        "if (-not $t) { Write-Output 'null'; exit 0 };"
-        "$a = $t.Actions[0];"
-        "$o = [ordered]@{ name=$t.TaskName; state=[string]$t.State;"
-        " execute=$a.Execute; arguments=$a.Arguments; workdir=$a.WorkingDirectory };"
-        "Write-Output ($o | ConvertTo-Json -Compress)"
-    ) % AUTOSTART_NAME()
-    rc, obj, raw = _ps_json(ps)
-    if rc != 0 or not isinstance(obj, dict):
-        return None
-    return obj
+    """Read back the registered task; None when it does not exist.
+
+    Kept here rather than moved: the ``schtasks`` read-back is also used by
+    ``--status``, and the self-test patches this exact name.
+    """
+    _autostart_bind()
+    return _autostart_mod.query_task()
 
 
 def verify_task(spec: dict):
-    """Compare the registered task with ``spec``; returns the failure list (empty ⇒ ok).
-
-    ``WorkingDirectory`` is deliberately **not** a hard failure: some Windows
-    versions do not echo it back after ``New-ScheduledTaskAction -WorkingDirectory``.
-    When absent, verify only Execute + Arguments and say so with the sentinel
-    ``__workdir_unverifiable__``.
-    """
-    actual = query_task()
-    if not actual:
-        return ["任务未注册（Get-ScheduledTask 查无）"]
-
-    fails = []
-    exe_ok = str(actual.get("execute") or "").strip().lower() == spec["execute"].strip().lower()
-    if not exe_ok:
-        fails.append("Execute 不符：期望 %r，实际 %r"
-                     % (spec["execute"], actual.get("execute")))
-
-    args = str(actual.get("arguments") or "")
-    if spec["script"] not in args:
-        fails.append("Arguments 缺脚本路径：期望含 %r，实际 %r"
-                     % (spec["script"], args))
-    elif "--daemon" not in args:
-        fails.append("Arguments 缺 --daemon：实际 %r" % args)
-
-    wd = actual.get("workdir")
-    if wd is None or str(wd).strip() == "":
-        fails.append("__workdir_unverifiable__")
-    elif str(wd).strip().lower() != spec["workdir"].strip().lower():
-        fails.append("WorkingDirectory 不符：期望 %r，实际 %r"
-                     % (spec["workdir"], wd))
-    return fails
+    _autostart_bind()
+    return _autostart_mod.verify_task(spec)
 
 
 def install_autostart() -> int:
-    """Register login autostart, then read back and verify. Non-zero on failure.
-
-    Exit codes (do not change): 0 registered+verified, 3 registration failed
-    (permission/policy), 4 registered but verification failed.
-
-    Why read back at all: the old implementation trusted its own
-    ``registered`` print. ``Register-ScheduledTask`` throws ``Access is denied``
-    when unelevated, but PowerShell defaults to ``Continue`` and the script
-    still reached ``Write-Output 'registered'`` — success printed, exit 0, no
-    task. ``$ErrorActionPreference='Stop'`` now turns the exception into JSON and
-    ``Get-ScheduledTask`` verifies the fields.
-    """
-    spec = task_spec()
-    if not spec.get("execute_is_windowless", True):
-        print("[autostart] 警告：%s" % spec.get("execute_note"), file=sys.stderr)
-    ps = (
-        "$ErrorActionPreference='Stop';"
-        "try {"
-        " $a = New-ScheduledTaskAction -Execute '%s' -Argument '%s' -WorkingDirectory '%s';"
-        " $t = New-ScheduledTaskTrigger -AtLogOn;"
-        " $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries"
-        " -DontStopIfGoingOnBatteries -RestartCount 3"
-        " -RestartInterval (New-TimeSpan -Minutes 1);"
-        " Register-ScheduledTask -TaskName '%s' -Action $a -Trigger $t -Settings $s -Force"
-        " | Out-Null;"
-        " Write-Output '{\"ok\":true}'"
-        "} catch {"
-        " Write-Output ('{\"ok\":false,\"err\":'"
-        " + (ConvertTo-Json ([string]$_.Exception.Message)) + '}')"
-        "}"
-    ) % (spec["execute"], spec["arguments"], spec["workdir"], spec["name"])
-
-    rc, obj, raw = _ps_json(ps)
-    if rc != 0 or not isinstance(obj, dict) or not obj.get("ok"):
-        err = (obj or {}).get("err") if isinstance(obj, dict) else raw
-        print("[autostart] 注册失败：%s" % err, file=sys.stderr)
-        if "denied" in str(err).lower():
-            print("[autostart] 提示：注册计划任务需要管理员权限，"
-                  "请在**提升权限**的终端里执行本命令。", file=sys.stderr)
-        return AUTOSTART_EXIT_REGISTER_FAILED
-
-    fails = verify_task(spec)
-    workdir_unverifiable = "__workdir_unverifiable__" in fails
-    hard_fails = [f for f in fails if f != "__workdir_unverifiable__"]
-
-    if hard_fails:
-        print("[autostart] 注册返回成功，但回读校验失败：", file=sys.stderr)
-        for f in hard_fails:
-            print("  x %s" % f, file=sys.stderr)
-        print("[autostart] 请手工清理：schtasks /Delete /TN %s /F" % spec["name"],
-              file=sys.stderr)
-        return AUTOSTART_EXIT_VERIFY_FAILED
-
-    actual = query_task() or {}
-    print("[autostart] 注册成功并已回读验证：")
-    print("  name       : %s" % actual.get("name"))
-    print("  state      : %s" % actual.get("state"))
-    print("  Execute    : %s" % actual.get("execute"))
-    print("  Arguments  : %s" % actual.get("arguments"))
-    if workdir_unverifiable:
-        print("  WorkingDir : (本机 PowerShell 不回显，无法校验；期望 %s)" % spec["workdir"])
-    else:
-        print("  WorkingDir : %s" % actual.get("workdir"))
-    print("  Trigger    : AtLogOn")
-    if spec.get("execute_is_windowless"):
-        print("  窗口       : 无（pythonw.exe，不弹控制台）")
-    else:
-        print("  窗口       : **会弹控制台**（降级用 python.exe，见上方警告）")
-    return AUTOSTART_EXIT_OK
+    _autostart_bind()
+    return _autostart_mod.install_autostart()
 
 
 def uninstall_autostart() -> int:
-    """Unregister login autostart, then confirm it is gone. Non-zero on failure.
-
-    Exit codes: 0 uninstalled or absent (idempotent), 5 still present.
-    """
-    if query_task() is None:
-        print("[autostart] not installed（本来就没有该任务，无需卸载）")
-        return AUTOSTART_EXIT_OK
-
-    ps = (
-        "$ErrorActionPreference='Stop';"
-        "try {"
-        " Unregister-ScheduledTask -TaskName '%s' -Confirm:$false;"
-        " Write-Output '{\"ok\":true}'"
-        "} catch {"
-        " Write-Output ('{\"ok\":false,\"err\":'"
-        " + (ConvertTo-Json ([string]$_.Exception.Message)) + '}')"
-        "}"
-    ) % AUTOSTART_NAME()
-
-    rc, obj, raw = _ps_json(ps)
-    if rc != 0 or not isinstance(obj, dict) or not obj.get("ok"):
-        err = (obj or {}).get("err") if isinstance(obj, dict) else raw
-        print("[autostart] 卸载命令失败：%s" % err, file=sys.stderr)
-        return AUTOSTART_EXIT_UNINSTALL_FAILED
-
-    if query_task() is not None:
-        print("[autostart] 卸载后仍能查到任务 %s，判定失败" % AUTOSTART_NAME(),
-              file=sys.stderr)
-        return AUTOSTART_EXIT_UNINSTALL_FAILED
-    print("[autostart] 已卸载并回读确认查无：%s" % AUTOSTART_NAME())
-    return AUTOSTART_EXIT_OK
+    _autostart_bind()
+    return _autostart_mod.uninstall_autostart()
 
 
 # --------------------------------------------------------------------- client
-def bus_health(timeout: float = HEALTH_TIMEOUT, port: int | None = None) -> dict | None:
-    """Is the daemon usable? None ⇒ **the caller should fall back to direct**."""
-    import urllib.request
+# ISS-131: the HTTP client moved to ``wss_client`` so this module could shed the
+# lines its lock change cost. The four names stay callable here: they are the
+# documented way to ask the bus something, and ``--status`` uses them.
+from . import wss_client as _client                  # noqa: E402
 
-    p = port or PORT
-    if not p:
-        p = int(os.environ.get("WSS_BUS_PORT", "0") or 0)
-    if not p:
-        return None
-    try:
-        with urllib.request.urlopen(f"http://{HOST}:{p}/healthz", timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8", "replace"))
-    except Exception:  # noqa: BLE001
-        return None
+_client.bind(lambda: PORT)
+
+
+def bus_health(timeout: float = HEALTH_TIMEOUT, port: int | None = None) -> dict | None:
+    """Forwarder: see :func:`wss_client.health`."""
+    return _client.health(timeout=timeout, port=port)
 
 
 def _port_of(port: int | None) -> int:
-    p = port or PORT
-    if not p:
-        p = int(os.environ.get("WSS_BUS_PORT", "0") or 0)
-    if not p:
-        raise RuntimeError("未指定端口（configure(port=...) 或 WSS_BUS_PORT）")
-    return p
+    """Forwarder: see :func:`wss_client.port_of`."""
+    return _client.port_of(port)
 
 
 def bus_get(path: str, timeout: float = 3.0, port: int | None = None):
-    import urllib.request
-
-    p = _port_of(port)
-    with urllib.request.urlopen(f"http://{HOST}:{p}{path}", timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8", "replace"))
+    """Forwarder: see :func:`wss_client.get`."""
+    return _client.get(path, timeout=timeout, port=port)
 
 
 def bus_post(path: str, body: dict, timeout: float = 20.0, port: int | None = None):
-    import urllib.request
-
-    p = _port_of(port)
-    req = urllib.request.Request(
-        f"http://{HOST}:{p}{path}",
-        data=json.dumps(body).encode(), method="POST",
-        headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8", "replace"))
+    """Forwarder: see :func:`wss_client.post`."""
+    return _client.post(path, body, timeout=timeout, port=port)
 
 
 def note_degraded(why: str = "") -> None:
@@ -4091,7 +3846,19 @@ def probe(sid: str = "", keep: bool = False) -> int:
 
 
 # --------------------------------------------------------------------- daemon
-async def _run_daemon() -> int:
+async def _run_daemon(stop: asyncio.Event | None = None) -> int:
+    """Run the daemon. Returns an exit code; ``stop`` ends it when set.
+
+    ``stop`` is why the launcher can host this (ISS-131 P0-1): the signature used
+    to take nothing, so a caller that passed ``(stop_event)`` got ``TypeError``
+    instead of a running WSS. With ``python -m super_agent.wss_bus --daemon`` the
+    argument stays ``None`` and the behaviour is unchanged - three producers are
+    awaited forever, exactly as before.
+
+    The lock, the app and the three producers are assembled here rather than in
+    the caller: a second assembly is the copy that drifts (the launcher used to
+    rebuild it, and got the cleanup order wrong).
+    """
     from aiohttp import web
 
     PATHS.mkdir()
@@ -4108,14 +3875,15 @@ async def _run_daemon() -> int:
     prod = asyncio.create_task(producer())
     flush = asyncio.create_task(_flush_loop())
     watch = asyncio.create_task(_watch_files())
+    waiter = asyncio.create_task(_await_stop(stop))
     try:
-        await asyncio.gather(prod, flush, watch)
+        await asyncio.gather(prod, flush, watch, waiter)
     except asyncio.CancelledError:
         pass
     finally:
-        for t in (prod, flush, watch):
+        for t in (prod, flush, watch, waiter):
             t.cancel()
-        for t in (prod, flush, watch):
+        for t in (prod, flush, watch, waiter):
             try:
                 await t
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
@@ -4126,6 +3894,19 @@ async def _run_daemon() -> int:
         PATHS.pid.unlink(missing_ok=True)
         release_lock()
     return 0
+
+
+async def _await_stop(stop: asyncio.Event | None) -> None:
+    """Block until ``stop`` fires; with no event this never returns.
+
+    Kept separate so the ``None`` case is one clearly inert coroutine instead of
+    a branch inside the gather: gathering a coroutine that never finishes is
+    exactly the old "run forever" behaviour, and it is visible here.
+    """
+    if stop is None:
+        await asyncio.Event().wait()
+        return
+    await stop.wait()
 
 
 async def _flush_loop() -> None:
