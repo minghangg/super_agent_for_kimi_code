@@ -165,9 +165,11 @@ class TestEntryPointParity(Base):
         new_store = Store(self.root / "new")
         old = cli._engine(self.cfg, old_store, None)
         new = launcher.build_engine_component(self.cfg, new_store)
-        old.startup()
-        old.run_once()
-        new.run_once()
+        with mock.patch("super_agent.engine_parts.triage_batch.now",
+                        return_value="2026-11-26T00:00:00+00:00"):
+            old.startup()
+            old.run_once()
+            new.run_once()
         self.assertEqual(old_store.load_index().get("issues"),
                          new_store.load_index().get("issues"))
         self.assertEqual(old_store.load_cursor(), new_store.load_cursor())
