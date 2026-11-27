@@ -31,59 +31,10 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+from .seams import config  # noqa: F401  re-exported: the assembly is a host seam
+
 #: Default long-poll wait, matching ``decide_watch.main``'s ``--wait``.
 DEFAULT_WAIT_S = 20.0
-
-
-def config(cfg: dict, store, *, bus=None, port: int = 0,
-           wait: float | None = None):
-    """The complete ``DecideWatchConfig`` for this launcher. No guesswork.
-
-    Every injectable is supplied, because ``decide_watch.missing_injections()``
-    refuses to start on a partial set and a launcher that half-wires the leg would
-    register a component that can only fail - a permanent red row in every health
-    summary. Returning the config keeps this testable without module state.
-
-    The three session-side paths are passed **explicitly** (#139): omitting them
-    let ``decide_watch._path()`` fall back to ``state_root``, which holds no
-    session files. **Assembly never raises** (P0-1): an undeclared session root
-    degrades through :func:`seams.session_files_or_engine_root`, and the reason
-    reaches the health row via ``register_c2``.
-    """
-    from .. import decide_watch as dw
-    from . import seams
-
-    if bus is None:
-        from .. import wss_bus as bus
-
-    state = Path(store.root)
-    paths = seams.session_files_or_engine_root(cfg, state)
-    workspace = seams.workspace_root(cfg)
-    engine_cfg = cfg.get("engine") or {}
-    resolved_port = int(port or getattr(bus, "PORT", 58800))
-    waits = float(wait if wait is not None
-                  else (engine_cfg.get("decide_watch_wait_s") or DEFAULT_WAIT_S))
-
-    def inject(path: str, body: dict, port_=0):
-        return bus.bus_post(path, body, port=port_ or resolved_port)
-
-    return dw.DecideWatchConfig(
-        state_root=state,
-        sessions_path=paths["sessions"],
-        bind_path=paths["bind"],
-        ledger_path=paths["ledger"],
-        workspace_root=workspace,
-        event_source=bus,
-        heartbeat=seams.heartbeat(state),
-        inject_event=inject,
-        ps_json=seams.ps_json,
-        windowless_python=seams.windowless_python,
-        probe_session=seams.probe_session,
-        send_transport=seams.send_transport,
-        session_script=workspace / "tools" / "session_client.py",
-        liveness_state_path=state / "worker_liveness_state.json",
-        lock_path=state / "decide_watch.lock",
-    ), waits, resolved_port
 
 
 class C2Leg:
@@ -173,8 +124,29 @@ class C2Leg:
         unregistered = dw.notice_registration_problem()
         if unregistered:
             self._ensure_heartbeat_visible(dw, unregistered)
+        else:
+            self._clear_heartbeat_problem()
         self._prepared = True
         return waits, resolved_port
+
+    def _patrol(self, dw=None):
+        """The module whose registry the patrol reads: the injected bus, or ``wss_bus``."""
+        from . import seams
+
+        return seams.patrol_module(self.bus, dw=dw)
+
+    def _clear_heartbeat_problem(self) -> None:
+        """Drop the reason once the name **is** registered (#138 P2-2).
+
+        ``_ensure_heartbeat_visible`` used to be the only writer, so an operator
+        who fixed ``guardian_extra.json`` kept reading ``heartbeat_problem`` on
+        ``/healthz`` forever - a standing false alarm on a leg that had healed.
+        """
+        if not self.heartbeat_problem:
+            return
+        self.heartbeat_problem = ""
+        if self.health_row is not None:
+            self.health_row.heartbeat_problem = ""
 
     def _ensure_heartbeat_visible(self, dw, problem: str) -> None:
         """WARN once, and keep the unregistered name visible on **both** surfaces.
@@ -202,7 +174,7 @@ class C2Leg:
             return
         self._registration_warned = True
         dw.delivery_log(f"WARN 心跳未注册，收单腿继续运行（不再拒绝启动）：{problem}")
-        ensure = getattr(self.bus, "register_guardian", None)
+        ensure = getattr(self._patrol(dw), "register_guardian", None)
         if callable(ensure):
             try:
                 ensure(name, f"heartbeat/{name}.json", 900.0,

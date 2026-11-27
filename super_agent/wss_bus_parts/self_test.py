@@ -542,3 +542,70 @@ def self_test() -> int:
     for f_ in fails:
         print(f'  FAIL  {f_}')
     return 0 if not fails else 1
+
+
+def isolate(host) -> Path | None:
+    """Point ``host`` and the package copy at a throw-away root before ``self_test``.
+
+    Lives beside the assertions because it exists only for them: the self-test
+    asserts it never touches production, so both the state root and the
+    "production" baseline it compares against are throw-away directories.
+
+    **Two module objects, one configuration** (#138 P0-2). Under ``-m`` the file
+    runs as ``__main__`` and the *package* copy is a second object: the assertions
+    here reach ``wss_bus`` through ``from .. import wss_bus``, and that import
+    builds the package copy. Configuring only ``__main__`` left the assertions
+    reading an unconfigured ``_UnconfiguredPaths``, and they raised
+    ``RuntimeError: 未注入 state_root`` on the first ``PATHS`` access - the whole
+    ``-m`` entry point died before one assertion ran, while the import path stayed
+    green. ``hosts`` configures every live identity, and this module's assertions
+    then patch the same objects that were isolated.
+    """
+    return _isolate(host)
+
+
+def _isolate(host) -> Path | None:
+    cfg = host._cfg()
+    injected = cfg.self_test_root is not None
+    root = Path(cfg.self_test_root or tempfile.mkdtemp(prefix="wss_selftest_run_"))
+    root.mkdir(parents=True, exist_ok=True)
+    fake_prod = root / "_fake_production"
+    fake_prod.mkdir(parents=True, exist_ok=True)
+    overrides: dict = {}
+    if cfg.workspace_root is None:
+        overrides["workspace_root"] = root
+    if cfg.production_state_root is None:
+        overrides["production_state_root"] = fake_prod
+    if cfg.sessions_path is None:
+        overrides["sessions_path"] = root / "sessions.json"
+    for mod in _identities(host):
+        mod.configure(**overrides)
+        mod.PATHS = mod.Paths(root)
+        mod.PATHS.mkdir()
+        mod.STATE.seq = mod.SeqStore(mod.PATHS.seq)
+        mod.STATE.journal = mod.Journal(mod.PATHS.journal)
+    return None if injected else root
+
+
+def _identities(host) -> list:
+    """Every live ``wss_bus`` module object that must share one throw-away root.
+
+    ``__main__`` under ``-m``, the package copy this module imports, and ``host``;
+    de-duplicated because the import path has all three pointing at one module.
+    The package copy is imported **here** rather than left to happen later: under
+    ``-m`` it does not exist yet when isolation runs, and it must be configured
+    before any assertion reaches it.
+    """
+    import importlib
+    import sys
+
+    out = [host]
+    pkg = sys.modules.get("super_agent.wss_bus")
+    if pkg is None:
+        try:
+            pkg = importlib.import_module("super_agent.wss_bus")
+        except ImportError:            # pragma: no cover  only a broken install
+            pkg = None
+    if pkg is not None and not any(pkg is m for m in out):
+        out.append(pkg)
+    return out

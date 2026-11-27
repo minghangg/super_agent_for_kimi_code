@@ -22,6 +22,8 @@ Run: ``python -m pytest tests/test_iss138_heartbeat_registration.py -q``
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -150,6 +152,62 @@ class TheGapStaysVisible(_Base):
         self.assertNotIn("heartbeat_problem", payload["components"]["engine"])
 
 
+class ProductionAssembly(_Base):
+    """``bus=None`` is what production builds: ``launcher.py`` passes no ``bus``.
+
+    The twelve tests above all inject a ``_Bus`` that already has
+    ``register_guardian``, which is exactly why they were green while the live
+    leg stayed invisible (QA P0-1, measured on ``8c448fd``). These go through the
+    same ``getattr`` the production object does.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        saved = wss_bus.DEFAULT_CONFIG
+        self.addCleanup(lambda: wss_bus.configure(saved))
+        self.addCleanup(wss_bus._RUNTIME_GUARDIANS.clear)
+        wss_bus._RUNTIME_GUARDIANS.clear()
+        # ``self.root`` is the throw-away state root of a real ``wss_bus``.
+        wss_bus.configure(wss_bus.WssBusConfig(
+            state_root=self.root, production_state_root=self.root / "prod",
+            port=58800))
+        (self.root / "prod").mkdir(parents=True, exist_ok=True)
+
+    def test_a_leg_built_without_a_bus_still_registers_the_name(self):
+        """The repair must reach the module registry, not be skipped on ``None``."""
+        self.assertNotIn("supervisor_notice", wss_bus.guardian_thresholds())
+        leg = c2.C2Leg({}, None, decide_watch_config=self.config(wss_bus))
+        leg.prepare()                        # must not raise, must not skip
+        self.assertIn("supervisor_notice", wss_bus.guardian_thresholds(),
+                      "bus=None 时补注册被静默跳过 ⇒ /healthz 看不到缺失")
+        self.assertIn("supervisor_notice", leg.heartbeat_problem)
+
+    def test_healthz_reports_missing_not_absent_without_a_bus(self):
+        """Criterion 3 end to end: the patrol lists it and says ``missing``."""
+        leg = c2.C2Leg({}, None, decide_watch_config=self.config(wss_bus))
+        leg.prepare()
+        summary = wss_bus._guardian_summary()
+        self.assertIn("supervisor_notice", summary,
+                      "名字不在注册表 ⇒ 监护表里连 missing 都不报")
+        self.assertEqual(summary["supervisor_notice"]["state"], "missing")
+
+    def test_the_problem_is_cleared_once_the_name_is_registered(self):
+        """P2-2: a healed registration must not leave a permanent WARN behind."""
+        from super_agent.runner_parts.components import ComponentHealth
+
+        leg = c2.C2Leg({}, None, decide_watch_config=self.config(wss_bus))
+        row = ComponentHealth(name="decide_watch", kind="thread", budget=30.0)
+        leg.health_row = row
+        leg.prepare()
+        self.assertIn("supervisor_notice", row.heartbeat_problem)
+        wss_bus.register_guardian("supervisor_notice",
+                                  "heartbeat/supervisor_notice.json", 900.0)
+        leg.prepare()
+        self.assertEqual(leg.heartbeat_problem, "", "已注册却不回清＝永久假告警")
+        self.assertEqual(row.heartbeat_problem, "")
+        self.assertEqual(row.last_error, "", "清理不得改写 last_error")
+
+
 class RuntimeRegistration(unittest.TestCase):
     """``wss_bus.register_guardian`` is the seam the leg uses; pin its contract."""
 
@@ -195,6 +253,48 @@ class RuntimeRegistration(unittest.TestCase):
         summary = wss_bus._guardian_summary()
         self.assertIn("supervisor_notice", summary)
         self.assertEqual(summary["supervisor_notice"]["state"], "missing")
+
+
+class TheModuleEntryPointRuns(unittest.TestCase):
+    """``python -m super_agent.wss_bus --self-test`` must not crash (P0-2).
+
+    Under ``-m`` the file runs as ``__main__`` while ``wss_bus_parts.self_test``
+    imports the *package* copy, so the split created two module objects with two
+    separate ``PATHS``. Isolation configured only one, the assertions read the
+    other, and the entry point died on its first ``PATHS`` access - one assertion
+    short of running. No ``-m … --self-test`` test existed for this module, which
+    is why the whole suite stayed green. The assertion set itself is unchanged
+    (two pre-existing autostart failures), so the check is "it ran to the summary".
+    """
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def test_the_module_entry_point_reaches_the_summary(self):
+        proc = subprocess.run(
+            [sys.executable, "-m", "super_agent.wss_bus", "--self-test"],
+            cwd=str(self.ROOT), capture_output=True, text=True, timeout=300)
+        out = proc.stdout + proc.stderr
+        self.assertNotIn("未注入 state_root", out,
+                         "-m 入口在自检隔离前就读了 PATHS")
+        self.assertNotIn("Traceback", out, out[-2000:])
+        self.assertIn("--self-test:", out, out[-2000:])
+
+    def test_isolation_configures_both_module_identities(self):
+        """The isolation assertion itself must pass, which needs *both* copies.
+
+        ``PATHS 非生产根（自检隔离）`` reads ``_wb.PATHS`` through the package
+        copy. Under ``-m`` that copy is a different object from ``__main__``, so
+        the assertion passing is the observable proof that both were configured -
+        a single-object isolation leaves it reading ``_UnconfiguredPaths`` and
+        raises instead of checking.
+        """
+        proc = subprocess.run(
+            [sys.executable, "-m", "super_agent.wss_bus", "--self-test"],
+            cwd=str(self.ROOT), capture_output=True, text=True, timeout=300)
+        out = proc.stdout + proc.stderr
+        failures = [ln for ln in out.splitlines() if ln.startswith("  FAIL")]
+        self.assertFalse([f for f in failures if "自检隔离" in f], out[-2000:])
+        self.assertIn("--self-test:", out, out[-2000:])
 
 
 if __name__ == "__main__":

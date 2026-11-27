@@ -313,163 +313,20 @@ def log(msg: str) -> None:
 
 
 # --------------------------------------------------------------------- issue keys
-def repo_full_of(repo: str) -> str:
-    """Normalise ``owner/repo`` for key building: lowercase, slash-preserved."""
-    raw = str(repo or "").strip()
-    if "/" not in raw:
-        return ""
-    owner, _, name = raw.rpartition("/")
-    owner = owner.strip().lower()
-    name = name.strip().lower()
-    if not owner or not name:
-        return ""
-    return f"{owner}/{name}"
+# 键规范化整块搬到 ``wss_bus_parts.issue_keys``（#138 边改边打扫）：它只回答
+# 「owner/repo#N 与短键怎么建、怎么比」，是纯函数，不碰环形缓冲、锁或守护表。
+# 这里保留同名转发：``/healthz``、投递台账与自检都按名字访问它们。
+from .wss_bus_parts import issue_keys as _keys                 # noqa: E402
+from .wss_bus_parts.issue_keys import (                        # noqa: E402,F401
+    _normalised_bindings, _record_repo_full, bind_worker, delivery_key,
+    issue_key, legacy_issue_keys, lookup_issue_record, project_of_repo,
+    qualify_event_payload, repo_full_of)
 
 
-def project_of_repo(repo: str) -> str:
-    """``owner/repo`` → ``repo`` (lowercased). Used only for read-only compat."""
-    full = repo_full_of(repo)
-    return full.rsplit("/", 1)[-1] if full else ""
+def _bind_issue_keys() -> None:
+    """Hand the moved key module its two seams (deferred: both are defined later)."""
+    _keys.bind(cfg=_cfg, state_root=current_state_root)
 
-
-def issue_key(repo: str, issue) -> str:
-    """Canonical, cross-repository-safe key: ``owner/repo#issue``."""
-    full = repo_full_of(repo)
-    num = str(issue if issue is not None else "").strip()
-    if not full or not num:
-        return ""
-    return f"{full}#{num}"
-
-
-def legacy_issue_keys(repo: str, issue) -> list[str]:
-    """Short keys a pre-migration writer may have used — **read-only** compat."""
-    num = str(issue if issue is not None else "").strip()
-    out: list[str] = []
-    full = repo_full_of(repo)
-    proj = project_of_repo(repo)
-    for short in (full, proj):
-        if short and num:
-            out.append(f"{short}#{num}")
-    return out
-
-
-def _record_repo_full(key: str, rec) -> str:
-    """Best-effort ``owner/repo`` of a stored record (key or payload)."""
-    if isinstance(rec, dict):
-        val = rec.get("repo_full") or rec.get("repo") or ""
-        if val:
-            return repo_full_of(str(val))
-    if isinstance(key, str) and "/" in key and "#" in key:
-        return repo_full_of(key.split("#", 1)[0])
-    return ""
-
-
-def _normalised_bindings(db: dict) -> dict:
-    """Index a binding table under case-folded keys (qualified and short alike)."""
-    out: dict = {}
-    for k, v in db.items():
-        if not isinstance(k, str) or "#" not in k:
-            continue
-        head, _, num = k.rpartition("#")
-        full = repo_full_of(head) if "/" in head else ""
-        norm = f"{full}#{num.strip()}" if full else f"{head.strip().lower()}#{num.strip()}"
-        out[norm] = v
-    return out
-
-
-def lookup_issue_record(db: dict | None, repo: str, issue) -> dict | None:
-    """Binding lookup: fully-qualified key first, short keys only when unambiguous.
-
-    A short key such as ``demo#12`` cannot tell two owners apart. It is therefore
-    read **only** when no other repository could own it; a short key that is
-    ambiguous, or that points at a different owner, returns ``None`` instead of
-    silently matching the wrong repository. That is the anti-crosstalk rule.
-    """
-    if not isinstance(db, dict):
-        return None
-    norm = _normalised_bindings(db)
-    full_key = issue_key(repo, issue)
-    if full_key and isinstance(norm.get(full_key), dict):
-        return norm[full_key]
-    proj = project_of_repo(repo)
-    num = str(issue if issue is not None else "").strip()
-    if not proj or not num:
-        return None
-    short = f"{proj}#{num}"
-    rec = norm.get(short)
-    if not isinstance(rec, dict):
-        return None
-    # Every record that could own this short key: the bare spelling plus any
-    # qualified spelling of the same repository name and issue number.
-    owners: set[str] = set()
-    suffix = f"/{short}"
-    for k in norm:
-        if k == short:
-            continue
-        if k.endswith(suffix):
-            owners.add(k[: -len(suffix)])
-    want = repo_full_of(repo)
-    if owners:
-        # Another owner claims the same repo name and issue number ⇒ ambiguous.
-        return None
-    return rec
-
-
-def bind_worker(repo: str, issue, bind_path: Path | None = None) -> tuple[str, str]:
-    """``(worker name, session)`` from the binding table, or ``("unknown", "")``."""
-    cfg = _cfg()
-    if cfg.bind_lookup is not None:
-        try:
-            res = cfg.bind_lookup(repo, issue)
-        except Exception:                       # noqa: BLE001  injected, best effort
-            return "unknown", ""
-        if isinstance(res, tuple) and len(res) == 2:
-            return str(res[0] or "unknown"), str(res[1] or "")
-        return "unknown", ""
-    path = Path(bind_path) if bind_path else current_state_root() / cfg.bind_file
-    try:
-        db = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return "unknown", ""
-    rec = lookup_issue_record(db, repo, issue) or {}
-    worker = rec.get("worker") if isinstance(rec, dict) else None
-    if not isinstance(worker, dict):
-        return "unknown", ""
-    return str(worker.get("name") or "unknown"), str(worker.get("session") or "")
-
-
-def delivery_key(repo: str, issue, evidence: str = "") -> str:
-    """Key used by delivery bookkeeping (nudge / undelivered / pending)."""
-    key = issue_key(repo, issue)
-    ev = str(evidence or "").strip()
-    return f"{key}#{ev}" if key and ev else key
-
-
-def qualify_event_payload(payload: dict, repo: str = "", issue=None) -> dict:
-    """Return a payload whose issue-space keys are fully qualified.
-
-    The original ``project`` field is preserved; ``repo_full`` and ``key`` are
-    added so two repositories that share a name can never collide.
-    """
-    if not isinstance(payload, dict):
-        return {}
-    out = dict(payload)
-    raw_repo = str(repo or out.get("repo_full") or out.get("repo") or "")
-    num = issue if issue is not None else out.get("issue")
-    full = repo_full_of(raw_repo)
-    if not full:
-        proj = str(out.get("project") or "")
-        mapper = _cfg().repo_full_of_project
-        if proj and callable(mapper):
-            try:
-                full = repo_full_of(str(mapper(proj) or ""))
-            except Exception:                   # noqa: BLE001  injected, best effort
-                full = ""
-    out.setdefault("project", project_of_repo(raw_repo) or str(out.get("project") or ""))
-    out["repo_full"] = full
-    if full and num not in (None, ""):
-        out["key"] = issue_key(full, num)
-    return out
 
 
 # --------------------------------------------------------------------- seq/journal
@@ -3184,14 +3041,6 @@ async def _flush_loop() -> None:
             log(f"落盘失败：{type(exc).__name__}: {exc}")
 
 
-def _status() -> int:
-    h = bus_health(port=PORT)
-    if not h:
-        print(f"daemon: DOWN（localhost:{PORT} 不通；工具会降级直连）")
-        return 1
-    print("daemon: UP")
-    print(json.dumps(h, ensure_ascii=False, indent=1))
-    return 0
 
 
 def main(argv=None) -> int:
@@ -3225,7 +3074,8 @@ def main(argv=None) -> int:
     if args.self_check:
         return self_check()
     if args.self_test:
-        _cleanup = _isolate_for_self_test()
+        from .wss_bus_parts import self_test as _st_mod
+        _cleanup = _st_mod.isolate(sys.modules[__name__])
         try:
             return self_test()
         finally:
@@ -3234,13 +3084,13 @@ def main(argv=None) -> int:
     if args.probe:
         return probe(sid=args.sid, keep=args.keep)
     if args.status:
-        return _status()
+        return _cli_once.status()
     if args.install_autostart:
         return install_autostart()
     if args.uninstall_autostart:
         return uninstall_autostart()
     if args.once:
-        return asyncio.run(_once(args.wait))
+        return asyncio.run(_cli_once.once(args.wait))
     if args.daemon:
         try:
             return asyncio.run(_run_daemon())
@@ -3250,86 +3100,12 @@ def main(argv=None) -> int:
     return 2
 
 
-def _isolate_for_self_test() -> Path:
-    """Point PATHS and the seq/journal at a throw-away root before self_test.
+from .wss_bus_parts import cli_once as _cli_once              # noqa: E402
 
-    The self-test asserts it never touches production, so both the state root and
-    the "production" baseline it compares against are throw-away directories. A
-    standalone ``python -m super_agent.wss_bus --self-test`` therefore needs no
-    caller injection at all, and still cannot write a real state directory.
-
-    Returns the root so the caller can remove it afterwards (an injected
-    ``self_test_root`` is the caller's to clean, so it is never deleted here).
-    """
-    global PATHS
-    cfg = _cfg()
-    injected = cfg.self_test_root is not None
-    root = Path(cfg.self_test_root or tempfile.mkdtemp(prefix="wss_selftest_run_"))
-    root.mkdir(parents=True, exist_ok=True)
-    fake_prod = root / "_fake_production"
-    fake_prod.mkdir(parents=True, exist_ok=True)
-    overrides: dict = {}
-    if cfg.workspace_root is None:
-        overrides["workspace_root"] = root
-    if cfg.production_state_root is None:
-        overrides["production_state_root"] = fake_prod
-    if cfg.sessions_path is None:
-        overrides["sessions_path"] = root / "sessions.json"
-    if overrides:
-        configure(**overrides)
-    PATHS = Paths(root)
-    PATHS.mkdir()
-    STATE.seq = SeqStore(PATHS.seq)
-    STATE.journal = Journal(PATHS.journal)
-    return None if injected else root
-
-
-async def _once(wait: float) -> int:
-    import aiohttp
-
-    token = kimi_paths.token()
-    if not token:
-        print("读不到 token")
-        return 1
-    n, types = 0, {}
-    try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.ws_connect(K._ws_url(),
-                                       headers={"Authorization": f"Bearer {token}"},
-                                       heartbeat=20) as ws:
-                await _handshake(ws)
-                deadline = time.time() + wait
-                while time.time() < deadline:
-                    try:
-                        msg = await ws.receive(timeout=max(0.5, deadline - time.time()))
-                    except asyncio.TimeoutError:
-                        break
-                    if msg.type != aiohttp.WSMsgType.TEXT:
-                        break
-                    try:
-                        frame = json.loads(msg.data)
-                    except ValueError:
-                        continue
-                    t = frame.get("type") or ""
-                    if t == "ping":
-                        await ws.send_json({"type": "pong",
-                                            "payload": {"nonce": (frame.get("payload")
-                                                                  or {}).get("nonce", "")}})
-                        continue
-                    if t in ("pong", "server_hello"):
-                        continue
-                    if t in ("ack", "error", "response"):
-                        _mark_ack(frame)
-                        continue
-                    types[t] = types.get(t, 0) + 1
-                    n += 1
-    except Exception as exc:  # noqa: BLE001
-        print(f"--once 失败：{type(exc).__name__}: {exc}")
-        return 1
-    ok = sum(1 for r in STATE.subscribed.values() if r.get("ok"))
-    print(f"--once 完成：请求订阅 {len(STATE.subscribed)}，ack 成功 {ok}，收到 {n} 帧")
-    print("  类型分布：" + (json.dumps(types, ensure_ascii=False) if types else "（无事件）"))
-    return 0 if ok else 1
+_cli_once.bind(port=lambda: PORT, state=STATE, handshake=_handshake,
+               mark_ack=_mark_ack, bus_health=bus_health,
+               client=K, paths=kimi_paths)
+_bind_issue_keys()
 
 
 if __name__ == "__main__":

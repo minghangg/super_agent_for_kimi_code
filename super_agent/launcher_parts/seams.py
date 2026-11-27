@@ -30,6 +30,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+#: Default long-poll wait, matching ``decide_watch.main``'s ``--wait``. Lives here
+#: because :func:`config` is where it is applied; ``c2`` re-exports the name.
+DEFAULT_WAIT_S = 20.0
+
 
 def powershell_exe() -> str:
     import shutil
@@ -94,6 +98,31 @@ def thresholds():
     from .. import wss_bus
 
     return wss_bus.guardian_thresholds()
+
+
+def patrol_module(bus, *, dw=None):
+    """The module whose guardian registry the patrol reads (#138 P0-1).
+
+    Production's only launcher entry calls ``build_runner`` **without** ``bus``
+    (``launcher.py``), so the leg is built with ``bus=None`` there. Asking that
+    ``None`` for ``register_guardian`` skipped the repair silently, and
+    ``/healthz.guardians`` never listed the missing heartbeat - which is the one
+    half of the ruling that makes "warn and continue" acceptable.
+
+    ``c2.config()`` already falls back to ``wss_bus`` when ``bus is None``, but the
+    fallback only reached ``event_source``. Resolving it here keeps one answer for
+    "which module owns the registry" instead of a second copy in the leg.
+    """
+    if bus is not None:
+        return bus
+    if dw is None:
+        from .. import decide_watch as dw
+    source = getattr(getattr(dw, "_cfg")(), "event_source", None)
+    if source is not None:
+        return source
+    from .. import wss_bus
+
+    return wss_bus
 
 
 def heartbeat(store_root: Path):
@@ -199,3 +228,56 @@ def session_problem(cfg: dict) -> str:
 
 def workspace_root(cfg: dict) -> Path:
     return Path(str(cfg.get("workspace_root") or os.getcwd())).resolve()
+
+
+def config(cfg: dict, store, *, bus=None, port: int = 0,
+           wait: float | None = None):
+    """The complete ``DecideWatchConfig`` for this launcher. No guesswork.
+
+    Assembled here rather than in ``c2`` (#138 rework): every injection this
+    function supplies is a host seam, and ``c2`` is the consumer leg itself.
+
+    Every injectable is supplied, because ``decide_watch.missing_injections()``
+    refuses to start on a partial set and a launcher that half-wires the leg would
+    register a component that can only fail - a permanent red row in every health
+    summary. Returning the config keeps this testable without module state.
+
+    The three session-side paths are passed **explicitly** (#139): omitting them
+    let ``decide_watch._path()`` fall back to ``state_root``, which holds no
+    session files. **Assembly never raises** (P0-1): an undeclared session root
+    degrades through :func:`seams.session_files_or_engine_root`, and the reason
+    reaches the health row via ``register_c2``.
+    """
+    from .. import decide_watch as dw
+
+    if bus is None:
+        from .. import wss_bus as bus
+
+    state = Path(store.root)
+    paths = session_files_or_engine_root(cfg, state)
+    workspace = workspace_root(cfg)
+    engine_cfg = cfg.get("engine") or {}
+    resolved_port = int(port or getattr(bus, "PORT", 58800))
+    waits = float(wait if wait is not None
+                  else (engine_cfg.get("decide_watch_wait_s") or DEFAULT_WAIT_S))
+
+    def inject(path: str, body: dict, port_=0):
+        return bus.bus_post(path, body, port=port_ or resolved_port)
+
+    return dw.DecideWatchConfig(
+        state_root=state,
+        sessions_path=paths["sessions"],
+        bind_path=paths["bind"],
+        ledger_path=paths["ledger"],
+        workspace_root=workspace,
+        event_source=bus,
+        heartbeat=heartbeat(state),
+        inject_event=inject,
+        ps_json=ps_json,
+        windowless_python=windowless_python,
+        probe_session=probe_session,
+        send_transport=send_transport,
+        session_script=workspace / "tools" / "session_client.py",
+        liveness_state_path=state / "worker_liveness_state.json",
+        lock_path=state / "decide_watch.lock",
+    ), waits, resolved_port
