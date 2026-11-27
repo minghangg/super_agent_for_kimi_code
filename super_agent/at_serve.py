@@ -416,7 +416,6 @@ def main(argv=None) -> int:
 
     from . import agent_config
     from . import config as config_mod
-    from . import store as store_mod
 
     parser = argparse.ArgumentParser(prog="python -m super_agent.at_serve")
     parser.add_argument("--root", default="", help="state root (default: the store root)")
@@ -426,8 +425,10 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     # Resolve the root the same way ``cli._build`` does, so the service reads
     # the files the engine wrote instead of a look-alike directory beside them.
-    root, _note = store_mod.choose_root(config_mod.state_root(
-        config_mod.load(overrides=agent_config.overrides())))
+    # No legacy guess here (#140): a bare ``choose_root(root)`` would fall back
+    # to ``"state"``, a directory chosen by its name rather than declared.
+    root = config_mod.state_root(
+        config_mod.load(overrides=agent_config.overrides()))
     if args.root:
         root = Path(args.root)
     return run(root=root, port=args.port,

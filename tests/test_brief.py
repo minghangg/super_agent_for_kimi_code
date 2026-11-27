@@ -47,8 +47,14 @@ def _dropped_total(text: str, start: str, end: str) -> int:
 
 
 def _make_workbench(root: Path, sessions: dict) -> Path:
-    """A workbench stand-in: state/sessions.json plus the referenced docs."""
-    state = root / "state"
+    """A workbench stand-in: the documents plus a ``data/`` session root.
+
+    The session root is named ``data`` on purpose (#140): the brief must find
+    ``sessions.json`` through the configured root, never by assuming the
+    directory is called ``state``. The caller declares it in
+    ``engine.session_state_dir`` exactly as a deployment does.
+    """
+    state = root / "data"
     state.mkdir(parents=True, exist_ok=True)
     (state / "sessions.json").write_text(json.dumps(sessions), encoding="utf-8")
     for rel in ("playbooks/workflow_12steps.md", "playbooks/closeout_checklist.md",
@@ -71,11 +77,13 @@ class BriefBase(unittest.TestCase):
             "pm-other": {"id": "session_pmother", "updated": "2026-11-08T10:00"},
             "steward": {"id": "session_steward", "updated": "2026-11-08T10:00"},
         })
+        self.sessions_path = self.lwa / "data" / "sessions.json"
         self.store = Store(self.state)
         self.cfg = config.load(None, {
             "role": "supervisor",
             "github": {"source": "none"},
             "store": {"max_event_lines": 1000, "max_outbox_lines": 1000},
+            "engine": {"session_state_dir": str(self.lwa / "data")},
         })
 
     def tearDown(self) -> None:
@@ -133,6 +141,55 @@ class Sections(BriefBase):
         self.assertIn("pm-demo -> session_pmdemo", text)
         self.assertNotIn("pm-other", text)
         self.assertNotIn("session_pmother", text)
+
+
+class SessionRootFromConfig(BriefBase):
+    """#140: the roster is read from the declared root, never by directory name."""
+
+    def test_root_named_data_is_read(self):
+        """The fixture's root is ``data``; a name test would return nothing."""
+        _raw, text = self.brief()
+        self.assertIn("pm-demo -> session_pmdemo", text)
+        self.assertFalse((self.lwa / "state").exists(),
+                         "夹具不应再建 state/ 目录")
+
+    def test_undeclared_root_reports_why_instead_of_empty(self):
+        """No session root configured must say so, not print an empty roster."""
+        self.cfg = config.load(None, {
+            "role": "supervisor",
+            "github": {"source": "none"},
+            "store": {"max_event_lines": 1000, "max_outbox_lines": 1000},
+        })
+        _raw, text = self.brief()
+        self.assertIn("会话根未配置", text)
+        self.assertNotIn("pm-demo -> session_pmdemo", text)
+
+    def test_missing_lwa_root_says_where_to_declare_it(self):
+        """A workbench root is declared, not derived - and the hint says which."""
+        self.cfg = config.load(None, {
+            "role": "supervisor",
+            "github": {"source": "none"},
+            "store": {"max_event_lines": 1000, "max_outbox_lines": 1000},
+        })
+        out = brief_mod.build_brief(self.cfg, self.store)
+        text = brief_mod.render(out, limits=brief_mod.Limits())
+        self.assertIn("engine.lwa_root", text)
+
+    def test_the_roster_follows_the_configured_root_not_a_sibling(self):
+        """Cross-contamination guard, kept from the old ``wb_root`` branch.
+
+        Reading the roster from wherever the workbench happens to be would make
+        an isolated brief list the production PM sids. The configured root is
+        the only source, so a second ``sessions.json`` under the workbench is
+        ignored.
+        """
+        decoy = self.lwa / "state"
+        decoy.mkdir()
+        (decoy / "sessions.json").write_text(
+            json.dumps({"pm-production": {"id": "session_prod"}}), encoding="utf-8")
+        _raw, text = self.brief()
+        self.assertIn("pm-demo -> session_pmdemo", text)
+        self.assertNotIn("pm-production", text)
 
 
 class WaitingItems(BriefBase):
@@ -299,7 +356,7 @@ class CorruptState(BriefBase):
         self.assertNotIn("active_assignments=0", health_block)
 
     def test_corrupt_sessions_json_reports_unknown(self):
-        (self.lwa / "state" / "sessions.json").write_text("nope", encoding="utf-8")
+        self.sessions_path.write_text("nope", encoding="utf-8")
         _raw, text = self.brief()
         self.assertIn("未知（sessions.json", text)
 

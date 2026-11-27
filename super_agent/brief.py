@@ -153,22 +153,23 @@ def _strict_json(path: Path):
 def _lwa_root(cfg: dict, override: str | None) -> Path | None:
     """Workbench checkout root: where the charter and its playbooks live.
 
-    ``engine.lwa_root`` is the declared answer. Deriving it from the session
-    stream (the old behaviour) answered a different question: the stream's
-    parent is the *session root*, and a session root need not sit inside a
-    workbench checkout - so the guess silently produced ``None`` and the role
-    section quietly went empty (ISS-79). The override (``--lwa``) still wins.
+    Declared, never derived (#140). ``engine.lwa_root`` (or ``--lwa``) is the
+    answer; when neither is set this returns ``None`` and section 1 says so.
+    The old derivation read the session stream's parent and required it to be
+    named ``state``, which made the answer depend on a directory *name*: as
+    soon as a deployment put its runtime root in ``data`` the condition was
+    false for every run and the role section went quietly empty.
+
+    A workbench root is a different fact from a runtime root - one holds
+    documents, the other holds state - so it has to be declared once instead of
+    inferred from the other.
     """
     if override:
         return Path(override).expanduser().resolve()
     declared = str(((cfg or {}).get("engine") or {}).get("lwa_root") or "").strip()
     if declared:
         return Path(os.path.expanduser(declared)).resolve()
-    try:
-        root = session_events.resolve_session_root(cfg)
-    except OSError:
-        return None
-    return root.parent if root.name == "state" else None
+    return None
 
 
 def _classify(reason: str, markers=None) -> int:
@@ -185,7 +186,7 @@ def _classify(reason: str, markers=None) -> int:
 def _role_items(root: Path | None, role: str) -> list[Item]:
     if root is None:
         return [Item("role", PRIORITY_SKELETON,
-                     "未找到工作台根目录（设 --lwa 或 LWA_STATE_DIR）")]
+                     "未找到工作台根目录（设 --lwa 或配置 engine.lwa_root）")]
     wanted = [
         f"assistants/{role}.md",
         "playbooks/workflow_12steps.md",
@@ -207,18 +208,22 @@ def _role_items(root: Path | None, role: str) -> list[Item]:
 
 
 def _projects_items(cfg: dict, *, target: str, project: str | None,
-                    limit: int, wb_root: Path | None) -> tuple[list[Item], list[Problem]]:
-    """PM keys and sids only. The ledger is read from ``wb_root`` when given.
+                    limit: int) -> tuple[list[Item], list[Problem]]:
+    """PM keys and sids only, read from the **configured** session root.
 
-    Resolving the ledger from the engine's state dir would make an isolated
-    brief read the production roster, which is exactly the cross-contamination
-    this command exists to avoid: a pm brief would then leak every other
-    project's session id.
+    One resolution source (#140): ``sessions.json`` sits beside the event
+    stream, so :func:`session_events.resolve_sessions_path` answers it. The
+    caller's workbench root is a document location and must not be used to
+    build a state path - that is how a brief came to look for
+    ``<workbench>/state/sessions.json`` in a deployment whose root is ``data``,
+    and printed an empty roster instead of an error.
     """
-    if wb_root is not None:
-        path = wb_root / "state" / "sessions.json"
-    else:
+    try:
         path = session_events.resolve_sessions_path(cfg)
+    except session_events.SessionStreamNotConfigured as exc:
+        return ([Item("projects", PRIORITY_SKELETON,
+                      f"未知（会话根未配置：{exc}）")],
+                [Problem("sessions.json", str(exc))])
     data, err = _strict_json(path)
     items: list[Item] = []
     problems: list[Problem] = []
@@ -417,8 +422,7 @@ def build_brief(cfg: dict, store, *, target: str = "supervisor",
     sections["role"] = _role_items(root, str(cfg.get("role") or "supervisor"))
 
     project_items, project_problems = _projects_items(
-        cfg, target=target, project=project, limit=limits.projects,
-        wb_root=root)
+        cfg, target=target, project=project, limit=limits.projects)
     sections["projects"] = project_items
     problems.extend(project_problems)
 

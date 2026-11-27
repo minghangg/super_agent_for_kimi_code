@@ -56,6 +56,7 @@ import json
 import os
 from pathlib import Path
 
+from . import config_paths as path_rules
 from .config import ConfigError
 
 CHECKOUT = Path(__file__).resolve().parents[1]
@@ -236,8 +237,7 @@ def get(dotted: str, default=None, *, path: Path | str | None = None):
 
 def projects_file() -> str:
     """The project table file, or ``""`` when neither layer configures one."""
-    raw = str(get("github.projects_file") or "").strip()
-    return os.path.expanduser(raw) if raw else ""
+    return path_rules.declared(get("github.projects_file"))
 
 
 def projects() -> dict:
@@ -251,87 +251,57 @@ def projects() -> dict:
 def token_source() -> tuple[str, str]:
     """``(env name, file path)`` for the GitHub token. Values are never printed."""
     env_name = str(get("github.token_env") or "GITHUB_TOKEN").strip()
-    raw = str(get("github.token_file") or "").strip()
-    return env_name, os.path.expanduser(raw) if raw else ""
+    return env_name, path_rules.declared(get("github.token_file"))
 
 
 def allowlist_file() -> str:
-    raw = str(get("github.allowlist_file") or "").strip()
-    return os.path.expanduser(raw) if raw else ""
+    return path_rules.declared(get("github.allowlist_file"))
 
 
 def state_dir() -> str:
-    """The declared session/state root, or ``""`` (the caller decides).
-
-    A relative value -- from any layer, file or environment -- is resolved
-    against **this checkout**, never the process working directory: the same
-    command run from the checkout and from elsewhere used to write two
-    different roots (P0-1 #98, same shape as the derived fallback). An
-    absolute value is passed through unchanged after ``expanduser``.
-
-    Anchoring is by *value shape*, not by which layer answered: "a relative
-    path means relative to this checkout" is a path rule, so ``tmp/x`` from the
-    environment and ``tmp/x`` from the file must name one directory. A caller
-    that wants working-directory semantics passes an absolute path.
-    """
-    raw = str(get("paths.state_dir") or "").strip()
-    if not raw:
-        return ""
-    path = Path(os.path.expanduser(raw))
-    if not path.is_absolute():
-        path = (CHECKOUT / path)
-    return str(path.resolve())
+    """The declared session/state root anchored at this checkout (see #98)."""
+    return path_rules.anchored(get("paths.state_dir"), CHECKOUT)
 
 
 def engine_state_dir() -> str:
     """The engine/AT artifact root, independent of the session ledger root."""
-    raw = str(get("paths.engine_state_dir") or "").strip()
-    if not raw:
-        return ""
-    path = Path(os.path.expanduser(raw))
-    if not path.is_absolute():
-        path = (CHECKOUT / path)
-    return str(path.resolve())
+    return path_rules.anchored(get("paths.engine_state_dir"), CHECKOUT)
 
 
 def project_env_dir() -> str:
-    """The declared project-environment directory, or ``""`` (the caller decides).
-
-    Relative values resolve against **this checkout**, never the working
-    directory -- the same rule as :func:`state_dir` (#98 P0-1). A second anchor
-    for one key family is how two answers start disagreeing.
-    """
-    raw = str(get("paths.project_env_dir") or "").strip()
-    if not raw:
-        return ""
-    path = Path(os.path.expanduser(raw))
-    if not path.is_absolute():
-        path = (CHECKOUT / path)
-    return str(path.resolve())
+    """The declared project-environment directory, anchored at this checkout."""
+    return path_rules.anchored(get("paths.project_env_dir"), CHECKOUT)
 
 
 def sessions_dir() -> str:
-    raw = str(get("paths.sessions_dir") or "").strip()
-    return os.path.expanduser(raw) if raw else ""
+    return path_rules.declared(get("paths.sessions_dir"))
+
 
 def quota_config() -> str:
-    raw = str(get("quota.config_file") or "").strip()
-    return os.path.expanduser(raw) if raw else ""
+    return path_rules.declared(get("quota.config_file"))
 
 
 def quota_cores_dir() -> str:
-    raw = str(get("quota.cores_dir") or "").strip()
-    return os.path.expanduser(raw) if raw else ""
+    return path_rules.declared(get("quota.cores_dir"))
 
 
 def model_profiles_file() -> str:
-    raw = str(get("models.profiles_file") or "").strip()
-    return os.path.expanduser(raw) if raw else ""
+    return path_rules.declared(get("models.profiles_file"))
 
 
 def charter_root() -> str:
-    raw = str(get("charter.root") or "").strip()
-    return os.path.expanduser(raw) if raw else ""
+    return path_rules.declared(get("charter.root"))
+
+
+def lwa_root() -> str:
+    """The declared workbench checkout root (``engine.lwa_root``), or ``""``.
+
+    Mapped into the config by :func:`overrides` on purpose (#140): the key was
+    readable here but never reached ``cfg``, so ``brief`` could not see a
+    workbench root the deployment *had* declared and printed "not found" on
+    every run. A value nobody routes is a value nobody reads.
+    """
+    return path_rules.declared(get("engine.lwa_root"))
 
 
 def charter_project_prefixes() -> tuple:
@@ -458,6 +428,9 @@ def overrides() -> dict:
     console = dispatch_console()
     if console:
         engine.setdefault("dispatch", {})["console"] = console
+    lwa = lwa_root()
+    if lwa:
+        engine["lwa_root"] = lwa
     archive = session_archive_cmd()
     if archive:
         engine["session_archive_cmd"] = archive
@@ -506,6 +479,7 @@ def _reset_cache() -> None:
 __all__ = [
     "AgentConfigError", "ENV", "DEFAULTS", "allowlist_file", "autostart_tasks",
     "charter_map", "charter_project_prefixes", "charter_root", "config_path",
+    "lwa_root",
     "describe", "dispatch_console", "engine_state_dir", "get", "load", "model_profiles_file",
     "overrides", "project_env_dir", "projects", "projects_file", "quota_config",
     "quota_cores_dir", "role_prefixes", "sessions_dir", "state_dir",

@@ -195,18 +195,18 @@ def check_migration(root: Path, *, accept_empty_index: bool = False) -> None:
                 "拒绝启动；请从快照恢复或重跑迁移脚本。")
 
 
-def choose_root(data: str | Path, legacy: str | Path = "state") -> tuple[Path, str]:
+def choose_root(data: str | Path, legacy: str | Path | None = None) -> tuple[Path, str]:
     """Pick the runtime root and describe the choice.
 
-    ``data/`` wins whenever it holds any engine file. The legacy ``state/`` is
-    read only when ``data/`` holds none *and* ``state/`` holds at least one -
-    the case of a user who upgrades before migrating. Both present is reported
-    so the stale copy gets deleted; neither present is a fresh install.
+    ``data/`` wins whenever it holds any engine file; ``legacy`` is read only
+    when handed in, and reported when both hold state. No default for
+    ``legacy`` (#140): it was the literal ``"state"``, found by name.
     """
     data = Path(data)
-    legacy = Path(legacy)
     data_has = any((data / name).is_file() for name in ENGINE_FILES)
-    legacy_has = any((legacy / name).is_file() for name in ENGINE_FILES)
+    legacy = Path(legacy) if legacy is not None else None
+    legacy_has = legacy is not None and any(
+        (legacy / name).is_file() for name in ENGINE_FILES)
     if not data_has and legacy_has:
         return legacy, f"runtime state read from legacy path {legacy}"
     if data_has and legacy_has:

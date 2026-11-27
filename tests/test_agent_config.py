@@ -131,6 +131,23 @@ class OverrideMappingTest(_Isolated):
         self.assertNotIn("unknown_section", overrides)
         config.load(overrides=overrides)      # validate accepts what we injected
 
+    def test_declared_lwa_root_reaches_the_caller(self):
+        """#140: a declared workbench root must arrive, not just be readable.
+
+        ``agent_config.get("engine.lwa_root")`` answered the right path while
+        ``overrides()`` never mapped it, so ``brief`` saw no workbench root and
+        said "not found" on every run.
+        """
+        self.write({"engine": {"lwa_root": str(self.root / "wb")}})
+        cfg = config.load(overrides=agent_config.overrides())
+        self.assertEqual(Path(cfg["engine"]["lwa_root"]),
+                         (self.root / "wb").resolve())
+
+    def test_absent_lwa_root_injects_nothing(self):
+        """An empty string would replace a ``--config`` file's own value."""
+        self.write({})
+        self.assertNotIn("lwa_root", agent_config.overrides().get("engine") or {})
+
 
 class EnvironmentLayerTest(_Isolated):
     """Environment wins over the file, and the file wins over the default."""

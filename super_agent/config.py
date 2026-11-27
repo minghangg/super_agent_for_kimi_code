@@ -26,8 +26,10 @@ DEFAULTS: dict = {
     "role": "supervisor",
     "mode": "observe",
     "state_dir": "data",
-    # Where the pre-migration runtime root is looked for. "" means "the
-    # ``state`` sibling of the chosen root" (see ``cli._legacy_root``).
+    # The pre-migration runtime root. Declared or absent (#140): there is no
+    # "sibling ``state/``" default any more, because finding a directory by its
+    # name answered "no legacy data" as soon as a deployment moved its root to
+    # ``data``. See ``cli._legacy_root``.
     "legacy_state_dir": "",
     # ISS-101: path-like keys that are not the state root. A section rather
     # than loose top-level keys because ``agent_config.overrides()`` maps
