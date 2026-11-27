@@ -20,7 +20,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .. import session_map_io, sessionkeys
+from .. import markers as markers_mod
+from .. import session_events, session_map_io, sessionkeys
+
+parse_five = markers_mod.parse_five
 
 
 def read_session_map(path: Path) -> tuple[dict, str]:
@@ -93,3 +96,62 @@ def keys_from_map(data: dict | None, role: str, *, released=(),
             continue
         out.add(name)
     return out
+
+
+def sid_of(data: dict, key_name: str) -> str:
+    """The sid a key name maps to in ``sessions.json``, or ``""``.
+
+    The map's entries are either ``{"id": sid}`` or a bare sid string, depending
+    on who wrote them; both shapes are read here so a caller does not have to
+    know which one it got.
+    """
+    entry = (data or {}).get(str(key_name or ""))
+    if isinstance(entry, dict):
+        return str(entry.get("id") or entry.get("session") or "")
+    return str(entry or "")
+
+
+def authored_by(data: dict, claimed: str, sid: str) -> bool:
+    """Does key ``claimed`` resolve to ``sid``? Unknown answers ``False``.
+
+    ``False`` on an unknown key is deliberate: the caller uses this to decide
+    whether a frame would go back to its author, and skipping a real request is
+    worse than ringing one that turned out to be noisy.
+    """
+    if not claimed or not sid:
+        return False
+    return sid_of(data, claimed) == sid
+
+
+def escalation_is_self_authored(sid: str, comment: dict, cfg: dict, *,
+                                session_map) -> bool:
+    """Would an escalation frame ring the session that wrote it?
+
+    A supervisor's own ``[告警]`` used to ring itself and leave a
+    ``needs_person`` row nobody could resolve (#140 cids 7222965791 /
+    7223070715). Ringing it is a loop; the request is already on the issue,
+    written by the very person the wake would reach.
+
+    Every unknown answers ``False`` - ring rather than skip. Skipping a real
+    request to silence a noisy one is the wrong trade: the noisy one costs a
+    glance, the skipped one costs a stalled issue.
+
+    ``session_map(path)`` is injected so this module keeps its one rule: it does
+    not know how ``sessions.json`` is located, only how it is read.
+    """
+    if not sid:
+        return False
+    claimed = str((comment or {}).get("session_key") or "").strip()
+    if not claimed:
+        body = str((comment or {}).get("body") or "")
+        claimed = str((parse_five(body) or {}).get("who") or "").strip()
+    if not claimed:
+        return False
+    try:
+        path = session_events.resolve_sessions_path(cfg)
+    except OSError:
+        return False
+    data, problem = session_map(path)
+    if problem:
+        return False
+    return authored_by(data, claimed, sid)

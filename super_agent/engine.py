@@ -249,16 +249,6 @@ def _tail_events(path: Path, *, limit: int, max_bytes: int = 512 * 1024) -> list
     return rows
 
 
-def _parse_ts(value: str) -> datetime | None:
-    """Parse an ISO timestamp written by ``_now()``; ``None`` when unusable."""
-    text = str(value or "").strip()
-    if not text:
-        return None
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def _default_allowlist_path() -> Path:
@@ -1027,6 +1017,19 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
         if claimed:
             return claimed in keys
         return False
+
+    def _escalation_from_supervisor(self, index: dict | None,
+                                    comment: dict) -> bool:
+        """Would this escalation frame ring the session that wrote it?
+
+        A supervisor's own ``[告警]`` used to ring itself and leave a
+        ``needs_person`` row nobody could resolve (#140). The whole decision -
+        key, map, comparison - is in
+        :func:`engine_parts.session_keys.escalation_is_self_authored`.
+        """
+        return session_key_mod.escalation_is_self_authored(
+            self._supervisor_sid(index), comment, self.cfg,
+            session_map=lambda path: self._session_map(path))
 
     # ------------------------------------------------------------- at routing
     def _at_session_keys(self, thread: str) -> set[str]:
@@ -1888,6 +1891,17 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
             self.store.log_event({
                 "type": "pm.escalation", "at": _now(), "thread": thread,
                 "comment_id": cid, "marker": escalated})
+            if self._escalation_from_supervisor(index, comment):
+                # The author is the session this frame would wake. Ringing it
+                # is a loop, and the row is one nobody can resolve: the request
+                # is already on the issue, written by the person the wake would
+                # reach. One event, no row, no frame (#140).
+                self.store.log_event({
+                    "type": "pm.escalation_self", "at": _now(),
+                    "thread": thread, "comment_id": cid,
+                    "detail": "escalation authored by the supervisor sid; "
+                              "not routed back to itself"})
+                return "tracked", "escalation authored by supervisor"
             self._pm_needs_person(index, thread, cid, "pm.escalation[user]",
                                   f"escalation marker {escalated!r}", verdict)
             self._record_pm_verdict(index, thread, verdict, cid)
@@ -2418,13 +2432,9 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
 
     @staticmethod
     def _pm_frame_text(issue, cid, verdict: dict, *, exception: bool) -> str:
-        """The one line a person reads for a PM frame."""
-        state = str(verdict.get("state") or "") or "unreadable"
-        if exception:
-            return (f"【PM 例外】#{int(issue)} PM 结论 {state}"
-                    f"（cid {cid}），需要人看一眼")
-        return (f"【可关单】#{int(issue)}，PM 结论 ready"
-                f"（cid {cid}），可以关单")
+        """Forwarder: the wording lives in ``engine_parts.frame_text``."""
+        return frame_text_mod.pm_frame_text(issue, cid, verdict,
+                                            exception=exception)
 
     def _retry_pm_frames(self, index: dict) -> int:
         """Re-send PM frames a refused/suppressed dispatch never sent.
@@ -4252,7 +4262,7 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
     def _check_process(self) -> tuple:
         """Forwarder: :func:`engine_parts.doctor.process`."""
         return doctor_mod.process(self.store, current_head=_current_head,
-                                  parse_ts=_parse_ts)
+                                  parse_ts=frame_text_mod.parse_ts)
 
     def _check_config(self) -> tuple:
         """Forwarder: :func:`engine_parts.doctor.config`."""
