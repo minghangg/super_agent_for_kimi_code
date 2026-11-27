@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from .c2 import DEFAULT_WAIT_S, C2Leg, config  # noqa: F401  re-exported
 from .c2 import config as decide_watch_config
+from .seams import session_problem  # noqa: F401  re-exported (#139 P0-1)
 
 
 def decide_watch_tick(cfg: dict, store, *, bus=None, port: int = 0,

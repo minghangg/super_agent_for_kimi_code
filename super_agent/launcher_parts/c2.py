@@ -43,6 +43,12 @@ def config(cfg: dict, store, *, bus=None, port: int = 0,
     refuses to start on a partial set and a launcher that half-wires the leg would
     register a component that can only fail - a permanent red row in every health
     summary. Returning the config keeps this testable without module state.
+
+    The three session-side paths are passed **explicitly** (#139): omitting them
+    let ``decide_watch._path()`` fall back to ``state_root``, which holds no
+    session files. **Assembly never raises** (P0-1): an undeclared session root
+    degrades through :func:`seams.session_files_or_engine_root`, and the reason
+    reaches the health row via ``register_c2``.
     """
     from .. import decide_watch as dw
     from . import seams
@@ -51,6 +57,7 @@ def config(cfg: dict, store, *, bus=None, port: int = 0,
         from .. import wss_bus as bus
 
     state = Path(store.root)
+    paths = seams.session_files_or_engine_root(cfg, state)
     workspace = seams.workspace_root(cfg)
     engine_cfg = cfg.get("engine") or {}
     resolved_port = int(port or getattr(bus, "PORT", 58800))
@@ -62,6 +69,9 @@ def config(cfg: dict, store, *, bus=None, port: int = 0,
 
     return dw.DecideWatchConfig(
         state_root=state,
+        sessions_path=paths["sessions"],
+        bind_path=paths["bind"],
+        ledger_path=paths["ledger"],
         workspace_root=workspace,
         event_source=bus,
         heartbeat=seams.heartbeat(state),
@@ -136,14 +146,13 @@ class C2Leg:
         * ``gate_check()`` is the fixture gate - a wrong config must not send, so
           it still refuses;
         * ``notice_registration_problem()`` is about a **missing heartbeat name**,
-          and refusing on it took the whole collection leg down. Measured on the
-          live launcher: ``runs`` 134 → 135 with ``running=false`` and
-          ``last_error`` repeating "refused to run" every round, so
-          ``delivery_tick()`` never executed once. A missing heartbeat makes one
-          leg invisible to the watchdog; killing the leg makes the feature stop.
-          The lighter fault wins: WARN and continue, and the name is registered
-          for the patrol (see :func:`_ensure_heartbeat_visible`) so ``/healthz``
-          still reports it ``missing`` instead of dropping it.
+          and refusing on it took the whole collection leg down (measured:
+          ``runs`` 134 → 135 with ``running=false`` and ``last_error`` repeating
+          "refused to run", so ``delivery_tick()`` never ran once). A missing
+          heartbeat makes one leg invisible; killing the leg stops the feature.
+          The lighter fault wins: WARN, continue, and register the name for the
+          patrol (see :func:`_ensure_heartbeat_visible`) so ``/healthz`` reports
+          it ``missing`` instead of dropping it.
         """
         from .. import decide_watch as dw
 

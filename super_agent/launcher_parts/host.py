@@ -71,6 +71,16 @@ def register_c2(cfg, store, rn, *, runner_mod, bus, interval, budget, enable,
     row = rn.register("decide_watch", leg, kind=runner_mod.THREAD,
                       interval=interval, budget=budget)
     row.health.supervisor = _supervisor_label(supervisor)
+    # Why the three session paths fell back to the engine root, or "" (#139
+    # P0-1). Asked here, not raised by ``c2.config()``: a raise would take
+    # ``build_runner`` down, and an unconfigured session stream is a
+    # configuration answer, not a crash. The row is still registered and the leg
+    # still runs, so this rides beside ``last_error`` the way
+    # ``heartbeat_problem`` does - a leg scanning a ledger nobody writes must be
+    # visible without being reported as broken.
+    session_problem = parts.session_problem(cfg)
+    if session_problem:
+        row.health.session_problem = session_problem
     # The leg only learns about an unregistered heartbeat on its first round, so
     # it is handed its own row and writes the reason there itself (#138). The
     # alternative - guessing here - would mean re-deriving the registry lookup in

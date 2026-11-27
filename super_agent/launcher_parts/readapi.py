@@ -56,7 +56,9 @@ COMPONENT_FIELDS = ("enabled", "running", "kind", "started", "last_started_at",
 #: must be visible on ``/healthz``). ``heartbeat_problem`` follows the same rule
 #: (#138): only the ``decide_watch`` leg has a supervisor-notice heartbeat, and an
 #: empty string on every other row would claim they all have one.
-OPTIONAL_COMPONENT_FIELDS = ("supervisor", "heartbeat_problem")
+#: ``session_problem`` (#139) is why the three session paths degraded to the
+#: engine root: the leg still runs, so it is not a failure, but it is not silent.
+OPTIONAL_COMPONENT_FIELDS = ("supervisor", "heartbeat_problem", "session_problem")
 
 #: Top-level fields. ``failures`` is derived, never a stored dict.
 TOP_FIELDS = ("pid", "running", "phase", "started_at", "stalled")

@@ -105,6 +105,16 @@ def _build(args) -> tuple[dict, Store]:
         overrides["role"] = args.role
     if args.state_dir:
         overrides["state_dir"] = args.state_dir
+        # ``--state-dir`` isolates the **whole** run, session state included
+        # (ISS-139 P0-2). ``agent_config.overrides()`` has already filled
+        # ``engine.session_state_dir`` from the private deployment file, and
+        # ``resolve_session_root`` prefers that key - so setting ``state_dir``
+        # alone left an isolated launcher scanning the production ledger and
+        # resolving the production PM (measured: 227 rows, the real PM sid).
+        # #132 recorded the same accident for the session backend and
+        # ``at_service._deployment_resolver`` pins the rule for the AT maps: an
+        # isolated run reads its own root, never the deployment's.
+        overrides.setdefault("engine", {})["session_state_dir"] = args.state_dir
     if args.source:
         overrides.setdefault("github", {})["source"] = args.source
     cfg = config_mod.load(args.config, overrides)

@@ -59,6 +59,12 @@ class ComponentHealth:
     #: ``supervisor``: the leg stays healthy, so this cannot go in ``last_error``,
     #: yet the missing heartbeat must not be silent.
     heartbeat_problem: str = ""
+    #: Why this leg's three session paths fell back to the engine root, or ``""``.
+    #: Present only when the fallback happened (#139 P0-1). Same rule again: the
+    #: leg still assembles and runs, so ``last_error`` would report a failure that
+    #: did not occur - but a leg scanning a ledger nobody writes is exactly the
+    #: silence #139 was filed for, so it cannot be dropped either.
+    session_problem: str = ""
 
     def as_dict(self) -> dict:
         row = {"enabled": bool(self.enabled), "running": bool(self.running),
@@ -72,6 +78,8 @@ class ComponentHealth:
             row["supervisor"] = self.supervisor
         if self.heartbeat_problem:
             row["heartbeat_problem"] = self.heartbeat_problem
+        if self.session_problem:
+            row["session_problem"] = self.session_problem
         return row
 
 
