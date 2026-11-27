@@ -234,6 +234,23 @@ def _send(sid: str, text: str, *, timeout: float = 60.0):
     return cfg.send_transport(sid, text, timeout=timeout)
 
 
+def _send_result(res) -> tuple[int, str]:
+    """``send_transport`` 的两种返回形态 → ``(rc, tail)``。
+
+    ``seams.send_transport`` 返回 ``direct.send`` 的 ``(ok, detail)``；更早的
+    实现返回带 ``returncode`` 的子进程对象。两种都必须接受：只认后者会每轮抛
+    ``AttributeError``（该条不记为已发，于是无限重发）；只认前者会把失败的
+    tuple 读成 ``rc=0``（静默假报已投）。
+    """
+    if isinstance(res, tuple):
+        ok = bool(res[0]) if res else False
+        detail = res[1] if len(res) > 1 else ""
+        return (0 if ok else 1), str(detail or "").strip()[:160]
+    rc = int(getattr(res, "returncode", 0) or 0)
+    tail = (getattr(res, "stderr", "") or getattr(res, "stdout", "") or "").strip()
+    return rc, tail[:160]
+
+
 def _probe_session(sid: str):
     probe = _cfg().probe_session
     if probe is None:
@@ -602,8 +619,9 @@ def notify(rsid: str, text: str, dry: bool) -> bool:
     except Exception as exc:  # noqa: BLE001
         log(f"send 失败：{type(exc).__name__}: {exc}")
         return False
-    if r.returncode != 0:
-        log(f"send 失败 rc={r.returncode}：{(r.stderr or r.stdout or '').strip()[:160]}")
+    rc, tail = _send_result(r)
+    if rc != 0:
+        log(f"send 失败 rc={rc}：{tail}")
         return False
     log(f"已通知 supervisor {rsid[:14]}…：{text[:60]}")
     return True
@@ -823,8 +841,7 @@ def _attempt_notice(row: dict, dry: bool) -> tuple[str, str, bool]:
         res = _send(sid, text)
     except Exception as exc:  # noqa: BLE001  send 异常＝本轮没投出去，留台账下轮再试
         return "retry_later", f"send 异常 {type(exc).__name__}: {exc}", True
-    rc = int(getattr(res, "returncode", 0) or 0)
-    tail = (getattr(res, "stderr", "") or getattr(res, "stdout", "") or "").strip()
+    rc, tail = _send_result(res)
     if rc == SEND_RC_DELIVERED:
         return "delivered", "", False
     if rc == SEND_RC_RETIRED:
@@ -1404,8 +1421,9 @@ def delivery_notify(sid: str, text: str, dry: bool) -> bool:
     except Exception as exc:  # noqa: BLE001
         delivery_log(f"send 失败：{type(exc).__name__}: {exc}")
         return False
-    if r.returncode != 0:
-        delivery_log(f"send 失败 rc={r.returncode}：{(r.stderr or r.stdout or '')[:160]}")
+    rc, tail = _send_result(r)
+    if rc != 0:
+        delivery_log(f"send 失败 rc={rc}：{tail}")
         return False
     delivery_log(f"已发 {sid[:14]}…：{text[:60]}")
     return True
