@@ -416,6 +416,7 @@ def main(argv=None) -> int:
 
     from . import agent_config
     from . import config as config_mod
+    from . import config_paths as path_rules
 
     parser = argparse.ArgumentParser(prog="python -m super_agent.at_serve")
     parser.add_argument("--root", default="", help="state root (default: the store root)")
@@ -423,12 +424,14 @@ def main(argv=None) -> int:
     parser.add_argument("--allow-send", action="store_true",
                         help="send the answer to the AT console (off by default)")
     args = parser.parse_args(argv)
-    # Resolve the root the same way ``cli._build`` does, so the service reads
-    # the files the engine wrote instead of a look-alike directory beside them.
-    # No legacy guess here (#140): a bare ``choose_root(root)`` would fall back
-    # to ``"state"``, a directory chosen by its name rather than declared.
-    root = config_mod.state_root(
-        config_mod.load(overrides=agent_config.overrides()))
+    # The root chain lives in ``config_paths.runtime_root``: state_dir, then a
+    # **declared** ``legacy_state_dir``, then ``store.choose_root``. Reading it
+    # through that one function is what keeps this service on the same files
+    # the engine wrote -- spelling it out here is how the legacy branch got
+    # dropped and the page read an empty directory (QA 7222834246). A legacy
+    # root is never found by its directory name.
+    cfg = config_mod.load(overrides=agent_config.overrides())
+    root, _note = path_rules.runtime_root(cfg)
     if args.root:
         root = Path(args.root)
     return run(root=root, port=args.port,

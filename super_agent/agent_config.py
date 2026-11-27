@@ -31,23 +31,18 @@ Importing this module reads nothing: :func:`load` reads on first call and
 caches the result. That keeps "import has no side effects" true for the whole
 package and keeps the tests offline.
 
-Note on ``paths.state_dir``: it is the session-ledger root and also the default
-engine root. ``paths.engine_state_dir`` may override only the engine/AT artifact
-root when a deployment intentionally separates them; both must then stay explicit.
-When neither is configured the derived fallback is ``config.DEFAULTS["state_dir"]``
-(``data``) **resolved against this checkout**, so the two keys stay equal and
-the value does not move with the process working directory. That absolute path
-is still a **known degradation**, not a fix: the close guard reads
-``<workbench>/state/ledger.jsonl`` and cannot see a ledger written under
-``<checkout>/data/``. Point ``paths.state_dir`` at that workbench's ``state/``
-to make the two the same file.
+Note on ``paths.state_dir``: it is the session-ledger root and the default
+engine root. ``paths.engine_state_dir`` may override only the engine/AT
+artifact root; both must then stay explicit. The derived fallback is
+``config.DEFAULTS["state_dir"]`` resolved against this checkout, so the value
+does not move with the process working directory. That absolute path is still a
+**known degradation**: the close guard reads the workbench's ``state/ledger``
+and cannot see a ledger under this checkout's ``data/``.
 
-Note on ``github.allowlist_file``: it has **no** default here. This module is
-the private layer, and a public placeholder path is not a private fact -- when
-it was used as a default, :func:`overrides` overwrote a ``--config`` file's own
-``engine.project_allowlist`` on every run (a deep merge puts overrides last),
-which silently replaced a deployment's project table with the shipped one. When
-nothing configures it, :func:`overrides` injects nothing and the caller's own
+Note on ``github.allowlist_file``: it has **no** default here. A public
+placeholder path is not a private fact -- as a default, :func:`overrides`
+overwrote a ``--config`` file's own ``engine.project_allowlist`` on every run
+(overrides merge last). Unconfigured means inject nothing, and the caller's own
 fallback decides (``cli._repo_allowlist``, ``issue_cli._allowlist_path``).
 """
 from __future__ import annotations
@@ -136,6 +131,10 @@ DEFAULTS = {
     "paths.state_dir": "",
     "paths.project_env_dir": "",
     "paths.sessions_dir": "",
+    # #140 QA 7222834246: the pre-migration runtime root. Without a declaration
+    # here the value a deployment writes is never read, so every reader saw
+    # "no legacy root" no matter what the file said.
+    "legacy_state_dir": "",
     "quota.config_file": "",
     "quota.cores_dir": "",
     "models.profiles_file": "",
@@ -222,10 +221,12 @@ def get(dotted: str, default=None, *, path: Path | str | None = None):
         raw = (os.environ.get(env_name) or "").strip()
         if raw:
             return os.path.expanduser(raw)
-    section, _, leaf = dotted.partition(".")
-    doc = load(path)
-    node = doc
-    for part in (section, leaf):
+    # ``a.b`` walks two levels; a bare ``a`` is a top-level key. Splitting on a
+    # missing dot used to leave ``leaf == ""``, so ``node.get("")`` answered
+    # ``None`` and a top-level key was unreadable no matter what the file said
+    # (#140 QA 7222834246: that is why ``legacy_state_dir`` never arrived).
+    node = load(path)
+    for part in dotted.split("."):
         if not isinstance(node, dict):
             node = None
             break
@@ -296,12 +297,20 @@ def charter_root() -> str:
 def lwa_root() -> str:
     """The declared workbench checkout root (``engine.lwa_root``), or ``""``.
 
-    Mapped into the config by :func:`overrides` on purpose (#140): the key was
-    readable here but never reached ``cfg``, so ``brief`` could not see a
-    workbench root the deployment *had* declared and printed "not found" on
-    every run. A value nobody routes is a value nobody reads.
+    Routed into ``cfg`` by :func:`overrides` (#140): readable here but never
+    reaching ``cfg`` is why ``brief`` printed "not found" for a root the
+    deployment had declared.
     """
     return path_rules.declared(get("engine.lwa_root"))
+
+
+def legacy_state_dir() -> str:
+    """The declared pre-migration runtime root, or ``""`` (#140 QA 7222834246).
+
+    Same shape as :func:`lwa_root`, and routed the same way: without the route
+    ``at_serve`` could not learn that a legacy root was declared at all.
+    """
+    return path_rules.declared(get("legacy_state_dir"))
 
 
 def charter_project_prefixes() -> tuple:
@@ -318,11 +327,9 @@ def charter_map() -> tuple:
     name prefix is a general fact (``wk-`` reads ``worker.md``), and a fresh
     clone that configured nothing must still get its charters. A configured
     ``charter.map`` is merged **in front** so a deployment can override a
-    prefix or add one, without having to restate the whole table.
-
-    Before ISS-95 this returned only the configured table, which was empty in
-    every deployment -- so ``charter_for()`` answered "" for every session name
-    and warm-up injected no charter at all.
+    prefix or add one, without restating the whole table. Before ISS-95 only the
+    configured table was returned -- empty in every deployment, so
+    ``charter_for()`` answered "" for every name and warm-up injected nothing.
     """
     configured = get("charter.map") or {}
     merged: list[tuple[str, str]] = []
@@ -362,10 +369,8 @@ def session_archive_cmd() -> str:
 def autostart_tasks() -> dict:
     """``{part: scheduled task name}`` -- ``{}`` when no layer configures one.
 
-    The public floor is empty on purpose: a task name is a deployment fact, and
-    a made-up name would register or verify a task nobody asked about. Callers
-    treat an empty mapping as "not configured" and refuse (rc=2) rather than
-    guess.
+    The public floor is empty on purpose: a task name is a deployment fact, so
+    callers treat an empty mapping as "not configured" and refuse (rc=2).
     """
     table = get("autostart.tasks") or {}
     if not isinstance(table, dict):
@@ -376,21 +381,15 @@ def autostart_tasks() -> dict:
 def overrides() -> dict:
     """The overrides dict for ``config.load(overrides=...)``.
 
-    Only keys ``config`` actually declares are mapped here -- a key with no
-    declaration would bypass ``config.validate`` and become a second source of
-    truth. ``agent_config`` adds no ``state_dir`` key of its own: it maps the
-    one that already exists.
+    Only keys ``config`` declares are mapped: an undeclared key would bypass
+    ``config.validate`` and become a second source of truth.
 
-    ``engine.session_state_dir`` is derived here when ``paths.state_dir`` is
-    not configured. That derivation is the **only** fallback in the package:
-    ``session_ledger.root()`` and ``session_events`` add none, because a second
-    one is how two answers start disagreeing about the same file.
-
-    The derived value is **absolute** -- ``<checkout>/data`` -- not the bare
-    ``"data"`` relative path it used to be. A relative value is resolved against
-    whatever the process's working directory happens to be, so the same command
-    run from the checkout and from the workbench wrote two different ledgers,
-    and the close guard read neither of the two it expected (P0-1, #98 fix 1).
+    ``engine.session_state_dir`` is derived here when ``paths.state_dir`` is not
+    configured -- the **only** fallback in the package, because a second one is
+    how two answers start disagreeing about one file. The derived value is
+    absolute (``<checkout>/data``): a relative one moves with the process's
+    working directory, so the same command run from two places wrote two
+    ledgers (#98 P0-1).
     """
     from . import config as config_mod
 
@@ -403,16 +402,10 @@ def overrides() -> dict:
     engine_state = engine_state_dir()
     if engine_state:
         out["state_dir"] = engine_state
-    # ``paths`` is a declared section (``config.DEFAULTS["paths"]``), so
-    # mapping it here goes through ``config.validate`` like every other key.
-    # Leaving it out was not harmless: a ``--config`` file's
-    # ``paths.project_env_dir`` was answered by a *different* layer than the
-    # one the user wrote, so the file looked configured while every lookup fell
-    # back to the default (#98 P0-2 shape, one section over).
-    #
-    # Only a value that actually resolves is mapped. An empty entry would
-    # recreate the bug: ``overrides`` is merged **last**, so ``""`` would
-    # replace a ``--config`` file's own value.
+    # ``paths`` is a declared section, so mapping it here goes through
+    # ``config.validate`` like every other key. Only a value that resolves is
+    # mapped: ``overrides`` is merged **last**, so ``""`` would replace a
+    # ``--config`` file's own value (#98 P0-2, one section over).
     penv = project_env_dir()
     if penv:
         out.setdefault("paths", {})["project_env_dir"] = penv
@@ -431,6 +424,12 @@ def overrides() -> dict:
     lwa = lwa_root()
     if lwa:
         engine["lwa_root"] = lwa
+    # #140 QA 7222834246: a top-level key, mapped at the top level. Every
+    # reader builds its cfg from ``overrides()``, so leaving it out made the
+    # declared pre-migration root invisible to all of them.
+    legacy = legacy_state_dir()
+    if legacy:
+        out["legacy_state_dir"] = legacy
     archive = session_archive_cmd()
     if archive:
         engine["session_archive_cmd"] = archive

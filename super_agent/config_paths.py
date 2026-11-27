@@ -47,3 +47,33 @@ def anchored(raw, checkout: str | Path) -> str:
     if not path.is_absolute():
         path = Path(checkout) / path
     return str(path.resolve())
+
+
+def runtime_root(cfg: dict, override: str | None = None) -> tuple[Path, str]:
+    """The engine's runtime root, and the note explaining the choice.
+
+    One resolution chain, called by every process that reads what the engine
+    wrote (#140): ``state_root`` -> the declared ``legacy_state_dir`` ->
+    ``store.choose_root``. ``cli._build`` and ``at_serve`` used to each spell
+    this out, and they drifted -- ``at_serve`` dropped the legacy branch and
+    read an empty root while the engine wrote elsewhere, both silently.
+
+    The legacy root is consulted **only when declared**. It used to default to
+    the ``"state"`` sibling of the chosen root, a directory found by its name;
+    that answered "no legacy data" for ever once a deployment moved its root to
+    ``data``.
+
+    Imports are deferred: ``store`` imports ``issuekey``, ``config`` is read by
+    both, and this module is imported early by ``agent_config``.
+    """
+    from . import config as config_mod
+    from . import store as store_mod
+
+    root = config_mod.state_root(cfg, override)
+    legacy = declared(cfg.get("legacy_state_dir"))
+    if not legacy:
+        return root, ""
+    legacy_path = Path(legacy).resolve()
+    if legacy_path == root:
+        return root, ""
+    return store_mod.choose_root(root, legacy=legacy_path)

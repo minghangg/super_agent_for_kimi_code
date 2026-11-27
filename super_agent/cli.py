@@ -38,6 +38,7 @@ from . import session_events
 from . import session_ledger
 from . import assignments as asg_mod
 from . import cli_resolve
+from . import config_paths as path_rules
 from . import needs as needs_mod
 from . import runloop
 from . import stopcontrol
@@ -89,11 +90,12 @@ def _legacy_root(cfg: dict) -> Path | None:
     An upgrade from a pre-migration layout therefore declares the old root::
 
         {"state_dir": ".../data", "legacy_state_dir": ".../state"}
+
+    The look-up itself lives in :func:`config_paths.runtime_root`, so this
+    module and ``at_serve`` cannot answer it differently (QA 7222834246).
     """
-    raw = str(cfg.get("legacy_state_dir") or "").strip()
-    if raw:
-        return Path(os.path.expanduser(raw)).resolve()
-    return None
+    raw = path_rules.declared(cfg.get("legacy_state_dir"))
+    return Path(raw).resolve() if raw else None
 
 
 def _build(args) -> tuple[dict, Store]:
@@ -126,12 +128,9 @@ def _build(args) -> tuple[dict, Store]:
     if allow_path:
         cfg.setdefault("engine", {})["project_allowlist"] = allow_path
     store_cfg = cfg.get("store") or {}
-    root = config_mod.state_root(cfg, args.state_dir)
-    legacy = _legacy_root(cfg)
-    if legacy is not None and legacy != root:
-        root, note = store_mod.choose_root(root, legacy=legacy)
-        if note:
-            print(f"WARN {note}", file=sys.stderr)
+    root, note = path_rules.runtime_root(cfg, args.state_dir)
+    if note:
+        print(f"WARN {note}", file=sys.stderr)
     store = Store(root,
                   max_event_lines=int(store_cfg.get("max_event_lines") or 10_000),
                   max_outbox_lines=int(store_cfg.get("max_outbox_lines") or 5_000),

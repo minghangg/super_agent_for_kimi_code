@@ -89,9 +89,9 @@ DEFAULTS: dict = {
         # "" = fall back to the parent of the resolved stream.
         "session_state_dir": "",
         # ISS-79: the workbench checkout root, for documents (charter, its
-        # playbooks). Independent of where the session stream lives: the brief
-        # used to infer it from ".../state/events.jsonl", which is a guess about
-        # a different question. "" = infer from the session root's parent.
+        # playbooks). Independent of where the session stream lives, and
+        # **declared only** (#140): "" = no workbench root, never inferred from
+        # a directory name.
         "lwa_root": "",
         # ISS-79: the session console (``sess.py``). Declared here so the path
         # stops being assembled from a directory name; "" = the assembled
