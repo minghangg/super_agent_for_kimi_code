@@ -32,6 +32,7 @@ from __future__ import annotations
 from ..store import action_id
 from .. import markers, needs
 from .. import assignments as asg_mod
+from . import frame_text as frame_text_mod
 
 
 def _now() -> str:
@@ -141,7 +142,7 @@ class ReviewRoutes:
                    "verdict": str(review.get("verdict") or ""),
                    "project": target["project"], "pm_sid": target["pm_sid"],
                    "sid": target["pm_sid"],
-                   "text": self._qa_notice_text(
+                   "text": frame_text_mod.qa_notice_text(
                        target["project"], issue, cid,
                        str(review.get("verdict") or "")),
                    "unverified": not verified}

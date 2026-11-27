@@ -22,9 +22,13 @@ import threading
 import time
 
 from . import stopcontrol
+from .engine_parts import fault_report as fault_report_mod
 
 #: Consecutive failures that end the loop with exit code 1.
-DEFAULT_MAX_FAILURES = 10
+#: Three, not ten (user ruling 2026-11-28: an engine that keeps running while it
+#: keeps failing is worse than one that stops). Network blips are the exception
+#: the counter buys: a couple of them pass, a third in a row is a broken link.
+DEFAULT_MAX_FAILURES = 3
 
 #: Sleep granularity, so a stop request lands within ~0.2 s.
 WAIT_SLICE = 0.2
@@ -70,7 +74,7 @@ def run_loop(engine, store, *, interval: float = 60.0,
             break
         rounds += 1
         summary: dict = {}
-        ok, err = True, ""
+        ok, err, trace = True, "", ""
         try:
             summary = engine.run_once()
         except KeyboardInterrupt:            # no handler installed (embedded use)
@@ -80,10 +84,22 @@ def run_loop(engine, store, *, interval: float = 60.0,
             break
         except Exception as exc:             # noqa: BLE001  a bad round is not fatal
             ok, err = False, f"{type(exc).__name__}: {exc}"
+            # The reason, not the symptom: a crash is recorded with its frames
+            # so the next reader does not have to reproduce it (2026-11-28).
+            trace = fault_report_mod.describe(exc, frames=8)
         else:
             errors = summary.get("errors") or []
             if errors:
                 ok, err = False, "; ".join(str(e) for e in errors)
+
+        # A fault the engine cannot retry its way out of ends the run now: the
+        # loop's failure counter exists for transient trouble, and using it for
+        # a 401 would turn one loud error into three quiet ones.
+        if summary.get("source_fatal"):
+            store.log_event({"type": "run.fatal", "at": now(), "round": rounds,
+                             "error": err, "trace": trace})
+            reason = "fatal"
+            break
 
         external = int(store.load_counters().get("external_actions") or 0)
         try:
@@ -102,9 +118,11 @@ def run_loop(engine, store, *, interval: float = 60.0,
         else:
             consecutive += 1
             store.log_event({"type": "run.failed", "at": now(), "round": rounds,
-                             "error": err})
+                             "error": err, "trace": trace})
             print(f"round={rounds} failed ({consecutive}/{max_failures}): {err}",
                   file=sys.stderr, flush=True)
+            if trace:
+                print(trace, file=sys.stderr, flush=True)
 
         if consecutive >= max_failures:
             reason = "max_failures"
@@ -123,7 +141,7 @@ def run_loop(engine, store, *, interval: float = 60.0,
             reason = "signal"
             break
 
-    exit_code = 1 if reason == "max_failures" else 0
+    exit_code = 1 if reason in ("max_failures", "fatal") else 0
     store.log_event({"type": "run.stopped", "at": now(), "reason": reason,
                      "rounds": rounds, "external_actions": external})
     # A clean stop must not look like a crash: the pid lock is about to go, so
@@ -131,8 +149,12 @@ def run_loop(engine, store, *, interval: float = 60.0,
     # here and leaves running=true, which is exactly what doctor reports.
     write_health = getattr(engine, "write_health", None)
     if callable(write_health):
+        # A stop caused by a failure names it: ``health.json`` is what the next
+        # person opens first, and "running=false" alone says nothing about why.
+        last_error = err if reason in ("fatal", "max_failures") else ""
         try:
-            write_health(running=False)
+            write_health(running=False, error=last_error,
+                         degraded=bool(last_error))
         except OSError as exc:
             print(f"warning: health write failed: {exc}", file=sys.stderr)
     stopcontrol.flush_state(store)

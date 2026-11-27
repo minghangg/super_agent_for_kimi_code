@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from .. import markers
 from ..store import action_id
+from . import frame_text as frame_text_mod
 
 
 def _now() -> str:
@@ -42,6 +43,8 @@ class RefusedRoutes:
     # type it carries. Three matches the E61 liveness window, so a person hears
     # about a stuck verdict on the same rhythm they hear about a stuck session.
     REFUSED_RETRY_ROUNDS = 3
+    # Re-alert cadence after the first: once ever is amnesia, every round is noise.
+    REFUSED_REALERT_ROUNDS = 30
     REFUSED_RETRY_ROW = "route.refused_retryable"
 
     def _route_refused_review(self, index: dict, thread: str, issue: int,
@@ -72,7 +75,7 @@ class RefusedRoutes:
                    "project": target["project"],
                    "verdict": str(review.get("verdict") or ""),
                    "sid": target["pm_sid"], "pm_sid": target["pm_sid"],
-                   "text": self._qa_notice_text(
+                   "text": frame_text_mod.qa_notice_text(
                        target["project"], issue, cid,
                        str(review.get("verdict") or "")),
                    "refused": True, "reason": reason,
@@ -261,9 +264,14 @@ class RefusedRoutes:
         streak["rounds"] = int(streak.get("rounds") or 0) + 1
         if streak["rounds"] < self.REFUSED_RETRY_ROUNDS:
             return
-        if streak.get("alerted_at"):
+        # One alert is a moment, not a report (#122/#123/#129: 4243/4240/2839
+        # refused rounds, one alert each). First at 3, then every 30.
+        if not streak.get("alerted_at"):
+            streak["alerted_at"] = _now()
+        elif streak["rounds"] % self.REFUSED_REALERT_ROUNDS:
             return
-        streak["alerted_at"] = _now()
+        else:
+            streak["realerted_at"] = _now()
         reason = (f"{self.REFUSED_RETRY_ROW}[user]: verdict on cid {cid} of "
                   f"{thread} was refused {streak['rounds']} rounds in a row; "
                   "see route.decided for what each round answered")
@@ -278,11 +286,14 @@ class RefusedRoutes:
 
     @staticmethod
     def _clear_route_refusal(route: dict) -> None:
-        """A landed dispatch ends the streak.
+        """A landed dispatch ends the streak - and the alert stamps with it.
 
-        ``alerted_at`` stays as the one-shot proof, so the same comment can
-        never alert twice even if it is refused again afterwards.
+        Keeping ``alerted_at`` became a trap once re-alerting existed: a route
+        that succeeded and was later refused for a new cause could never
+        announce it. A new streak earns its own first alert.
         """
         streak = route.get("refusal_streak")
         if isinstance(streak, dict):
             streak["rounds"] = 0
+            streak.pop("alerted_at", None)
+            streak.pop("realerted_at", None)

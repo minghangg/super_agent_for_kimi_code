@@ -46,7 +46,8 @@ class ReadResult:
 
 def read_issue(source, issue: int, key: str, rec: dict, cur: int, *,
                at_mode: bool, qa_recovery: bool, max_comments: int,
-               max_pages: int, pause_read=None, log=None, summary=None) -> ReadResult:
+               max_pages: int, delivery_recovery: bool = False,
+               pause_read=None, log=None, summary=None) -> ReadResult:
     """Run the read chain for one issue and report what came out of it.
 
     ``pause_read(index, key, issue, cur, rows, budget, summary)`` and
@@ -81,7 +82,7 @@ def read_issue(source, issue: int, key: str, rec: dict, cur: int, *,
         rec["read_budget"] = {}
     batch = github_source.paged_batch(
         source, issue, cursor_before=cur, max_pages=budget,
-        whole_listing=bool(qa_recovery or at_mode))
+        whole_listing=bool(qa_recovery or at_mode or delivery_recovery))
     out.batch = batch
     out.rows_read = len(batch.rows)
     if not walk_claims.walk_covers_cursor(batch, cur):
@@ -92,6 +93,8 @@ def read_issue(source, issue: int, key: str, rec: dict, cur: int, *,
     out.fresh = [c for c in batch.rows
                  if int(c["id"]) > cur
                  or (qa_recovery and markers.parse_review(
+                     str(c.get("body") or "")))
+                 or (delivery_recovery and markers.parse_delivery(
                      str(c.get("body") or "")))][:max_comments]
     if at_mode:
         out.history_rows = walk_claims.walk_rows(batch)
@@ -117,6 +120,37 @@ def qa_recovery(assignments, *, terminal, output_cids) -> bool:
         str(rec.get("role") or "") == "qa"
         and str(rec.get("status") or "") not in terminal
         and rec.get("review_comment_id") is None for rec in assignments)
+
+
+def delivery_recovery(assignments, *, terminal, output_cids) -> bool:
+    """Is there a live worker whose delivery never made it onto the record?
+
+    The exact mirror of :func:`qa_recovery`, and it exists for the same reason:
+    a markered comment that arrived in a window where the assignment did not
+    exist yet is either consumed as ``assignment.unmatched`` and lost, or
+    re-read later. Only a whole-listing walk can still see it, because the
+    cursor has already moved past it.
+
+    ``asg_mod.on_delivery`` is idempotent on the comment id, so a recovery read
+    can never record the same delivery twice or re-notify the project PM for
+    one that is already on record.
+    """
+    return any(str(rec.get("role") or "") == "worker"
+               and str(rec.get("status") or "") not in terminal
+               and not output_cids(rec) for rec in assignments)
+
+
+def recovery_flags(assignments, thread: str, *, terminal, output_cids) -> tuple:
+    """``(qa_recovery, delivery_recovery)`` for one thread, in one pass.
+
+    Both questions start from the same slice (the thread's assignments), and
+    answering them separately made the caller repeat the filter and the two
+    keyword arguments. One function, one place to keep them in step.
+    """
+    rows = [rec for rec in assignments.values()
+            if str(rec.get("thread") or "") == thread]
+    return (qa_recovery(rows, terminal=terminal, output_cids=output_cids),
+            delivery_recovery(rows, terminal=terminal, output_cids=output_cids))
 
 
 def replay_rows(source, issue: int, paged_batch):

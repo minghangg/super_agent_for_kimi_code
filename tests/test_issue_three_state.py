@@ -492,10 +492,15 @@ class RefusedRetryAlert(unittest.TestCase):
         route = engine.store.load_index()["routes"][self.KEY]
         self.assertTrue(route["ok"])
         self.assertEqual(route["refusal_streak"]["rounds"], 0)
-        stamp = route["refusal_streak"]["alerted_at"]
+        # A delivered route has no alert stamp left: the streak it belonged to
+        # is over, so a *new* refusal later earns its own first alert rather
+        # than inheriting a stamp nobody can date (#140 re-alert cadence). The
+        # "one alert, ever" property is asserted by the counts below, not by
+        # keeping a dead stamp around.
+        self.assertNotIn("alerted_at", route["refusal_streak"])
         self.assertEqual(len(self.alerts(engine)), 1, "one alert, ever")
         # Ten more rounds: ok=True keeps the retry pass out, so no call and no
-        # second alert, and the alert moment does not move.
+        # second alert, and no new row is written.
         for _ in range(10):
             engine.run_once()
         self.assertEqual(calls["n"], 1, "a delivered route is never retried")
@@ -503,7 +508,7 @@ class RefusedRetryAlert(unittest.TestCase):
         self.assertEqual(len(self.alerts(engine)), 1)
         self.assertEqual(
             engine.store.load_index()["routes"][self.KEY]
-            ["refusal_streak"]["alerted_at"], stamp)
+            ["refusal_streak"]["rounds"], 0)
 
     def test_a_restart_does_not_re_alert(self):
         engine = self.engine()

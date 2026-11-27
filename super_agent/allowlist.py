@@ -35,6 +35,8 @@ malformed. Deleting the overlay restores single-file behaviour exactly.
 """
 from __future__ import annotations
 
+from . import allowlist_overlay as overlay_mod
+
 import copy
 import hashlib
 import json
@@ -368,60 +370,8 @@ class ProjectAllowlist:
         return self.reload()
 
     def sync_issues(self, project: str, issues) -> dict:
-        """Record ``issues`` for ``project`` in the untracked overlay.
-
-        The tracked allowlist is a published file: rewriting it from a running
-        engine would turn configuration into run state and put a private
-        repository's issue numbers into a tracked diff. The overlay
-        (``<name>.local.json``) already has ``issues`` in
-        :data:`OVERLAY_FIELDS` and is never committed, so that is where the
-        engine keeps "which issues are live right now".
-
-        **This call is the single source of truth for the in-flight set**
-        (``super_agent/engine.py:3996`` calls it once per round with what GitHub
-        reports as open-and-not-on-hold). The ``issues`` list in the *tracked*
-        file is an initial snapshot only: :func:`merge_overlay` replaces the
-        column wholesale, so a hand-added number there neither guarantees
-        delivery nor survives the next round. A number GitHub does not return
-        is never in flight, no matter what any file says (ISS-74 E).
-
-        Idempotent: identical content is not rewritten. A write failure is
-        reported, never raised - a read-only checkout must still run.
-        """
-        name = str(project or "").strip()
-        wanted = sorted({int(n) for n in (issues or []) if str(n).strip().lstrip("-").isdigit()})
-        out = {"project": name, "written": False, "changed": False, "error": ""}
-        if not name or self.data is None or name not in self.data["projects"]:
-            out["error"] = f"project {name!r} not in the allowlist"
-            return out
-        current = self.data["projects"][name].get("issues") or []
-        if sorted(current) == wanted:
-            return out
-        raw, error = self._read_overlay()
-        if error:
-            out["error"] = error
-            return out
-        overlay = copy.deepcopy(raw) if raw else {}
-        projects = overlay.setdefault("projects", {})
-        entry = projects.setdefault(name, {})
-        if not isinstance(entry, dict):
-            out["error"] = f"overlay project {name!r} is not an object"
-            return out
-        entry["issues"] = wanted
-        text = json.dumps(overlay, ensure_ascii=False, indent=1, sort_keys=True) + "\n"
-        try:
-            self.overlay_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.overlay_path.with_name(self.overlay_path.name + ".tmp")
-            with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(text)
-            os.replace(tmp, self.overlay_path)
-        except OSError as exc:
-            out["error"] = f"{type(exc).__name__}: {exc}"
-            return out
-        out["written"] = True
-        out["changed"] = True
-        self.poll()
-        return out
+        """Write the live set into the overlay; see :mod:`.allowlist_overlay`."""
+        return overlay_mod.sync_issues(self, project, issues)
 
     # ----------------------------------------------------------------- checks
     def project(self, name: str | None) -> dict | None:
@@ -462,7 +412,17 @@ class ProjectAllowlist:
             return False, (self.load_error or "allowlist has no usable copy")
         entry = self.project(project)
         if entry is None:
-            return False, f"project {project!r} not allowlisted (repository unlisted)"
+            # Two different faults, two different fixes: an empty name means no
+            # project claimed the repository at all, a name means the project
+            # is not in this file. One message for both sent readers looking at
+            # the repository when the problem was the overlay (#122/#123/#129).
+            if not project:
+                # Keeps the historical "not allowlisted" substring: dispatchers
+                # and doctor rows match on it, and a clearer sentence must not
+                # quietly change what a refusal is recognised by.
+                return False, ("no project claims this repository "
+                               "(repository not allowlisted)")
+            return False, f"project {project!r} not allowlisted"
         if issue is not None:
             try:
                 issue_number = int(issue)

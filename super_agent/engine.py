@@ -83,7 +83,13 @@ from . import (at_serve, envelope, flow as flow_mod, github_source, health, issu
                markers, needs, requirement_auth, requirements, session_broker,
                session_events, session_ledger, sessionkeys)
 from . import assignments as asg_mod
+from .engine_parts import at_routes as at_routes_mod
 from .engine_parts import claims as walk_claims
+from .engine_parts import fault_report as fault_report_mod
+from .engine_parts import frame_text as frame_text_mod
+from .engine_parts import project_lookup as project_lookup_mod
+from .engine_parts import source_faults as source_faults_mod
+from .engine_parts.at_routes import AtRoutes
 from .engine_parts import archive as archive_mod
 from .engine_parts import at_ledger as at_ledger_mod
 from .engine_parts import close as close_mod
@@ -260,7 +266,7 @@ def _default_allowlist_path() -> Path:
     return Path(__file__).resolve().parent.parent / "config" / "allowlist.json"
 
 
-class Engine(ReviewRoutes, RefusedRoutes):
+class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
     def __init__(self, cfg: dict, store: Store, source, bus=None, *, clock=_now_ts,
                  project_allowlist: ProjectAllowlist | None = None,
                  adapter=None, session_api=None):
@@ -324,6 +330,7 @@ class Engine(ReviewRoutes, RefusedRoutes):
         self._index_skip_logged = False
         self._archived_cache: dict | None = None
         self._archived_unreadable = False
+        self._probe_fault = ""  # why the session probe could not answer
         # Archive refusals already written to ``events.jsonl``, read once on
         # first use (see ``_note_archived_sid``). Round-scoped state would be
         # the bug: the whole point is that round 2 adds no second line.
@@ -377,17 +384,12 @@ class Engine(ReviewRoutes, RefusedRoutes):
         return issuekey.thread_key(repo, issue)
 
     def _project_for(self, issue) -> str | None:
-        """Project name that lists ``issue``; None when nothing claims it."""
+        """Project that owns ``issue``; see :mod:`.engine_parts.project_lookup`."""
         if self.projects is None or self.projects.data is None:
             return None
-        try:
-            issue = int(issue)
-        except (TypeError, ValueError):
-            return None
-        for name, entry in self.projects.data["projects"].items():
-            if issue in entry["issues"]:
-                return name
-        return None
+        return project_lookup_mod.project_for(
+            self.projects.data["projects"], issue,
+            str((self.cfg.get("github") or {}).get("repo") or ""))
 
     def _flow_selection(self, issue) -> tuple[str, str]:
         entry = self.projects.project(self._project_for(issue)) if self.projects else None
@@ -1458,7 +1460,7 @@ class Engine(ReviewRoutes, RefusedRoutes):
                    "verdict": str(review.get("verdict") or ""),
                    "fix_needed": bool(review.get("fix_needed")),
                    "sid": sid, "at": _now(),
-                   "text": self._release_text(issue, cid)}
+                   "text": frame_text_mod.release_text(issue, cid)}
         result = self._dispatch(self._route_action(
             thread, issue, cid, payload, "event.agent.supervisor",
             target_role="supervisor", origin_role=markers.QA.lower(),
@@ -1484,15 +1486,6 @@ class Engine(ReviewRoutes, RefusedRoutes):
             "reason": result.get("reason") or "",
         })
         return result
-
-    @staticmethod
-    def _release_text(issue, cid) -> str:
-        """The one line a person reads: the issue and the verdict that closed it."""
-        return f"【可关单】#{int(issue)}，QA cid {cid}（P0=0，无必修项）"
-
-    @staticmethod
-    def _qa_notice_text(project, issue, cid, verdict) -> str:
-        return f"【QA 结论】{project}#{int(issue)} {verdict}，QA cid {cid}"
 
     def _route_pm_delivery_failure(self, index: dict, thread: str, issue: int,
                                    cid: int, target: dict) -> dict:
@@ -1771,206 +1764,6 @@ class Engine(ReviewRoutes, RefusedRoutes):
                 "detail": f"{type(exc).__name__}: {exc}"})
             return ""
         return at_serve.url(port, qid)
-
-    def _on_at_verdict(self, index: dict, thread: str, issue: int,
-                       comment: dict, verdict: dict) -> tuple[str, str]:
-        """Apply one ``[AT]`` verdict and route it.
-
-        Four answers:
-
-        * ``questions`` - a supervisor frame carrying ``question_url``. It is
-          **not** an exception frame: a question is a normal stop on the path,
-          and marking it as a failure teaches the reader to skip the failures;
-        * ``ready``   - a supervisor frame saying the work can be dispatched;
-        * ``blocked`` - the same frame with ``exception: true``;
-        * unreadable (``""``) - **treated as blocked**, for the same reason as
-          the PM side: an answer that arrived and was dropped is invisible.
-
-        At most once per comment: the frame is written to ``release_frames``
-        under ``at:<thread>:<cid>`` after it lands, so a re-read comment is
-        silent while a *different* comment on the same thread still rings.
-
-        This function reads and writes nothing in ``pm_verdicts``/``pm_stall``,
-        and the QA/PM release gate never reads ``at_verdicts``. That is the J4
-        property, and it is a property of the tables, not of the call order.
-        """
-        cid = int(comment["id"])
-        state = str(verdict.get("state") or "")
-        if not self._at_verified(thread, comment):
-            self.store.log_event({
-                "type": "at.unverified", "at": _now(), "thread": thread,
-                "comment_id": cid, "consumers": ["doctor"],
-                "detail": "the verdict did not name an at session key of this "
-                          "thread"})
-            self._pm_needs_person(index, thread, cid,
-                                  "at.verdict_unverified[user]",
-                                  "at verdict from unverified author")
-            return "needs_person", "at verdict from unverified author"
-        named = verdict.get("issue")
-        if named is not None and int(named) != int(issue):
-            self.store.log_event({
-                "type": "at.verdict_wrong_issue", "at": _now(),
-                "thread": thread, "comment_id": cid,
-                "named_issue": int(named), "thread_issue": int(issue)})
-            self._pm_needs_person(
-                index, thread, cid, "at.verdict_wrong_issue[user]",
-                f"verdict names issue #{int(named)} but thread is #{int(issue)}")
-            return "needs_person", (f"verdict names issue #{int(named)} but "
-                                    f"thread is #{int(issue)}")
-        if self._at_mode(issue) and state in ("ready", "questions"):
-            try:
-                packages = requirements.blocks(str(comment.get("body") or ""),
-                                               requirements.PACKAGE_FENCE)
-                if len(packages) != 1:
-                    raise requirements.RequirementError(
-                        "AT READY/questions requires exactly one requirement fence")
-                package = requirements.validate_package(packages[0])
-                current = self._requirement_current(index, thread)
-                if not current or current.get("source_comment_id") != cid \
-                        or current.get("requirement_hash") != package["requirement_hash"]:
-                    raise requirements.RequirementError(
-                        "AT verdict is not the current readable requirement revision")
-                if state == "questions" and not package.get("open_questions"):
-                    raise requirements.RequirementError(
-                        "questions verdict requires a non-empty open_questions list")
-            except requirements.RequirementError as exc:
-                self._pm_needs_person(index, thread, cid,
-                                      "at.requirement_invalid[user]", str(exc))
-                return "needs_person", str(exc)
-            verdict = dict(verdict)
-            verdict.update(requirement_id=package["requirement_id"],
-                           revision=package["revision"],
-                           requirement_hash=package["requirement_hash"],
-                           _requirement=package)
-        self._record_at_verdict(index, thread, verdict, cid)
-        if self._at_announced(index, thread, cid) is not None:
-            self.store.log_event({
-                "type": "route.supervisor_skipped", "at": _now(),
-                "thread": thread, "comment_id": cid, "to": "supervisor",
-                "reason": "this at verdict already rang",
-                "announced_by": "at"})
-            return "at_verdict", ""
-        if state == "questions":
-            kind, exception, reason = "at_question", False, ""
-        elif state == "ready":
-            kind, exception, reason = "at_ready", False, ""
-        else:
-            kind, exception = "at_blocked", True
-            if not state:
-                reason = (verdict.get("coords_error")
-                          or "no unmarked at verdict; treated as blocked")
-            else:
-                reason = "at reports blocked"
-        url = (self._at_question_url(thread, issue, cid, verdict)
-               if state == "questions" else "")
-        result = self._route_at_frame(index, thread, issue, comment, verdict,
-                                      exception=exception, kind=kind,
-                                      reason=reason, question_url=url)
-        dispatched = bool(result.get("dispatched"))
-        ok = bool(result.get("ok")) if dispatched else False
-        if dispatched and ok:
-            self._mark_at_frame(index, thread, cid, kind=kind)
-        elif dispatched:
-            self._note_undeliverable(
-                index, thread, cid,
-                "at frame was dispatched but the send was not confirmed; it "
-                "may or may not have arrived - check before resending",
-                issue=issue, to="supervisor",
-                once_key=f"atuncertain:{thread}:{cid}")
-        else:
-            self._note_undeliverable(
-                index, thread, cid,
-                "at verdict could not be delivered: "
-                f"{result.get('reason') or 'unknown'}",
-                issue=issue, to="supervisor", once_key=f"at:{thread}:{cid}")
-        return "at_verdict", ""
-
-    def _route_at_frame(self, index: dict, thread: str, issue: int,
-                        comment: dict, verdict: dict, *, exception: bool,
-                        kind: str, reason: str = "", question_url: str = "",
-                        action_key: str = "", body_text: str = "") -> dict:
-        """Send one AT frame on ``event.agent.supervisor``; at most once.
-
-        Same order as :meth:`_route_pm_frame` - snapshot first, dispatch
-        second - so a crash between them loses one send and never the
-        decision. There is no retry pass for AT frames (the PM one is its own
-        leg); a frame that could not be dispatched leaves a ``needs_person``
-        row through :meth:`_note_undeliverable`, which is what makes the loss
-        readable instead of silent.
-        """
-        cid = int(comment["id"]) if comment.get("id") is not None else 0
-        key = action_key or self._at_frame_key(thread, cid)
-        base = action_id(key, "bus_inject", str(cid))
-        frames = index.setdefault("at_frames", {})
-        if not isinstance(frames, dict):
-            frames = index["at_frames"] = {}
-        record = at_ledger_mod.frame_record(
-            frames.get(key), thread=thread, cid=cid, issue=issue,
-            kind=kind, exception=exception, question_url=question_url,
-            text=(body_text or self._at_frame_text(
-                issue, cid, verdict, exception=exception, kind=kind,
-                question_url=question_url)),
-            action_id=base, now=_now())
-        frames[key] = record
-        if self.store.action_attempted(base) > 0:
-            return {"dispatched": False, "reason": "already attempted",
-                    "action_id": base}
-        sid = self._supervisor_sid(index)
-        if not sid:
-            record["ok"] = False
-            record["undeliverable"] = True
-            self._note_undeliverable(
-                index, thread, cid,
-                "no supervisor sid: engine.supervisor_sid is empty and none of "
-                "engine.supervisor_keys resolve", issue=issue,
-                to="supervisor", once_key=f"atsid:{key}")
-            return {"dispatched": False, "reason": "no supervisor sid",
-                    "action_id": base}
-        record["undeliverable"] = False
-        payload = {"thread": thread, "issue": int(issue),
-                   "review_comment_id": cid, "kind": kind,
-                   "state": str(verdict.get("state") or ""),
-                   "exception": bool(exception), "reason": reason,
-                   "question_url": question_url,
-                   "sid": sid, "at": _now(), "text": record["text"]}
-        result = self._dispatch(self._route_action(
-            thread, issue, cid, payload, "event.agent.supervisor",
-            target_role="supervisor", origin_role="at",
-            assignment_id=key))
-        record["ok"] = bool(result.get("ok")) if result.get("dispatched") else False
-        record["refused"] = bool(result.get("refused"))
-        record["action_id"] = result.get("action_id") or base
-        # ISS-74 C(b): counted here as well. An AT frame has no *retry pass* of
-        # its own, but a refused one leaves no attempt on record, so the next
-        # round tries it again - a streak is exactly what that loop looks like
-        # from outside, and it was invisible until this call existed.
-        if result.get("dispatched"):
-            self._clear_route_refusal(record)
-        elif result.get("refused") is True:
-            self._count_route_refusal(index, record, thread, cid, result)
-        self.store.log_event({
-            "type": "route.decided", "at": _now(), "thread": thread,
-            "comment_id": cid, "to": "supervisor", "origin": "at",
-            "kind": kind, "state": str(verdict.get("state") or ""),
-            "exception": bool(exception),
-            "dispatched": bool(result.get("dispatched")),
-            "refused": bool(result.get("refused")),
-            "reason": result.get("reason") or "",
-        })
-        return result
-
-    @staticmethod
-    def _at_frame_text(issue, cid, verdict: dict, *, exception: bool, kind: str,
-                       question_url: str = "") -> str:
-        """The one line a person reads for an AT frame."""
-        state = str(verdict.get("state") or "") or "unreadable"
-        if kind == "at_question":
-            return (f"【AT 有疑问】#{int(issue)}（cid {cid}），请回答："
-                    f"{question_url or '（问卷链接未生成，见事件日志）'}")
-        if exception:
-            return (f"【AT 例外】#{int(issue)} AT 结论 {state}"
-                    f"（cid {cid}），需要人看一眼")
-        return f"【AT 可派单】#{int(issue)}（cid {cid}），可以派单"
 
     # ------------------------------------------------------- release identity
     def _release_key(self, index: dict, thread: str, cid,
@@ -2791,72 +2584,6 @@ class Engine(ReviewRoutes, RefusedRoutes):
             split_key=issuekey.split_key)
 
     # ------------------------------------------------------- at stall watchdog
-    def _check_at_stall(self, index: dict) -> int:
-        """Ask once about a registered AT that stopped answering.
-
-        **``at_stall_rounds`` defaults to 15, and that 15 is an independent
-        value.** It is not derived from ``release_timeout_s`` and it is not
-        copied from ``pm_stall_rounds``: the PM watchdog's number is chosen to
-        sit inside the release budget, this one is the AT's own budget. Tune it
-        by watching it fire, not by arithmetic on another role's setting.
-
-        The ledger is ``index["at_stall"]`` and never ``pm_stall``. A PM that
-        never answered and an AT that never spoke are two different silences
-        over two different questions; sharing the counter would let one role's
-        answer erase the other role's alarm (J4/J5). Nothing here reads
-        ``pm_verdicts``, so a missing PM book cannot change this answer.
-
-        "Registered" means an ``at`` entry in ``issue_sessions.json[thread]`` -
-        a thread no AT was ever bound to is not watched, because a watchdog
-        with nobody to watch fires on everything.
-
-        Counting is by round; one frame per hold, and a new hold (leaving and
-        re-entering the register) is a new notice through ``at_stall_seq``.
-        """
-        engine_cfg = self.cfg.get("engine") or {}
-        try:
-            limit = int(engine_cfg.get("at_stall_rounds") or 15)
-        except (TypeError, ValueError):
-            limit = 15
-        if limit <= 0:
-            return 0
-        stall = watchdog_mod.table(index, "at_stall")
-        registered = watchdog_mod.at_registered(
-            self._load_issue_sessions(), self._thread_key,
-            needs_answer=lambda t, e: self._at_needs_answer(index, t, e))
-        for thread in list(stall):
-            if thread not in registered:
-                watchdog_mod.bump_hold_seq(index, "at_stall_seq", thread)
-                stall.pop(thread, None)
-        fired = 0
-        for thread, at_entry in sorted(registered.items()):
-            entry = watchdog_mod.round_count(stall.get(thread), thread, _now())
-            stall[thread] = entry
-            if not watchdog_mod.due(entry, limit):
-                continue
-            issue = at_entry.get("issue")
-            if issue is None:
-                for rec in (index.get("assignments") or {}).values():
-                    if str(rec.get("thread") or "") == thread:
-                        issue = rec.get("issue")
-                        break
-            if issue is None:
-                # The binding records a session, not a number. The thread key
-                # carries it, and ``issue: 0`` would fail the project allowlist
-                # - a watchdog whose notice is always refused looks exactly
-                # like a watchdog that never fired.
-                _repo, parsed = issuekey.split_key(thread)
-                issue = parsed
-            seq = watchdog_mod.hold_seq(index, "at_stall_seq", thread)
-            stall[thread] = self._fire_stall(
-                index, thread, issue=issue, comment_id=0, seq=seq,
-                table="at_stall_seq", entry=entry, kind="at", assignment="",
-                body_text=f"【AT 停摆】{thread} {entry['rounds']} 轮无 AT 结论",
-                row_reason="at.stall[user]",
-                row_detail=f"{entry['rounds']} 轮无 AT 结论")
-            fired += 1
-        return fired
-
     # -------------------------------------------------- release-time reminders
     def _fire_stall(self, index: dict, thread: str, *, issue, comment_id,
                     seq: int, table: str, entry: dict, kind: str,
@@ -3179,7 +2906,7 @@ class Engine(ReviewRoutes, RefusedRoutes):
             state = session_events.replay(events)
         except Exception as exc:  # noqa: BLE001  fail closed, report why
             self.degraded = True
-            self._assignments_error = f"{type(exc).__name__}: {exc}"
+            self._assignments_error = fault_report_mod.describe(exc)
             self.store.log_event({"type": "assignment.stream_unreadable", "at": _now(),
                                   "thread": thread, "error": self._assignments_error})
             return {"created": [], "updated": [], "conflict": [],
@@ -3455,16 +3182,20 @@ class Engine(ReviewRoutes, RefusedRoutes):
             info = self._session_api().session_info(sid)
         except Exception as exc:  # noqa: BLE001  unreachable means "closed"
             cache[sid] = True
+            # "Unknown" is not "archived": do not fork a second assignment, but
+            # tell the round, with the cause, instead of passing as success.
+            self._probe_fault = fault_report_mod.one_line(exc)
             self.store.log_event({"type": "assignment.archived_unreachable",
                                   "at": _now(), "sid": sid,
-                                  "error": f"{type(exc).__name__}: {exc}"})
+                                  "error": f"{type(exc).__name__}: {exc}",
+                                  "trace": fault_report_mod.describe(exc)})
             return True
         if not isinstance(info, dict) or info.get("_err"):
             cache[sid] = True
+            self._probe_fault = str((info or {}).get("_err") or "no session info")
             self.store.log_event({"type": "assignment.archived_unreachable",
                                   "at": _now(), "sid": sid,
-                                  "error": str((info or {}).get("_err")
-                                               or "no session info")})
+                                  "error": self._probe_fault})
             return True
         cache[sid] = bool(info.get("archived"))
         return cache[sid]
@@ -4024,6 +3755,7 @@ class Engine(ReviewRoutes, RefusedRoutes):
         # and each candidate sid is asked of the server at most once per round.
         self._archived_cache = None
         self._archived_unreadable = False
+        self._probe_fault = ""  # round-scoped: reported by _read_and_consume
         self._live_check = {}
         self._session_state_cache = None
         self._session_map_cache = None
@@ -4084,13 +3816,21 @@ class Engine(ReviewRoutes, RefusedRoutes):
             issue_numbers = self.source.issues(limit=int(prep["max_issues"]))
         except Exception as exc:  # noqa: BLE001  a dead source is a reportable state
             summary["errors"].append(f"issues: {type(exc).__name__}: {exc}")
+            # No fallback page (2026-11-28): a failed round reads nothing, so
+            # nothing is consumed and nothing is lost; the next good round reads
+            # it after creating the assignment it needs (sync precedes triage).
+            kind = source_faults_mod.classify(f"{type(exc).__name__}: {exc}")
+            summary["source_fatal"] = summary.get("source_fatal") or kind == "fatal"
             issue_numbers = []
             state.source_ok = False
             self.store.log_event({"type": "source.failed", "at": _now(),
-                                  "round_seq": state.seq,
-                                  "error": f"{type(exc).__name__}: {exc}"})
+                                  "round_seq": state.seq, "kind": kind,
+                                  "error": f"{type(exc).__name__}: {exc}",
+                                  "trace": fault_report_mod.describe(exc)})
         self._live_issues = {int(issue) for issue in issue_numbers}
         state.issues = [int(issue) for issue in issue_numbers]
+        if issue_numbers and len(issue_numbers) >= int(prep["max_issues"]):
+            summary["issues_truncated"] = int(prep["max_issues"])  # newest-first
         # The issue itself now says whether it is live (open, not on hold), so
         # the allowlist is kept in step with that instead of being a hand-kept
         # list. A failed sync is a warning: a read-only checkout must still run.
@@ -4115,7 +3855,8 @@ class Engine(ReviewRoutes, RefusedRoutes):
                 state.fail(thread)
                 self.store.log_event({"type": "issue.error", "at": _now(),
                                       "issue": int(issue),
-                                      "error": f"{type(exc).__name__}: {exc}"})
+                                      "error": f"{type(exc).__name__}: {exc}",
+                                      "trace": fault_report_mod.describe(exc)})
         state.round_result.carry = round_mod.carry_remaining(state.round_result)
 
     def run_global_phase(self, index: dict, cursor: dict,
@@ -4306,15 +4047,19 @@ class Engine(ReviewRoutes, RefusedRoutes):
         # Qualified key first, legacy second: a mixed file converges instead of
         # re-reading comments already consumed under the old form.
         cur = int(issuekey.read_both(cursor.get("issues") or {}, key, legacy) or 0)
-        qa_recovery = collect_mod.qa_recovery(
-            [rec for rec in (index.get("assignments") or {}).values()
-             if str(rec.get("thread") or "") == key],
+        qa_recovery, delivery_recovery = collect_mod.recovery_flags(
+            index.get("assignments") or {}, key,
             terminal=asg_mod.TERMINAL_STATES,
             output_cids=asg_mod.assignment_cids)
+        if delivery_recovery:
+            self.store.log_event({"type": "delivery.recovery_read", "at": _now(),
+                                  "thread": key, "issue": int(issue),
+                                  "reason": "worker live, no delivery recorded"})
         at_mode = self._at_mode(issue)
         read = collect_mod.read_issue(
             self.source, issue, key, rec, cur, at_mode=at_mode,
-            qa_recovery=qa_recovery, max_comments=max_comments,
+            qa_recovery=qa_recovery, delivery_recovery=delivery_recovery,
+            max_comments=max_comments,
             max_pages=max_pages, summary=summary,
             pause_read=lambda rows, budget: self._pause_read(
                 index, key, issue, cur, rows, budget, summary),
@@ -4360,6 +4105,9 @@ class Engine(ReviewRoutes, RefusedRoutes):
         # not permission to work before the exact revision has been approved.
         synced = self._sync_assignments(index, key, issue)
         summary["assignments"] += len(synced.get("created") or [])
+        if self._probe_fault:
+            summary["errors"].append(f"session probe: {self._probe_fault}")
+            self._probe_fault = ""
 
         triage_batch_mod.triage_batch(self, index, issue, key, rec, fresh,
                                       accepted=accepted, summary=summary)
