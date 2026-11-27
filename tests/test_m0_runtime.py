@@ -1026,5 +1026,64 @@ class ShippedAllowlist(Base):
         self.assertEqual(len(bus.injected), 1)
 
 
+class CmdlineProbeCache(unittest.TestCase):
+    """The pid probe costs one PowerShell start per call without ``wmic``.
+
+    One lock decision asks the same question several times; on a machine where
+    ``wmic`` is gone each ask is ~1s, so the same answer was being paid for
+    three or four times per test (measured: 3.9s of a 5.0s test).
+    """
+
+    def test_the_same_pid_is_probed_once_per_ttl(self):
+        from unittest import mock
+
+        from super_agent import pidlock
+
+        calls = []
+
+        def fake_probe(pid):
+            calls.append(pid)
+            return "python -m super_agent run"
+
+        with mock.patch.object(pidlock, "_probe_cmdline", fake_probe),                 mock.patch.object(pidlock, "_CMDLINE_CACHE", {}):
+            self.assertEqual(pidlock._pid_cmdline(4242), "python -m super_agent run")
+            self.assertEqual(pidlock._pid_cmdline(4242), "python -m super_agent run")
+            self.assertEqual(calls, [4242], "one probe, two answers")
+
+    def test_the_cache_expires_so_a_reused_pid_is_asked_again(self):
+        from unittest import mock
+
+        from super_agent import pidlock
+
+        calls = []
+        clock = {"t": 100.0}
+
+        def fake_probe(pid):
+            calls.append(pid)
+            return f"probe-{len(calls)}"
+
+        with mock.patch.object(pidlock, "_probe_cmdline", fake_probe),                 mock.patch.object(pidlock, "_CMDLINE_CACHE", {}),                 mock.patch.object(pidlock.time, "monotonic", lambda: clock["t"]):
+            self.assertEqual(pidlock._pid_cmdline(7), "probe-1")
+            clock["t"] += pidlock._CMDLINE_TTL_S + 0.1
+            self.assertEqual(pidlock._pid_cmdline(7), "probe-2")
+            self.assertEqual(calls, [7, 7])
+
+    def test_a_failed_probe_is_cached_too(self):
+        from unittest import mock
+
+        from super_agent import pidlock
+
+        calls = []
+
+        def boom(pid):
+            calls.append(pid)
+            return None
+
+        with mock.patch.object(pidlock, "_probe_cmdline", boom),                 mock.patch.object(pidlock, "_CMDLINE_CACHE", {}):
+            self.assertIsNone(pidlock._pid_cmdline(9))
+            self.assertIsNone(pidlock._pid_cmdline(9))
+            self.assertEqual(len(calls), 1, "a machine without either probe pays once")
+
+
 if __name__ == "__main__":
     unittest.main()

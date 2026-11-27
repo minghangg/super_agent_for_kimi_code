@@ -23,6 +23,7 @@ import time
 
 from . import stopcontrol
 from .engine_parts import fault_report as fault_report_mod
+from .engine_parts import stop_notice as stop_notice_mod
 
 #: Consecutive failures that end the loop with exit code 1.
 #: Three, not ten (user ruling 2026-11-28: an engine that keeps running while it
@@ -168,6 +169,11 @@ def run_loop(engine, store, *, interval: float = 60.0,
             break
 
     exit_code = 1 if reason in ("max_failures", "fatal") else 0
+    if reason in ("max_failures", "fatal"):
+        # A stop that nobody hears is not fail-loud, it is fail-quiet: the
+        # process is gone and only health.json knows why. One injection, on the
+        # leg the consumer already watches, before the final record is written.
+        stop_notice_mod.notice(engine, store, reason=reason, error=err, now=now)
     store.log_event({"type": "run.stopped", "at": now(), "reason": reason,
                      "rounds": rounds, "external_actions": external})
     # A clean stop must not look like a crash: the pid lock is about to go, so

@@ -140,17 +140,25 @@ def delivery_recovery(assignments, *, terminal, output_cids) -> bool:
                and not output_cids(rec) for rec in assignments)
 
 
-def recovery_flags(assignments, thread: str, *, terminal, output_cids) -> tuple:
+def recovery_flags(assignments, thread: str, *, terminal, output_cids,
+                   due: bool = True) -> tuple:
     """``(qa_recovery, delivery_recovery)`` for one thread, in one pass.
 
     Both questions start from the same slice (the thread's assignments), and
     answering them separately made the caller repeat the filter and the two
     keyword arguments. One function, one place to keep them in step.
+
+    ``due`` throttles **only** the delivery half. Its read walks the whole
+    listing, which is the right price once but a standing cost every round for
+    a worker that never delivers - the throttle caps that at one walk per N
+    rounds. Nothing is lost by waiting: the comment is behind the cursor, so the
+    next due round still finds it.
     """
     rows = [rec for rec in assignments.values()
             if str(rec.get("thread") or "") == thread]
     return (qa_recovery(rows, terminal=terminal, output_cids=output_cids),
-            delivery_recovery(rows, terminal=terminal, output_cids=output_cids))
+            delivery_recovery(rows, terminal=terminal, output_cids=output_cids)
+            and bool(due))
 
 
 def replay_rows(source, issue: int, paged_batch):

@@ -331,6 +331,7 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
         self._archived_cache: dict | None = None
         self._archived_unreadable = False
         self._probe_fault = ""  # why the session probe could not answer
+        self._probe_fatal = False
         # Archive refusals already written to ``events.jsonl``, read once on
         # first use (see ``_note_archived_sid``). Round-scoped state would be
         # the bug: the whole point is that round 2 adds no second line.
@@ -3185,6 +3186,7 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
             # "Unknown" is not "archived": do not fork a second assignment, but
             # tell the round, with the cause, instead of passing as success.
             self._probe_fault = fault_report_mod.one_line(exc)
+            self._probe_fatal = source_faults_mod.is_fatal(exc)
             self.store.log_event({"type": "assignment.archived_unreachable",
                                   "at": _now(), "sid": sid,
                                   "error": f"{type(exc).__name__}: {exc}",
@@ -4047,10 +4049,13 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
         # Qualified key first, legacy second: a mixed file converges instead of
         # re-reading comments already consumed under the old form.
         cur = int(issuekey.read_both(cursor.get("issues") or {}, key, legacy) or 0)
+        every = int((self.cfg.get("github") or {}).get("delivery_recovery_every") or 3)
+        seq = int((index.get("meta") or {}).get("round_seq") or 0)
         qa_recovery, delivery_recovery = collect_mod.recovery_flags(
             index.get("assignments") or {}, key,
             terminal=asg_mod.TERMINAL_STATES,
-            output_cids=asg_mod.assignment_cids)
+            output_cids=asg_mod.assignment_cids,
+            due=every <= 1 or seq % every == 0)
         if delivery_recovery:
             self.store.log_event({"type": "delivery.recovery_read", "at": _now(),
                                   "thread": key, "issue": int(issue),
@@ -4107,7 +4112,9 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
         summary["assignments"] += len(synced.get("created") or [])
         if self._probe_fault:
             summary["errors"].append(f"session probe: {self._probe_fault}")
-            self._probe_fault = ""
+            if self._probe_fatal:
+                summary["source_fatal"] = True  # same rule as the source: stop now
+            self._probe_fault, self._probe_fatal = "", False
 
         triage_batch_mod.triage_batch(self, index, issue, key, rec, fresh,
                                       accepted=accepted, summary=summary)

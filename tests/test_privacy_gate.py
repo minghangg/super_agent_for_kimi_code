@@ -35,9 +35,17 @@ def git(root: Path, *args: str) -> subprocess.CompletedProcess:
 
 
 class GateSource(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # One full-repo scan costs ~4s here (2.5M regex searches over every
+        # tracked file). The point of the test is the answer, not paying for it
+        # twice: the class scans once, and ``main()`` still exercises the whole
+        # entry point on its own.
+        cls.scan = gate.scan_files(ROOT)
+
     def test_readme_is_not_exempt(self):
         self.assertFalse(hasattr(gate, "EXEMPT_MACHINE_CODES"))
-        self.assertEqual(gate.scan_files(ROOT), [])
+        self.assertEqual(self.scan, [])
         self.assertEqual(gate.main(), 0)
 
     def test_the_role_name_survives_an_underscore_on_each_side(self):

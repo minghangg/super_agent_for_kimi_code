@@ -26,7 +26,8 @@ from pathlib import Path
 from super_agent import config, github_source, runloop
 from super_agent.allowlist import ProjectAllowlist
 from super_agent.engine import Engine
-from super_agent.engine_parts import collect, fault_report, source_faults
+from super_agent.engine_parts import (collect, fault_report,
+                                      source_faults, stop_notice)
 from super_agent.store import Store
 
 ALLOW = {
@@ -421,6 +422,102 @@ class FaultsCarryTheirCause(Base):
             "store": Store(self.state)})())
             if e.get("type") == "run.failed"][-1]
         self.assertIn("KeyError", failed["trace"])
+
+
+class StopNotice(Base):
+    """A stop that nobody hears is not fail-loud, it is fail-quiet."""
+
+    class _Bus:
+        def __init__(self, reply=None, boom=None):
+            self.sent = []
+            self.reply = reply if reply is not None else {"ok": True}
+            self.boom = boom
+
+        def inject(self, event, payload):
+            self.sent.append((event, payload))
+            if self.boom:
+                raise self.boom
+            return self.reply
+
+    def _engine(self, *, sid="session_sup", bus=None):
+        engine = self.engine(_ListSource([]))
+        engine._supervisor_sid = lambda index=None: sid
+        engine.bus = bus
+        return engine
+
+    def test_a_fatal_stop_is_handed_to_the_supervisor_leg(self):
+        bus = self._Bus()
+        engine = self._engine(bus=bus)
+        out = stop_notice.notice(engine, engine.store, reason="fatal",
+                                 error="GitHub 401: Bad credentials",
+                                 now=lambda: "2026-11-28T01:00:00+00:00")
+        self.assertTrue(out["sent"])
+        event, payload = bus.sent[-1]
+        self.assertEqual(event, "event.agent.supervisor")
+        self.assertEqual(payload["sid"], "session_sup")
+        self.assertIn("【引擎停机】", payload["text"])
+        self.assertIn("GitHub 401", payload["text"])
+        labels = [e for e in self.events_of(engine)
+                  if e.get("type") == "run.stop_notice"][-1]
+        self.assertTrue(labels["ok"])
+
+    def test_no_supervisor_sid_is_reported_not_raised(self):
+        engine = self._engine(sid="", bus=self._Bus())
+        out = stop_notice.notice(engine, engine.store, reason="max_failures",
+                                 error="TimeoutError", now=lambda: "t")
+        self.assertFalse(out["sent"])
+        self.assertEqual(out["error"], "no supervisor sid")
+
+    def test_a_bus_that_raises_does_not_raise(self):
+        engine = self._engine(bus=self._Bus(boom=RuntimeError("daemon down")))
+        out = stop_notice.notice(engine, engine.store, reason="fatal",
+                                 error="x", now=lambda: "t")
+        self.assertFalse(out["sent"])
+        self.assertIn("daemon down", out["error"])
+
+    def test_a_clean_stop_sends_nothing(self):
+        bus = self._Bus()
+        engine = self._engine(bus=bus)
+
+        class Clean:
+            rounds = 0
+
+            def run_once(self):
+                Clean.rounds += 1
+                return {"mode": "assist", "errors": []}
+
+            def write_health(self, **_kw):
+                return {}
+
+        engine_obj = Clean()
+        engine_obj.bus = bus
+        engine_obj._supervisor_sid = lambda index=None: "session_sup"
+        runloop.run_loop(engine_obj, Store(self.state), interval=1,
+                         max_failures=3, max_rounds=2, sleep=lambda _s: None)
+        self.assertEqual(bus.sent, [], "a clean stop is not an incident")
+
+
+class RecoveryThrottle(unittest.TestCase):
+    def test_the_delivery_walk_is_gated_but_never_the_qa_one(self):
+        terminal = {"completed"}
+        cids = lambda rec: list(rec.get("delivery_cids") or [])
+        rows = {"asg_1": {"role": "worker", "status": "working",
+                           "delivery_cids": [], "thread": "t"},
+                "asg_2": {"role": "qa", "status": "working",
+                          "review_comment_id": None, "thread": "t"}}
+        qa_off, delivery_off = collect.recovery_flags(
+            rows, "t", terminal=terminal, output_cids=cids, due=False)
+        qa_on, delivery_on = collect.recovery_flags(
+            rows, "t", terminal=terminal, output_cids=cids, due=True)
+        self.assertTrue(qa_off, "the QA half is not what the throttle is for")
+        self.assertEqual(qa_off, qa_on, "due must not change the QA answer")
+        self.assertFalse(delivery_off, "the whole-listing walk is throttled")
+        self.assertTrue(delivery_on)
+
+    def test_the_default_cadence_is_three_rounds(self):
+        from super_agent import config_defaults
+        self.assertEqual(
+            config_defaults.DEFAULTS["github"]["delivery_recovery_every"], 3)
 
 
 if __name__ == "__main__":

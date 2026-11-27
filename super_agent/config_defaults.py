@@ -49,6 +49,9 @@ DEFAULTS: dict = {
         # much work one round *consumes*.
         "max_issues": 100,
         "max_comments_per_issue": 50,
+        # How often a thread may pay for the whole-listing delivery re-read.
+        # 0/1 = every round (tests), 3 = at most one walk per three rounds.
+        "delivery_recovery_every": 3,
         # Labels that mean "suspend this issue": the issue stays open but the
         # engine does not look at it. Matched as a set against the labels the
         # list endpoint already returns, so no extra request. Empty list means

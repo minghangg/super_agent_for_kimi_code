@@ -89,6 +89,16 @@ def _cim_cmdline(pid: int) -> str | None:
     return " ".join((done.stdout or "").split()) or None
 
 
+#: A pid's command line cannot change while the process lives, and a reused pid
+#: inside seconds is not a case this check has to answer. The probe is expensive
+#: on a machine without ``wmic`` (one PowerShell start per call, measured ~1s),
+#: and a single lock decision asks it several times - three of those calls are
+#: the same question. The TTL keeps the answer fresh without paying again.
+_CMDLINE_TTL_S = 3.0
+_CMDLINE_CACHE: dict[int, tuple[float, "str | None"]] = {}
+_CMDLINE_CACHE_MAX = 256
+
+
 def _pid_cmdline(pid: int) -> str | None:
     """Command line of ``pid`` when the platform can report it, else None.
 
@@ -97,7 +107,25 @@ def _pid_cmdline(pid: int) -> str | None:
     silently pass and only a human could ever clear a stale lock. None is
     returned only after *both* probes failed, which keeps the caller's
     conservative "assume it is the incumbent" behaviour instead of guessing.
+
+    Answers are cached for :data:`_CMDLINE_TTL_S` seconds (see above); ``None``
+    is cached too, so a machine where neither probe works stops paying for the
+    same failure several times in one decision.
     """
+    key = int(pid)
+    now = time.monotonic()
+    hit = _CMDLINE_CACHE.get(key)
+    if hit is not None and now - hit[0] < _CMDLINE_TTL_S:
+        return hit[1]
+    text = _probe_cmdline(key)
+    if len(_CMDLINE_CACHE) >= _CMDLINE_CACHE_MAX:
+        _CMDLINE_CACHE.clear()
+    _CMDLINE_CACHE[key] = (now, text)
+    return text
+
+
+def _probe_cmdline(pid: int) -> str | None:
+    """The uncached question: ``wmic``, then PowerShell, then ``/proc``."""
     if os.name == "nt":
         text = _wmic_cmdline(pid)
         if text is None:
