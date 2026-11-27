@@ -67,7 +67,7 @@ python -m super_agent.dispatch_cli --session <sid> --detach --no-activate \
 
 worker 的 `--cwd` 是项目仓；QA 按部署约定运行，但测试必须在被验项目执行。PM 自己不跑测试。
 
-**派给 safkc 的活必须在短令里带上失败策略**（用户 2026-11-28 令）：任务书凡涉及错误处理、降级或重试，必须写明「容忍上限」与「超限动作」。写不清就退回重写，不要派出去让 worker 自己猜。条文见 `rules/shared/rules/fail_loud.md` §五。
+**派给 safkc 的活必须在短令里带上失败策略**（用户 2026-11-28 令）：任务书凡涉及错误处理、降级或重试，必须写明**容忍轮次上限**与**超限动作**。只写时长不写轮次 ⇒ 退回重写，会让 QA 无从判据。条文见 `rules/shared/rules/fail_loud.md` §五。
 
 ## 4. 状态维护
 

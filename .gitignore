@@ -24,3 +24,6 @@ new_workbench/
 
 # 全量测试单套锁：运行态，随进程生灭，不入库。
 .full_suite.lock
+
+# 规则改前备份：只作本地回滚点，不入公开仓（同一份规则出现两次会让 grep 命中备份）。
+backup/rules/
