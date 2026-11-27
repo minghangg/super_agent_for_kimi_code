@@ -30,6 +30,11 @@ from .engine_parts import fault_report as fault_report_mod
 #: the counter buys: a couple of them pass, a third in a row is a broken link.
 DEFAULT_MAX_FAILURES = 3
 
+#: Hard ceiling on one failure streak, in seconds. ``fail_loud`` §2.2: rounds and
+#: wall clock are both honoured, whichever comes first - raising
+#: ``--max-failures`` cannot buy an hour of retrying a broken link.
+FAIL_BUDGET_S = 600.0
+
 #: Sleep granularity, so a stop request lands within ~0.2 s.
 WAIT_SLICE = 0.2
 
@@ -37,6 +42,24 @@ WAIT_SLICE = 0.2
 def now() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _over_budget(started: str, current: str) -> bool:
+    """Has one failure streak outlived :data:`FAIL_BUDGET_S`?
+
+    ``started`` is the ISO stamp of the streak's first failure; an empty or
+    unparseable stamp answers ``False`` (a clock we cannot read must not invent
+    a stop - the round limit still applies).
+    """
+    if not started:
+        return False
+    from datetime import datetime
+    try:
+        first = datetime.fromisoformat(started)
+        latest = datetime.fromisoformat(current)
+    except ValueError:
+        return False
+    return (latest - first).total_seconds() >= FAIL_BUDGET_S
 
 
 def wait(stop_event: threading.Event, seconds: float, sleep) -> None:
@@ -65,6 +88,7 @@ def run_loop(engine, store, *, interval: float = 60.0,
     max_failures = max(1, int(max_failures))
     rounds = 0
     consecutive = 0
+    streak_started = ""
     reason = "max_rounds"
     external = int(store.load_counters().get("external_actions") or 0)
 
@@ -116,6 +140,8 @@ def run_loop(engine, store, *, interval: float = 60.0,
                   f"processed={summary.get('processed', 0)} "
                   f"external_actions={external}", flush=True)
         else:
+            if consecutive == 0:
+                streak_started = now()  # first failure of this streak
             consecutive += 1
             store.log_event({"type": "run.failed", "at": now(), "round": rounds,
                              "error": err, "trace": trace})
@@ -124,7 +150,7 @@ def run_loop(engine, store, *, interval: float = 60.0,
             if trace:
                 print(trace, file=sys.stderr, flush=True)
 
-        if consecutive >= max_failures:
+        if consecutive >= max_failures or _over_budget(streak_started, now()):
             reason = "max_failures"
             break
 

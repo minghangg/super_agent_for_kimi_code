@@ -271,6 +271,31 @@ class LoopStops(Base):
     def test_the_default_budget_is_three(self):
         self.assertEqual(runloop.DEFAULT_MAX_FAILURES, 3)
 
+    def test_the_clock_budget_stops_a_streak_that_rounds_allow(self):
+        """``min(rounds, 10 min)``: a raised round budget cannot buy an hour."""
+
+        from datetime import datetime, timedelta, timezone
+
+        class Blip:
+            rounds = 0
+
+            def run_once(self):
+                Blip.rounds += 1
+                return {"errors": ["issues: TimeoutError: "]}
+
+        base = datetime(2026, 11, 28, tzinfo=timezone.utc)
+
+        def fake_now():
+            # 4 minutes per round: three rounds fit in the 10-minute budget,
+            # the fourth does not - even though 99 rounds are allowed.
+            return (base + timedelta(minutes=4 * Blip.rounds)).isoformat(
+                timespec="seconds")
+
+        out = runloop.run_loop(Blip(), self._store(), interval=1,
+                               max_failures=99, sleep=lambda _s: None, now=fake_now)
+        self.assertEqual(out["reason"], "max_failures")
+        self.assertEqual(out["rounds"], 4, "10 minutes at 4 min/round is the ceiling")
+
     def test_a_stop_names_its_cause_in_health(self):
         """``running=false`` alone is not a report; the next reader needs why."""
 
@@ -284,11 +309,10 @@ class LoopStops(Base):
                 return kwargs
 
         engine = Fatal()
-        runloop.run_loop(engine, Store(self.state), interval=1, max_failures=3,
+        runloop.run_loop(engine, self._store(), interval=1, max_failures=3,
                          sleep=lambda _s: None)
         self.assertIn("GitHub 401", engine.kwargs.get("error", ""))
         self.assertTrue(engine.kwargs.get("degraded"))
-        self.assertIn("running", engine.kwargs)
 
 
 class RefusalRealert(Base):

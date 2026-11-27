@@ -45,6 +45,8 @@ DEFAULT_WAIT_S = 0.0
 ENV_SESSION_KEY = "SAFKC_SESSION_KEY"
 ENV_LOCK_PATH = "SAFKC_FULL_SUITE_LOCK"
 ENV_SKIP = "SAFKC_SKIP_FULL_SUITE_GUARD"
+#: Set by pytest-xdist in every worker process.
+WORKER_ENV = "PYTEST_XDIST_WORKER"
 
 
 class FullSuiteRefused(RuntimeError):
@@ -182,6 +184,13 @@ def install_pytest_hook() -> None:
 
     def pytest_configure(config):
         if not is_full_suite_run(config.args):
+            return
+        if os.environ.get(WORKER_ENV):
+            # An xdist worker is a child of the process that already holds the
+            # lock: asking for it again would deadlock the run it belongs to.
+            # The parent's guard still makes "one full run per machine" true.
+            state["run"] = _NoopRun()
+            state["run"].__enter__()
             return
         state["run"] = guard(wait_s=0.0)
         state["run"].__enter__()
