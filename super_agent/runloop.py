@@ -117,15 +117,6 @@ def run_loop(engine, store, *, interval: float = 60.0,
             if errors:
                 ok, err = False, "; ".join(str(e) for e in errors)
 
-        # A fault the engine cannot retry its way out of ends the run now: the
-        # loop's failure counter exists for transient trouble, and using it for
-        # a 401 would turn one loud error into three quiet ones.
-        if summary.get("source_fatal"):
-            store.log_event({"type": "run.fatal", "at": now(), "round": rounds,
-                             "error": err, "trace": trace})
-            reason = "fatal"
-            break
-
         external = int(store.load_counters().get("external_actions") or 0)
         try:
             store.save_heartbeat({"ts": now(), "round": rounds, "ok": ok,
@@ -151,6 +142,17 @@ def run_loop(engine, store, *, interval: float = 60.0,
             if trace:
                 print(trace, file=sys.stderr, flush=True)
 
+        # A fault the engine cannot retry its way out of ends the run now: the
+        # loop's failure counter exists for transient trouble, and using it for
+        # a 401 would turn one loud error into three quiet ones. This sits
+        # **after** the round's bookkeeping on purpose - a run that stops for a
+        # fatal must not print ``consecutive_failures=0``, which reads as "no
+        # failure happened" in the one line an operator sees first.
+        if summary.get("source_fatal"):
+            store.log_event({"type": "run.fatal", "at": now(), "round": rounds,
+                             "error": err, "trace": trace})
+            reason = "fatal"
+            break
         if consecutive >= max_failures or _over_budget(streak_started, now()):
             reason = "max_failures"
             break
