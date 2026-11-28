@@ -84,7 +84,6 @@ class Baseline(unittest.TestCase):
                 ("qa-lwa-ISS-95", "qa.md"),
                 ("pm-demo-project", "pm.md"),
                 ("scout-20261120", "scout.md"),
-                ("steward-20261120", "steward.md"),
                 ("auditor-20261120", "auditor.md"),
                 ("reviewer-20261120", "reviewer.md"),
                 ("planner-20261120", "planner.md"),
@@ -250,15 +249,21 @@ class NoPrivateNames(unittest.TestCase):
     def test_the_charter_directory_holds_the_nine_roles(self):
         root = Path(__file__).resolve().parent.parent / "rules" / "charters"
         names = {f.name for f in root.glob("*.md")}
-        # Nine role charters plus the session contract and the rotation flow.
+        # Eight live role charters plus the session contract and the rotation flow.
         # The two non-role files ship here for the same reason: a session that
         # reads only this directory must get its contract and its rotation rules.
-        roles = {"worker.md", "qa.md", "pm.md", "scout.md", "steward.md",
+        # ``steward.md`` still ships as an **archive** (retired 2026-11-28, no
+        # longer mapped in ``DEFAULT_CHARTER_MAP``), so it is not in this set.
+        roles = {"worker.md", "qa.md", "pm.md", "scout.md",
                  "auditor.md", "reviewer.md", "planner.md", "analyst.md"}
         self.assertTrue(roles <= names, f"缺角色章程：{roles - names}")
         self.assertIn("session_contract.md", names)
         self.assertIn("rotation.md", names)
         self.assertNotIn("watch.md", names, "watch is retired; it is not migrated")
+        # The retired charter stays on disk for audit but must not resolve.
+        self.assertIn("steward.md", names, "steward.md 应留档")
+        self.assertEqual(charters.leaf_for("steward-20261120"), "",
+                         "steward is retired: its key must not load a charter")
 
     def test_the_contract_ships_with_the_package(self):
         # A public package that needs the workbench's contract is not usable on

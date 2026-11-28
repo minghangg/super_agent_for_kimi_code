@@ -107,7 +107,10 @@ DEFAULT_CHARTER_MAP: tuple[tuple[str, str], ...] = (
     ("analyst", "analyst.md"),
     ("reviewer", "reviewer.md"),
     ("auditor", "auditor.md"),
-    ("steward", "steward.md"),
+    # ``("steward", "steward.md")`` removed 2026-11-28 (user order): the role is
+    # retired, and its charter is kept as a non-loaded archive. A key written as
+    # ``steward-*`` no longer resolves to any charter, so a dispatch to one fails
+    # loudly at warm-up instead of loading a document nothing maintains.
     ("scout", "scout.md"),
     ("worker", "worker.md"),
     ("at-", "analyst.md"),
