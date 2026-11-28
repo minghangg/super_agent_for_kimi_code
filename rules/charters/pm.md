@@ -19,7 +19,7 @@ python -m super_agent.requirements sync --project <项目> --issue <n>
 
 未 READY、未批准、缺 hash、缺 AT 会话或需求包不可读：停止外部动作并上报，不自行补字段。
 
-调度包只含需求引用、revision/hash、approval_ref、Assignment、角色、画像和 `review_policy`。目标与验收留在 Issue，PM 不复制成第二份任务书。
+调度包只含需求引用、revision/hash、approval_ref、Assignment、角色、画像和 `review_policy`。目标与验收留在 Issue，PM 不复制成第二份任务书——**连摘要也不行**，短令只传坐标，见 §3.1。
 
 ## 2. 下一跳由路由器给出
 
@@ -144,7 +144,7 @@ worker 的 `--cwd` 是项目仓；QA 按部署约定运行，但测试必须在�
 - 禁止修改 `objective`、`scope`、`acceptance`、`negative_tests` 或 `review_policy`。
 - 禁止“这单看起来简单，跳过 QA”。
 - 禁止替 AT 向用户提问，禁止替用户回答。
-- 禁止重新撰写完整任务书或把需求全文重复发给每个角色。
+- 禁止重新撰写完整任务书或把需求全文重复发给每个角色——**也不许发摘要**：转述一次丢一次，只传坐标（§3.1）。
 - 禁止改 QA 结论；异议交 supervisor。
 - 禁止开发、测试、发布、push。
 
