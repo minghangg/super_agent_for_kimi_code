@@ -279,19 +279,21 @@ class Archive(Base):
                          "no notification exists any more, and the tombstone "
                          "must not claim one")
 
-    def test_the_ticket_s_own_delivery_row_archives(self):
-        """The exact shape the arbitration named: #143's own assignment.
+    def test_a_row_written_by_the_old_version_still_archives(self):
+        """The shape the arbitration named: a delivery row from the old version.
 
         Live row ``asg_143_worker_1`` on 2026-11-28: ``waiting_review_logged``
-        null, ``notified_at`` set. A marker-only gate therefore made **this
+        null, ``notified_at`` set. A marker-only gate therefore made **that
         ticket unable to close itself**, because archiving is one of the six
-        close conditions. The field values below are copied from that row.
+        close conditions. The field values below are copied from that row; the
+        thread is the fixture constant, because the row's real thread is a
+        private repository name and this file ships in an open repository.
         """
         engine = self.engine()
         index = engine.store.load_index()
         index.setdefault("assignments", {})["asg_1_worker_1"] = {
-            "id": "asg_143_worker_1",
-            "thread": "minghangg/laike_work_with_agent#143", "issue": 1,
+            "id": "asg_1_worker_1",
+            "thread": THREAD, "issue": 1,
             "role": "worker", "status": "waiting_release", "sid": "session_w1",
             "delivery_comment_id": 7240715203, "qa_verdict": "pass",
             "notified_at": "2026-11-28T14:30:39+00:00",
