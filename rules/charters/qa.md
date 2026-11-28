@@ -104,6 +104,58 @@ QA 评论必须带 PM packet 的唯一 `requirement_marker`：
 - `requirement_ambiguous`：回 AT，不替用户决定。
 - `pass` 只对当前版本有效，不代表可绕过 supervisor 关单门禁。
 
+### 5.1 退回必须附 fix packet（用户 2026-11-28 令）
+
+**退回不是「说哪里不对」，是「给出可直接执行的修复指令」。缺下面三项中的任一项，该退回不成立。**
+
+#### 三项硬要求
+
+| # | 要求 | 形式 | 不合格的形态 |
+|---|---|---|---|
+| 1 | **精确 `file:line`** | `super_agent/engine_parts/health_flag.py:58` | 「在恢复判定那里」「相关文件」 |
+| 2 | **可复制的复现命令** | 一行能直接粘进终端的完整命令 | 「跑一下测试」「构造一个失败场景」 |
+| 3 | **期望 vs 实际** | 两段并列，各自带具体值 | 「行为不对」「结果不符合预期」 |
+
+#### 范例（合格）
+
+```
+P0 · super_agent/engine_parts/health_flag.py:58
+
+复现：
+python -m pytest tests/test_iss142_degraded_recovery.py::PersistentSourceFailureIsNotARecovery -q
+
+期望：health.recovered 条数 == 0（故障持续时不应报恢复）
+实际：1（AssertionError: 1 != 0 : degraded -> degraded is never a recovery）
+
+根因：recovery_row 用 engine.degraded 与快照比较，两者不同源。
+```
+
+#### 范例（不合格，不算退回）
+
+```
+P0 · 恢复逻辑有问题
+
+期望：应该只报一次
+实际：报了多次
+```
+
+**这三项缺任何一项，PM 不得据以派返修**——worker 拿到这种退回只能猜，猜错再退回，就是两轮白跑。
+
+#### 给不出 fix packet 时：上升 SR，不硬退回
+
+**如果 QA 判定有问题但给不出三项**（例如：现象复现不了、根因未定位、只是「感觉不对」），**不要写成退回**。
+
+改为：
+
+1. 在 Issue 发一条 `[qa-…]-[告警]-[supervisor]` 评论，写明：
+   - 观察到什么现象（带证据）
+   - 已试过什么（命令＋输出）
+   - **卡在哪一步导致给不出 fix packet**
+2. 结论首行用 `fix_needed: false` 但正文标「**待 SR 裁决**」——因为**没有可执行修复指令的退回会让 worker 空转**。
+3. 由 SR 决定：补证据后重派 QA、直接改范围、或判为通过并记 P2。
+
+**判据**：Issue 里出现 `[QA] 结论：退回` 但正文缺三项之一 ⇒ SR 打回该 QA 结论，要求补全或改走上升路径。
+
 ## 6. 红线
 
 不改产品代码、测试、需求包或 QA 自己以外的状态；不 push；不读密钥；不对生产做未授权写操作。
