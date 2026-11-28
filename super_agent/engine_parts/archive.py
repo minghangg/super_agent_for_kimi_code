@@ -82,24 +82,27 @@ def from_stream(events, missing: bool) -> tuple[dict, bool]:
     return {sid: bool(rec.get("archived")) for sid, rec in sessions.items()}, False
 
 
-def eligible(aid: str, rec: dict, *, notify_attempted, archive_attempted
-             ) -> tuple[str, str]:
+def eligible(aid: str, rec: dict, *, archive_attempted) -> tuple[str, str]:
     """``(decision, detail)`` for one assignment before any side effect.
 
     ``decision`` is one of:
 
     * ``"skip"`` - nothing to do here (already archived, wrong state, no
-      delivery, the notification never went out, or this archive already ran);
-    * ``"unnotified"`` - proceed, but the supervisor was never told (recorded in
-      the tombstone as ``notified: false``);
+      delivery, or this archive already ran);
     * ``"go"`` - proceed.
 
-    ``notify_attempted``/``archive_attempted`` are the store's try counters,
-    read through ``action_id(aid, verb, delivery)`` by the caller: the action id
-    has a shape of its own, and rebuilding it here would be a second copy of
-    that shape. An *attempt* is not a delivery: ``uncertain`` means the bus call
-    raised, so the archive still proceeds (a worker that delivered is done)
-    while the tombstone tells the truth about the notification.
+    There used to be a third answer, ``"unnotified"``, plus two gates in front
+    of it: the delivery notification had to be *attempted* and its
+    ``notified_at`` had to be set. Both are gone with the notification itself
+    (#143): the waiting-review bus event had no consumer, so the archive pass
+    was waiting for a bus write that only ever proved "the bus accepted an
+    event nobody reads". Keeping the gate would have parked every delivery in
+    ``waiting_review`` forever, since ``notified_at`` can no longer be written
+    by anything.
+
+    ``archive_attempted`` is the store's try counter, read through
+    ``action_id(aid, "archive", delivery)`` by the caller: the action id has a
+    shape of its own, and rebuilding it here would be a second copy.
 
     **The order is the contract.** The idempotency checks come before the QA gate
     because ``begin_action`` is the first side effect; a gate placed after it
@@ -113,21 +116,17 @@ def eligible(aid: str, rec: dict, *, notify_attempted, archive_attempted
     delivery = rec.get("delivery_comment_id")
     if delivery is None:
         return "skip", "no delivery"
-    if notify_attempted(aid, delivery) < 1:
-        return "skip", "review notification not sent"
     if archive_attempted(aid, delivery) > 0:
         return "skip", "archive already attempted"
-    if not str(rec.get("notified_at") or ""):
-        return "unnotified", "notification unconfirmed"
     return "go", ""
 
 
-def record_archived(rec: dict, *, delivery, notified: bool, now: str) -> dict:
+def record_archived(rec: dict, *, delivery, now: str) -> dict:
     """The tombstone written after a confirmed archive."""
     rec["status"] = "waiting_release"
     rec["archived_at"] = now
     rec["tombstone"] = {"archived": True, "read_back": True,
-                        "notified": bool(notified), "at": now,
+                        "notified": False, "at": now,
                         "cid": delivery, "attempt": 1}
     return rec
 

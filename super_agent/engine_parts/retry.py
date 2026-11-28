@@ -216,3 +216,13 @@ def note_closed_route(route: dict, log_event, etype: str, thread: str,
     """
     closed_route(route, now)
     closed_thread_event(log_event, etype, thread, issue, cid, now)
+
+
+def release_skipped_row(thread: str, assignment: str, *, now: str) -> dict:
+    """The ``release_timeout.skipped`` row for a hold with no usable start.
+
+    One row per assignment, not per round: the scan runs every round, and an
+    unconditional write buried the queue it was supposed to describe.
+    """
+    return {"type": "release_timeout.skipped", "at": now, "thread": thread,
+            "assignment": assignment, "reason": "no usable start time"}

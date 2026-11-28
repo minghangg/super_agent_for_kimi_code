@@ -216,7 +216,12 @@ class Gates(Base):
         engine.run_once()
         rec = self.index(engine)["assignments"]["asg_1_worker_1"]
         self.assertEqual(rec["status"], "waiting_review")
-        notice = self.bus.events("event.agent.waiting_review")[-1]
+        # #143: the audit row carries the version binding the bus event used to
+        # carry; nothing is dispatched any more, so that row is the check.
+        rows = [json.loads(x) for x in
+                (self.state / "events.jsonl").read_text("utf-8").splitlines()]
+        notice = [r for r in rows
+                  if r["type"] == "assignment.waiting_review"][-1]
         self.assertEqual(notice["requirement_hash"], value["requirement_hash"])
         self.source.add({"id": 9100, "issue": 1, "author": "qa",
                          "session_key": QA_KEY,

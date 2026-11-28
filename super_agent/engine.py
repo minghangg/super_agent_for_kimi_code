@@ -94,15 +94,18 @@ from .engine_parts.at_routes import AtRoutes
 from .engine_parts import archive as archive_mod
 from .engine_parts import at_ledger as at_ledger_mod
 from .engine_parts import close as close_mod
+from .engine_parts import closed_needs as closed_needs_mod
 from .engine_parts import collect as collect_mod
 from .engine_parts import consume as consume_mod
 from .engine_parts import doctor as doctor_mod
 from .engine_parts import delivery as delivery_mod
 from .engine_parts import pause as read_pause_mod
+from .engine_parts import probes
 from .engine_parts import requirement_gate as requirement_gate_mod
 from .engine_parts import retry as retry_mod
 from .engine_parts import round as round_mod
 from .engine_parts.review_routes import ReviewRoutes
+from .engine_parts import session_truth as session_truth_mod
 from .engine_parts.refusal_ledger import RefusedRoutes
 from .engine_parts import session_keys as session_key_mod
 from .engine_parts import triage as triage_mod
@@ -167,94 +170,26 @@ SID_RE = session_ledger.FULL_SID_RE
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return probes.now()
 
 
 def _now_ts() -> float:
     return time.time()
 
 
-_CODE_VERSION = None
-
-
-def _quiet_subprocess_kwargs() -> dict:
-    if os.name != "nt":
-        return {}
-    info = subprocess.STARTUPINFO()
-    info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    info.wShowWindow = subprocess.SW_HIDE
-    return {"creationflags": subprocess.CREATE_NO_WINDOW, "startupinfo": info}
-
-
 def _current_head() -> str:
-    root = Path(__file__).resolve().parent.parent
-    try:
-        return subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, timeout=3, check=False,
-            **_quiet_subprocess_kwargs()).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return ""
+    """Forwarder: :func:`engine_parts.probes.current_head`."""
+    return probes.current_head()
 
 
 def _code_version() -> tuple[str, bool | None]:
-    global _CODE_VERSION
-    root = Path(__file__).resolve().parent.parent
-    commit = str((_CODE_VERSION or ("", None))[0] or "")
-    try:
-        if not commit:
-            commit = _current_head()
-        dirty = bool(subprocess.run(
-            ["git", "-C", str(root), "status", "--porcelain"],
-            capture_output=True, text=True, timeout=3, check=False,
-            **_quiet_subprocess_kwargs()).stdout.strip())
-        _CODE_VERSION = (commit, dirty)
-    except (OSError, subprocess.SubprocessError):
-        _CODE_VERSION = (commit, None)
-    return _CODE_VERSION
+    """Forwarder: :func:`engine_parts.probes.code_version`."""
+    return probes.code_version()
 
 
 def _tail_events(path: Path, *, limit: int, max_bytes: int = 512 * 1024) -> list:
-    """The last ``limit`` JSON rows of an append-only JSONL file.
-
-    ``events.jsonl`` is unbounded in practice (the live file passed 9000 rows
-    and grows every round), so the doctor must not read it whole. Two bounds
-    and no third: at most ``limit`` rows, and at most ``max_bytes`` read from
-    the end. A row that does not parse is skipped - the file is a log, and a
-    torn last line is not a fault of its own.
-    """
-    try:
-        with open(path, "rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            start = max(0, size - max_bytes)
-            fh.seek(start)
-            chunk = fh.read()
-    except OSError:
-        return []
-    text = chunk.decode("utf-8", "replace")
-    if start > 0:
-        # The first line of a mid-file read is almost certainly a fragment.
-        text = text.split("\n", 1)[1] if "\n" in text else ""
-    rows = []
-    for raw in text.splitlines()[-limit:]:
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            row = json.loads(raw)
-        except ValueError:
-            continue
-        if isinstance(row, dict):
-            rows.append(row)
-    return rows
-
-
-
-
-def _default_allowlist_path() -> Path:
-    """``config/allowlist.json`` next to the package, i.e. inside the repo."""
-    return Path(__file__).resolve().parent.parent / "config" / "allowlist.json"
+    """Forwarder: :func:`engine_parts.probes.tail_events`."""
+    return probes.tail_events(path, limit=limit, max_bytes=max_bytes)
 
 
 class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
@@ -780,16 +715,16 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
 
     # ------------------------------------------------------------ qa routing
     def _session_map_problem(self, where: str, problem: str) -> None:
-        """Report an unreadable ``sessions.json`` from a role key table.
+        """Forwarder: :func:`engine_parts.session_truth.map_problem_row`.
 
         The three key tables used to return their explicit-binding answer and
         say nothing, which made "the map could not be read" and "nobody has a
         key" the same value (#130 QA P1-3). Addendum 2's rule is that the fault
         must be observable, so it is logged exactly where it is discovered.
         """
-        if problem:
-            self.store.log_event({"type": "session_map.unreadable", "at": _now(),
-                                  "where": where, "detail": problem})
+        row = session_truth_mod.map_problem_row(where, problem, _now())
+        if row is not None:
+            self.store.log_event(row)
 
     def _qa_session_keys(self, thread: str) -> set[str]:
         """Session keys that count as *this thread's* QA.
@@ -874,62 +809,6 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
         if project:
             scopes.add(str(project).lower())
         return {s for s in scopes if s and not s.isdigit()}
-
-    def _session_map(self, path: Path | None = None) -> tuple[dict, str]:
-        """``(map, problem)`` for ``sessions.json`` - one read, one meaning.
-
-        Five call sites used to do ``json.loads(read_text_shared(path))`` inside
-        a ``try`` that folded **every** failure into ``data = {}``. Two very
-        different states came out identical: a genuinely empty ledger, and a
-        ledger the engine could not read. The second one silently emptied the
-        role key tables, so a bound AT/PM/QA looked like nobody had a key
-        (ISS-130 addendum 2).
-
-        So the problem sentence is returned, never swallowed. A caller that only
-        needs the explicit ledger binding ignores it; the ones whose answer
-        would otherwise read as "no keys" log one event per round per site, and
-        a genuinely empty file answers ``({}, "")`` - no fault, empty table.
-
-        Cached per round by ``(path, mtime_ns, size)`` so the five sites share
-        one read of a file that is read up to five times per issue.
-        """
-        if path is None:
-            try:
-                path = self._session_stream()[1]
-            except Exception:  # noqa: BLE001  undeclared stream = no session truth
-                # Nothing declared is the configured state, not a fault: the
-                # same answer the inline readers gave (#79). A *declared* path
-                # that cannot be read is the fault, and that is reported below.
-                return {}, ""
-        path = Path(path)
-        try:
-            stat = path.stat()
-            stamp = (str(path), stat.st_mtime_ns, stat.st_size)
-        except OSError:
-            stamp = (str(path), 0, 0)
-        cache = getattr(self, "_session_map_cache", None)
-        if cache is not None and cache[0] == stamp:
-            return dict(cache[1]), cache[2]
-        data, problem = session_key_mod.read_session_map(path)
-        self._session_map_cache = (stamp, dict(data), problem)
-        return data, problem
-
-    def _session_state(self) -> dict:
-        """Replayed lifecycle state, cached for the round.
-
-        ``None``-free on purpose: an unreadable stream returns ``{}`` and the
-        callers treat "cannot tell" as "no evidence to exclude a key". That is
-        the same weakness the key check already has; it must not become a new
-        way to fail closed on a healthy thread.
-        """
-        if self._session_state_cache is None:
-            try:
-                path, _sessions = self._session_stream()
-                self._session_state_cache = session_events.replay(
-                    session_events.load_events(path))
-            except Exception:  # noqa: BLE001  a broken stream must not block a verdict
-                self._session_state_cache = {}
-        return self._session_state_cache
 
     def _pm_session_keys(self, thread: str) -> set[str]:
         """Session keys that count as *this thread's* PM.
@@ -1535,10 +1414,8 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
         """
         if f"skipped:{assignment}" not in self._sup_notice_logged:
             self._sup_notice_logged.add(f"skipped:{assignment}")
-            self.store.log_event({
-                "type": "release_timeout.skipped", "at": _now(),
-                "thread": thread, "assignment": assignment,
-                "reason": "no usable start time"})
+            self.store.log_event(
+                retry_mod.release_skipped_row(thread, assignment, now=_now()))
         self._note_undeliverable(index, thread, comment_id, detail,
                                  assignment=assignment,
                                  once_key=f"notime:{assignment}")
@@ -2958,75 +2835,40 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
                                   "thread": thread, "conflict": out["conflict"]})
         return out
 
-    def _notify_waiting_review(self, assignment: dict) -> dict:
-        """Send ``event.agent.waiting_review`` at most once per delivery."""
+    def _record_waiting_review(self, assignment: dict) -> dict:
+        """Log one ``assignment.waiting_review`` row, at most once per delivery.
+
+        This deliberately sends **nothing**: #143 established that the
+        waiting-review bus event had no consumer anywhere in the repo
+        (``decide_watch.NOTICE_EVENT_TYPES`` never listed it), so the bus
+        write was cost with no reader. A PM learns about a delivery through
+        the delivery leg, which reads the ledger - not through this row.
+
+        What survives is the audit row: it is the only local evidence that a
+        delivery reached ``waiting_review`` and which requirement version it
+        carried, so the AT revision/hash binding stays checkable after the
+        fact. Dropping it would leave no trace at all - a silent success,
+        which ``fail_loud.md`` forbids as much as a silent failure.
+        """
         delivery = assignment.get("delivery_comment_id")
         if delivery is None:
-            return {"dispatched": False, "reason": "no delivery recorded"}
-        base = action_id(assignment["id"], "bus_inject", str(delivery))
-        if self.store.action_attempted(base) > 0:
-            assignment["notification_action_id"] = base
-            return {"dispatched": False, "reason": "already attempted",
-                    "action_id": base}
-        assignment["notification_action_id"] = base
-        assignment["attempts"] = int(assignment.get("attempts") or 0) + 1
-        result = self._dispatch({
-            "kind": "bus_inject",
-            "event": "event.agent.waiting_review",
-            "assignment_id": assignment["id"],
-            "input_ref": str(delivery),
-            "issue": assignment.get("issue"),
-            "payload": {"thread": assignment.get("thread"),
-                        "assignment": assignment["id"],
-                        "sid": assignment.get("sid"),
-                        "delivery_comment_id": delivery,
-                        "requirement_id": assignment.get("requirement_id"),
-                        "revision": assignment.get("revision"),
-                        "requirement_hash": assignment.get("requirement_hash"),
-                        "approval_ref": assignment.get("approval_ref"),
-                        "review_policy": assignment.get("review_policy")},
+            return {"recorded": False, "reason": "no delivery recorded"}
+        key = action_id(assignment["id"], "bus_inject", str(delivery))
+        if assignment.get("waiting_review_logged") == key:
+            return {"recorded": False, "reason": "already recorded",
+                    "action_id": key}
+        assignment["waiting_review_logged"] = key
+        self.store.log_event({
+            "type": "assignment.waiting_review", "at": _now(),
+            "assignment": assignment["id"],
+            "delivery_comment_id": delivery,
+            "action_id": key,
+            "requirement_id": assignment.get("requirement_id"),
+            "revision": assignment.get("revision"),
+            "requirement_hash": assignment.get("requirement_hash"),
+            "approval_ref": assignment.get("approval_ref"),
         })
-        if result.get("dispatched"):
-            # ``ok`` is the only confirmation: ``mark_done`` runs only when the
-            # bus accepted the event. A dispatch that was attempted and failed
-            # (`uncertain`) is recorded in the outbox but is *not* a delivery,
-            # and recording ``notified_at`` for it is how the archive pass used
-            # to mark a never-sent notification as sent.
-            if result.get("ok"):
-                assignment["notified_at"] = _now()
-            else:
-                assignment["notified_at"] = ""
-            self.store.log_event({
-                "type": "assignment.waiting_review", "at": _now(),
-                "assignment": assignment["id"],
-                "delivery_comment_id": delivery,
-                "action_id": result.get("action_id") or base,
-                "ok": bool(result.get("ok")),
-            })
-        return result
-
-    def _retry_waiting_review(self, index: dict) -> int:
-        """Re-attempt notifications a refused/suppressed dispatch never sent.
-
-        The delivery comment is already behind the cursor by then, so this is
-        the only path that can retry: the attempt counter is what keeps it
-        at-most-once (a real attempt - success or ``uncertain`` - is never
-        repeated).
-        """
-        sent = 0
-        for rec in (index.get("assignments") or {}).values():
-            if str(rec.get("status") or "") != "waiting_review":
-                continue
-            if rec.get("delivery_comment_id") is None:
-                continue
-            base = action_id(rec["id"], "bus_inject",
-                             str(rec["delivery_comment_id"]))
-            if self.store.action_attempted(base) > 0:
-                continue
-            result = self._notify_waiting_review(rec)
-            if result.get("dispatched"):
-                sent += 1
-        return sent
+        return {"recorded": True, "action_id": key}
 
     def _on_delivery(self, index: dict, thread: str, issue: int, comment: dict,
                      delivery: dict, summary: dict) -> str:
@@ -3062,9 +2904,9 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
                                   "assignment": assignment["id"], "thread": thread,
                                   "comment_id": cid, "reason": moved.get("reason")})
             return "needs_person", str(moved.get("reason") or "delivery refused")
-        # Retried on a later round when the previous attempt was refused or
-        # suppressed: those paths write no attempt counter on purpose.
-        self._notify_waiting_review(assignment)
+        # One audit row per delivery (#143): the bus event this used to send had
+        # no consumer, so only the local record survives.
+        self._record_waiting_review(assignment)
         return "delivery", ""
 
     # ------------------------------------------------------------- archive (C7)
@@ -3234,10 +3076,10 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
         proved closed yet. ``completed`` is written by the close reconciliation
         (four conditions, two rounds), never here.
 
-        The notification gate is ``notified_at``, not the attempt counter alone:
-        an attempt that came back ``uncertain`` never reached the bus, so the
-        tombstone records ``notified: false`` rather than claiming a delivery
-        that did not happen.
+        Nothing here waits on a notification any more: #143 removed the bus
+        event this pass used to require, so ``eligible`` no longer asks whether
+        one was attempted. The tombstone still records ``notified: false`` -
+        that is now the honest, constant answer rather than a failure case.
         """
         out = {"archived": [], "skipped": [], "blocked": [], "errors": []}
         save = index is None
@@ -3247,21 +3089,12 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
                 continue
             decision, detail = archive_mod.eligible(
                 aid, rec,
-                notify_attempted=lambda a, d: self.store.action_attempted(
-                    action_id(a, "bus_inject", str(d))),
                 archive_attempted=lambda a, d: self.store.action_attempted(
                     action_id(a, "archive", str(d))))
             if decision == "skip":
                 out["skipped"].append(aid)
                 continue
             delivery = rec.get("delivery_comment_id")
-            notified = decision != "unnotified"
-            if not notified:
-                self.store.log_event({"type": "assignment.notify_unconfirmed",
-                                      "at": _now(), "assignment": aid,
-                                      "delivery_comment_id": delivery,
-                                      "action_id": action_id(
-                                          aid, "bus_inject", str(delivery))})
             # The gate, and its position: after the idempotency checks in
             # ``eligible``, before ``begin_action`` below - which is the first
             # side effect (a persisted ``prepared`` record and a bumped try
@@ -3288,10 +3121,8 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
             archived = self._read_back_archived(sid)
             if ok and archived:
                 self.store.mark_done(base, sid=sid)
-                archive_mod.record_archived(rec, delivery=delivery,
-                                            notified=notified, now=_now())
-                # Only the archive counter is prunable here: the notification
-                # counter must survive so a late retry cannot re-send it.
+                archive_mod.record_archived(rec, delivery=delivery, now=_now())
+                # Only the archive counter is prunable: it is terminal.
                 self.store.prune_attempts(base)
                 out["archived"].append(aid)
             else:
@@ -3350,20 +3181,15 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
 
     # ------------------------------------------------- close reconciliation
     def _binding_roles(self, thread: str) -> list[str]:
-        """Roles still registered for ``thread`` in ``issue_sessions.json``."""
-        ledger = self._load_issue_sessions().get(thread)
-        if not isinstance(ledger, dict):
-            return []
-        return sorted(str(role) for role, entry in ledger.items()
-                      if isinstance(entry, dict) and entry)
+        """Roles still registered for ``thread``, per :mod:`engine_parts.close`."""
+        return close_mod.binding_roles(self._load_issue_sessions().get(thread))
 
     def _running_tasks(self, sid: str):
-        """``(running, skipped)`` for one sid.
+        """``(running, skipped)`` for one sid; the judgement is in the module.
 
-        An archived session returns ``[]`` from ``tasks()``, which is neither
-        "idle" nor evidence: the concurrency question is answered by the
-        un-cached archive read-back, so a skipped table is reported as skipped
-        and the condition does not depend on it.
+        The probe itself stays here because it is the only place that decides
+        which client answers (``direct.tasks``), and an unreadable table is
+        reported as ``unreadable:`` rather than as idle.
         """
         if not sid:
             return [], "no sid"
@@ -3372,9 +3198,7 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
             rows = direct.tasks(sid)
         except Exception as exc:  # noqa: BLE001  an unreadable table is not "idle"
             return [], f"unreadable: {type(exc).__name__}"
-        running = [str(t.get("id") or "") for t in (rows or [])
-                   if str(t.get("status") or "") == "running"]
-        return running, ""
+        return close_mod.running_tasks(rows)
 
     def close_conditions(self, thread: str, index: dict) -> dict:
         """The four conditions that make a closed thread provable.
@@ -3647,52 +3471,37 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
         return results
 
     def _resolve_closed_needs(self, index: dict) -> int:
-        """Mark needs_person rows resolved once their Issue is confirmed closed."""
+        """Mark needs_person rows resolved once their Issue is confirmed closed.
+
+        Forwarder: which rows qualify is decided in
+        :mod:`engine_parts.closed_needs` (a pure read of the index). What stays
+        here is the per-process state - the "already reported" set for foreign
+        repos, the live-issue set, and the event log.
+        """
         try:
             limit = max(1, int((self.cfg.get("engine") or {}).get(
                 "max_closed_thread_checks") or 10))
         except (TypeError, ValueError):
             limit = 10
         current_repo = issuekey.repo_full((self.cfg.get("github") or {}).get("repo"))
-        pending = []
         skipped = getattr(self, "_closed_resolution_skipped", None)
         if skipped is None:
             skipped = self._closed_resolution_skipped = set()
-        for thread, rec in (index.get("issues") or {}).items():
-            repo, issue = issuekey.split_key(thread)
-            repo = repo or current_repo
-            if repo != current_repo:
-                if thread not in skipped:
-                    skipped.add(thread)
-                    self.store.log_event({"type": "needs_person.resolution_skipped",
-                                          "at": _now(), "thread": thread,
-                                          "repo": repo, "current_repo": current_repo})
+        for thread, repo in closed_needs_mod.foreign_threads(
+                index, current_repo=current_repo):
+            if thread in skipped:
                 continue
-            if issue is None:
-                continue
-            rows = [row for row in (rec.get("needs_person") or [])
-                    if needs.is_open(index, thread, row)]
-            if rows:
-                pending.append((thread, issue, rows))
-        resolved = 0
-        for thread, issue, rows in sorted(pending)[:limit]:
-            if issue in getattr(self, "_live_issues", set()):
-                continue
-            if self._issue_state(issue) != "closed":
-                continue
-            for row in rows:
-                cid = needs.cid_of(row)
-                if cid is None:
-                    continue
-                entries = sum(needs.cid_of(other) == cid for other in rows)
-                marked = needs.mark(index, thread, cid, state=needs.RESOLVED,
-                                    by="engine", reason="issue closed", entries=entries)
-                if marked.get("changed"):
-                    resolved += 1
-                    self.store.log_event({"type": "needs_person.closed_resolved",
-                                          "at": _now(), "thread": thread,
-                                          "comment_id": cid, "entries": entries})
-        return resolved
+            skipped.add(thread)
+            self.store.log_event({"type": "needs_person.resolution_skipped",
+                                  "at": _now(), "thread": thread,
+                                  "repo": repo, "current_repo": current_repo})
+        plan = closed_needs_mod.pending_rows(
+            index, current_repo=current_repo, limit=limit)
+        return closed_needs_mod.resolve(
+            index, plan,
+            live=getattr(self, "_live_issues", set()),
+            issue_state=self._issue_state,
+            log_row=lambda row: self.store.log_event({"at": _now(), **row}))
 
     def run_round(self) -> dict:
         """One round = ``begin_round`` → ``run_issue_phase`` → ``run_global_phase``.
@@ -3868,7 +3677,6 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
         if state.queue.refused:
             summary["backpressure"] = list(state.queue.refused)
 
-        summary["notifications_retried"] = self._retry_waiting_review(index)
         self._retry_routes(index)
         self._retry_supervisor_routes(index)
         self._retry_pm_frames(index)
@@ -4205,7 +4013,7 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
         else:
             add(*doctor_mod.github_check(self.source, str(source_name)))
 
-        add(*self._check_config())
+        add(*doctor_mod.config(self.projects))
 
         add(*doctor_mod.outbox_check(self.store))
         add(*doctor_mod.waiting_person_check(self.store))
@@ -4221,9 +4029,11 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
         index = self.store.load_index()
         add(*doctor_mod.assignments_check(asg_mod.active_assignments(index)))
 
-        add(*self._check_supervisor_visibility())
+        add(*doctor_mod.supervisor_visibility(
+            self.cfg, self.store.events_path, self.SUPERVISOR_SID_MALFORMED_ROW,
+            _tail_events))
 
-        add(*self._check_charters())
+        add(*doctor_mod.charters())
 
         counters = self.store.load_counters()
         return {"checks": checks, "external_actions":
@@ -4231,24 +4041,102 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
                 "mode": self.mode}
 
     # ------------------------------------------------------ doctor sub-checks
-    def _check_charters(self) -> tuple:
-        """Forwarder: :func:`engine_parts.doctor.charters`."""
-        return doctor_mod.charters()
-
-    def _check_supervisor_visibility(self) -> tuple:
-        """Forwarder: :func:`engine_parts.doctor.supervisor_visibility`."""
-        return doctor_mod.supervisor_visibility(
-            self.cfg, self.store.events_path, self.SUPERVISOR_SID_MALFORMED_ROW,
-            _tail_events)
-
     def _check_process(self) -> tuple:
-        """Forwarder: :func:`engine_parts.doctor.process`."""
-        return doctor_mod.process(self.store, current_head=_current_head,
-                                  parse_ts=frame_text_mod.parse_ts)
+        """Forwarder: :func:`engine_parts.doctor.process`.
 
-    def _check_config(self) -> tuple:
-        """Forwarder: :func:`engine_parts.doctor.config`."""
-        return doctor_mod.config(self.projects)
+        Nothing is injected that the module can read itself; ``current_head`` is
+        passed because a test patches the engine-level name.
+        """
+        return doctor_mod.process(self.store, current_head=_current_head)
+
+    # ------------------------------------------------------ session truth (ISS-27)
+    def _session_stream(self) -> tuple[Path, Path]:
+        """Forwarder: :func:`engine_parts.session_truth.resolve_paths`.
+
+        Raises :class:`session_events.SessionStreamNotConfigured` when the config
+        declares no stream: an undeclared stream is a configured state, not a
+        fault. Never guessed from the working directory (ISS-79).
+        """
+        return session_truth_mod.resolve_paths(self.cfg)
+
+    def _note_stream_state(self) -> str:
+        """Apply :func:`engine_parts.session_truth.stream_fault` to this round.
+
+        The decision (missing vs undecodable, and why they differ) lives in the
+        module; this method only applies it, because the effect - one degraded
+        flag, one error string, one event row - is host state.
+        """
+        try:
+            events, _sessions = self._session_stream()
+        except session_events.SessionStreamNotConfigured:
+            return ""
+        fault = session_truth_mod.stream_fault(events, _now())
+        if fault is None:
+            return ""
+        self.degraded = True
+        self._stream_error = fault["error"]
+        self.store.log_event(fault["row"])
+        return self._stream_error
+
+    def _session_map(self, path: Path | None = None) -> tuple[dict, str]:
+        """``(map, problem)`` for ``sessions.json``, cached per round.
+
+        Forwarder: the read and its "problem is returned, never swallowed" rule
+        live in :func:`engine_parts.session_truth.read_session_map`. Caching by
+        ``(path, mtime_ns, size)`` stays here because it is per-round host state.
+        """
+        if path is None:
+            try:
+                path = self._session_stream()[1]
+            except Exception:  # noqa: BLE001  undeclared stream = no session truth
+                # Nothing declared is the configured state, not a fault: the
+                # same answer the inline readers gave (#79). A *declared* path
+                # that cannot be read is the fault, reported by the reader.
+                return {}, ""
+        path = Path(path)
+        try:
+            stat = path.stat()
+            stamp = (str(path), stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            stamp = (str(path), 0, 0)
+        cache = getattr(self, "_session_map_cache", None)
+        if cache is not None and cache[0] == stamp:
+            return dict(cache[1]), cache[2]
+        data, problem = session_truth_mod.read_session_map(path)
+        self._session_map_cache = (stamp, dict(data), problem)
+        return data, problem
+
+    def _session_state(self) -> dict:
+        """Replayed lifecycle state, cached for the round.
+
+        Forwarder: :func:`engine_parts.session_truth.replay_state`, which answers
+        ``{}`` on a broken stream so "cannot tell" never becomes a new way to
+        fail closed on a healthy thread.
+        """
+        if self._session_state_cache is None:
+            try:
+                path, _sessions = self._session_stream()
+            except Exception:  # noqa: BLE001  undeclared stream = no session truth
+                self._session_state_cache = {}
+                return self._session_state_cache
+            self._session_state_cache = session_truth_mod.replay_state(path)
+        return self._session_state_cache
+
+    def replay_sessions(self, at: str | None = None) -> dict:
+        """Rebuild ``sid -> (role, issue, assignment, profile)`` as of ``at``.
+
+        Forwarder: :func:`engine_parts.session_truth.replay_as_of`. Read-only -
+        the engine's own ``events.jsonl`` is a different stream.
+        """
+        events_path, _sessions_path = self._session_stream()
+        return session_truth_mod.replay_as_of(events_path, at)
+
+    def reconcile_sessions(self, at: str | None = None,
+                           server_sids: set[str] | None = None) -> dict:
+        """Three-way: replay x ``sessions.json`` x live server. Read-only."""
+        events_path, sessions_path = self._session_stream()
+        return session_truth_mod.reconcile(events_path, sessions_path,
+                                           server_sids, at)
 
     # -------------------------------------------------------------------- replay
     def replay(self, issue: int) -> dict:
@@ -4297,100 +4185,6 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
                 "state": rec["state"], "cursor_gap": gap,
                 "external_actions": self.store.load_counters()
                 .get("external_actions", 0)}
-
-    # ------------------------------------------------------ session truth (ISS-27)
-    def _session_stream(self) -> tuple[Path, Path]:
-        """``(events, sessions)``; raises ``SessionStreamNotConfigured`` when undeclared.
-
-        ISS-79: the stream is never guessed from the working directory. A config
-        that declares nothing has no session truth, and a config that declares a
-        path the engine cannot find is a fault the round must report - the two
-        cases are deliberately kept apart here.
-        """
-        engine_cfg = self.cfg.get("engine") or {}
-        events = session_events.resolve_events_path(
-            self.cfg, engine_cfg.get("session_events_path") or None)
-        sessions = session_events.resolve_sessions_path(self.cfg)
-        return events, sessions
-
-    def _note_stream_state(self) -> str:
-        """Fail closed when a **declared** session stream is absent or unreadable.
-
-        Four cases, and only the last two are faults:
-
-        * nothing declared - the engine has no session truth by configuration;
-          it runs, and it says nothing, because that is the configured state;
-        * declared and readable - the round is unaffected;
-        * declared but no segment on disk - :func:`session_events.read_stream`
-          reports ``missing``; the round is degraded and one event says so;
-        * declared, present, but not UTF-8 - ``_read_jsonl`` raises
-          :class:`session_events.StreamUnreadable`. It is caught **here**, not
-          left to bubble out of the round: an escaping exception skipped the
-          round's own ``write_health``, so ``health.json`` kept the previous,
-          healthy snapshot while every round failed (ISS-79 P1-1).
-
-        Missing and unreadable are kept apart on purpose. The operator's next
-        action differs: one restores a file, the other fixes an encoding. A
-        single vague "stream unavailable" would leave them guessing.
-
-        The judgement uses ``segments()``, never ``path.is_file()``: a stream
-        whose current file was rotated to ``.1`` is still readable, and calling
-        that missing would degrade a healthy engine once per rotation.
-        """
-        try:
-            events, _sessions = self._session_stream()
-        except session_events.SessionStreamNotConfigured:
-            return ""
-        try:
-            rows, missing = session_events.read_stream(events)
-        except session_events.StreamUnreadable as exc:
-            self.degraded = True
-            self._stream_error = f"session stream not decodable as UTF-8: {exc}"
-            self.store.log_event({"type": "session.stream_unreadable", "at": _now(),
-                                  "path": str(events), "rows": 0,
-                                  "encoding": "utf-8",
-                                  "error": self._stream_error,
-                                  "level": "warn",
-                                  "consumers": ["doctor", "brief", "health"]})
-            return self._stream_error
-        except OSError as exc:
-            self.degraded = True
-            self._stream_error = f"session stream unreadable: {type(exc).__name__}: {exc}"
-            self.store.log_event({"type": "session.stream_unreadable", "at": _now(),
-                                  "path": str(events), "rows": 0,
-                                  "error": self._stream_error,
-                                  "level": "warn",
-                                  "consumers": ["doctor", "brief", "health"]})
-            return self._stream_error
-        if not missing:
-            return ""
-        self.degraded = True
-        self._stream_error = f"session stream missing: {events}"
-        self.store.log_event({"type": "session.stream_missing", "at": _now(),
-                              "path": str(events), "rows": len(rows),
-                              "error": self._stream_error})
-        return self._stream_error
-
-    def replay_sessions(self, at: str | None = None) -> dict:
-        """Rebuild ``sid -> (role, issue, assignment, profile)`` as of ``at``.
-
-        Reads the workbench lifecycle stream (``tools/sess_events.py:emit`` wrote
-        it). Strictly read-only and it never writes into ``store/``: the engine's
-        own ``events.jsonl`` is a different stream and stays untouched.
-        """
-        events_path, _sessions_path = self._session_stream()
-        events, missing = session_events.read_stream(events_path)
-        state = session_events.replay(events, at)
-        state["events_path"] = str(events_path)
-        state["missing"] = missing
-        state["keys_active"] = session_events.active_keys(state)
-        return state
-
-    def reconcile_sessions(self, at: str | None = None,
-                           server_sids: set[str] | None = None) -> dict:
-        """Three-way: replay × ``sessions.json`` × live server. Read-only."""
-        events_path, sessions_path = self._session_stream()
-        return session_events.reconcile(events_path, sessions_path, server_sids, at)
 
 
 def build_engine(cfg: dict, store: Store, bus=None, *, source=None) -> Engine:

@@ -196,25 +196,6 @@ class ArchiveIsNotPermanent(Base):
         engine._dispatch({**common, "assignment_id": "asg_7_worker_1"})
         self.assertEqual(len(self.events(engine, "dispatch.archived_sid")), 2)
 
-    def test_a_waiting_review_refused_for_archive_keeps_no_permanent_key(self):
-        """The shape #84 actually saw: 458 rows, all one worker assignment."""
-        engine = self.engine()
-        engine._sid_archived = lambda sid: True
-        engine.dispatch_enabled = True
-        assignment = {"id": "asg_7_worker_1", "thread": THREAD, "issue": 7,
-                      "role": "worker", "status": "waiting_review",
-                      "sid": "session_dead", "delivery_comment_id": 3}
-        index = self.index()
-        for _ in range(3):
-            out = engine._notify_waiting_review(assignment)
-            self.assertTrue(out["refused"], out)
-            self.assertEqual(out["reason"], "target session is archived")
-        self.assertEqual(len(self.events(engine, "dispatch.archived_sid")), 1)
-        # Nothing about this refusal is permanent: ``restore`` makes it
-        # deliverable again, so the record must stay a plain refusal.
-        self.assertNotIn("permanent", index["routes"][KEY])
-        self.assertEqual(engine.store.load_counters()["external_actions"], 0)
-
     def test_a_route_refused_for_archive_keeps_no_permanent_key(self):
         """The PM route path refuses the same way and also stays unmarked."""
         engine = self.engine()

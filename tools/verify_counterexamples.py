@@ -9,20 +9,29 @@ No network, no session service, no change to the live workbench state.
 
 Semantics this file asserts (read this before trusting a green run)
 --------------------------------------------------------------------
-``verify-semantics: 2``  -  the assignment lifecycle of milestone 2.
+``verify-semantics: 3``  -  the assignment lifecycle after #143.
 ``follows: milestone 2`` -  ``70a2a48`` (archive stops at ``waiting_release``)
                              and ``b80e991`` (a thread-level ``completed``
                              follows the result).
-``synced-at: d4a573f``  -  the commit that re-read the semantics: example 5
-                             moved from ``completed`` to ``waiting_release``.
+``synced-at: #143``     -  the change that re-read the semantics: examples 1
+                             and 2 moved off the waiting-review notification.
 ``collected-by: tests/test_verify_scripts.py``.
 
-The one assertion that moved: example 5 used to require ``completed`` after a
-successful archive. Since milestone 2 C4 that is wrong - an archive proves the
-worker is done, not that the Issue is closed, so the record stops at
-``waiting_release`` and only the close reconciliation (four conditions, two
-rounds) writes ``completed``. Example 5 now pins ``waiting_release``,
-``archived_at`` and the archive read-back.
+Two assertions moved, and why:
+
+* **Examples 1 and 2** used to pin "the waiting-review notification is at most
+  once, and an uncertain one is never re-sent". #143 removed the notification:
+  the event had no consumer, so a delivery now dispatches nothing and logs one
+  local audit row. What those examples pin now is the replacement invariant -
+  *no* outbox record, *zero* attempts, and the delivery still held in
+  ``waiting_review`` rather than lost. Leaving the old assertions would have
+  made this script assert a channel that no longer exists.
+* **Example 5** used to require ``completed`` after a successful archive. Since
+  milestone 2 C4 that is wrong - an archive proves the worker is done, not that
+  the Issue is closed, so the record stops at ``waiting_release`` and only the
+  close reconciliation (four conditions, two rounds) writes ``completed``.
+  Example 5 now pins ``waiting_release``, ``archived_at`` and the archive
+  read-back.
 
 **A milestone change must update the assertions in this file.** When a
 milestone moves a transition, a green ``pytest`` that never runs this script is
@@ -167,6 +176,7 @@ def record(name, ok, detail):
 
 
 # --- 1: a failed send (bus raises) is uncertain and never re-created/re-sent ---
+# --- 1: a delivery dispatches nothing, and logs exactly one audit row ---
 def example_1():
     tmp, events, allow = scenario()
     bind(events)
@@ -178,17 +188,21 @@ def example_1():
     base = action_id("asg_1_worker_1", "bus_inject", "9001")
     first = eng.store.action_attempted(base)
     state = eng.store.load_outbox_state()
-    status = (state["actions"].get(base) or {}).get("status")
+    queued = bool(state["actions"])
+    rows = [e for e in events_of(tmp) if e["type"] == "assignment.waiting_review"]
     eng.run_once()                      # restart-equivalent: same state dir
-    second = eng.store.action_attempted(base)
     again = len([e for e in events_of(tmp)
                  if e["type"] == "assignment.waiting_review"])
-    record("1 uncertain-not-resent",
-           first == 1 and second == 1 and status == "uncertain" and again == 1,
-           f"attempts={first}->{second} status={status} waiting_review_events={again}")
+    # #143: the waiting-review bus event had no consumer, so a delivery must
+    # dispatch nothing at all - not even to a healthy bus, and certainly not to
+    # a failing one. The audit row is the only trace, once per delivery.
+    record("1 delivery-dispatches-nothing",
+           first == 0 and not queued and len(rows) == 1 and again == 1,
+           f"attempts={first} outbox_records={queued} "
+           f"waiting_review_events={len(rows)}->{again}")
 
 
-# --- 2: an uncertain action never produces a second comment/notification ---
+# --- 2: no uncertain record can exist, so nothing is ever re-sent ---
 def example_2():
     tmp, events, allow = scenario()
     bind(events)
@@ -199,14 +213,19 @@ def example_2():
     probe = lambda rec: {"found": False, "detail": "remote side has nothing"}  # noqa: E731
     reconciled = eng.reconcile_uncertain(probe)
     base = action_id("asg_1_worker_1", "bus_inject", "9002")
-    status = (eng.store.load_outbox_state()["actions"].get(base) or {}).get("status")
+    queued = (eng.store.load_outbox_state()["actions"].get(base) or {})
     eng.run_once()
     after = eng.store.action_attempted(base)
-    record("2 reconcile-then-no-resend",
-           status == "waiting_person" and after == 1
-           and not any(r["outcome"] == "done" for r in reconciled),
-           f"reconciled={[r['outcome'] for r in reconciled]} status={status} "
-           f"attempts={after}")
+    rec = eng.store.load_index()["assignments"]["asg_1_worker_1"]
+    # The old invariant was "an uncertain notification is never re-sent". With
+    # no notification there is no uncertain record to reconcile, and the run
+    # must still hold the delivery in waiting_review rather than lose it.
+    record("2 no-notification-no-uncertain",
+           not reconciled and not queued and after == 0
+           and rec["status"] == "waiting_review",
+           f"reconciled={[r['outcome'] for r in reconciled]} "
+           f"outbox_record={queued or None} attempts={after} "
+           f"status={rec['status']}")
 
 
 # --- 3: a dispatch to an archived sid is refused, counted nowhere, queued nowhere ---
@@ -215,7 +234,7 @@ def example_3():
     bind(events, archive=True)
     eng = engine(tmp, events, allow, Comments(), FakeBus(), FakeSessions())
     before = eng.store.load_counters()
-    out = eng._dispatch({"kind": "bus_inject", "event": "event.agent.waiting_review",
+    out = eng._dispatch({"kind": "bus_inject", "event": "event.agent.supervisor",
                          "issue": 1, "input_ref": "1", "payload": {"sid": "session_w1"}})
     after = eng.store.load_counters()
     kinds = [e["type"] for e in events_of(tmp)]

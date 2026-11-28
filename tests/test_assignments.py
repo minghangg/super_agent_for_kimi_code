@@ -524,25 +524,45 @@ class Delivery(Base):
 
 
 class Notification(Base):
-    def test_exactly_one_waiting_review_event_and_attempt(self):
+    """#143: a delivery leaves **one local audit row and no bus event**.
+
+    ``_record_waiting_review`` used to dispatch a waiting-review bus event.
+    Nothing consumed that event, so the write was pure cost; the row is now the
+    only trace, and the PM learns about the delivery from the delivery leg.
+    """
+
+    def test_exactly_one_audit_row_and_no_bus_event(self):
         self.bind("session_w1")
         self.source.add(9001, "[WK:owner/demo#1] done")
         engine = self.engine()
         engine.run_once()
-        engine.run_once()             # a second round must not notify again
+        engine.run_once()             # a second round must not log again
         events = [json.loads(x) for x in
                   (self.state / "events.jsonl").read_text("utf-8").splitlines()]
         kinds = [e["type"] for e in events]
         self.assertEqual(kinds.count("assignment.waiting_review"), 1)
-        self.assertEqual(len(self.bus.injected), 1)
-        state = engine.store.load_outbox_state()
-        base = action_id("asg_1_worker_1", "bus_inject", "9001")
-        self.assertEqual(state["attempts"][base], 1)
+        self.assertEqual(self.bus.injected, [],
+                         "no consumer exists, so nothing may be dispatched")
 
-    def test_refused_dispatch_retries_next_round(self):
-        # No bus_inject in the allowlist: the dispatch is refused, no attempt
-        # is recorded, so the next round is allowed to try again.
-        allow = dict(GOOD)
+    def test_the_audit_row_carries_the_requirement_binding(self):
+        # The AT revision/hash binding has to stay checkable after the fact;
+        # that is the reason this row survives at all.
+        self.bind("session_w1")
+        self.source.add(9001, "[WK:owner/demo#1] done")
+        engine = self.engine()
+        engine.run_once()
+        rows = [json.loads(x) for x in
+                (self.state / "events.jsonl").read_text("utf-8").splitlines()]
+        row = [r for r in rows if r["type"] == "assignment.waiting_review"][0]
+        self.assertEqual(row["delivery_comment_id"], 9001)
+        self.assertEqual(row["assignment"], "asg_1_worker_1")
+        for key in ("requirement_id", "revision", "requirement_hash",
+                    "approval_ref"):
+            self.assertIn(key, row)
+
+    def test_a_blocked_allowlist_does_not_stop_the_audit_row(self):
+        # The row is local bookkeeping, not an external action: an allowlist
+        # without ``bus_inject`` must not silence it.
         allow = json.loads(json.dumps(GOOD))
         allow["projects"]["demo"]["actions"] = ["collect", "reconcile"]
         self.allow.write_text(json.dumps(allow), encoding="utf-8")
@@ -550,61 +570,40 @@ class Notification(Base):
         self.source.add(9001, "[WK:owner/demo#1] done")
         engine = self.engine()
         engine.run_once()
-        self.assertEqual(self.bus.injected, [])
-        self.assertEqual(engine.store.action_attempted(
-            action_id("asg_1_worker_1", "bus_inject", "9001")), 0)
-        self.allow.write_text(json.dumps(GOOD), encoding="utf-8")
-        self.assertEqual(engine.projects.poll()["used"], "new",
-                         "a valid edit must be picked up before the next round")
-        engine.run_once()
-        self.assertEqual(len(self.bus.injected), 1)
+        rows = [json.loads(x) for x in
+                (self.state / "events.jsonl").read_text("utf-8").splitlines()]
+        self.assertEqual([r["type"] for r in rows].count(
+            "assignment.waiting_review"), 1)
+        self.assertEqual(engine.store.load_counters()["external_actions"], 0,
+                         "a local row is not an external action")
 
-    def test_bus_failure_is_uncertain_and_not_resent(self):
+    def test_a_failing_bus_is_never_called(self):
+        # A delivery must not depend on the bus being healthy any more.
         self.bind("session_w1")
         self.source.add(9001, "[WK:owner/demo#1] done")
-        engine = self.engine(bus=FakeBus(fail=True))
-        engine.run_once()
-        state = engine.store.load_outbox_state()
-        base = action_id("asg_1_worker_1", "bus_inject", "9001")
-        self.assertEqual(state["attempts"][base], 1)
-        self.assertIn(base, state["actions"], "an uncertain action stays visible")
-        self.assertEqual(state["actions"][base]["status"], "uncertain")
-
-        engine.run_once()
-        # The uncertain notification is never re-sent; the archive pass may add
-        # its own (separate) attempt, so only the notification counter matters.
-        self.assertEqual(engine.store.action_attempted(
-            action_id("asg_1_worker_1", "bus_inject", "9001")), 1,
-            "an uncertain action is never re-sent blindly")
-
-    def test_uncertain_notification_is_never_recorded_as_notified(self):
-        # QA's real-probe shape: the bus raised, so the event never left the
-        # process, yet the archive pass used the *attempt* counter as proof of
-        # delivery and wrote ``notified_at``. A pass still archives the worker
-        # (it did deliver), but it must not claim the supervisor was told.
-        self.bind("session_w1")
-        self.source.add(9001, "[WK:owner/demo#1] done")
-        self.source.add(9100, "[QA] **通过**", author="qa")
         engine = self.engine(bus=FakeBus(fail=True))
         engine.run_once()
         rec = self.index(engine)["assignments"]["asg_1_worker_1"]
-        self.assertEqual(rec["status"], "waiting_release")
-        self.assertEqual(rec["notified_at"], "",
-                         "a failed send is not a notification")
-        self.assertFalse(rec["tombstone"]["notified"])
-        kinds = [json.loads(x)["type"] for x in
-                 (self.state / "events.jsonl").read_text("utf-8").splitlines()]
-        self.assertEqual(kinds.count("assignment.notify_unconfirmed"), 1)
+        self.assertEqual(rec["status"], "waiting_review")
+        state = engine.store.load_outbox_state()
+        self.assertEqual(state["actions"], {}, "nothing was dispatched")
 
-    def test_successful_notification_is_recorded_as_notified(self):
+    def test_archive_does_not_wait_on_a_notification(self):
+        # The old gate demanded an attempted notification plus ``notified_at``.
+        # Both are gone: a QA pass now archives on the first round that sees it.
         self.bind("session_w1")
         self.source.add(9001, "[WK:owner/demo#1] done")
         self.source.add(9100, "[QA] **通过**", author="qa")
         engine = self.engine()
         engine.run_once()
         rec = self.index(engine)["assignments"]["asg_1_worker_1"]
-        self.assertTrue(rec["notified_at"])
-        self.assertTrue(rec["tombstone"]["notified"])
+        self.assertEqual(rec["status"], "waiting_release")
+        self.assertFalse(rec["tombstone"]["notified"],
+                         "no external notification exists, so the tombstone "
+                         "must not claim one")
+        kinds = [json.loads(x)["type"] for x in
+                 (self.state / "events.jsonl").read_text("utf-8").splitlines()]
+        self.assertNotIn("assignment.notify_unconfirmed", kinds)
 
     def test_disabled_dispatch_writes_no_attempt(self):
         self.bind("session_w1")

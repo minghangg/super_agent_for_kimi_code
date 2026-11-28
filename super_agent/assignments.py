@@ -71,15 +71,16 @@ Rules this module enforces (each one is a test):
 * A delivery is matched to an assignment by marker name first, then by "the
   only live worker on this thread". Anything else is ``unmatched`` and escalates
   to a person - a delivery is never dropped silently.
-* The ``waiting_review`` notification is **at-most-once**. The decision is
-  ``Store.action_attempted(base) == 0``, and the attempt counter is persisted
-  before the external call, so a crash either replays the same record or waits
-  for reconciliation. A refused/disabled dispatch writes no counter, which is
-  what makes "refused -> retry next round" safe.
-* **An attempt is not a delivery.** ``uncertain`` means the call raised, so the
-  supervisor was never told; it must never be recorded as ``notified_at``. The
-  archive pass may still close the assignment (a worker that delivered is
-  done), but its tombstone says ``notified: false`` and the loss is logged.
+* The ``waiting_review`` row is **a local audit row, not a notification**
+  (#143). Nothing is dispatched: the waiting-review bus event had no consumer
+  anywhere, so the engine logs one ``assignment.waiting_review`` event per
+  delivery and that is all. The PM learns about a delivery through the delivery
+  leg, which reads the ledger.
+* **An attempt is not a delivery.** When a dispatch is attempted and the call
+  raises, the result is ``uncertain``: the remote side was never told. Such a
+  call must never be recorded as if it had succeeded, and the archive tombstone
+  says so (``notified: false``) rather than claiming a delivery that did not
+  happen.
 """
 from __future__ import annotations
 
@@ -394,7 +395,6 @@ def sync(index: dict, thread: str, issue, live: list[dict], *,
             "id": aid, "thread": thread, "issue": int(issue), "role": role,
             "sid": bind["sid"], "session_key": key,
             "input_comment_id": None, "status": "working",
-            "attempts": 0, "notification_action_id": "", "notified_at": "",
             "delivery_comment_id": None, "delivery_cids": [],
             "delivery_marker": "", "matched_by": "",
             "created_at": now(), "updated_at": now(),

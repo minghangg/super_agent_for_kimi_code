@@ -213,3 +213,29 @@ def reconcile(index: dict, thread: str, *, conditions, enter_reconcile,
     return {"thread": thread, "status": "pending", "completed": completed,
             "reason": record["blocked_reason"],
             "conditions": snap["conditions"], "consecutive_ok": streak}
+
+
+def binding_roles(ledger) -> list[str]:
+    """Roles still registered for one thread in ``issue_sessions.json``.
+
+    A role whose entry is not a non-empty dict is not registered: a retired
+    binding leaves its key behind, and counting that as "still bound" would make
+    a closed thread look live forever.
+    """
+    if not isinstance(ledger, dict):
+        return []
+    return sorted(str(role) for role, entry in ledger.items()
+                  if isinstance(entry, dict) and entry)
+
+
+def running_tasks(rows) -> tuple[list, str]:
+    """``(running ids, skip reason)`` from one session's task table.
+
+    An archived session answers ``[]`` from ``tasks()``, which is neither "idle"
+    nor evidence. The concurrency question is carried by the un-cached archive
+    read-back instead, so an unreadable table is reported as skipped rather than
+    contributing a false "no running task".
+    """
+    running = [str(t.get("id") or "") for t in (rows or [])
+               if str(t.get("status") or "") == "running"]
+    return running, ""

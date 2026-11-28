@@ -248,30 +248,35 @@ class RuntimeObservability(Base):
         self.assertTrue(snap["degraded"])
 
     def test_dirty_state_is_refreshed_without_changing_the_running_commit(self):
+        # The implementation moved to ``engine_parts.probes`` (#143 cleanup), so
+        # the patch targets move with it; the assertions are unchanged.
+        from super_agent.engine_parts import probes
         from super_agent import engine as engine_mod
-        saved = engine_mod._CODE_VERSION
+        saved = probes._CODE_VERSION
         try:
-            engine_mod._CODE_VERSION = ("abc123", False)
-            with mock.patch.object(engine_mod.subprocess, "run",
+            probes._CODE_VERSION = ("abc123", False)
+            with mock.patch.object(probes.subprocess, "run",
                                    side_effect=[mock.Mock(stdout=""),
                                                 mock.Mock(stdout=" M README.md")]) as run, \
-                    mock.patch.object(engine_mod, "_current_head") as head:
-                self.assertEqual(engine_mod._code_version(), ("abc123", False))
-                self.assertEqual(engine_mod._code_version(), ("abc123", True))
+                    mock.patch.object(probes, "current_head") as head:
+                self.assertEqual(probes.code_version(), ("abc123", False))
+                self.assertEqual(probes.code_version(), ("abc123", True))
             self.assertEqual(run.call_count, 2)
             head.assert_not_called()
         finally:
-            engine_mod._CODE_VERSION = saved
+            probes._CODE_VERSION = saved
+        self.assertTrue(hasattr(engine_mod, "_code_version"),
+                        "the engine keeps a forwarder so health keeps reading it")
 
     def test_git_subprocesses_hide_the_windows_console(self):
-        from super_agent import engine as engine_mod
-        kwargs = engine_mod._quiet_subprocess_kwargs()
+        from super_agent.engine_parts import probes
+        kwargs = probes.quiet_subprocess_kwargs()
         if os.name == "nt":
-            self.assertTrue(kwargs["creationflags"] & engine_mod.subprocess.CREATE_NO_WINDOW)
+            self.assertTrue(kwargs["creationflags"] & probes.subprocess.CREATE_NO_WINDOW)
             self.assertTrue(kwargs["startupinfo"].dwFlags &
-                            engine_mod.subprocess.STARTF_USESHOWWINDOW)
+                            probes.subprocess.STARTF_USESHOWWINDOW)
             self.assertEqual(kwargs["startupinfo"].wShowWindow,
-                             engine_mod.subprocess.SW_HIDE)
+                             probes.subprocess.SW_HIDE)
         else:
             self.assertEqual(kwargs, {})
 

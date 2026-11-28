@@ -214,15 +214,16 @@ class Archive(Base):
         rec = engine.store.load_index()["assignments"]["asg_1_worker_1"]
         self.assertEqual(rec["status"], "blocked")
 
-    def test_archive_attempt_is_pruned_but_the_notification_is_kept(self):
+    def test_archive_attempt_is_pruned_and_leaves_no_notification_counter(self):
         engine = self.engine()
         self.review(engine)
         state = engine.store.load_outbox_state()
         leftovers = sorted(k for k in state["attempts"]
                            if k.startswith("asg_1_worker_1:"))
-        # The archive counter is terminal and pruned; the notification counter
-        # must survive (a late retry would otherwise re-send it).
-        self.assertEqual(leftovers, ["asg_1_worker_1:bus_inject:9001"])
+        # Both counters are terminal: the archive one is pruned, and the
+        # notification one no longer exists at all (#143 - a delivery logs a
+        # local row instead of dispatching, so nothing is left to re-send).
+        self.assertEqual(leftovers, [])
 
 
 class ArchivedSidGuard(Base):
@@ -230,7 +231,7 @@ class ArchivedSidGuard(Base):
         self.bind(archive=True)
         engine = self.engine()
         out = engine._dispatch({"kind": "bus_inject",
-                                "event": "event.agent.waiting_review",
+                                "event": "event.agent.supervisor",
                                 "issue": 1, "input_ref": "1",
                                 "payload": {"sid": "session_w1"}})
         self.assertFalse(out["dispatched"])
