@@ -240,7 +240,8 @@ def verdict(usage: float | None, kind: str, force: bool = False,
     "hard-cap", "force-allow".
     """
     if usage is None:
-        return "allow-unknown", EXIT_OK, "ctx 未知（bus 与直连都取不到）——放行但请留意"
+        return "allow-unknown", EXIT_OK, (
+            "ctx 未知（数字过期或未产生，非故障）——放行但请留意")
     pct = usage * 100
     pm_tiered = _pm_tiers_apply(sid, kind, sessions_path)
     if usage >= THRESHOLD_FORCE_HARD:
