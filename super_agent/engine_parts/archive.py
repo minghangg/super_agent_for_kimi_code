@@ -82,27 +82,47 @@ def from_stream(events, missing: bool) -> tuple[dict, bool]:
     return {sid: bool(rec.get("archived")) for sid, rec in sessions.items()}, False
 
 
+def delivered(rec: dict) -> bool:
+    """Did the engine's delivery pass handle this assignment's delivery?
+
+    Two witnesses, and either one is enough:
+
+    * ``waiting_review_logged`` - the marker ``_record_waiting_review`` writes
+      for every delivery matched since #143;
+    * ``notified_at`` - the field the *pre-#143* code wrote once the bus
+      accepted the notification. The notification is gone, so nothing writes it
+      now, but every record stored before #143 still carries it.
+
+    The second is not a courtesy. Measured on the live index (2026-11-28): of
+    200 assignments, **0** carry the marker and **92** carry ``notified_at`` -
+    the entire stored population predates the marker. A gate that accepted only
+    the marker would have skipped every one of them forever, and a record that
+    never archives never reaches ``waiting_release``, which is the one state the
+    PM watchdog watches.
+
+    Reading "was the notification attempted" from the store's try counter is
+    not an option either: with no dispatch there is no attempt, so the counter
+    is 0 for every new delivery. That is why this asks about the delivery, not
+    about a notification that no longer exists.
+    """
+    return bool(str(rec.get("waiting_review_logged") or "")
+                or str(rec.get("notified_at") or ""))
+
+
 def eligible(aid: str, rec: dict, *, archive_attempted) -> tuple[str, str]:
     """``(decision, detail)`` for one assignment before any side effect.
 
     ``decision`` is one of:
 
     * ``"skip"`` - nothing to do here (already archived, wrong state, no
-      delivery, the delivery chain did not finish, or this archive already ran);
+      delivery, the delivery pass never handled it, or this archive already
+      ran);
     * ``"go"`` - proceed.
 
-    **The "delivery chain finished" precondition survives the notification.**
-    Before #143 it was ``notify_attempted(...) < 1`` - the bus event had to have
-    been attempted. That event is gone, but the precondition is not: a record
-    that carries a ``delivery_comment_id`` without a
-    ``waiting_review_logged`` marker never finished the delivery pass (a hand
-    written row, a restored index, a line seeded by a fixture). Archiving such a
-    record immediately is how a ``blocked`` state appears for a thread the PM
+    **The precondition is "the delivery pass handled this delivery"**, see
+    :func:`delivered`. It exists because archiving a row that no delivery pass
+    ever produced is how a ``blocked`` state appears for a thread the PM
     watchdog then stops watching - ``blocked`` is not a held state.
-
-    The marker is the one ``_record_waiting_review`` writes, so the gate now
-    reads a field that is actually produced instead of ``notified_at``, which
-    #143 removed along with its only writer.
 
     ``archive_attempted`` is the store's try counter, read through
     ``action_id(aid, "archive", delivery)`` by the caller: the action id has a
@@ -120,8 +140,8 @@ def eligible(aid: str, rec: dict, *, archive_attempted) -> tuple[str, str]:
     delivery = rec.get("delivery_comment_id")
     if delivery is None:
         return "skip", "no delivery"
-    if not str(rec.get("waiting_review_logged") or ""):
-        return "skip", "delivery chain did not finish"
+    if not delivered(rec):
+        return "skip", "delivery pass never handled this row"
     if archive_attempted(aid, delivery) > 0:
         return "skip", "archive already attempted"
     return "go", ""

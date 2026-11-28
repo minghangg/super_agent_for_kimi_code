@@ -3060,10 +3060,11 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
         proved closed yet. ``completed`` is written by the close reconciliation
         (four conditions, two rounds), never here.
 
-        Nothing here waits on a notification any more: #143 removed the bus
-        event this pass used to require, so ``eligible`` no longer asks whether
-        one was attempted. The tombstone still records ``notified: false`` -
-        that is now the honest, constant answer rather than a failure case.
+        The precondition is "the delivery pass handled this delivery", asked by
+        :func:`engine_parts.archive.delivered` of two witnesses - the #143
+        marker and the pre-#143 ``notified_at``. Neither the bus event nor its
+        try counter can answer it any more: nothing is dispatched, so no
+        counter is ever written.
         """
         out = {"archived": [], "skipped": [], "blocked": [], "errors": []}
         save = index is None

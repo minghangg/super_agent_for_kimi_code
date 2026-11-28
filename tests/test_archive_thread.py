@@ -228,12 +228,11 @@ class Archive(Base):
     def test_a_hold_that_never_finished_the_delivery_chain_is_not_archived(self):
         """#143 P0-1: a seeded hold must not be archived on the first round.
 
-        The old gate was "the notification was attempted". Deleting it outright
-        made a row that never went through the delivery pass (a hand written
-        row, a restored index, a fixture) archive immediately; with a read-back
-        that does not confirm, that lands in ``blocked`` - a state the PM
-        watchdog does not watch. The replacement precondition reads
-        ``waiting_review_logged``, which the delivery pass actually writes.
+        A row with no witness at all - no ``waiting_review_logged`` marker and no
+        ``notified_at`` - is a row no delivery pass ever produced (a hand written
+        row, a restored index, a fixture seed). Archiving it at once lands in
+        ``blocked`` when the read-back does not confirm, and ``blocked`` is not a
+        held state, so the PM watchdog stops watching that thread.
         """
         engine = self.engine()
         index = engine.store.load_index()
@@ -245,8 +244,64 @@ class Archive(Base):
         engine.run_once()
         rec = engine.store.load_index()["assignments"]["asg_1_worker_1"]
         self.assertEqual(rec["status"], "waiting_release",
-                         "a hold whose delivery chain never ran stays held")
+                         "a hold no delivery pass produced stays held")
         self.assertEqual(self.sessions.archive_calls, [])
+
+    def test_a_record_written_before_143_still_archives(self):
+        """QA P0-1: the stored population must not be frozen out.
+
+        Every assignment written before #143 has ``notified_at`` and **no**
+        marker - measured on the live index 2026-11-28: 0 of 200 carry the
+        marker, 92 carry ``notified_at``. A gate that accepted only the marker
+        skipped all of them forever, and a record that never archives never
+        reaches ``waiting_release`` - the state the PM watchdog watches.
+
+        This is the shape no test covered, which is why a 2313-case full run
+        went green while the gate was wrong.
+        """
+        engine = self.engine()
+        index = engine.store.load_index()
+        index.setdefault("assignments", {})["asg_1_worker_1"] = {
+            "id": "asg_1_worker_1", "thread": THREAD, "issue": 1,
+            "role": "worker", "status": "waiting_release", "sid": "session_w1",
+            "delivery_comment_id": 9001, "qa_verdict": "pass",
+            "notified_at": "2026-11-20T10:00:00+00:00",
+            "waiting_review_logged": ""}
+        engine.store.save_index(index)
+        engine.run_once()
+        rec = engine.store.load_index()["assignments"]["asg_1_worker_1"]
+        self.assertEqual(self.sessions.archive_calls, ["session_w1"],
+                         "a pre-#143 record carries notified_at, which is a "
+                         "witness that the delivery pass handled it")
+        self.assertEqual(rec["status"], "waiting_release")
+        self.assertTrue(rec["tombstone"]["archived"])
+        self.assertFalse(rec["tombstone"]["notified"],
+                         "no notification exists any more, and the tombstone "
+                         "must not claim one")
+
+    def test_the_ticket_s_own_delivery_row_archives(self):
+        """The exact shape the arbitration named: #143's own assignment.
+
+        Live row ``asg_143_worker_1`` on 2026-11-28: ``waiting_review_logged``
+        null, ``notified_at`` set. A marker-only gate therefore made **this
+        ticket unable to close itself**, because archiving is one of the six
+        close conditions. The field values below are copied from that row.
+        """
+        engine = self.engine()
+        index = engine.store.load_index()
+        index.setdefault("assignments", {})["asg_1_worker_1"] = {
+            "id": "asg_143_worker_1",
+            "thread": "minghangg/laike_work_with_agent#143", "issue": 1,
+            "role": "worker", "status": "waiting_release", "sid": "session_w1",
+            "delivery_comment_id": 7240715203, "qa_verdict": "pass",
+            "notified_at": "2026-11-28T14:30:39+00:00",
+            "waiting_review_logged": None}
+        engine.store.save_index(index)
+        engine.run_once()
+        self.assertEqual(self.sessions.archive_calls, ["session_w1"],
+                         "#143 cannot close itself if its own row is skipped")
+        rec = engine.store.load_index()["assignments"]["asg_1_worker_1"]
+        self.assertTrue(rec["tombstone"]["archived"])
 
     def test_a_delivery_through_the_engine_does_finish_the_chain(self):
         """The counterpart: a real delivery writes the marker, so it archives."""
