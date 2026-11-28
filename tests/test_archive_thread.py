@@ -225,6 +225,37 @@ class Archive(Base):
         # local row instead of dispatching, so nothing is left to re-send).
         self.assertEqual(leftovers, [])
 
+    def test_a_hold_that_never_finished_the_delivery_chain_is_not_archived(self):
+        """#143 P0-1: a seeded hold must not be archived on the first round.
+
+        The old gate was "the notification was attempted". Deleting it outright
+        made a row that never went through the delivery pass (a hand written
+        row, a restored index, a fixture) archive immediately; with a read-back
+        that does not confirm, that lands in ``blocked`` - a state the PM
+        watchdog does not watch. The replacement precondition reads
+        ``waiting_review_logged``, which the delivery pass actually writes.
+        """
+        engine = self.engine()
+        index = engine.store.load_index()
+        index.setdefault("assignments", {})["asg_1_worker_1"] = {
+            "id": "asg_1_worker_1", "thread": THREAD, "issue": 1,
+            "role": "worker", "status": "waiting_release", "sid": "session_w1",
+            "delivery_comment_id": 9001, "qa_verdict": "pass"}
+        engine.store.save_index(index)
+        engine.run_once()
+        rec = engine.store.load_index()["assignments"]["asg_1_worker_1"]
+        self.assertEqual(rec["status"], "waiting_release",
+                         "a hold whose delivery chain never ran stays held")
+        self.assertEqual(self.sessions.archive_calls, [])
+
+    def test_a_delivery_through_the_engine_does_finish_the_chain(self):
+        """The counterpart: a real delivery writes the marker, so it archives."""
+        engine = self.engine()
+        self.review(engine)
+        rec = engine.store.load_index()["assignments"]["asg_1_worker_1"]
+        self.assertEqual(rec["status"], "waiting_release")
+        self.assertEqual(self.sessions.archive_calls, ["session_w1"])
+
 
 class ArchivedSidGuard(Base):
     def test_dispatch_refuses_an_archived_sid(self):

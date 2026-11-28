@@ -1,4 +1,4 @@
-"""Assignment lifecycle and the one-shot ``waiting_review`` notification.
+"""Assignment lifecycle and the local ``waiting_review`` audit row.
 
 Every test injects its own session stream through
 ``engine.session_events_path``: ``--state-dir`` does **not** isolate the

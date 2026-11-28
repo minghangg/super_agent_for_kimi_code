@@ -252,3 +252,31 @@ def at_needs_answer(*, issue, thread, at_entry: dict, flow_of, standard: str,
     if current and current.get("open_questions"):
         return bool(question_answered(thread, current.get("source_comment_id")))
     return bool(at_entry.get("awaiting") or current)
+
+
+HELD_STATES = ("waiting_release", "close_reconcile")
+
+
+def held_candidates(index: dict, *, issue_state) -> list[tuple]:
+    """``[(assignment_id, record)]`` for holds a release reminder may cover.
+
+    Sorted by id so a round's reminders are reproducible. Two filters, and both
+    are the reason a reminder is *not* noise:
+
+    * only the two held states - before a QA pass there is nothing to release;
+    * a **closed** Issue is not overdue. Reconciling a closed Issue is the end
+      state, not a stuck state, and reading it as "overdue" is the false alarm
+      #80 was filed for. ``issue_state`` is the caller's cached probe, so an
+      unreadable answer must read as ``unknown`` rather than ``closed``.
+    """
+    out = []
+    for aid, rec in sorted((index.get("assignments") or {}).items()):
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("status") or "") not in HELD_STATES:
+            continue
+        issue = rec.get("issue")
+        if issue is not None and issue_state(issue) == "closed":
+            continue
+        out.append((aid, rec))
+    return out

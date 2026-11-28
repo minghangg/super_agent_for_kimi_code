@@ -141,11 +141,6 @@ def replay_sessions(events_path) -> dict:
     return state
 
 
-def reconcile(events_path, sessions_path, server_sids, at) -> dict:
-    """Three-way: replay x ``sessions.json`` x live server. Read-only."""
-    return session_events.reconcile(events_path, sessions_path, server_sids, at)
-
-
 def replay_as_of(events_path, at) -> dict:
     """:func:`replay_sessions` at a point in time (``at=None`` means now)."""
     events, missing = session_events.read_stream(events_path)

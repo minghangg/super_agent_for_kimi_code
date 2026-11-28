@@ -88,17 +88,21 @@ def eligible(aid: str, rec: dict, *, archive_attempted) -> tuple[str, str]:
     ``decision`` is one of:
 
     * ``"skip"`` - nothing to do here (already archived, wrong state, no
-      delivery, or this archive already ran);
+      delivery, the delivery chain did not finish, or this archive already ran);
     * ``"go"`` - proceed.
 
-    There used to be a third answer, ``"unnotified"``, plus two gates in front
-    of it: the delivery notification had to be *attempted* and its
-    ``notified_at`` had to be set. Both are gone with the notification itself
-    (#143): the waiting-review bus event had no consumer, so the archive pass
-    was waiting for a bus write that only ever proved "the bus accepted an
-    event nobody reads". Keeping the gate would have parked every delivery in
-    ``waiting_review`` forever, since ``notified_at`` can no longer be written
-    by anything.
+    **The "delivery chain finished" precondition survives the notification.**
+    Before #143 it was ``notify_attempted(...) < 1`` - the bus event had to have
+    been attempted. That event is gone, but the precondition is not: a record
+    that carries a ``delivery_comment_id`` without a
+    ``waiting_review_logged`` marker never finished the delivery pass (a hand
+    written row, a restored index, a line seeded by a fixture). Archiving such a
+    record immediately is how a ``blocked`` state appears for a thread the PM
+    watchdog then stops watching - ``blocked`` is not a held state.
+
+    The marker is the one ``_record_waiting_review`` writes, so the gate now
+    reads a field that is actually produced instead of ``notified_at``, which
+    #143 removed along with its only writer.
 
     ``archive_attempted`` is the store's try counter, read through
     ``action_id(aid, "archive", delivery)`` by the caller: the action id has a
@@ -116,6 +120,8 @@ def eligible(aid: str, rec: dict, *, archive_attempted) -> tuple[str, str]:
     delivery = rec.get("delivery_comment_id")
     if delivery is None:
         return "skip", "no delivery"
+    if not str(rec.get("waiting_review_logged") or ""):
+        return "skip", "delivery chain did not finish"
     if archive_attempted(aid, delivery) > 0:
         return "skip", "archive already attempted"
     return "go", ""

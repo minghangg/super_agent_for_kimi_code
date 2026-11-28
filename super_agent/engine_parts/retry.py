@@ -226,3 +226,12 @@ def release_skipped_row(thread: str, assignment: str, *, now: str) -> dict:
     """
     return {"type": "release_timeout.skipped", "at": now, "thread": thread,
             "assignment": assignment, "reason": "no usable start time"}
+
+
+def undeliverable_event_row(thread: str, comment_id, *, to: str,
+                            assignment: str, issue, detail: str,
+                            now: str) -> dict:
+    """The ``route.supervisor_undeliverable`` row for one failed notice."""
+    return {"type": "route.supervisor_undeliverable", "at": now,
+            "thread": thread, "comment_id": comment_id, "to": to,
+            "assignment": assignment, "issue": issue, "detail": detail}

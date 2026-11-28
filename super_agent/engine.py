@@ -170,6 +170,7 @@ SID_RE = session_ledger.FULL_SID_RE
 
 
 def _now() -> str:
+    """ISO-8601 UTC to the second; ``probes.now`` is the only definition."""
     return probes.now()
 
 
@@ -1390,11 +1391,9 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
                            f"{detail}")
         if key not in self._sup_notice_logged:
             self._sup_notice_logged.add(key)
-            self.store.log_event({
-                "type": "route.supervisor_undeliverable", "at": _now(),
-                "thread": thread, "comment_id": comment_id, "to": to,
-                "assignment": assignment, "issue": issue, "detail": detail,
-            })
+            self.store.log_event(retry_mod.undeliverable_event_row(
+                thread, comment_id, to=to, assignment=assignment,
+                issue=issue, detail=detail, now=_now()))
         numbers = index.setdefault("issues", {}).setdefault(
             thread, {"state": "idle", "comments_seen": 0, "needs_person": []})
         row = retry_mod.undeliverable_row(
@@ -1406,14 +1405,10 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
 
     def _note_skipped(self, index: dict, assignment: str, thread: str,
                       comment_id, detail: str) -> None:
-        """A held thread with no usable start time: said once, then queued.
-
-        The scan runs every round, so an unconditional ``log_event`` here wrote
-        the same line on every round - the same "bury the queue" problem the row
-        de-duplication already solves. One event and one row per assignment.
-        """
-        if f"skipped:{assignment}" not in self._sup_notice_logged:
-            self._sup_notice_logged.add(f"skipped:{assignment}")
+        """A held thread with no usable start time: said once, then queued."""
+        key = f"skipped:{assignment}"
+        if key not in self._sup_notice_logged:
+            self._sup_notice_logged.add(key)
             self.store.log_event(
                 retry_mod.release_skipped_row(thread, assignment, now=_now()))
         self._note_undeliverable(index, thread, comment_id, detail,
@@ -2517,21 +2512,10 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
             timeout = 1800.0
         now = datetime.now(timezone.utc)
         sent = 0
-        for aid, rec in sorted((index.get("assignments") or {}).items()):
-            if not isinstance(rec, dict):
-                continue
-            if str(rec.get("status") or "") not in ("waiting_release",
-                                                    "close_reconcile"):
-                continue
+        for aid, rec in watchdog_mod.held_candidates(
+                index, issue_state=self._issue_state):
             thread = str(rec.get("thread") or "")
             issue = rec.get("issue")
-            # A closed issue has nothing to release. Reconciling a closed issue
-            # is the end state, not a stuck state; reading it as "overdue" is
-            # the false alarm (#80). The attempt de-dup below stays: it is what
-            # ended the 57-round re-send of #68, and removing it to "make the
-            # alarm show up" would trade one noise for another.
-            if issue is not None and self._issue_state(issue) == "closed":
-                continue
             start = self._release_start(index, thread, rec)
             due, seconds, problem = watchdog_mod.overdue(start, timeout)
             if problem:
@@ -4135,8 +4119,8 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
                            server_sids: set[str] | None = None) -> dict:
         """Three-way: replay x ``sessions.json`` x live server. Read-only."""
         events_path, sessions_path = self._session_stream()
-        return session_truth_mod.reconcile(events_path, sessions_path,
-                                           server_sids, at)
+        return session_events.reconcile(events_path, sessions_path,
+                                        server_sids, at)
 
     # -------------------------------------------------------------------- replay
     def replay(self, issue: int) -> dict:

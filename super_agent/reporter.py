@@ -482,17 +482,13 @@ def _cid_from_input_ref(rec: dict):
     ``route``           a comment id                no
     ==================  ==========================  ====================
 
-    ``waiting_review`` used to be a row here. It is gone (#143): the delivery no
-    longer dispatches a bus event, so there is no such outbox record to read.
-    Old rows still on disk keep their meaning - the gate reads
-    ``assignment_id``, not the kind name.
+    ``waiting_review`` used to be a row here; #143 removed it with the bus
+    event. Old rows keep their meaning - the gate reads ``assignment_id``.
 
     The gate is structural rather than a list of names: ``engine`` always
     attaches an ``assignment_id`` when it dispatches for an assignment, and the
-    ``needs_person`` notification (``engine.py:1522``) never does. So "no
-    assignment" means "``input_ref`` is not a delivery id". Reading it as one
-    would invent a comment that does not exist and, worse, collide with a real
-    entry for that number.
+    ``needs_person`` notification (``engine.py:1522``) never does. Reading a
+    bare number as a delivery id would collide with a real comment.
 
     The engine's own defect - the needs_person dispatch not passing
     ``input_ref`` at all - is out of scope for this ticket; this gate is what
