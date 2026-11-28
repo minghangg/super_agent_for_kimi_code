@@ -102,6 +102,12 @@ def supervisor_candidate(record, *, attempted) -> str:
     """
     if not isinstance(record, dict) or record.get("ok"):
         return "skip"
+    # ``permanent`` is the same end state ``route_candidate`` honours: a closed
+    # issue (or a creation-mode refusal) is not retried, and without this check
+    # the caller re-probed the issue every round to reach the same answer
+    # (#142: three records, 382 rows each).
+    if record.get("permanent"):
+        return "skip"
     if "sup_eligible" not in record:
         return "undecidable"
     if record.get("sup_eligible") is not True:
@@ -172,3 +178,41 @@ def undeliverable_row(rows, *, comment_id, reason: str, assignment: str,
             return None
     return {"comment_id": comment_id, "reason": reason, "at": now,
             "assignment": str(assignment or ""), "detail": str(detail or "")}
+
+def issue_of(index: dict, thread: str):
+    """The issue number a thread belongs to, or ``None``.
+
+    Every retry pass needs it and each one used to walk ``assignments`` with
+    its own copy of the loop. The three copies drifted: one gained a
+    closed-issue skip and the others did not, so a closed issue's frames kept
+    regenerating refusals every round (#142).
+    """
+    for rec in (index.get("assignments") or {}).values():
+        if str(rec.get("thread") or "") == thread:
+            return rec.get("issue")
+    return None
+
+def closed_thread_event(log_event, etype: str, thread: str, issue, cid,
+                        now: str) -> None:
+    """One ``info`` row when a retry pass first sees its issue closed.
+
+    The row is written on the pass that *marks* the record permanent, so it
+    appears exactly once: after that the record is no longer a candidate and
+    this function is not reached again. Both retry passes share it, which is
+    what keeps the two event names from growing two different payload shapes.
+    """
+    log_event({"type": etype, "at": now, "thread": thread,
+               "issue": int(issue), "comment_id": cid,
+               "level": "info", "consumers": ["doctor"]})
+
+
+def note_closed_route(route: dict, log_event, etype: str, thread: str,
+                      issue, cid, now: str) -> None:
+    """End a route on a closed issue, and say so exactly once.
+
+    The mark and the row always travel together: a mark without the row hides
+    the decision, and a row without the mark regenerates it every round. Both
+    retry passes call this, so the two keep one shape (#142).
+    """
+    closed_route(route, now)
+    closed_thread_event(log_event, etype, thread, issue, cid, now)

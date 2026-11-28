@@ -86,6 +86,7 @@ from . import assignments as asg_mod
 from .engine_parts import at_routes as at_routes_mod
 from .engine_parts import claims as walk_claims
 from .engine_parts import fault_report as fault_report_mod
+from .engine_parts import health_flag as health_flag_mod
 from .engine_parts import frame_text as frame_text_mod
 from .engine_parts import project_lookup as project_lookup_mod
 from .engine_parts import source_faults as source_faults_mod
@@ -303,6 +304,7 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
         self.last_successful_action_at: str | None = None
         # Set when the session stream cannot be read: no assignment is created
         # and health reports degraded (fail closed, never an empty loop).
+        # Round-scoped since #142 (see engine_parts.health_flag).
         self.degraded = False
         self._assignments_error = ""
         # Set when a **declared** session stream has no segment on disk
@@ -506,27 +508,8 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
 
     # ------------------------------------------------------------------ health
     def _note_index_state(self) -> str:
-        """Read once, and mark degraded when ``index.json`` cannot be trusted.
-
-        Same shape as ``_sync_assignments``: a reportable state, not a crash,
-        so health and the event both get written. ``load_index`` records the
-        fault and moves the file aside at most once per process, so the store's
-        marker - not a second ``index_problem`` probe - keeps the reason after
-        the path is empty.
-        """
-        self.store.load_index()
-        problem = self.store.index_unreadable
-        self._index_error = problem
-        if not problem:
-            return ""
-        self.degraded = True
-        self.store.log_event({"type": "index.unreadable", "at": _now(),
-                              "error": problem,
-                              "path": str(self.store.index_path),
-                              "quarantined": self.store.index_quarantined,
-                              "level": "warn",
-                              "consumers": ["doctor", "brief", "health"]})
-        return problem
+        """Forwarder: see :func:`engine_parts.health_flag.note_index_state`."""
+        return health_flag_mod.note_index_state(self, _now())
 
     def health_record(self, *, error: str = "", degraded: bool = False,
                       running: bool = True, phase: str = "") -> dict:
@@ -1242,20 +1225,13 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
                 continue
             cid = route.get("comment_id")
             thread = str(route.get("thread") or "")
-            issue = None
-            for rec in (index.get("assignments") or {}).values():
-                if str(rec.get("thread") or "") == thread:
-                    issue = rec.get("issue")
-                    break
+            issue = retry_mod.issue_of(index, thread)
             if issue is None:
                 continue
             if self._issue_state(issue) == "closed":
-                retry_mod.closed_route(route, _now())
-                self.store.log_event({
-                    "type": "route.skipped_closed_issue", "at": _now(),
-                    "thread": thread, "issue": int(issue), "comment_id": cid,
-                    "level": "info", "consumers": ["doctor"],
-                })
+                retry_mod.note_closed_route(
+                    route, self.store.log_event, "route.skipped_closed_issue",
+                    thread, issue, cid, _now())
                 continue
             review = {"verdict": str(route.get("verdict") or "")}
             result = self._route_review(index, thread, int(issue),
@@ -1588,11 +1564,7 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
             base = str(record.get("action_id") or "")
             thread = str(record.get("thread") or "")
             cid = record.get("comment_id")
-            issue = None
-            for rec in (index.get("assignments") or {}).values():
-                if str(rec.get("thread") or "") == thread:
-                    issue = rec.get("issue")
-                    break
+            issue = retry_mod.issue_of(index, thread)
             if issue is None or cid is None:
                 # Dropping this quietly would leave the record ``ok=False``
                 # forever with nothing to look at - the same silence this bit
@@ -1602,6 +1574,15 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
                     index, thread, cid,
                     "retry cannot resolve the issue for this supervisor record",
                     issue=issue, once_key=f"retry-issue:{key}")
+                continue
+            # A closed issue ends the wait, as it does for ``routes`` (#84);
+            # this copy never had the check, so three stuck records rang 382
+            # refusals each -- a refusal writes no attempt, so nothing ended it.
+            if self._issue_state(issue) == "closed":
+                retry_mod.note_closed_route(
+                    record, self.store.log_event,
+                    "route.supervisor_skipped_closed",
+                    thread, issue, cid, _now())
                 continue
             review = {"verdict": str(record.get("verdict") or "")}
             result = self._route_supervisor(index, thread, int(issue),
@@ -3288,12 +3269,9 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
             # refuses.
             gate_ok, gate_why = asg_mod.qa_gate(rec)
             if not gate_ok:
-                self.store.log_event({
-                    "type": "assignment.qa_gate_refused", "at": _now(),
-                    "assignment": aid, "thread": thread,
-                    "delivery_comment_id": delivery, "reason": gate_why,
-                    "level": "info", "consumers": ["doctor"],
-                })
+                # First sighting + a 30-round re-alert; see engine_parts.archive.
+                archive_mod.note_qa_refusal(self, index, aid, rec,
+                                            gate_why, _now())
                 out["skipped"].append(aid)
                 continue
             sid = str(rec.get("sid") or "")
@@ -3744,6 +3722,7 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
         # Round-scoped: a stream fault from the previous round must not linger
         # in this round's health line after the stream came back.
         self._stream_error = ""
+        health_flag_mod.clear(self)   # round-scoped; see engine_parts.health_flag
         self._note_index_state()
         # ISS-79 F: a declared-but-absent session stream must not turn into a
         # quiet round. Checked here, before any issue is read, so the fault is
@@ -3957,7 +3936,10 @@ class Engine(AtRoutes, ReviewRoutes, RefusedRoutes):
         # private attribute where a reader would never see it.
         if self._stream_error:
             health_errors.append(self._stream_error)
-        self.write_health(error="; ".join(health_errors), degraded=self.degraded)
+        # Snapshot first, then date a recovery across the two published ones;
+        # see ``engine_parts.health_flag.publish_round_health``.
+        health_flag_mod.publish_round_health(
+            self, "; ".join(health_errors), now=_now(), round_seq=state.seq)
         return summary
 
     def _note_collected(self, thread: str, batch, cursor_before: int,

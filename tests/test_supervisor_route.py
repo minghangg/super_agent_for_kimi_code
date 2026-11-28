@@ -833,3 +833,60 @@ class ConfigSurface(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClosedIssueEndsTheSupervisorRetry(Base):
+    """#142: a closed issue stops the supervisor retry, as it already did routes.
+
+    ``_retry_routes`` has had the closed check since #84 and
+    ``_retry_supervisor_routes`` never got it. The allowlist refuses a closed
+    issue every round, a refusal writes no attempt counter, so the loop had no
+    end: three stuck records rang 382 ``dispatch.refused`` rows each.
+    """
+
+    def closed_record(self, engine) -> dict:
+        index = self.index(engine)
+        sup_key = f"sup:{THREAD}:9100"
+        index["supervisor_routes"] = {sup_key: {
+            "thread": THREAD, "comment_id": 9100, "at": "2026-11-10T10:00:00Z",
+            "verdict": "pass", "fix_needed": False, "sup_eligible": True,
+            "action_id": action_id(sup_key, "bus_inject", "9100")}}
+        index["assignments"] = {"asg_1_worker_1": {
+            "id": "asg_1_worker_1", "thread": THREAD, "issue": 1,
+            "role": "worker", "status": "waiting_release",
+            "sid": "session_w1", "delivery_comment_id": 9001}}
+        return index
+
+    def test_closed_marks_once_and_never_probes_again(self):
+        engine = self.engine()
+        asked = {"n": 0}
+
+        def state(issue):
+            asked["n"] += 1
+            return "closed"
+
+        engine._issue_state = state
+        index = self.closed_record(engine)
+        sup_key = f"sup:{THREAD}:9100"
+        self.assertEqual(engine._retry_supervisor_routes(index), 0)
+        record = index["supervisor_routes"][sup_key]
+        self.assertTrue(record["permanent"])
+        self.assertEqual(record["permanent_reason"], "issue closed")
+        self.assertEqual(len([r for r in self.rows()
+                              if r["type"] == "route.supervisor_skipped_closed"]), 1)
+        for _ in range(5):
+            engine._retry_supervisor_routes(index)
+        self.assertEqual(asked["n"], 1, "``permanent`` is what stops the probe")
+        self.assertEqual(len([r for r in self.rows()
+                              if r["type"] == "route.supervisor_skipped_closed"]), 1)
+
+    def test_unknown_still_retries_and_marks_nothing(self):
+        engine = self.engine()
+        engine._issue_state = lambda issue: "unknown"
+        index = self.closed_record(engine)
+        record = index["supervisor_routes"][f"sup:{THREAD}:9100"]
+        engine._retry_supervisor_routes(index)
+        self.assertNotIn("permanent", record)
+        self.assertNotIn("skipped_closed_at", record)
+        self.assertEqual([r for r in self.rows()
+                          if r["type"] == "route.supervisor_skipped_closed"], [])

@@ -130,3 +130,62 @@ def record_archived(rec: dict, *, delivery, notified: bool, now: str) -> dict:
                         "notified": bool(notified), "at": now,
                         "cid": delivery, "attempt": 1}
     return rec
+
+
+QA_REFUSED_ROW = "assignment.qa_gate_refused"
+
+
+QA_REFUSED_REALERT_ROUNDS = 30
+
+
+def qa_refusal_row(rec: dict, reason: str, *, issue_is_closed,
+                   aid: str, thread: str, delivery, now: str):
+    """The ``assignment.qa_gate_refused`` row to write, or ``None``.
+
+    A delivery parked in ``waiting_review`` without a verdict is *not a fault* -
+    it simply has not been reviewed yet - and the archive pass asks the gate
+    again every round. Writing one row per round per assignment turned that
+    answer into 388 identical lines per stuck thread (#142): the log grew and
+    nobody learned anything.
+
+    The rule is the one the refusal ledger already uses for routes: the **first**
+    sighting is news, then the same reason stays quiet until it has run for
+    ``QA_REFUSED_REALERT_ROUNDS`` more rounds, so a thread stuck for a day is
+    still visible at a glance without becoming the log. A *different* reason
+    starts over - "no qa pass recorded" turning into "qa rejected" is news.
+
+    ``issue_is_closed`` is a callable because reading the Issue costs a probe:
+    a round whose answer is already quiet must not pay for it.
+    """
+    text = str(reason or "")
+    streak = rec.get("qa_refused_streak")
+    if not isinstance(streak, dict) or streak.get("reason") != text:
+        streak = rec["qa_refused_streak"] = {"reason": text, "rounds": 0}
+    streak["rounds"] = int(streak.get("rounds") or 0) + 1
+    if streak["rounds"] > 1 and streak["rounds"] % QA_REFUSED_REALERT_ROUNDS:
+        return None
+    if issue_is_closed():
+        return None
+    return {"type": QA_REFUSED_ROW, "at": now, "assignment": aid,
+            "thread": thread, "delivery_comment_id": delivery,
+            "reason": reason, "rounds": streak["rounds"],
+            "level": "info", "consumers": ["doctor"]}
+
+
+def note_qa_refusal(engine, index: dict, aid: str, rec: dict,
+                    reason: str, now: str) -> None:
+    """Write the QA-gate refusal row, when this answer is news.
+
+    Takes the engine for the two inputs ``rec`` cannot supply: the Issue state,
+    read lazily, and the event sink. Keeping the whole decision here means the
+    archive pass reads as one line per assignment.
+    """
+    issue = rec.get("issue")
+    row = qa_refusal_row(
+        rec, reason,
+        issue_is_closed=lambda: issue is not None
+        and engine._issue_state(issue) == "closed",
+        aid=aid, thread=str(rec.get("thread") or ""),
+        delivery=rec.get("delivery_comment_id"), now=now)
+    if row is not None:
+        engine.store.log_event(row)

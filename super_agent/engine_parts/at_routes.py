@@ -17,6 +17,7 @@ from .. import issuekey, requirements
 from ..store import action_id
 from . import at_ledger as at_ledger_mod
 from . import frame_text as frame_text_mod
+from . import retry as retry_mod
 from . import watchdog as watchdog_mod
 
 
@@ -258,12 +259,7 @@ class AtRoutes:
             stall[thread] = entry
             if not watchdog_mod.due(entry, limit):
                 continue
-            issue = at_entry.get("issue")
-            if issue is None:
-                for rec in (index.get("assignments") or {}).values():
-                    if str(rec.get("thread") or "") == thread:
-                        issue = rec.get("issue")
-                        break
+            issue = at_entry.get("issue") or retry_mod.issue_of(index, thread)
             if issue is None:
                 # The binding records a session, not a number. The thread key
                 # carries it, and ``issue: 0`` would fail the project allowlist

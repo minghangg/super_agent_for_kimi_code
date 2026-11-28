@@ -295,3 +295,69 @@ class ReconcileClose(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QaRefusalIsNotRepeatedEveryRound(Base):
+    """#142: the same unanswered QA gate is one fact, not one row per round.
+
+    A delivery parked in ``waiting_review`` is *not* a fault - it simply has no
+    verdict yet - and the archive pass asks the gate again on every round. One
+    row per round per assignment turned that into 388 identical lines per stuck
+    thread, which grows the log and teaches a reader to skip it.
+    """
+
+    def test_same_reason_is_written_once(self):
+        engine = self.engine()
+        self.review(engine, pass_cid=None)
+        count = lambda: len([r for r in self.events_rows()
+                             if r["type"] == "assignment.qa_gate_refused"])
+        self.assertEqual(count(), 1)
+        for _ in range(4):
+            engine.archive_thread(THREAD)
+        self.assertEqual(count(), 1, "an unchanged answer is not news")
+
+    def test_a_stuck_thread_realerts_on_a_long_interval(self):
+        engine = self.engine()
+        self.review(engine, pass_cid=None)
+        index = engine.store.load_index()
+        rec = index["assignments"]["asg_1_worker_1"]
+        self.assertEqual(rec["qa_refused_streak"]["rounds"], 1)
+        engine.archive_thread(THREAD, index)
+        self.assertEqual(rec["qa_refused_streak"]["rounds"], 2,
+                         "the streak keeps counting while the row stays quiet")
+        for _ in range(27):
+            engine.archive_thread(THREAD, index)
+        rows = [r for r in self.events_rows()
+                if r["type"] == "assignment.qa_gate_refused"]
+        self.assertEqual(len(rows), 1, "rounds 3..29 stay quiet")
+        engine.archive_thread(THREAD, index)
+        rows = [r for r in self.events_rows()
+                if r["type"] == "assignment.qa_gate_refused"]
+        self.assertEqual(len(rows), 2, "round 30 is a re-alert")
+        self.assertEqual(rows[-1]["rounds"], 30)
+
+    def test_a_changed_reason_earns_its_own_row(self):
+        engine = self.engine()
+        self.review(engine, pass_cid=None)
+        index = engine.store.load_index()
+        rec = index["assignments"]["asg_1_worker_1"]
+        rec["qa_verdict"] = "reject"
+        engine.archive_thread(THREAD, index)
+        reasons = [r["reason"] for r in self.events_rows()
+                   if r["type"] == "assignment.qa_gate_refused"]
+        self.assertEqual(len(reasons), 2, "'qa rejected' is different news")
+        self.assertIn("no qa pass recorded", reasons[0])
+        self.assertIn("rejected", reasons[1])
+
+    def test_a_closed_issue_writes_no_row_at_all(self):
+        engine = self.engine()
+        self.review(engine, pass_cid=None)
+        before = len([r for r in self.events_rows()
+                      if r["type"] == "assignment.qa_gate_refused"])
+        engine._issue_state = lambda issue: "closed"
+        index = engine.store.load_index()
+        index["assignments"]["asg_1_worker_1"].pop("qa_refused_streak", None)
+        engine.archive_thread(THREAD, index)
+        after = len([r for r in self.events_rows()
+                     if r["type"] == "assignment.qa_gate_refused"])
+        self.assertEqual(after, before, "a closed issue has nothing to wait for")
