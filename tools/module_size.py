@@ -82,6 +82,47 @@ BASELINE = {
     "store.py": 821,
 }
 
+#: Code lines (blank and comment-only lines excluded) at the moment this metric
+#: was introduced (user ruling 2026-11-28). Physical line count alone rewarded
+#: the wrong behaviour: an agent could delete logic and keep the number flat by
+#: writing prose in its place, or compress twenty explanatory lines into one
+#: unreadable line. Neither is a smaller file.
+#:
+#: Both numbers are now reported, and **both** must not grow. Comments stay free
+#: to write - this repository's comments explain *why*, and deleting them to hit
+#: a number would be the loss the rule is trying to prevent. What the code-line
+#: count stops is using prose to hide that the logic did not shrink.
+#:
+#: These are **current** values, not historical peaks: the metric starts now.
+CODE_BASELINE = {
+    "engine.py": 3485,
+    "wss_bus.py": 2526,
+    "decide_watch.py": 2638,
+    "dispatch_cli.py": 1214,
+    "console.py": 1170,
+    "cli.py": 896,
+    "reporter.py": 1011,
+    "markers.py": 870,
+    "issue_cli.py": 1065,
+    "direct.py": 908,
+    "autostart.py": 752,
+    "assignments.py": 777,
+    "store.py": 675,
+}
+
+
+def code_lines(text: str) -> int:
+    """Lines that carry code: no blanks, no ``#``-only lines.
+
+    Deliberately crude. A line that ends in a comment still counts as code, and
+    a docstring counts as code - both are content someone has to read. Only two
+    things are free: whitespace, and a line whose first non-space character is
+    ``#``. Anything finer (AST node counts, token counts) stops being something
+    a person can check by looking, and a number nobody can verify is not a rule.
+    """
+    return sum(1 for line in text.splitlines()
+               if line.strip() and not line.strip().startswith("#"))
+
 
 def _parse(path: Path):
     """The module AST, or ``None`` when it does not parse.
@@ -113,6 +154,7 @@ def scan_file(path: Path) -> dict:
     return {
         "path": path.name,
         "lines": len(text.splitlines()),
+        "code_lines": code_lines(text),
         "docstring": bool(ast.get_docstring(tree)),
         "functions": len(funcs),
         "long_functions": [f for f in funcs if f["lines"] > FUNC_ALARM],
@@ -153,7 +195,9 @@ def over_budget(rows: list[dict]) -> list[dict]:
         if "error" in row:
             continue
         name, lines = row["path"], row["lines"]
+        code = row.get("code_lines", 0)
         base = BASELINE.get(name)
+        code_base = CODE_BASELINE.get(name)
         if base is None:
             if lines > FILE_ALARM:
                 out.append({**row, "baseline": None,
@@ -162,6 +206,13 @@ def over_budget(rows: list[dict]) -> list[dict]:
             out.append({**row, "baseline": base,
                         "reason": f"grew {lines - base} lines past {base}"
                                   f" (allowance {GROWTH_ALLOWANCE})"})
+        # The code-line half. A file may keep its physical size while its logic
+        # grows, or shrink its logic while prose fills the gap; neither is a
+        # smaller file, and only this count can see either.
+        if code_base is not None and code > code_base + GROWTH_ALLOWANCE:
+            out.append({**row, "baseline": code_base,
+                        "reason": f"code lines grew {code - code_base} past"
+                                  f" {code_base} (allowance {GROWTH_ALLOWANCE})"})
     return out
 
 
@@ -212,10 +263,17 @@ def render(rows: list[dict], as_json: bool = False) -> str:
         cleaned = [d for d in debt if d["cleaned"]]
         lines.append("")
         lines.append(f"历史超线（{len(debt)}）— 不判失败；改它时目标是净降:")
+        lines.append(f"  {'物理':>6s} {'代码':>6s}  {'文件':22s} {'基线':>5s}  变化")
         for row in sorted(debt, key=lambda d: d["lines"], reverse=True):
             mark = f"净降 {-row['delta']}" if row["cleaned"] else (
                 f"+{row['delta']}" if row["delta"] else "未变")
-            lines.append(f"  {row['lines']:6d}  {row['path']:22s} 基线 {row['baseline']:5d}  {mark}")
+            code = row.get("code_lines", 0)
+            code_base = CODE_BASELINE.get(row["path"])
+            code_delta = code - code_base if code_base is not None else 0
+            code_mark = "—" if code_base is None else (
+                f"代码 {code_delta:+d}" if code_delta else "代码 0")
+            lines.append(f"  {row['lines']:6d} {code:6d}  {row['path']:22s}"
+                         f" {row['baseline']:5d}  {mark}  {code_mark}")
         if cleaned:
             lines.append(f"  本次已打扫 {len(cleaned)} 个")
     long_funcs = [(f["lines"], r["path"], f["name"], f["line"])

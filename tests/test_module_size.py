@@ -163,5 +163,51 @@ class RealRepository(unittest.TestCase):
         self.assertLessEqual(len(missing), 1, missing)
 
 
+class CodeLines(unittest.TestCase):
+    """Code-line counting: what the second column is for.
+
+    Physical lines alone rewarded two things that are not "a smaller file":
+    deleting logic and writing prose in its place (number flat, content gone),
+    and compressing twenty explanatory lines into one unreadable line (number
+    down, readability worse). Both are invisible to ``wc -l`` and both are
+    visible here.
+    """
+
+    def test_blanks_and_comment_only_lines_are_free(self):
+        text = "a = 1\n\n# a note\n   # indented note\nb = 2\n"
+        self.assertEqual(ms.code_lines(text), 2)
+
+    def test_a_trailing_comment_still_counts_as_code(self):
+        # "x = 1  # why" is a line someone has to read; it is not free.
+        self.assertEqual(ms.code_lines("x = 1  # why\n"), 1)
+
+    def test_a_docstring_counts_as_code(self):
+        self.assertEqual(ms.code_lines('"""Module."""\n'), 1)
+
+    def test_swapping_logic_for_comments_lowers_the_count(self):
+        """The trick this column exists to catch: same physical size, less code."""
+        before = "a = 1\nb = 2\nc = 3\n"
+        after = "# a = 1\n# b = 2\n# c = 3\n"
+        self.assertEqual(len(before.splitlines()), len(after.splitlines()))
+        self.assertEqual(ms.code_lines(after), 0)
+        self.assertLess(ms.code_lines(after), ms.code_lines(before))
+
+    def test_a_file_whose_code_grew_past_its_code_baseline_fails(self):
+        row = {"path": "engine.py", "lines": 100, "code_lines": 10_000}
+        base = ms.CODE_BASELINE["engine.py"]
+        self.assertGreater(row["code_lines"], base + ms.GROWTH_ALLOWANCE)
+        reasons = [r["reason"] for r in ms.over_budget([row])]
+        self.assertTrue(any("code lines grew" in r for r in reasons), reasons)
+
+    def test_every_code_baseline_names_a_real_file(self):
+        names = {r["path"] for r in ms.scan()}
+        for name in ms.CODE_BASELINE:
+            self.assertIn(name, names, f"code baseline names a gone file: {name}")
+
+    def test_every_code_baseline_has_a_physical_baseline(self):
+        """Two tables must cover the same files, or one column silently skips."""
+        self.assertEqual(set(ms.CODE_BASELINE), set(ms.BASELINE))
+
+
 if __name__ == "__main__":
     unittest.main()
